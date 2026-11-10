@@ -8,9 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/commands"
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/launcher"
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/supervisor"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/commands"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/launcher"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/supervisor"
 	"github.com/charmbracelet/x/term"
 )
 
@@ -22,6 +22,7 @@ func run(args []string) int {
 	var opts supervisor.Options
 	var capabilities bool
 	fs.StringVar(&opts.Root, "root", defaultRoot(), "setup repository root")
+	fs.StringVar(&opts.Home, "home", os.Getenv("DOTS_HOME"), "dots manager directory (DOTS_HOME)")
 	fs.StringVar(&opts.Command, "command", "", "dots command; omitted means up")
 	fs.BoolVar(&capabilities, "capabilities", false, "print frontend protocol")
 	fs.BoolVar(&opts.MAS, "mas", false, "include Mac App Store updates")
@@ -39,7 +40,7 @@ func run(args []string) int {
 		return 2
 	}
 	if capabilities {
-		fmt.Println("dots-shared-cli/1")
+		fmt.Println("dots-shared-cli/2")
 		return 0
 	}
 	if opts.Plain && opts.Verbose {
@@ -61,6 +62,14 @@ func run(args []string) int {
 		return 2
 	}
 	opts.Root = root
+	if opts.Home != "" {
+		home, err := filepath.Abs(opts.Home)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		opts.Home = home
+	}
 	if opts.Command == "menu" {
 		if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
 			fs.Usage()
@@ -147,10 +156,14 @@ func execute(opts supervisor.Options) int {
 }
 
 func directBackend(opts supervisor.Options) int {
-	args := []string{filepath.Join(opts.Root, "dotfiles", ".local", "bin", "dots"), "--backend", opts.Command}
+	if opts.Home == "" {
+		fmt.Fprintln(os.Stderr, "dots: the dots manager directory is unknown; pass --home or set DOTS_HOME")
+		return 2
+	}
+	args := []string{filepath.Join(opts.Home, "bin", "dots"), "--backend", opts.Command}
 	args = append(args, opts.Args...)
 	cmd := exec.Command("bash", args...)
-	cmd.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root)
+	cmd.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root, "DOTS_HOME="+opts.Home)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

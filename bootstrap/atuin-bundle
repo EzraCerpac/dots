@@ -186,7 +186,9 @@ finish() {
 
 TOTAL_STAGES=1
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The configuration dots selected; outside dots, the checkout holding the manager.
+ROOT_DIR="$(cd "${DOTS_ROOT:-$SCRIPT_DIR/../..}" && pwd -P)"
 OUTPUT="$ROOT_DIR/encrypted/atuin.json.age"
 ENV_FILE=/dev/null
 RECIPIENTS=()
@@ -223,7 +225,7 @@ ask_secret ATUIN_PASSWORD "Atuin password for EzraCerpac:"
 [[ -n "$ATUIN_PASSWORD" ]] || { warn "The password cannot be empty."; exit 2; }
 BUNDLE_ARGS=()
 for recipient in "${RECIPIENTS[@]}"; do BUNDLE_ARGS+=(--recipient "$recipient"); done
-printf '%s' "$ATUIN_PASSWORD" | uv run --no-project python "$ROOT_DIR/setup-scripts/bootstrap/atuin.py" bundle \
+printf '%s' "$ATUIN_PASSWORD" | uv run --no-project python "$SCRIPT_DIR/atuin.py" bundle \
   --output "$OUTPUT" "${BUNDLE_ARGS[@]}"
 ATUIN_PASSWORD=''
 note "Created $OUTPUT"

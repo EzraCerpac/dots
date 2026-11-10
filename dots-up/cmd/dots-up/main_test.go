@@ -1,14 +1,15 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestDirectCommandsHonorSelectedRootOverAmbientRoot(t *testing.T) {
-	source, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "dotfiles", ".local", "bin", "dots"))
+func TestDirectCommandsHonorSelectedRootAndHomeOverAmbient(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "bin", "dots"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,14 +23,20 @@ func TestDirectCommandsHonorSelectedRootOverAmbientRoot(t *testing.T) {
 				selected := filepath.Join(base, "selected")
 				other := filepath.Join(base, "ambient")
 				for _, root := range []string{selected, other} {
-					if err := os.MkdirAll(filepath.Join(root, "dotfiles", ".local", "bin"), 0700); err != nil {
+					if err := os.MkdirAll(root, 0700); err != nil {
 						t.Fatal(err)
 					}
 					if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte("# fixture\n"), 0600); err != nil {
 						t.Fatal(err)
 					}
 				}
-				if err := os.WriteFile(filepath.Join(selected, "dotfiles", ".local", "bin", "dots"), source, 0700); err != nil {
+				// The manager lives apart from both configurations.
+				home := filepath.Join(base, "manager")
+				otherHome := filepath.Join(base, "ambient-manager")
+				if err := os.MkdirAll(filepath.Join(home, "bin"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(home, "bin", "dots"), source, 0700); err != nil {
 					t.Fatal(err)
 				}
 				log := filepath.Join(base, "mise-args")
@@ -41,12 +48,15 @@ func TestDirectCommandsHonorSelectedRootOverAmbientRoot(t *testing.T) {
 				t.Setenv("DIRECT_TEST_LOG", log)
 				t.Setenv("HOME", base)
 				t.Setenv("DOTS_ROOT", other)
+				t.Setenv("DOTS_HOME", otherHome)
 				if ambient == "unset" {
-					if err := os.Unsetenv("DOTS_ROOT"); err != nil {
-						t.Fatal(err)
+					for _, key := range []string{"DOTS_ROOT", "DOTS_HOME"} {
+						if err := os.Unsetenv(key); err != nil {
+							t.Fatal(err)
+						}
 					}
 				}
-				args := []string{"--root", selected, "--command", command, "--"}
+				args := []string{"--root", selected, "--home", home, "--command", command, "--"}
 				if command == "sync" {
 					args = append(args, "--source-only")
 				}
@@ -64,10 +74,29 @@ func TestDirectCommandsHonorSelectedRootOverAmbientRoot(t *testing.T) {
 				if command == "plan" && strings.Join(lines[3:], " ") != "bootstrap plan" {
 					t.Fatalf("unexpected plan invocation: %q", output)
 				}
-				if command == "sync" && !strings.Contains(string(output), selected+"/setup-scripts/lib/source-repo.mjs\nsync\n"+selected+"\n--source-only") {
+				if command == "sync" && !strings.Contains(string(output), home+"/lib/source-repo.mjs\nsync\n"+selected+"\n--source-only") {
 					t.Fatalf("unexpected source-only invocation: %q", output)
 				}
 			})
 		}
+	}
+}
+
+func TestCapabilitiesReportsHomeAwareProtocol(t *testing.T) {
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	code := run([]string{"--capabilities"})
+	os.Stdout = stdout
+	_ = w.Close()
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 || strings.TrimSpace(string(output)) != "dots-shared-cli/2" {
+		t.Fatalf("capabilities = %q (exit %d)", output, code)
 	}
 }

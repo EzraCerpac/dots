@@ -356,7 +356,7 @@ SETUP_MACHINE_ID="$SETUP_MACHINE_ID" \
 SETUP_HISTORY_ORIGIN="$SETUP_HISTORY_ORIGIN" \
 SETUP_AGE_IDENTITY="$history_identity" \
 MISE_CONFIG_DIR="$SETUP_ROOT" \
-    setup_mise exec -- bash "$SETUP_ROOT/setup-scripts/bootstrap/enroll-history" \
+    setup_mise exec -- bash "$DOTS_HOME/bootstrap/enroll-history" \
         --profile "$SETUP_PROFILE" \
         --machine-id "$SETUP_MACHINE_ID" \
         --identity "$history_identity" \
@@ -381,7 +381,7 @@ for (const entry of document.entries) {
   process.stdout.write(target + "\n");
 }
 ' |
-    bash "$SETUP_ROOT/setup-scripts/bootstrap/history-permissions.sh"
+    bash "$DOTS_HOME/bootstrap/history-permissions.sh"
 printf 'Setting routine history mode to manual; no publish was run.\n'
 setup_mise settings set history.sync manual
 if [[ "$pending_restore" -eq 1 ]]; then

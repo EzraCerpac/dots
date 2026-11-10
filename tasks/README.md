@@ -32,7 +32,7 @@ noninteractive run defers that stage and continues. An interactive
 deferred App Store stage is not a task failure.
 
 If a wanted app has no suitable mise package backend, add one executable script
-per app under `exceptions/` and one row to `exceptions.tsv`:
+per app under `setup-scripts/setup/exceptions/` and one row to `setup-scripts/setup/exceptions.tsv`:
 
 ```text
 workstation<TAB>herdr-npm

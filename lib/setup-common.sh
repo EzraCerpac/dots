@@ -14,12 +14,20 @@ setup_init() {
 
     if [[ -n "${SETUP_CONFIG_ROOT:-}" && -d "$SETUP_CONFIG_ROOT" ]]; then
         # Explicit override exists for disposable task fixtures. Normal runs
-        # always use the checkout that contains this script, even if the
-        # caller's global MISE_CONFIG_DIR points elsewhere.
+        # use the configuration dots selected (DOTS_ROOT), even if the caller's
+        # global MISE_CONFIG_DIR points elsewhere.
         SETUP_ROOT="$(cd "$SETUP_CONFIG_ROOT" && pwd -P)" || return 1
+    elif [[ -n "${DOTS_ROOT:-}" && -d "$DOTS_ROOT" ]]; then
+        SETUP_ROOT="$(cd "$DOTS_ROOT" && pwd -P)" || return 1
     else
+        # Outside dots, the manager still sits inside its configuration checkout.
         SETUP_ROOT="$(cd "$script_dir/../.." && pwd -P)" || return 1
     fi
+    # Keep the manager that started this run for every child.
+    if [[ -z "${DOTS_HOME:-}" ]]; then
+        DOTS_HOME="$(cd "$script_dir/.." && pwd -P)" || return 1
+    fi
+    export DOTS_HOME
 
     SETUP_PROFILE="${SETUP_PROFILE:-}"
     if [[ -z "$SETUP_PROFILE" ]]; then

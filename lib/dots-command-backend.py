@@ -7,6 +7,8 @@ import subprocess
 import sys
 
 mise, root, command, *arguments = sys.argv[1:]
+# The manager that started this run; dots exports it, and this file lives in it.
+home = os.environ.get("DOTS_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def emit(kind, **fields):
     payload = json.dumps({"v": 1, "kind": kind, **fields}, separators=(",", ":"), ensure_ascii=True)
@@ -74,8 +76,8 @@ def status():
     selector = profile + (",host-" + os.environ["SETUP_MACHINE_ID"] if os.environ.get("SETUP_MACHINE_ID") else "")
     base = [mise, "-C", root, "-E", selector]
     probes = [
-        ("source", "Source", base + ["exec", "--", "node", root + "/setup-scripts/lib/source-repo.mjs", "status", root, "--json"]),
-        ("atuin", "Atuin", base + ["exec", "--", "uv", "run", "--no-project", "python", root + "/setup-scripts/bootstrap/atuin.py", "status", "--json"]),
+        ("source", "Source", base + ["exec", "--", "node", home + "/lib/source-repo.mjs", "status", root, "--json"]),
+        ("atuin", "Atuin", base + ["exec", "--", "uv", "run", "--no-project", "python", home + "/bootstrap/atuin.py", "status", "--json"]),
         ("setup", "Declared setup", base + ["bootstrap", "status", "--json"]),
         ("tools", "Tools", base + ["ls", "--current", "--json"]),
         ("history", "Files and history", base + ["bootstrap", "dotfiles", "status", "--json"]),
@@ -185,9 +187,9 @@ def status():
 
 def main():
     if command in ("up", "update"):
-        os.execv(mise, [mise, "-C", root, "run", "setup:update", *arguments])
+        os.execve(home + "/bin/dots", [home + "/bin/dots", "--backend", "up", *arguments], {**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise})
     if command == "status" and not arguments and not os.environ.get("DOTS_STATUS_IN_ENV"):
-        os.execvpe(mise, [mise, "-C", root, "exec", "--", "python3", __file__, mise, root, command], {**os.environ, "DOTS_STATUS_IN_ENV": "1", "MISE_CONFIG_DIR": root, "MISE_AUTO_INSTALL": "0", "MISE_EXEC_AUTO_INSTALL": "0", "MISE_AUTO_UPDATE": "0", "MISE_NO_HOOKS": "1"})
+        os.execvpe(mise, [mise, "-C", root, "exec", "--", "python3", __file__, mise, root, command], {**os.environ, "DOTS_HOME": home, "DOTS_STATUS_IN_ENV": "1", "MISE_CONFIG_DIR": root, "MISE_AUTO_INSTALL": "0", "MISE_EXEC_AUTO_INSTALL": "0", "MISE_AUTO_UPDATE": "0", "MISE_NO_HOOKS": "1"})
     emit("run_start", command=command, profile=os.environ.get("SETUP_PROFILE", ""), host=socket.gethostname().split(".")[0])
     try:
         if command == "status" and not arguments:
@@ -196,7 +198,7 @@ def main():
             stage_start(command, "Command", command, handoff=command not in ("sync", "backup", "test", "add", "remove"))
             event_fd = os.environ.get("DOTS_UP_EVENT_FD")
             pass_fds = tuple(int(os.environ[key]) for key in ("DOTS_UP_EVENT_FD", "DOTS_UP_ACK_FD") if os.environ.get(key, "").isdecimal())
-            code = subprocess.call([root + "/dotfiles/.local/bin/dots", "--backend", command, *arguments], env={**os.environ, "DOTS_ROOT": root, "DOTS_MISE_BIN": mise}, pass_fds=pass_fds)
+            code = subprocess.call([home + "/bin/dots", "--backend", command, *arguments], env={**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise}, pass_fds=pass_fds)
             stage_end(command, command, code)
     except (OSError, RuntimeError) as error:
         print(f"dots: {error}", file=sys.stderr)

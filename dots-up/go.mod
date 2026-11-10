@@ -1,4 +1,4 @@
-module github.com/EzraCerpac/dotfiles/setup-scripts/dots-up
+module github.com/EzraCerpac/dotfiles/manager/dots-up
 
 go 1.27.3
 

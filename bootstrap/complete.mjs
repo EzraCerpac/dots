@@ -10,10 +10,10 @@ import { applyHerdr } from './herdr.mjs';
 
 class Deferred extends Error {}
 
-export function complete({ root, home, miseBin, env = process.env, run = spawnSync }) {
+export function complete({ root, dotsHome, home, miseBin, env = process.env, run = spawnSync }) {
   const report = [];
   const local = path.join(root, 'config.local.toml');
-  const childEnv = { ...env, HOME: home, MISE_CONFIG_DIR: root };
+  const childEnv = { ...env, HOME: home, MISE_CONFIG_DIR: root, DOTS_ROOT: root, ...(dotsHome ? { DOTS_HOME: dotsHome } : {}) };
   let tailscaleAuthKey = childEnv.SETUP_TAILSCALE_AUTH_KEY;
   delete childEnv.SETUP_TAILSCALE_AUTH_KEY;
   const invoke = (command, args, capture = false) => run(command, args, {
@@ -50,13 +50,16 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
     const result = mise(args);
     if (result.status !== 0) throw new Error(message);
   };
+  // Configuration scripts are named from the setup root; manager scripts are
+  // absolute paths under DOTS_HOME.
   const scriptResult = (name, args = []) => mise(
-    ['exec', '--', 'bash', path.join(root, name), ...args]);
+    ['exec', '--', 'bash', path.resolve(root, name), ...args]);
   const script = (name, args = []) => {
     const result = scriptResult(name, args);
-    if (result.status !== 0) throw new Error(`${name} needs attention; rerun after resolving its message`);
+    if (result.status !== 0) throw new Error(`${path.isAbsolute(name) ? path.relative(dotsHome, name) : name} needs attention; rerun after resolving its message`);
     return result;
   };
+  const manager = (name) => path.join(dotsHome, name);
   const role = childEnv.SETUP_PROFILE || readLocal('env.SETUP_PROFILE');
   const machineId = readLocal('env.SETUP_MACHINE_ID') || childEnv.SETUP_MACHINE_ID;
   if (!['workstation', 'nas'].includes(role) || !/^[a-z0-9][a-z0-9-]*$/.test(machineId || '')) {
@@ -111,7 +114,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
   }
 
   stage('Source repository', () => requireCommand(
-    ['exec', '--', 'node', path.join(root, 'setup-scripts/lib/source-repo.mjs'), 'init', root],
+    ['exec', '--', 'node', manager('lib/source-repo.mjs'), 'init', root],
     'Source repository initialization needs attention'));
 
   const restoreId = childEnv.SETUP_RESTORE_MACHINE_ID;
@@ -126,7 +129,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
       Object.assign(childEnv, { SETUP_HISTORY_ORIGIN: origin, SETUP_AGE_IDENTITY: recoveryIdentity });
       // The restore task archives an unconnected local store before replacing it.
       // It fetches and restores; it never publishes defaults.
-      script('setup-scripts/setup/restore', ['--initialize-history']);
+      script(manager('tasks/restore'), ['--initialize-history']);
     });
   }
   if (privateReady && historyReady && role === 'workstation' && Object.keys(secrets).length) {
@@ -151,7 +154,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
     record('Neovim plugins', 'deferred', 'Complete configuration recovery before initializing Neovim');
   }
   stage('Atuin', () => {
-    const result = mise(['exec', '--', 'uv', 'run', '--no-project', 'python', path.join(root, 'setup-scripts/bootstrap/atuin.py'), 'enroll', '--root', root, '--identity', recoveryIdentity]);
+    const result = mise(['exec', '--', 'uv', 'run', '--no-project', 'python', manager('bootstrap/atuin.py'), 'enroll', '--root', root, '--identity', recoveryIdentity]);
     if (result.status === 3) throw new Deferred('Atuin enrollment needs credentials or account approval; rerun dots bootstrap after the displayed step');
     if (result.status !== 0) throw new Error('Atuin enrollment failed; inspect the reported recovery step');
   });
@@ -198,7 +201,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
       const origin = readLocal('env.SETUP_HISTORY_ORIGIN') || 'https://github.com/EzraCerpac/dotfiles-state.git';
       const args = ['--profile', role, '--machine-id', machineId, '--identity', hostIdentity, '--origin', origin, '--refresh'];
       for (const recipient of recipients) args.push('--recipient', recipient);
-      script('setup-scripts/bootstrap/enroll-history', args);
+      script(manager('bootstrap/enroll-history'), args);
       // Configuration of the origin remains local. First publication remains dots backup.
       setLocal('history.origin.url', origin);
       setLocal('settings.history.sync', 'manual');
@@ -216,7 +219,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
   }
   const tailscaleEnv = { ...childEnv };
   if (tailscaleAuthKey) tailscaleEnv.SETUP_TAILSCALE_AUTH_KEY = tailscaleAuthKey;
-  const tailscale = run('bash', [path.join(root, 'setup-scripts/bootstrap/tailnet')], {
+  const tailscale = run('bash', [manager('bootstrap/tailnet')], {
     cwd: root, env: tailscaleEnv, encoding: 'utf8', stdio: 'inherit',
   });
   const noLinuxSupervisor = process.platform === 'linux' && !fs.existsSync('/run/systemd/system');
@@ -235,10 +238,13 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    // dots passes the configuration root and its own home; never guess them here.
+    const root = process.env.DOTS_ROOT;
+    const dotsHome = process.env.DOTS_HOME;
+    if (!root || !dotsHome) throw new Error('run through dots internal complete (DOTS_ROOT and DOTS_HOME are required)');
     const standalone = path.join(os.homedir(), '.local/bin/mise');
     const miseBin = process.env.SETUP_MISE_BIN || process.env.MISE_BIN || (fs.existsSync(standalone) ? standalone : 'mise');
-    process.exitCode = complete({ root, home: process.env.HOME || os.homedir(), miseBin });
+    process.exitCode = complete({ root, dotsHome, home: process.env.HOME || os.homedir(), miseBin });
   } catch (error) {
     console.error(`bootstrap: ${error.message}`);
     process.exitCode = 1;

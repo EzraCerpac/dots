@@ -21,9 +21,10 @@ mise_bin="$1"
 setup_root="$2"
 target_file="$3"
 shift 3
-source "$setup_root/setup-scripts/lib/dots-add-common.sh"
-source "$setup_root/setup-scripts/lib/dots-up-events.sh"
-source "$setup_root/setup-scripts/lib/dots-command-events.sh"
+lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$lib_dir/dots-add-common.sh"
+source "$lib_dir/dots-up-events.sh"
+source "$lib_dir/dots-command-events.sh"
 
 emit_package() {
     local json

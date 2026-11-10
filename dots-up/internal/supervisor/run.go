@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/ansi/parser"
 	"github.com/charmbracelet/x/term"
@@ -26,7 +26,9 @@ import (
 )
 
 type Options struct {
-	Root, StateDir              string
+	// Root is the configuration (DOTS_ROOT); Home is the manager (DOTS_HOME)
+	// whose scripts run it. dots passes both explicitly.
+	Root, Home, StateDir        string
 	Command                     string
 	Args                        []string
 	Sensitive                   bool
@@ -690,6 +692,8 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 		cmd.Args = append(cmd.Args, "--mas")
 	}
 	childEnv := append([]string(nil), os.Environ()...)
+	childEnv = setEnv(childEnv, "DOTS_ROOT", opts.Root)
+	childEnv = setEnv(childEnv, "DOTS_HOME", opts.Home)
 	childEnv = setEnv(childEnv, "DOTS_UP_EVENT_FD", "3")
 	childEnv = setEnv(childEnv, "DOTS_UP_ACK_FD", "")
 	childEnv = setEnv(childEnv, "DOTS_UP_RUN_STARTED", "")
@@ -826,6 +830,15 @@ func updaterCommand(opts Options) (*exec.Cmd, error) {
 		cmd.Args = append(cmd.Args, opts.Args...)
 		return cmd, nil
 	}
+	if opts.Home == "" {
+		return nil, errors.New("the dots manager directory is unknown; pass --home or set DOTS_HOME")
+	}
+	if opts.Command == "" || opts.Command == "up" {
+		// dots runs its updater task in the setup's mise environment.
+		cmd := exec.Command("bash", filepath.Join(opts.Home, "bin", "dots"), "--backend", "up")
+		cmd.Args = append(cmd.Args, opts.Args...)
+		return cmd, nil
+	}
 	mise := os.Getenv("DOTS_MISE_BIN")
 	if mise == "" {
 		candidate := filepath.Join(os.Getenv("HOME"), ".local", "bin", "mise")
@@ -839,12 +852,7 @@ func updaterCommand(opts Options) (*exec.Cmd, error) {
 			}
 		}
 	}
-	if opts.Command == "" || opts.Command == "up" {
-		cmd := exec.Command(mise, "-C", opts.Root, "run", "setup:update")
-		cmd.Args = append(cmd.Args, opts.Args...)
-		return cmd, nil
-	}
-	args := []string{filepath.Join(opts.Root, "setup-scripts", "lib", "dots-command-backend"), mise, opts.Root, opts.Command}
+	args := []string{filepath.Join(opts.Home, "lib", "dots-command-backend"), mise, opts.Root, opts.Command}
 	args = append(args, opts.Args...)
 	return exec.Command("bash", args...), nil
 }

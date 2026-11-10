@@ -21,8 +21,9 @@ shift 3
 
 [[ -x "$mise_bin" ]] || { printf 'dots: mise executable is missing: %s\n' "$mise_bin" >&2; exit 2; }
 [[ -d "$setup_root" ]] || { printf 'dots: setup root is missing: %s\n' "$setup_root" >&2; exit 2; }
-[[ -f "$setup_root/setup-scripts/lib/dots-add-common.sh" ]] || {
-    printf 'dots: shared add helper is missing under %s\n' "$setup_root" >&2
+lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ -f "$lib_dir/dots-add-common.sh" ]] || {
+    printf 'dots: shared add helper is missing under %s\n' "$lib_dir" >&2
     exit 2
 }
 
@@ -31,9 +32,9 @@ shift 3
 # config as a partial-write destination.
 export MISE_CONFIG_DIR="$setup_root"
 # shellcheck source=/dev/null
-source "$setup_root/setup-scripts/lib/dots-add-common.sh"
-source "$setup_root/setup-scripts/lib/dots-up-events.sh"
-source "$setup_root/setup-scripts/lib/dots-command-events.sh"
+source "$lib_dir/dots-add-common.sh"
+source "$lib_dir/dots-up-events.sh"
+source "$lib_dir/dots-command-events.sh"
 
 emit_tool() {
     local json

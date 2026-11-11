@@ -259,7 +259,7 @@ def resolve(url, override=None):
         if override:
             options.pop("asset_pattern")
             options[f"platform_{system}_{machine}_asset_pattern"] = override
-        hook = 'uv run --no-project python "${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/setup-scripts/lib/dots-github.py" install-app ' + shlex.quote(repo)
+        hook = 'bash "${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/manager/bin/dots" internal github-install-app ' + shlex.quote(repo)
         options.update(strip_components=0, bin_path=".dots-no-bin", os=["macos"], postinstall={"run": hook, "when": "always"})
     if numeric_version and tag[:numeric_version.start()] not in {"", "v"}:
         options["version_prefix"] = tag[:numeric_version.start()]

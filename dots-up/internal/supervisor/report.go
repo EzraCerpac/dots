@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 )
 
 type Report struct {

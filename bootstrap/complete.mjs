@@ -6,14 +6,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { unlockBundle, applyPrivateFiles } from './bundle.mjs';
-import { applyHerdr } from './herdr.mjs';
+import { dotsVar, dotsList } from '../lib/source-repo.mjs';
 
 class Deferred extends Error {}
 
-export function complete({ root, home, miseBin, env = process.env, run = spawnSync }) {
+// The configuration hooks in DIRECTORY that apply to PROFILE, in name order,
+// as [{ label, path }]. lib/dots-hooks owns the naming contract (shared with
+// the updater); an invalid hook name throws its message.
+function listHooks(dotsHome, directory, profile, profiles) {
+  const result = spawnSync('bash', [path.join(dotsHome, 'lib/dots-hooks'), directory, profile, ...profiles], { encoding: 'utf8' });
+  if (result.error || result.status !== 0) throw new Error(String(result.stderr || result.error?.message || 'could not list hooks').trim());
+  return result.stdout.split('\n').filter(Boolean).map(line => {
+    const tab = line.indexOf('\t');
+    return { label: line.slice(0, tab), path: line.slice(tab + 1) };
+  });
+}
+
+// Hook exit statuses: 0 completed, 3 deferred (needs attention), 4 skipped.
+export const hookStatus = code => code === 0 ? 'completed' : code === 3 ? 'deferred' : code === 4 ? 'skipped' : 'failed';
+
+export function complete({ root, dotsHome, home, miseBin, env = process.env, run = spawnSync }) {
   const report = [];
   const local = path.join(root, 'config.local.toml');
-  const childEnv = { ...env, HOME: home, MISE_CONFIG_DIR: root };
+  const childEnv = { ...env, HOME: home, MISE_CONFIG_DIR: root, DOTS_ROOT: root, ...(dotsHome ? { DOTS_HOME: dotsHome } : {}) };
   let tailscaleAuthKey = childEnv.SETUP_TAILSCALE_AUTH_KEY;
   delete childEnv.SETUP_TAILSCALE_AUTH_KEY;
   const invoke = (command, args, capture = false) => run(command, args, {
@@ -50,31 +65,40 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
     const result = mise(args);
     if (result.status !== 0) throw new Error(message);
   };
+  // Configuration scripts are named from the setup root; manager scripts are
+  // absolute paths under DOTS_HOME.
   const scriptResult = (name, args = []) => mise(
-    ['exec', '--', 'bash', path.join(root, name), ...args]);
+    ['exec', '--', 'bash', path.resolve(root, name), ...args]);
   const script = (name, args = []) => {
     const result = scriptResult(name, args);
-    if (result.status !== 0) throw new Error(`${name} needs attention; rerun after resolving its message`);
+    if (result.status !== 0) throw new Error(`${path.isAbsolute(name) ? path.relative(dotsHome, name) : name} needs attention; rerun after resolving its message`);
     return result;
   };
+  const manager = (name) => path.join(dotsHome, name);
+  const setting = (name) => dotsVar(root, name, { miseBin, run });
+  // Private settings history lives in the GitHub repository [vars] dots_state_repo.
+  const defaultHistoryOrigin = () => `https://github.com/${setting('dots_state_repo')}.git`;
   const role = childEnv.SETUP_PROFILE || readLocal('env.SETUP_PROFILE');
   const machineId = readLocal('env.SETUP_MACHINE_ID') || childEnv.SETUP_MACHINE_ID;
-  if (!['workstation', 'nas'].includes(role) || !/^[a-z0-9][a-z0-9-]*$/.test(machineId || '')) {
+  if (!dotsList(setting('dots_profiles')).includes(role) || !/^[a-z0-9][a-z0-9-]*$/.test(machineId || '')) {
     throw new Error('Persist the role and machine identity before completing bootstrap');
   }
-  Object.assign(childEnv, { SETUP_PROFILE: role, SETUP_MACHINE_ID: machineId });
+  Object.assign(childEnv, { SETUP_PROFILE: role, DOTS_PROFILE: role, SETUP_MACHINE_ID: machineId });
   const expand = (value) => value.startsWith('~/') ? path.join(home, value.slice(2)) : path.resolve(value);
   const recoveryIdentity = expand(childEnv.SETUP_AGE_IDENTITY || readLocal('env.SETUP_AGE_IDENTITY') || path.join(home, '.config/age/keys.txt'));
   const persistedBundleIdentity = readLocal('vars.bootstrap_bundle_identity');
   const explicitBundle = childEnv.SETUP_BOOTSTRAP_BUNDLE || '';
   const explicitBundleIdentity = childEnv.SETUP_BUNDLE_IDENTITY || '';
-  // Workstation keeps the historical implicit bundle. NAS only considers the
-  // bundle when the caller or an earlier explicit enrollment selected it;
-  // otherwise a workstation-only bundle cannot block NAS history recovery.
-  const bundleRequested = role === 'workstation' || Boolean(explicitBundle || persistedBundleIdentity || explicitBundleIdentity);
+  // A profile that has its own bundle, encrypted/bootstrap.<profile>.json.age,
+  // uses it implicitly. Other profiles only consider a bundle the caller or an
+  // earlier explicit enrollment selected, so another profile's bundle cannot
+  // block their history recovery. Whichever bundle unlocks supplies the
+  // private files.
+  const profileBundle = path.join(root, `encrypted/bootstrap.${role}.json.age`);
+  const bundleRequested = fs.existsSync(profileBundle) || Boolean(explicitBundle || persistedBundleIdentity || explicitBundleIdentity);
   const bundleIdentityValue = explicitBundleIdentity || persistedBundleIdentity || (bundleRequested ? recoveryIdentity : '');
   const bundleIdentity = bundleIdentityValue ? expand(bundleIdentityValue) : '';
-  const bundleValue = explicitBundle || (bundleRequested ? path.join(root, 'encrypted/bootstrap.json.age') : '');
+  const bundleValue = explicitBundle || (bundleRequested ? profileBundle : '');
   const bundle = bundleValue ? expand(bundleValue) : '';
   let secrets = {};
   let recipients = [];
@@ -103,15 +127,14 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
     });
   } else if (bundleRequested) {
     record('Private inputs', 'deferred', 'Supply the encrypted bundle and an external age identity with dots bootstrap --bundle FILE --identity FILE');
-    // An explicit or persisted bundle selection is part of this run's
-    // contract. A missing implicit workstation bundle remains optional.
+    // An explicit or persisted bundle selection is part of this run's contract.
     if (childEnv.SETUP_BOOTSTRAP_BUNDLE || childEnv.SETUP_BUNDLE_IDENTITY || persistedBundleIdentity || fs.existsSync(bundle)) privateReady = false;
   } else {
-    record('Private inputs', 'completed', 'No bootstrap bundle requested for this NAS host');
+    record('Private inputs', 'completed', 'No bootstrap bundle requested for this host');
   }
 
   stage('Source repository', () => requireCommand(
-    ['exec', '--', 'node', path.join(root, 'setup-scripts/lib/source-repo.mjs'), 'init', root],
+    ['exec', '--', 'node', manager('lib/source-repo.mjs'), 'init', root],
     'Source repository initialization needs attention'));
 
   const restoreId = childEnv.SETUP_RESTORE_MACHINE_ID;
@@ -120,67 +143,43 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
     historyReady = privateReady && stage('Restore private settings', () => {
       if (restoreId !== machineId) throw new Error('Restore identity does not match the selected host');
       if (!fs.existsSync(recoveryIdentity)) throw new Error('Restoration requires the existing recovery identity');
-      const origin = readLocal('env.SETUP_HISTORY_ORIGIN') || 'https://github.com/EzraCerpac/dotfiles-state.git';
+      const origin = readLocal('env.SETUP_HISTORY_ORIGIN') || defaultHistoryOrigin();
       setLocal('env.SETUP_HISTORY_ORIGIN', origin);
       setLocal('settings.age.identity_files', recoveryIdentity, 'list');
       Object.assign(childEnv, { SETUP_HISTORY_ORIGIN: origin, SETUP_AGE_IDENTITY: recoveryIdentity });
       // The restore task archives an unconnected local store before replacing it.
       // It fetches and restores; it never publishes defaults.
-      script('setup-scripts/setup/restore', ['--initialize-history']);
+      script(manager('tasks/restore'), ['--initialize-history']);
     });
   }
-  if (privateReady && historyReady && role === 'workstation' && Object.keys(secrets).length) {
+  if (privateReady && historyReady && Object.keys(secrets).length) {
     privateReady = stage('Private configuration', () => applyPrivateFiles(secrets, { home, miseBin, root }));
   }
-  let defaultsReady = true;
-  if (restoreId && privateReady && historyReady) {
-    defaultsReady = stage('Missing public defaults', () => {
-      delete childEnv.SETUP_RESTORE_MACHINE_ID;
-      try { script('setup-scripts/local/seed-configs.sh'); }
-      finally { childEnv.SETUP_RESTORE_MACHINE_ID = restoreId; }
-    });
-  }
+  stage('Installer exceptions', () => script(manager('tasks/exceptions')));
 
-  stage('Installer exceptions', () => script('setup-scripts/local/install-exceptions.sh'));
-  if (role === 'nas') {
-    stage('jw NAS release', () => script('setup-scripts/install/jw-nas-release.sh', ['--if-missing']));
-  }
-  if (privateReady && historyReady && defaultsReady) {
-    stage('Neovim plugins', () => script('setup-scripts/setup/nvim-initialize'));
-  } else {
-    record('Neovim plugins', 'deferred', 'Complete configuration recovery before initializing Neovim');
+  // Configuration hooks (dots/hooks/bootstrap.d) run after installer
+  // exceptions, in name order, each as its own stage. They learn whether
+  // private recovery is complete and whether this run restored settings.
+  const hookEnv = {
+    ...childEnv,
+    DOTS_PRIVATE_READY: privateReady && historyReady ? '1' : '0',
+    DOTS_RESTORED: restoreId ? '1' : '0',
+  };
+  let hooks = [];
+  try { hooks = listHooks(dotsHome, path.join(root, 'dots/hooks/bootstrap.d'), role, dotsList(setting('dots_profiles'))); }
+  catch (error) { record('Bootstrap hooks', 'failed', error.message); }
+  for (const hook of hooks) {
+    const result = run(miseBin, ['-C', root, 'exec', '--', hook.path], { cwd: root, env: hookEnv, encoding: 'utf8', stdio: 'inherit' });
+    const status = result.error ? 'failed' : hookStatus(result.status);
+    record(hook.label, status,
+      status === 'failed' ? `dots/hooks/bootstrap.d/${path.basename(hook.path)} needs attention; rerun after resolving its message`
+        : status === 'deferred' ? 'See its message above; rerun dots bootstrap after resolving it' : '');
   }
   stage('Atuin', () => {
-    const result = mise(['exec', '--', 'uv', 'run', '--no-project', 'python', path.join(root, 'setup-scripts/bootstrap/atuin.py'), 'enroll', '--root', root, '--identity', recoveryIdentity]);
+    const result = mise(['exec', '--', 'uv', 'run', '--no-project', 'python', manager('bootstrap/atuin.py'), 'enroll', '--root', root, '--identity', recoveryIdentity]);
     if (result.status === 3) throw new Deferred('Atuin enrollment needs credentials or account approval; rerun dots bootstrap after the displayed step');
     if (result.status !== 0) throw new Error('Atuin enrollment failed; inspect the reported recovery step');
   });
-  if (['workstation', 'nas'].includes(role)) {
-    const shellReady = stage('Fish executable', () => script('setup-scripts/local/shell-select.sh', ['--prepare-only']) && 'Validated stable Fish path');
-    const herdrReady = shellReady && stage('Herdr shell', () => applyHerdr({ home, mise, invoke }));
-    if (herdrReady) stage('Login shell', () => {
-      const result = scriptResult('setup-scripts/local/shell-select.sh');
-      if (result.status === 3) {
-        throw new Deferred('Login shell setup needs administrator approval; rerun dots bootstrap after approving it');
-      }
-      if (result.status !== 0) {
-        throw new Error('setup-scripts/local/shell-select.sh needs attention; rerun after resolving its message');
-      }
-      return 'Fish is selected through native mise bootstrap.user settings';
-    });
-  }
-  if (process.platform === 'darwin') {
-    stage('Current-user keyboard', () => {
-      if (!process.stdin.isTTY) throw new Deferred('Run kbd activate in your Mac terminal to approve and activate the current-user Kanata service');
-      script('dotfiles/.local/bin/kbd', ['activate']);
-    });
-  }
-  if (role === 'workstation') {
-    stage('Personal command builds', () => {
-      if (!fs.existsSync(path.join(home, '.local/bin/jw'))) script('setup-scripts/install/jw-build-install.sh');
-      if (process.platform === 'darwin') script('setup-scripts/local/antinote-bridge-build.sh');
-    });
-  }
 
   if (privateReady && historyReady && fs.existsSync(recoveryIdentity)) {
     historyReady = stage('Encrypted local history', () => {
@@ -195,10 +194,10 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
       const publicKey = invoke('age-keygen', ['-y', fs.existsSync(bundle) ? bundleIdentity : recoveryIdentity], true);
       if (publicKey.status !== 0) throw new Error('Could not read the recovery public recipient');
       recipients = [...new Set([...recipients, ...publicKey.stdout.trim().split(/\s+/)])];
-      const origin = readLocal('env.SETUP_HISTORY_ORIGIN') || 'https://github.com/EzraCerpac/dotfiles-state.git';
+      const origin = readLocal('env.SETUP_HISTORY_ORIGIN') || defaultHistoryOrigin();
       const args = ['--profile', role, '--machine-id', machineId, '--identity', hostIdentity, '--origin', origin, '--refresh'];
       for (const recipient of recipients) args.push('--recipient', recipient);
-      script('setup-scripts/bootstrap/enroll-history', args);
+      script(manager('bootstrap/enroll-history'), args);
       // Configuration of the origin remains local. First publication remains dots backup.
       setLocal('history.origin.url', origin);
       setLocal('settings.history.sync', 'manual');
@@ -216,7 +215,7 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
   }
   const tailscaleEnv = { ...childEnv };
   if (tailscaleAuthKey) tailscaleEnv.SETUP_TAILSCALE_AUTH_KEY = tailscaleAuthKey;
-  const tailscale = run('bash', [path.join(root, 'setup-scripts/bootstrap/tailnet')], {
+  const tailscale = run('bash', [manager('bootstrap/tailnet')], {
     cwd: root, env: tailscaleEnv, encoding: 'utf8', stdio: 'inherit',
   });
   const noLinuxSupervisor = process.platform === 'linux' && !fs.existsSync('/run/systemd/system');
@@ -229,16 +228,20 @@ export function complete({ root, home, miseBin, env = process.env, run = spawnSy
   const temporary = `${reportPath}.${process.pid}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify({ machineId, profile: role, completedAt: new Date().toISOString(), stages: report }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   fs.renameSync(temporary, reportPath);
-  console.log(`\nBootstrap result: ${report.filter(r => r.status === 'completed').length} completed, ${report.filter(r => r.status === 'deferred').length} deferred, ${report.filter(r => r.status === 'failed').length} failed.`);
+  const skipped = report.filter(r => r.status === 'skipped').length;
+  console.log(`\nBootstrap result: ${report.filter(r => r.status === 'completed').length} completed, ${report.filter(r => r.status === 'deferred').length} deferred, ${report.filter(r => r.status === 'failed').length} failed${skipped ? `, ${skipped} skipped` : ''}.`);
   return report.some(r => r.status === 'failed') ? 1 : 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+    // dots passes the configuration root and its own home; never guess them here.
+    const root = process.env.DOTS_ROOT;
+    const dotsHome = process.env.DOTS_HOME;
+    if (!root || !dotsHome) throw new Error('run through dots internal complete (DOTS_ROOT and DOTS_HOME are required)');
     const standalone = path.join(os.homedir(), '.local/bin/mise');
     const miseBin = process.env.SETUP_MISE_BIN || process.env.MISE_BIN || (fs.existsSync(standalone) ? standalone : 'mise');
-    process.exitCode = complete({ root, home: process.env.HOME || os.homedir(), miseBin });
+    process.exitCode = complete({ root, dotsHome, home: process.env.HOME || os.homedir(), miseBin });
   } catch (error) {
     console.error(`bootstrap: ${error.message}`);
     process.exitCode = 1;

@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 )
 
 const (

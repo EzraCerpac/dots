@@ -7,6 +7,8 @@ import subprocess
 import sys
 
 mise, root, command, *arguments = sys.argv[1:]
+# The manager that started this run; dots exports it, and this file lives in it.
+home = os.environ.get("DOTS_HOME") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def emit(kind, **fields):
     payload = json.dumps({"v": 1, "kind": kind, **fields}, separators=(",", ":"), ensure_ascii=True)
@@ -48,6 +50,15 @@ def state(value):
     if value in ("error", "failed"): return "failed"
     return "unknown"
 
+def dots_profiles():
+    """The profile names in [vars] dots_profiles of the configuration's config.toml."""
+    config = os.path.join(root, "config.toml")
+    result = subprocess.run([mise, "-C", root, "config", "get", "--file", config, "vars.dots_profiles"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+    if result.returncode != 0:
+        raise ValueError(f"missing setting: add dots_profiles to [vars] in {config}")
+    return result.stdout.split()
+
 def run_json(label, argv):
     try:
         result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
@@ -68,14 +79,19 @@ def run_json(label, argv):
 
 def status():
     profile = os.environ.get("SETUP_PROFILE", "")
-    if profile not in ("workstation", "nas"):
-        print("setup: SETUP_PROFILE must be workstation or nas", file=sys.stderr)
+    try:
+        profiles = dots_profiles()
+    except ValueError as error:
+        print(f"setup: {error}", file=sys.stderr)
+        return 2
+    if profile not in profiles:
+        print("setup: SETUP_PROFILE must be one of [vars] dots_profiles: " + ", ".join(profiles), file=sys.stderr)
         return 2
     selector = profile + (",host-" + os.environ["SETUP_MACHINE_ID"] if os.environ.get("SETUP_MACHINE_ID") else "")
     base = [mise, "-C", root, "-E", selector]
     probes = [
-        ("source", "Source", base + ["exec", "--", "node", root + "/setup-scripts/lib/source-repo.mjs", "status", root, "--json"]),
-        ("atuin", "Atuin", base + ["exec", "--", "uv", "run", "--no-project", "python", root + "/setup-scripts/bootstrap/atuin.py", "status", "--json"]),
+        ("source", "Source", base + ["exec", "--", "node", home + "/lib/source-repo.mjs", "status", root, "--json"]),
+        ("atuin", "Atuin", base + ["exec", "--", "uv", "run", "--no-project", "python", home + "/bootstrap/atuin.py", "status", "--json"]),
         ("setup", "Declared setup", base + ["bootstrap", "status", "--json"]),
         ("tools", "Tools", base + ["ls", "--current", "--json"]),
         ("history", "Files and history", base + ["bootstrap", "dotfiles", "status", "--json"]),
@@ -163,18 +179,18 @@ def status():
     stage_start("exceptions", "Inspection", "Installer exceptions")
     code = 0
     try:
-        manifest = os.path.join(root, "setup-scripts/setup/exceptions.tsv")
+        manifest = os.path.join(root, "dots/exceptions.tsv")
         if os.path.exists(manifest):
             for line in open(manifest, encoding="utf-8"):
                 if not line.strip() or line.startswith("#"): continue
                 fields = line.rstrip("\n").split("\t")
-                if len(fields) != 2 or fields[0] not in ("base", "workstation", "nas"):
+                if len(fields) not in (2, 3) or (fields[0] != "base" and fields[0] not in profiles):
                     raise ValueError("invalid installer exception row")
-                role, name = fields
+                role, name = fields[:2]
                 if role not in ("base", profile): continue
                 if not name or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in name) or not name[0].isalnum():
                     raise ValueError("invalid installer exception name")
-                executable = os.access(os.path.join(root, "setup-scripts/setup/exceptions", name), os.X_OK)
+                executable = os.access(os.path.join(root, "dots/exceptions", name), os.X_OK)
                 item("Exceptions", name, "ok" if executable else "missing", "ready" if executable else "missing executable")
                 if not executable: code = 2
     except (OSError, ValueError) as error:
@@ -185,9 +201,9 @@ def status():
 
 def main():
     if command in ("up", "update"):
-        os.execv(mise, [mise, "-C", root, "run", "setup:update", *arguments])
+        os.execve(home + "/bin/dots", [home + "/bin/dots", "--backend", "up", *arguments], {**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise})
     if command == "status" and not arguments and not os.environ.get("DOTS_STATUS_IN_ENV"):
-        os.execvpe(mise, [mise, "-C", root, "exec", "--", "python3", __file__, mise, root, command], {**os.environ, "DOTS_STATUS_IN_ENV": "1", "MISE_CONFIG_DIR": root, "MISE_AUTO_INSTALL": "0", "MISE_EXEC_AUTO_INSTALL": "0", "MISE_AUTO_UPDATE": "0", "MISE_NO_HOOKS": "1"})
+        os.execvpe(mise, [mise, "-C", root, "exec", "--", "python3", __file__, mise, root, command], {**os.environ, "DOTS_HOME": home, "DOTS_STATUS_IN_ENV": "1", "MISE_CONFIG_DIR": root, "MISE_AUTO_INSTALL": "0", "MISE_EXEC_AUTO_INSTALL": "0", "MISE_AUTO_UPDATE": "0", "MISE_NO_HOOKS": "1"})
     emit("run_start", command=command, profile=os.environ.get("SETUP_PROFILE", ""), host=socket.gethostname().split(".")[0])
     try:
         if command == "status" and not arguments:
@@ -196,7 +212,7 @@ def main():
             stage_start(command, "Command", command, handoff=command not in ("sync", "backup", "test", "add", "remove"))
             event_fd = os.environ.get("DOTS_UP_EVENT_FD")
             pass_fds = tuple(int(os.environ[key]) for key in ("DOTS_UP_EVENT_FD", "DOTS_UP_ACK_FD") if os.environ.get(key, "").isdecimal())
-            code = subprocess.call([root + "/dotfiles/.local/bin/dots", "--backend", command, *arguments], env={**os.environ, "DOTS_ROOT": root, "DOTS_MISE_BIN": mise}, pass_fds=pass_fds)
+            code = subprocess.call([home + "/bin/dots", "--backend", command, *arguments], env={**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise}, pass_fds=pass_fds)
             stage_end(command, command, code)
     except (OSError, RuntimeError) as error:
         print(f"dots: {error}", file=sys.stderr)

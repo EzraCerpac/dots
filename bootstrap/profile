@@ -8,9 +8,9 @@ usage() {
     cat <<'EOF'
 Persist the local setup profile before loading host-specific mise config.
 
-Usage: setup-scripts/bootstrap/profile --profile ROLE --machine-id ID [--origin URL]
+Usage: manager/bootstrap/profile --profile ROLE --machine-id ID [--origin URL]
 
-ROLE is workstation or nas. The history origin is optional here;
+ROLE is one of [vars] dots_profiles. The history origin is optional here;
 use an SSH URL or credential-helper URL without embedded credentials.
 EOF
 }
@@ -29,6 +29,8 @@ while (($#)); do
     esac
 done
 
+# Resolve the configuration before validating the profile against it.
+bootstrap_init
 bootstrap_validate_profile
 bootstrap_persist_profile
 printf 'Saved local setup profile %s for host %s.\n' "$SETUP_PROFILE" "$SETUP_MACHINE_ID"

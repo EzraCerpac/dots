@@ -7,16 +7,14 @@ setup_init || exit $?
 
 printf 'Setup profile: %s\n' "$SETUP_PROFILE"
 printf 'Machine identity: %s\n' "${SETUP_MACHINE_ID:-not set}"
-if [[ "$SETUP_PROFILE" == "nas" ]]; then
-    printf 'NAS history: dots backup saves and publishes this host; watcher health is shown below.\n'
-fi
+printf 'History: dots backup saves and publishes this host; watcher health is shown below.\n'
 
 set +e
 printf '\nSource repository:\n'
-setup_mise exec -- node "$SETUP_ROOT/setup-scripts/lib/source-repo.mjs" status "$SETUP_ROOT"
+setup_mise exec -- node "$DOTS_HOME/lib/source-repo.mjs" status "$SETUP_ROOT"
 source_result=$?
 printf '\nAtuin:\n'
-setup_mise exec -- uv run --no-project python "$SETUP_ROOT/setup-scripts/bootstrap/atuin.py" status
+setup_mise exec -- uv run --no-project python "$DOTS_HOME/bootstrap/atuin.py" status
 atuin_result=$?
 printf '\nDeclared setup state:\n'
 setup_mise bootstrap status

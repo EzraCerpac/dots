@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Shared recording behavior for dots add tools and bootstrap packages.
 
+dots_add_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 dots_edit_config() {
-    (cd "$setup_root" && uv run --script "$setup_root/setup-scripts/lib/dots-add-config.py" "$@")
+    (cd "$setup_root" && uv run --script "$dots_add_lib_dir/dots-add-config.py" "$@")
 }
 
 dots_record_failed_prompt() {

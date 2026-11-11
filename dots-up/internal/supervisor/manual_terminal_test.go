@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 	"github.com/charmbracelet/x/term"
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"

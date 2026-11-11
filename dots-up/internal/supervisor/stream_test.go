@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 )
 
 func TestEventStreamDecoderPreservesBytesAndFragmentedEvents(t *testing.T) {

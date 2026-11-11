@@ -10,7 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/commands"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/commands"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -89,7 +89,7 @@ func BrowseReports(opts Options) int {
 		names = []string{name}
 	} else {
 		for _, s := range commands.All() {
-			if s.Name != "reports" && s.Name != "houseatlas" && s.Name != "plan" {
+			if s.Name != "reports" && s.Name != "plan" {
 				names = append(names, s.Name)
 			}
 		}

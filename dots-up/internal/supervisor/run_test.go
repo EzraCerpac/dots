@@ -7,9 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/ui"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
 )
 
 func TestDashboardFailureContinuesOneUpdaterRun(t *testing.T) {
@@ -67,5 +68,43 @@ func TestDashboardFailureContinuesOneUpdaterRun(t *testing.T) {
 	}
 	if report.ExitCode != 0 || len(report.Events) < 4 {
 		t.Fatalf("updater did not complete and save its report after renderer failure: %+v", report)
+	}
+}
+
+func TestUpdaterCommandRunsManagerFromHome(t *testing.T) {
+	t.Setenv("DOTS_UP_RUNNER", "")
+	t.Setenv("DOTS_MISE_BIN", "/fixture/mise")
+	if _, err := updaterCommand(Options{Root: "/fixture/config", Command: "status"}); err == nil {
+		t.Fatal("a command started without a manager directory")
+	}
+	up, err := updaterCommand(Options{Root: "/fixture/config", Home: "/fixture/manager", Args: []string{"--plain"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(up.Args, " "); got != "bash /fixture/manager/bin/dots --backend up --plain" {
+		t.Fatalf("up runs %q", got)
+	}
+	status, err := updaterCommand(Options{Root: "/fixture/config", Home: "/fixture/manager", Command: "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(status.Args, " "); got != "bash /fixture/manager/lib/dots-command-backend /fixture/mise /fixture/config status" {
+		t.Fatalf("status runs %q", got)
+	}
+}
+
+// A dots script from before DOTS_HOME runs the newest renderer for `dots up`
+// with only --root. The renderer must keep using that script's updater task.
+func TestUpdaterCommandWithoutHomeUsesLegacySetupTask(t *testing.T) {
+	t.Setenv("DOTS_UP_RUNNER", "")
+	t.Setenv("DOTS_MISE_BIN", "/fixture/mise")
+	for _, command := range []string{"", "up"} {
+		up, err := updaterCommand(Options{Root: "/fixture/config", Command: command, Args: []string{"--plain"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(up.Args, " "); got != "/fixture/mise -C /fixture/config run setup:update --plain" {
+			t.Fatalf("legacy up (%q) runs %q", command, got)
+		}
 	}
 }

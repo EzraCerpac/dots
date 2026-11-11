@@ -8,9 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/commands"
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/launcher"
-	"github.com/EzraCerpac/dotfiles/setup-scripts/dots-up/internal/supervisor"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/commands"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/launcher"
+	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/supervisor"
 	"github.com/charmbracelet/x/term"
 )
 
@@ -22,6 +22,7 @@ func run(args []string) int {
 	var opts supervisor.Options
 	var capabilities bool
 	fs.StringVar(&opts.Root, "root", defaultRoot(), "setup repository root")
+	fs.StringVar(&opts.Home, "home", os.Getenv("DOTS_HOME"), "dots manager directory (DOTS_HOME)")
 	fs.StringVar(&opts.Command, "command", "", "dots command; omitted means up")
 	fs.BoolVar(&capabilities, "capabilities", false, "print frontend protocol")
 	fs.BoolVar(&opts.MAS, "mas", false, "include Mac App Store updates")
@@ -39,7 +40,7 @@ func run(args []string) int {
 		return 2
 	}
 	if capabilities {
-		fmt.Println("dots-shared-cli/1")
+		fmt.Println("dots-shared-cli/2")
 		return 0
 	}
 	if opts.Plain && opts.Verbose {
@@ -61,12 +62,20 @@ func run(args []string) int {
 		return 2
 	}
 	opts.Root = root
+	if opts.Home != "" {
+		home, err := filepath.Abs(opts.Home)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		opts.Home = home
+	}
 	if opts.Command == "menu" {
 		if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
 			fs.Usage()
 			return 0
 		}
-		session := &launcher.Session{}
+		session := launcher.Discover(opts.Home, opts.Root)
 		for {
 			selected, err := session.Run(nil)
 			if errors.Is(err, launcher.ErrCancelled) {
@@ -82,7 +91,13 @@ func run(args []string) int {
 			selectedOpts := opts
 			selectedOpts.Command = selected[0]
 			selectedOpts.Args = selected[1:]
-			code := execute(selectedOpts)
+			var code int
+			if session.IsCommand(selected[0]) {
+				// Configuration commands run as `dots NAME`, attached to this terminal.
+				code = runDots(opts, selected...)
+			} else {
+				code = execute(selectedOpts)
+			}
 			if code != 0 {
 				fmt.Fprintf(os.Stderr, "dots %s exited with status %d\n", selectedOpts.Command, code)
 			}
@@ -136,9 +151,9 @@ func execute(opts supervisor.Options) int {
 		}
 		return supervisor.ShowLast(opts)
 	}
-	// Plan, source-only synchronization and the unavailable HouseAtlas binding retain
-	// their original direct routes. None starts an update supervisor.
-	if opts.Command == "plan" || (opts.Command == "sync" && len(opts.Args) == 1 && opts.Args[0] == "--source-only") || (opts.Command == "up" && len(opts.Args) > 0 && opts.Args[0] == "houseatlas") {
+	// Plan and source-only synchronization retain their original direct
+	// routes. Neither starts an update supervisor.
+	if opts.Command == "plan" || (opts.Command == "sync" && len(opts.Args) == 1 && opts.Args[0] == "--source-only") {
 		return directBackend(opts)
 	}
 	opts.Sensitive = spec.Sensitive
@@ -147,10 +162,18 @@ func execute(opts supervisor.Options) int {
 }
 
 func directBackend(opts supervisor.Options) int {
-	args := []string{filepath.Join(opts.Root, "dotfiles", ".local", "bin", "dots"), "--backend", opts.Command}
-	args = append(args, opts.Args...)
+	return runDots(opts, append([]string{"--backend", opts.Command}, opts.Args...)...)
+}
+
+// runDots runs `dots ARGS...` from the manager, attached to this terminal.
+func runDots(opts supervisor.Options, dotsArgs ...string) int {
+	if opts.Home == "" {
+		fmt.Fprintln(os.Stderr, "dots: the dots manager directory is unknown; pass --home or set DOTS_HOME")
+		return 2
+	}
+	args := append([]string{filepath.Join(opts.Home, "bin", "dots")}, dotsArgs...)
 	cmd := exec.Command("bash", args...)
-	cmd.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root)
+	cmd.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root, "DOTS_HOME="+opts.Home)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

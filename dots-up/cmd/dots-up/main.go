@@ -8,9 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/commands"
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/launcher"
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/supervisor"
+	"github.com/EzraCerpac/dots/dots-up/internal/commands"
+	"github.com/EzraCerpac/dots/dots-up/internal/launcher"
+	"github.com/EzraCerpac/dots/dots-up/internal/supervisor"
 	"github.com/charmbracelet/x/term"
 )
 

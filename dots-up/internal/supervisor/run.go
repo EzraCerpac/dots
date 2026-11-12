@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
+	"github.com/EzraCerpac/dots/dots-up/internal/ui"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/ansi/parser"
 	"github.com/charmbracelet/x/term"

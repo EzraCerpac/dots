@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
+	"github.com/EzraCerpac/dots/dots-up/internal/ui"
 )
 
 func TestDashboardFailureContinuesOneUpdaterRun(t *testing.T) {

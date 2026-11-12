@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/EzraCerpac/dotfiles/manager/dots-up/internal/ui"
+	"github.com/EzraCerpac/dots/dots-up/internal/ui"
 )
 
 func TestRunReportsArePrivateAndRetentionPreservesActiveRun(t *testing.T) {

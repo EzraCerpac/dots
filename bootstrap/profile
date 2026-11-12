@@ -8,7 +8,7 @@ usage() {
     cat <<'EOF'
 Persist the local setup profile before loading host-specific mise config.
 
-Usage: manager/bootstrap/profile --profile ROLE --machine-id ID [--origin URL]
+Usage: bootstrap/profile --profile ROLE --machine-id ID [--origin URL]
 
 ROLE is one of [vars] dots_profiles. The history origin is optional here;
 use an SSH URL or credential-helper URL without embedded credentials.

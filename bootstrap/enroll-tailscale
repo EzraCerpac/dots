@@ -16,7 +16,7 @@ usage() {
     cat <<'EOF'
 Enroll the local machine in Tailscale.
 
-Usage: manager/bootstrap/enroll-tailscale
+Usage: bootstrap/enroll-tailscale
 
 When the local backend already reports BackendState=Running, this is a no-op
 and preserves the current identity and network preferences.  Otherwise the

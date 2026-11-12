@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the dots manager's test suites: tests/run [python|node|shell ...]
 #
-# The suites need only this manager directory: every test builds its own
+# The suites need only this repository: every test builds its own
 # configuration in a temporary directory or copies tests/fixtures. A suite is
 # skipped (exit status 77) when its runtime is missing. The run is isolated
 # from the caller's Git and JJ configuration so personal settings (signing,

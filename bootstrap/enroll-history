@@ -8,7 +8,7 @@ usage() {
     cat <<'EOF'
 Prepare encrypted, exact-file mise history tracking for one host.
 
-Usage: manager/bootstrap/enroll-history --profile ROLE --machine-id ID \
+Usage: bootstrap/enroll-history --profile ROLE --machine-id ID \
        --identity PATH [--origin URL] [--recipient AGE-RECIPIENT]... \
        [--file PATH]... [--refresh]
 

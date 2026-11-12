@@ -28,7 +28,8 @@ If a recipe needs administrator access and none is cached, a noninteractive run 
 ## `dots up`
 
 `dots up` saves tracked settings before and after updates. It synchronizes
-source, then re-executes the updated manager once. It updates declared native
+source, then re-executes itself once so the remaining stages run from the
+synced configuration. It updates declared native
 packages, installs and upgrades declared mise tools (tools pinned to a
 revision keep it), runs installer exceptions and update hooks, and updates
 standalone mise last.

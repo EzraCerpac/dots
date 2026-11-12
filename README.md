@@ -4,7 +4,7 @@
 It wraps mise's native bootstrap and dotfile commands with a daily update, Git-based sharing of the configuration between machines, encrypted backup of app-written settings, and hooks for whatever mise cannot do itself.
 
 Your configuration is an ordinary mise config directory in its own Git repository, by default `~/.config/mise`.
-This directory, the manager, holds no personal settings and can live anywhere.
+This repository, the manager, holds no personal settings and lives apart from the configuration.
 
 ## Requirements
 
@@ -17,15 +17,38 @@ You can declare all of these as tools in the configuration itself, so `dots up` 
 
 ## Install
 
-Put this directory anywhere and link `bin/dots` onto your `PATH`:
+There is no package yet: `dots` runs from a checkout of this repository.
+Clone it anywhere and link `bin/dots` onto your `PATH`:
 
 ```sh
-ln -s "$PWD/bin/dots" ~/.local/bin/dots
+git clone https://github.com/EzraCerpac/dots ~/.local/share/dots
+ln -s ~/.local/share/dots/bin/dots ~/.local/bin/dots
 ```
 
-`dots` follows that link to find the rest of its files; `dots internal home` prints the directory it found.
-The optional `dots-up` renderer adds the interactive menu, live progress and saved reports (see [Development](#development)).
+`dots` follows that link to find the rest of its files; `dots internal home` prints the directory it found, and `DOTS_HOME` overrides it.
+`dots up` updates the configuration, not this checkout: pull it, or check out a release tag, to update `dots` itself.
+
+### Optional renderer
+
+The `dots-up` renderer adds the interactive menu, live progress and saved reports.
 Without it, every command still works with plain output.
+Each release publishes it as a standalone binary for macOS and Linux on arm64 and amd64, with `SHA256SUMS`.
+Install it with mise's GitHub backend, for example in the configuration itself:
+
+```toml
+[tools."github:EzraCerpac/dots"]
+version = "latest"
+rename_exe = "dots-up"
+
+[tools."github:EzraCerpac/dots".platforms]
+macos-arm64 = { asset_pattern = "dots-up-darwin-arm64" }
+macos-x64 = { asset_pattern = "dots-up-darwin-amd64" }
+linux-arm64 = { asset_pattern = "dots-up-linux-arm64" }
+linux-x64 = { asset_pattern = "dots-up-linux-amd64" }
+```
+
+`dots` uses the renderer when `DOTS_UP_BIN`, `mise which dots-up` or `PATH` finds a `dots-up` that reports the capability `dots-shared-cli/2`.
+To build it from the checkout instead: `(cd dots-up && go build -o ~/.local/bin/dots-up ./cmd/dots-up)`.
 
 ## Quickstart
 
@@ -245,7 +268,7 @@ ln -s "$(dots internal home)/skills/dots" ~/.claude/skills/dots
 | `skills/` | The agent skill |
 | `tests/` | The test suites and a fixture configuration |
 
-Run the tests from this directory; they need nothing outside it and never touch your machine:
+Run the tests from the repository root; they need nothing outside it and never touch your machine:
 
 ```sh
 tests/run              # Python, Node and shell suites; tests/run python, node or shell
@@ -263,19 +286,4 @@ DOTS_HOME=~/src/dots ~/src/dots/bin/dots status
 DOTS_ROOT=/tmp/other-config dots help        # and another configuration
 ```
 
-`dots` uses the renderer when `DOTS_UP_BIN`, `mise which dots-up` or `PATH` finds a `dots-up` that reports the capability `dots-shared-cli/2`.
-Tagging `dots-up-vX.Y.Z` runs the release workflow, which tests the module on Linux and macOS and publishes `dots-up-{darwin,linux}-{arm64,amd64}` with `SHA256SUMS`.
-Install a release with mise's GitHub backend, naming the repository that publishes it:
-
-```toml
-[tools."github:OWNER/NAME"]
-version = "latest"
-version_prefix = "dots-up-v"
-rename_exe = "dots-up"
-
-[tools."github:OWNER/NAME".platforms]
-macos-arm64 = { asset_pattern = "dots-up-darwin-arm64" }
-macos-x64 = { asset_pattern = "dots-up-darwin-amd64" }
-linux-arm64 = { asset_pattern = "dots-up-linux-arm64" }
-linux-x64 = { asset_pattern = "dots-up-linux-amd64" }
-```
+Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then publishes `dots-up-{darwin,linux}-{arm64,amd64}` with `SHA256SUMS` as a GitHub release.

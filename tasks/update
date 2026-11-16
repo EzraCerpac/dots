@@ -564,9 +564,31 @@ if [[ "$include_mas" -eq 1 && "$app_store" -eq 1 ]]; then
     run_stage "Mac App Store result" finish_app_store_packages || true
 fi
 
-# Standalone mise updates last. A Homebrew-owned installation will report that
-# self-update is disabled; the migration will switch ownership before relying on it.
-run_stage "standalone mise" setup_mise self-update --yes || true
+# Whether mise may update itself. A package manager (Homebrew, a distribution)
+# marks its mise with a file next to the binary, and mise then refuses
+# self-update; check the same places mise does (mise src/env.rs), relative to
+# the parent of the real binary's directory, and honor its override variable.
+mise_self_update_available() {
+    local base marker
+    case "${MISE_SELF_UPDATE_AVAILABLE:-}" in
+        1|true|yes) return 0 ;;
+        0|false|no) return 1 ;;
+    esac
+    base="$(dots_manager_home_of "$(resolve_mise_bin)")" || return 0
+    for marker in lib/.disable-self-update lib/mise/.disable-self-update lib64/mise/.disable-self-update \
+        lib/mise-self-update-instructions.toml lib/mise/mise-self-update-instructions.toml lib64/mise/mise-self-update-instructions.toml; do
+        [[ ! -e "$base/$marker" ]] || return 1
+    done
+    [[ -z "${MISE_SELF_UPDATE_INSTRUCTIONS:-}" ]]
+}
+
+# Standalone mise updates last; a package-managed mise updates with its package.
+if mise_self_update_available; then
+    run_stage "standalone mise" setup_mise self-update --yes || true
+else
+    printf '\nSkipped: standalone mise is updated by the package manager that installed it.\n'
+    dots_up_emit_notice info 'Standalone mise skipped; the package manager that installed mise updates it.'
+fi
 
 # dots updates itself only when the configuration declares it (a mise tool or
 # a Homebrew formula) and a stage above installed a new version; this run

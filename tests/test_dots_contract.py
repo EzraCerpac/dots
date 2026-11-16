@@ -147,6 +147,18 @@ class UpdateHookTests(ContractTestCase):
         self.assertEqual(out.read_text(), f"1 {self.f.manager}")
         self.assertIn("== dots manager ==\ndots 0.3.0 -> 0.3.1, used from the next run.\nResult: completed", result.stdout)
 
+    def test_update_skips_self_update_for_a_package_managed_mise(self) -> None:
+        # Homebrew's mise ships lib/.disable-self-update and refuses self-update.
+        package = self.f.base / "Cellar/mise/2026.11.7"
+        head, tail = FAKE_MISE.rsplit("    *) exit 0 ;;", 1)
+        refusing = head + "    self-update) echo 'mise: self-update is disabled' >&2; exit 1 ;;\n    *) exit 0 ;;" + tail
+        managed = write(package / "bin/mise", refusing, 0o755)
+        write(package / "lib/.disable-self-update", "")
+        result = self.f.update(SETUP_MISE_BIN=str(managed), DOTS_MISE_BIN=str(managed))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Skipped: standalone mise is updated by the package manager that installed it", result.stdout)
+        self.assertNotIn("self-update", self.f.log.read_text())
+
     def test_update_leaves_a_checkout_manager_alone(self) -> None:
         remove_git_marker(self.f.manager)
         (self.f.manager / ".git").mkdir()

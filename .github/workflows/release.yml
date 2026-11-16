@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: dots-up/go.mod
+          cache-dependency-path: dots-up/go.sum
+
+      - name: Build release assets
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          (
+            cd dots-up
+            test -f go.sum
+            go mod verify
+            for os in darwin linux; do
+              for arch in arm64 amd64; do
+                CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -mod=readonly -trimpath \
+                  -o "$GITHUB_WORKSPACE/dist/dots-up-$os-$arch" ./cmd/dots-up
+              done
+            done
+          )
+          # The whole tree at this tag, so a configuration can pin the manager by release.
+          version="${TAG#v}"
+          git archive --format=tar.gz --prefix="dots-$version/" -o "dist/dots-$version.tar.gz" "$TAG"
+          (cd dist && sha256sum dots-up-* "dots-$version.tar.gz" > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/dots-up-* dist/dots-*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes

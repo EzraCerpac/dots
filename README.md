@@ -286,7 +286,7 @@ DOTS_HOME=~/src/dots ~/src/dots/bin/dots status
 DOTS_ROOT=/tmp/other-config dots help        # and another configuration
 ```
 
-Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then publishes `dots-up-{darwin,linux}-{arm64,amd64}` with `SHA256SUMS` as a GitHub release.
+Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then publishes `dots-up-{darwin,linux}-{arm64,amd64}`, a source archive `dots-X.Y.Z.tar.gz` of the whole tree, and `SHA256SUMS` as a GitHub release.
 
 ## License
 

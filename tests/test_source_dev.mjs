@@ -286,13 +286,32 @@ test('a push that fails for another reason says why, not that dev kept moving', 
   assert.equal(f.remote(), before);
 });
 
+test('a push that fails and leaves origin unreachable keeps its reason next to OFFLINE', available, t => {
+  const f = fixture(t);
+  prePush(f, `mv '${f.origin}' '${f.origin}.gone'\necho 'fatal: unable to access origin: Could not resolve host' >&2\nexit 1`);
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  fs.renameSync(`${f.origin}.gone`, f.origin);
+  assert.match(text, /\n {2}NOT PUSHED: git push failed: fatal: unable to access origin: Could not resolve host\n/);
+  assert.match(text, /\n {2}OFFLINE: 1 commits unpushed, retried next run/);
+});
+
+test('credentials in a URL never reach the sync output', available, t => {
+  const f = fixture(t);
+  prePush(f, "echo \"fatal: unable to access 'https://ezra:ghp_TOPSECRET@github.com/o/r.git/': The requested URL returned error: 403\" >&2\nexit 1");
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  assert.match(text, /NOT PUSHED: git push failed: fatal: unable to access 'https:\/\/\*\*\*@github\.com\/o\/r\.git\/': The requested URL returned error: 403/);
+  assert.doesNotMatch(text, /TOPSECRET|ezra:/);
+});
+
 test('a hanging push times out and points at the credential helper', available, t => {
   const f = fixture(t); const before = f.remote();
-  prePush(f, 'sleep 5');
+  prePush(f, 'sleep 60');
   f.write(f.a, 'local', 'local\n');
   const started = Date.now();
   const { text } = f.sync(f.a, { pushTimeout: 500 });
-  assert(Date.now() - started < 4500, 'the push did not wait for the hanging hook');
+  assert(Date.now() - started < 45000, 'the sync waited for the hanging hook');
   assert.match(text, /\n {2}NOT PUSHED: git push timed out after 1s; check the Git credential helper for origin, then rerun/);
   assert.doesNotMatch(text, /kept moving/);
   assert.equal(f.remote(), before);

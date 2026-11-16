@@ -31,6 +31,8 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    Local `[dotfiles.NAME]` tables that the merged `dots/retired-declarations` retires are validated as already removed (see [the `dots/` reference](../init/README.md#retired-dotfiles-and-retired-declarations)).
 7. Pushes without force, merging and retrying up to three times when `origin/dev` moved meanwhile.
    A push that fails for any other reason is not retried, and one that takes longer than 60 seconds is stopped; Git never prompts for credentials here.
+   Stopping it stops Git, not a hook or credential helper Git started, so a push may still land later; the next sync reconciles it.
+   Output from failed commands is shown as they printed it, except that credentials in URLs (`https://user:secret@host`) are replaced with `***`.
 8. Moves the live files from the local commit to the merged one with a two-tree checkout, which refuses to overwrite a file edited during the run.
    When it retires tables, it moves only while the local files are still the ones it validated.
    Only then does it remove those retired tables from the local files, and runs `mise bootstrap dotfiles apply`.

@@ -7,7 +7,8 @@ import test from 'node:test';
 import { syncSource, withRepositoryLock } from '../lib/source-repo.mjs';
 import { miseBinary, requires } from './lib/prereq.mjs';
 
-const available = requires('git');
+// Every sync runs the encrypted-history guard, which reads mise's inventory with jq.
+const available = requires('git', 'jq');
 function run(bin, args, cwd, options = {}) {
   const r = spawnSync(bin, args, { cwd, encoding: 'utf8', ...options });
   assert.equal(r.status, 0, `${bin} ${args.join(' ')}: ${r.stderr}`);
@@ -59,6 +60,9 @@ function fixture(t) {
   fs.writeFileSync(miseBin, `#!/bin/sh
 set -eu
 case "$*" in
+  *'dotfiles paths --json'*) if [ -n "\${DEV_TEST_PATHS:-}" ]; then echo "$DEV_TEST_PATHS"; else echo '{"entries": []}'; fi ;;
+  *'.encrypt'*) exit 1 ;;
+  *'dotfiles save'*) if [ -n "\${DEV_TEST_SAVED:-}" ]; then touch "$DEV_TEST_SAVED"; fi ;;
   *'config ls'*)
     if [ -n "\${DEV_TEST_MUTATE:-}" ]; then echo late > "$DEV_TEST_MUTATE"; fi
     if grep -q INVALID "$2/config.toml"; then echo 'invalid config' >&2; exit 1; fi ;;
@@ -131,6 +135,20 @@ test('a local edit is shared and private files stay local', available, t => {
   assert.doesNotMatch(git(f.a, 'ls-tree', '-r', '--name-only', 'dev'), /config\.local\.toml|\.setup-state|locks/);
   assert.match(git(f.a, 'log', '-1', '--format=%s', 'dev'), /^Save local setup \(/);
   f.clean(f.a);
+});
+
+test('sync saves nothing while a tracked file is not declared encrypted', available, t => {
+  const f = fixture(t);
+  const saved = path.join(f.dir, 'saved');
+  process.env.DEV_TEST_SAVED = saved;
+  const { text } = f.sync(f.a);
+  assert(fs.existsSync(saved), 'an encrypted (here: empty) inventory is saved');
+  fs.rmSync(saved);
+  process.env.DEV_TEST_PATHS = JSON.stringify({ entries: [{ path: '~/.app', mode: 'track', declared_in: path.join(f.a, 'config.toml') }] });
+  const refused = f.sync(f.a);
+  assert.equal(text, 'dots sync: no local changes · pulled dev +0, main +0 · nothing to push');
+  assert.match(refused.text, /\n {2}SAVE REFUSED: history entry ~\/\.app in .*config\.toml is not encrypted; set encrypt = true there; nothing saved$/);
+  assert(!fs.existsSync(saved), 'mise bootstrap dotfiles save ran');
 });
 
 test('a remote change arrives on disk', available, t => {
@@ -311,7 +329,7 @@ test('an unpushed commit that ever tracked a private file blocks the push', avai
   assert.equal(f.remote(), before);
 });
 
-test('the real gitleaks reports a token by file and line only', requires('git', 'gitleaks'), t => {
+test('the real gitleaks reports a token by file and line only', requires('git', 'jq', 'gitleaks'), t => {
   const f = fixture(t);
   fs.copyFileSync(new URL('../init/gitleaks.toml', import.meta.url), path.join(f.a, '.gitleaks.toml'));
   const token = ['ghp', 'R8tq3LwVn5Xk2Jc9Hy7Pd4Mb6Fz1Sa0Gu3Ee'].join('_');
@@ -650,7 +668,7 @@ exit 0
 
 // The same upgrade against real mise: its own validation rejects the stale
 // declaration, and its apply leaves the rendered file in place.
-test('upgrading an older host with real mise', requires('git', 'mise'), async t => {
+test('upgrading an older host with real mise', requires('git', 'jq', 'mise'), async t => {
   for (const listed of [true, false]) {
     await t.test(listed ? 'one sync retires the listed declaration' : 'an unlisted declaration still fails validation', t => {
       const f = fixture(t);

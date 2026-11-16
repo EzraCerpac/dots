@@ -206,9 +206,15 @@ func TestHandoffFixtureProcess(t *testing.T) {
 }
 
 func fixtureReadable(fd int, wait time.Duration) bool {
-	var readable unix.FdSet
-	readable.Set(fd)
-	timeout := unix.NsecToTimeval(int64(wait))
-	n, err := unix.Select(fd+1, &readable, nil, nil, &timeout)
-	return err == nil && n > 0
+	deadline := time.Now().Add(wait)
+	for {
+		var readable unix.FdSet
+		readable.Set(fd)
+		timeout := unix.NsecToTimeval(int64(time.Until(deadline)))
+		n, err := unix.Select(fd+1, &readable, nil, nil, &timeout)
+		if err == unix.EINTR && time.Now().Before(deadline) {
+			continue // A signal (SIGWINCH, SIGCHLD) must not read as "nothing to read".
+		}
+		return err == nil && n > 0
+	}
 }

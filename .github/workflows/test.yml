@@ -1,0 +1,122 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      # mise uses the token for GitHub release lookups instead of anonymous rate limits.
+      GITHUB_TOKEN: ${{ github.token }}
+      MISE_YES: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Check shell syntax
+        run: |
+          status=0
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.sh) ;;
+              *) head -n1 "$file" | grep -Eq '^#!.*(bash|/sh|env sh)' || continue ;;
+            esac
+            bash -n "$file" || status=1
+          done < <(find bin tasks lib bootstrap init tests -type f -not -path '*/fixtures/*' -print0)
+          exit "$status"
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends rsync zsh
+
+      - name: Install system packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: Install mise and test tools
+        run: |
+          curl -fsSL https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          tools=(node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest jq@latest)
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            tools+=(github:fish-shell/fish-shell@latest)
+          fi
+          mise use --global "${tools[@]}"
+          # Real install paths, not shims: tests replace HOME and mise config dirs.
+          (cd "$RUNNER_TEMP" && mise bin-paths) >> "$GITHUB_PATH"
+          # These uv scripts declare PyYAML and tomlkit; their tests import them directly.
+          "$(cd "$RUNNER_TEMP" && mise which python3)" -m pip install --quiet pyyaml tomlkit
+
+      - name: Tool versions
+        run: |
+          mise --version
+          for tool in node python3 uv jj age gitleaks jq fish zsh; do
+            printf '%-8s %s\n' "$tool" "$(command -v "$tool" || echo missing)"
+          done
+
+      - name: Run tests
+        run: tests/run
+
+  go:
+    name: go (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+        with:
+          go-version-file: dots-up/go.mod
+          cache-dependency-path: dots-up/go.sum
+      - name: Verify modules and run Go checks
+        working-directory: dots-up
+        run: |
+          go mod verify
+          go vet ./...
+          go test ./...
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      MISE_YES: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Scan every commit: a secret removed later is still public.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -fsSL https://mise.run | sh
+          "$HOME/.local/bin/mise" use --global gitleaks@latest
+          (cd "$RUNNER_TEMP" && "$HOME/.local/bin/mise" bin-paths) >> "$GITHUB_PATH"
+
+      - name: Scan history
+        # Include merge diffs, which `git log` omits by default.
+        run: gitleaks git --no-banner --redact --verbose --log-opts='--all --full-history --diff-merges=first-parent' .

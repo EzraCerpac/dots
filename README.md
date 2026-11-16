@@ -287,3 +287,7 @@ DOTS_ROOT=/tmp/other-config dots help        # and another configuration
 ```
 
 Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then publishes `dots-up-{darwin,linux}-{arm64,amd64}` with `SHA256SUMS` as a GitHub release.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

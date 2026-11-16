@@ -280,7 +280,7 @@ Machine-local files and secrets never enter the repository.
 | `~/.agents/skills/dots` | Codex and other clients of the shared directory | `~/.agents` or `~/.codex` (or `CODEX_HOME`) exists |
 
 Each link points at `skills/dots` in the running installation: Homebrew's stable `opt` path, so a `brew upgrade` needs no relinking, or the version directory for mise and a checkout, which the next `dots` command or `dots up` moves to the new version.
-`dots` replaces only links it made, which it records in `~/.local/state/dots/skill-links`; a directory, a file or any other link at those paths is yours, and `dots` leaves it alone with a one-time notice.
+`dots` replaces only links it made and that still point where it left them (it records them in `~/.local/state/dots/skill-links`); a directory, a file or any other link at those paths is yours, and `dots` leaves it alone with a one-time notice.
 `dots status` shows each link.
 Set `DOTS_SKILL_LINKS=0` to turn linking off.
 To remove the skill, set that and delete the two links; after `brew uninstall dots` or removing a mise version, the links dangle until you delete them or install `dots` again.

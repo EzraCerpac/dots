@@ -68,15 +68,29 @@ dots_skill_links() {
     fi
 }
 
-# dots records each skill link it creates, so it replaces only those: a link
-# the user made, even one into another dots tree, is theirs.
+# dots records each skill link it creates as LINK<TAB>TARGET, so it replaces
+# only a link that still points where dots pointed it: a link the user made or
+# repointed, even into another dots tree, is theirs.
 dots_skill_record() {
     printf '%s/dots/skill-links\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
 }
 
-# Whether LINK is a symlink dots made.
+# Whether LINK is a symlink dots made and nobody has changed since.
 dots_skill_link_is_ours() {
-    [[ -L "$1" ]] && grep -qxF "$1" "$(dots_skill_record)" 2>/dev/null
+    [[ -L "$1" ]] && grep -qxF "$1"$'\t'"$(readlink "$1")" "$(dots_skill_record)" 2>/dev/null
+}
+
+# Point LINK at SOURCE and record it; without a record, undo the link so the
+# next run retries both instead of treating the link as the user's.
+dots_skill_link() {
+    local link="$1" source="$2" record kept
+    record="$(dots_skill_record)"
+    mkdir -p "${link%/*}" "${record%/*}" 2>/dev/null || return 0
+    ln -sfn "$source" "$link" 2>/dev/null || return 0
+    kept="$(LINK="$link" awk -F '\t' '$1 != ENVIRON["LINK"]' "$record" 2>/dev/null || true)"
+    if ! { printf '%s\n' ${kept:+"$kept"} "$link"$'\t'"$source" > "$record.tmp" && mv -f "$record.tmp" "$record"; } 2>/dev/null; then
+        rm -f "$link" "$record.tmp" 2>/dev/null || true
+    fi
 }
 
 # Link the bundled skill into every agent in use, pointing at HOME's skill.
@@ -84,21 +98,16 @@ dots_skill_link_is_ours() {
 # file, or another link) is left alone, with one notice per destination;
 # DOTS_SKILL_LINKS=0 turns linking off.
 dots_skill_refresh() {
-    local home="$1" source agent link notices notice record
+    local home="$1" source agent link notices notice
     [[ "${DOTS_SKILL_LINKS:-1}" != 0 && -n "${HOME:-}" ]] || return 0
     [[ -f "$home/skills/dots/SKILL.md" ]] || return 0
     source="$(dots_skill_source "$home")"
     notices="${XDG_STATE_HOME:-$HOME/.local/state}/dots/skill-notices"
-    record="$(dots_skill_record)"
     while IFS=$'\t' read -r agent link; do
         [[ -n "$link" ]] || continue
         [[ "$(readlink "$link" 2>/dev/null)" != "$source" ]] || continue
-        if dots_skill_link_is_ours "$link"; then
-            ln -sfn "$source" "$link" 2>/dev/null || true
-        elif [[ ! -e "$link" && ! -L "$link" ]]; then
-            if mkdir -p "${link%/*}" 2>/dev/null && ln -s "$source" "$link" 2>/dev/null; then
-                { mkdir -p "${record%/*}" && printf '%s\n' "$link" >> "$record"; } 2>/dev/null || true
-            fi
+        if dots_skill_link_is_ours "$link" || [[ ! -e "$link" && ! -L "$link" ]]; then
+            dots_skill_link "$link" "$source"
         else
             notice="$link"
             if ! grep -qxF "$notice" "$notices" 2>/dev/null; then

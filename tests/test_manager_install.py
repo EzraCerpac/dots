@@ -160,6 +160,18 @@ class ManagerInstallTests(unittest.TestCase):
         self.dots(new / "bin/dots", "--version")
         self.assertEqual(os.readlink(self.claude_link), str(new / "skills/dots"))
 
+    def test_a_link_the_user_repointed_is_left_alone(self) -> None:
+        self.agents(".claude")
+        mise = self.mise_install("0.3.0")
+        self.dots(mise / "bin/dots", "--version")
+        own = self.base / "own-skill"
+        own.mkdir()
+        self.claude_link.unlink()
+        self.claude_link.symlink_to(own)
+        new = self.mise_install("0.4.0")
+        self.dots(new / "bin/dots", "--version")
+        self.assertEqual(os.readlink(self.claude_link), str(own))
+
     def test_a_link_the_user_made_into_another_dots_tree_is_left_alone(self) -> None:
         self.agents(".claude")
         development = install_tree(self.base / "development", "9.9.9")

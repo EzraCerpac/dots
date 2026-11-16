@@ -344,6 +344,12 @@ func printReportHighlights(w io.Writer, report Report) {
 	if up {
 		fmt.Fprintln(w, ui.OutcomeReport(report.Events))
 	}
+	labels := map[string]string{}
+	for _, e := range report.Events {
+		if e.Kind == "stage_start" {
+			labels[e.ID] = e.Label
+		}
+	}
 	for _, e := range report.Events {
 		switch e.Kind {
 		case "item_upsert":
@@ -360,11 +366,19 @@ func printReportHighlights(w io.Writer, report Report) {
 			}
 		case "notice":
 			if e.Severity == "attention" || e.Severity == "error" {
-				fmt.Fprintf(w, "  Attention: %s\n", e.Summary)
+				printIssue(w, "Attention: "+e.Summary, e.Action, "")
 			}
 		case "stage_end":
-			if e.Status == "failed" {
-				fmt.Fprintf(w, "  Failed: %s — %s\n", e.Label, e.Summary)
+			if e.Status == "failed" || e.Status == "attention" {
+				label := labels[e.ID]
+				if label == "" {
+					label = e.Label
+				}
+				kind := "Failed"
+				if e.Status == "attention" {
+					kind = "Needs attention"
+				}
+				printIssue(w, fmt.Sprintf("%s: %s — %s", kind, label, e.Summary), e.Action, e.LogPath)
 			}
 		}
 	}
@@ -373,6 +387,13 @@ func printReportHighlights(w io.Writer, report Report) {
 			fmt.Fprintf(w, "Logs: %s\n", filepath.Dir(e.LogPath))
 			return
 		}
+	}
+}
+
+// printIssue prints one attention item with its output, log and next step.
+func printIssue(w io.Writer, text, action, logPath string) {
+	for _, line := range strings.Split(ui.IssueDetail(text, action, logPath), "\n") {
+		fmt.Fprintln(w, strings.TrimRight("  "+line, " "))
 	}
 }
 

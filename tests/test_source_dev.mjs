@@ -62,11 +62,16 @@ set -eu
 case "$*" in
   *'dotfiles paths --json'*) if [ -n "\${DEV_TEST_PATHS:-}" ]; then echo "$DEV_TEST_PATHS"; else echo '{"entries": []}'; fi ;;
   *'.encrypt'*) exit 1 ;;
-  *'dotfiles save'*) if [ -n "\${DEV_TEST_SAVED:-}" ]; then touch "$DEV_TEST_SAVED"; fi ;;
+  *'dotfiles save'*)
+    if [ -n "\${DEV_TEST_SAVE_FAIL:-}" ]; then echo "$DEV_TEST_SAVE_FAIL" >&2; exit 1; fi
+    if [ -n "\${DEV_TEST_SAVED:-}" ]; then touch "$DEV_TEST_SAVED"; fi ;;
   *'config ls'*)
     if [ -n "\${DEV_TEST_MUTATE:-}" ]; then echo late > "$DEV_TEST_MUTATE"; fi
     if grep -q INVALID "$2/config.toml"; then echo 'invalid config' >&2; exit 1; fi ;;
   *'dotfiles apply'*)
+    case "$*" in *--dry-run*) ;; *)
+      if [ -n "\${DEV_TEST_APPLY_FAIL:-}" ]; then echo 'applying 3 dotfiles'; echo "$DEV_TEST_APPLY_FAIL" >&2; exit 1; fi ;;
+    esac
     # Like mise: every source a local declaration names must exist.
     for file in "$2"/config.local.toml "$2"/config.host-*.toml; do
       [ -f "$file" ] || continue
@@ -262,6 +267,78 @@ git -C '${f.b}' push -q origin HEAD:dev
   assert.match(text, /· pushed/);
   assert.equal(f.remote(), f.dev(f.a));
   assert.equal(read(f.a, 'raced'), 'raced\n'); assert.equal(read(f.a, 'local'), 'local\n');
+});
+
+// A pre-push hook stands in for whatever makes a push fail or hang.
+const prePush = (f, body) => {
+  const hook = path.join(f.a, '.git/hooks/pre-push');
+  fs.writeFileSync(hook, `#!/bin/sh\n${body}\n`);
+  fs.chmodSync(hook, 0o755);
+};
+
+test('a push that fails for another reason says why, not that dev kept moving', available, t => {
+  const f = fixture(t); const before = f.remote();
+  prePush(f, "echo 'remote: Invalid username or password.' >&2\necho \"fatal: Authentication failed for 'https://example.invalid/dots.git/'\" >&2\nexit 1");
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  assert.match(text, /· not pushed\n {2}NOT PUSHED: git push failed: fatal: Authentication failed for 'https:\/\/example\.invalid\/dots\.git\/'\n {4}remote: Invalid username or password\.(\n|$)/);
+  assert.doesNotMatch(text, /kept moving|OFFLINE/);
+  assert.equal(f.remote(), before);
+});
+
+test('a push that fails and leaves origin unreachable keeps its reason next to OFFLINE', available, t => {
+  const f = fixture(t);
+  prePush(f, `mv '${f.origin}' '${f.origin}.gone'\necho 'fatal: unable to access origin: Could not resolve host' >&2\nexit 1`);
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  fs.renameSync(`${f.origin}.gone`, f.origin);
+  assert.match(text, /\n {2}NOT PUSHED: git push failed: fatal: unable to access origin: Could not resolve host\n/);
+  assert.match(text, /\n {2}OFFLINE: 1 commits unpushed, retried next run/);
+});
+
+test('credentials in a URL never reach the sync output', available, t => {
+  const f = fixture(t);
+  prePush(f, "echo \"fatal: unable to access 'https://ezra:ghp_TOPSECRET@github.com/o/r.git/': The requested URL returned error: 403\" >&2\nexit 1");
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  assert.match(text, /NOT PUSHED: git push failed: fatal: unable to access 'https:\/\/\*\*\*@github\.com\/o\/r\.git\/': The requested URL returned error: 403/);
+  assert.doesNotMatch(text, /TOPSECRET|ezra:/);
+});
+
+test('a hanging push times out and points at the credential helper', available, t => {
+  const f = fixture(t); const before = f.remote();
+  prePush(f, 'sleep 60');
+  f.write(f.a, 'local', 'local\n');
+  const started = Date.now();
+  const { text } = f.sync(f.a, { pushTimeout: 500 });
+  assert(Date.now() - started < 45000, 'the sync waited for the hanging hook');
+  assert.match(text, /\n {2}NOT PUSHED: git push timed out after 1s; check the Git credential helper for origin, then rerun/);
+  assert.doesNotMatch(text, /kept moving/);
+  assert.equal(f.remote(), before);
+});
+
+test('only pushes that keep losing the race say dev kept moving', available, t => {
+  const f = fixture(t);
+  prePush(f, `set -eu\ndate +%s%N >> '${f.b}/raced'\ngit -C '${f.b}' add raced\ngit -C '${f.b}' commit -qm Race\ngit -C '${f.b}' push -q origin HEAD:dev`);
+  f.write(f.a, 'local', 'local\n');
+  const { text } = f.sync(f.a);
+  assert.match(text, /\n {2}NOT PUSHED: origin\/dev kept moving; retried next run/);
+  assert.doesNotMatch(text, /git push failed/);
+});
+
+test('a failed apply carries the output that explains it', available, t => {
+  const f = fixture(t);
+  f.write(f.b, 'remote', 'from b\n'); f.sync(f.b);
+  process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found';
+  const { text } = f.sync(f.a);
+  assert.match(text, /\n {2}APPLY FAILED: mise bootstrap dotfiles apply \(exit 1\); fix the error below, then run dots apply\n {4}applying 3 dotfiles\n {4}mise ERROR pre-dotfiles hook failed: github:EzraCerpac\/dots@0\.3\.1 not found$/);
+});
+
+test('a failed save carries the output that explains it', available, t => {
+  const f = fixture(t);
+  process.env.DEV_TEST_SAVE_FAIL = 'mise ERROR cannot read ~/.config/app/state.json';
+  const { text } = f.sync(f.a);
+  assert.match(text, /\n {2}SAVE FAILED: mise bootstrap dotfiles save \(exit 1\); copied dotfiles not captured\n {4}mise ERROR cannot read ~\/\.config\/app\/state\.json(\n|$)/);
 });
 
 test('a push retry merges main again over a racing dev change to the same hunk', available, t => {
@@ -695,7 +772,7 @@ test('upgrading an older host with real mise', requires('git', 'jq', 'mise'), as
         assert.doesNotMatch(text, /APPLY FAILED/);
         assert.equal(read(f.a, 'config.local.toml'), KEPT);
       } else {
-        assert.match(text, /\n {2}INVALID merged config: [^\n]*sources do not exist[^\n]*; nothing pushed or applied$/);
+        assert.match(text, /\n {2}INVALID merged config: [^\n]*sources do not exist[^\n]*; nothing pushed or applied\n {4} *\[dotfiles\]\."~\/\.config\/herdr\/config\.toml": [^\n]*templates\/herdr\.tera\n/);
         assert.equal(read(f.a, 'config.local.toml'), KEPT + HERDR);
         assert(fs.existsSync(path.join(f.a, 'templates/herdr.tera')));
       }

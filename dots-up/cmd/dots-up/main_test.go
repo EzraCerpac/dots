@@ -94,3 +94,15 @@ func TestCapabilitiesReportsHomeAwareProtocol(t *testing.T) {
 		t.Fatalf("capabilities = %q (exit %d)", output, code)
 	}
 }
+
+func TestSelectedRootAndHomeReachTheDashboardProcess(t *testing.T) {
+	root, home := t.TempDir(), t.TempDir()
+	t.Setenv("DOTS_ROOT", "/ambient/config")
+	t.Setenv("DOTS_HOME", "/ambient/manager")
+	if code := run([]string{"--root", root, "--home", home, "--command", "no-such-command", "--"}); code != 2 {
+		t.Fatalf("run = %d, want 2 for an unknown command", code)
+	}
+	if os.Getenv("DOTS_ROOT") != root || os.Getenv("DOTS_HOME") != home {
+		t.Fatalf("DOTS_ROOT=%q DOTS_HOME=%q, want the selected %q and %q", os.Getenv("DOTS_ROOT"), os.Getenv("DOTS_HOME"), root, home)
+	}
+}

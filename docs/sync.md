@@ -30,6 +30,9 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
 6. Validates the merged configuration with this machine's local files; an invalid result is neither pushed nor applied.
    Local `[dotfiles.NAME]` tables that the merged `dots/retired-declarations` retires are validated as already removed (see [the `dots/` reference](../init/README.md#retired-dotfiles-and-retired-declarations)).
 7. Pushes without force, merging and retrying up to three times when `origin/dev` moved meanwhile.
+   A push that fails for any other reason is not retried, and one that takes longer than 60 seconds is stopped; Git never prompts for credentials here.
+   Stopping it stops Git, not a hook or credential helper Git started, so a push may still land later; the next sync reconciles it.
+   Output from failed commands is shown as they printed it, except that credentials in URLs (`https://user:secret@host`) are replaced with `***`.
 8. Moves the live files from the local commit to the merged one with a two-tree checkout, which refuses to overwrite a file edited during the run.
    When it retires tables, it moves only while the local files are still the ones it validated.
    Only then does it remove those retired tables from the local files, and runs `mise bootstrap dotfiles apply`.
@@ -53,7 +56,8 @@ dots sync: shared 2 files · pulled dev +1, main +0 · pushed 3f2a9c1
 | Push | `pushed COMMIT`, `nothing to push`, `not pushed` |
 
 Indented lines follow.
-Upper-case lines need attention; `dots up` repeats them in its final summary and reports the sync stage as needing attention.
+Upper-case lines need attention; `dots up` repeats them in its final summary and reports the sync stage as one issue, whose details show the whole block and the path of its log.
+When a command failed, the last lines it printed follow its attention line, indented further; they are the error to fix.
 Lower-case lines are information.
 
 | Line | Meaning and what to do |
@@ -66,6 +70,8 @@ Lower-case lines are information.
 | `NOT PUSHED: commit COMMIT changes private setup file PATH; remove it from local history` | An unpushed commit on `dev` tracked a machine-local file, even if a later commit removed it, so nothing is pushed. Rewrite that commit out of `origin/dev..dev` by hand, then sync again. |
 | `NOT PUSHED: REASON` | The scan of unpushed commits could not run. Fix gitleaks and sync again. |
 | `NOT PUSHED: origin/dev kept moving; retried next run` | Three pushes in a row lost a race. Nothing to do; the next run retries. |
+| `NOT PUSHED: git push failed: REASON` | The push failed while `origin/dev` stayed where it was: `REASON` is Git's own error, for example rejected credentials or a protected branch. Fix that and sync again; local work is committed on `dev`. |
+| `NOT PUSHED: git push timed out after 60s; check the Git credential helper for origin, then rerun` | The push hung, usually on a credential helper waiting for input it cannot get. Check that `git push origin dev` works in the live checkout without a prompt, then sync again. |
 | `OFFLINE: N commits unpushed, retried next run` | `origin` was unreachable. Local work is committed and applied; the next run pushes it. |
 | `INVALID merged config: ERROR; nothing pushed or applied` | The merged configuration fails mise's checks with this machine's local files. Fix the error (locally or upstream) and sync again; local work is already committed on `dev`. |
 | `LATE EDIT: PATH not updated; rerun` | A file changed while the run was updating files, so the run left it alone. Run sync again. |
@@ -74,8 +80,8 @@ Lower-case lines are information.
 | `NOT RETIRED: local declaration [TABLE] in FILE, which changed during sync; rerun, or remove the table by hand` | `FILE` changed between the file update and the removal, so the run left it alone and the table may name a source that is gone. Run sync again; if it then reports `INVALID merged config`, remove the table from `FILE` by hand. |
 | `NOT RECORDED: dev moved during sync; files updated, rerun` | Another process moved `dev` during the run. Run sync again. |
 | `SAVE REFUSED: history entry PATH in FILE is not encrypted; ...; nothing saved` | A tracked file is not declared with `encrypt = true` (or the tracked-path inventory could not be read), so nothing was saved. Fix the declaration and sync again. |
-| `SAVE FAILED: mise bootstrap dotfiles save (exit N); copied dotfiles not captured` | Copied dotfiles were not saved back. Run `mise bootstrap dotfiles save` to see why. |
-| `APPLY FAILED: mise bootstrap dotfiles apply (exit N)` | The configuration advanced but dotfiles were not applied. Run `dots apply` to see why. |
+| `SAVE FAILED: mise bootstrap dotfiles save (exit N); copied dotfiles not captured` | Copied dotfiles were not saved back. The lines under it are mise's error; fix it and sync again. |
+| `APPLY FAILED: mise bootstrap dotfiles apply (exit N); fix the error below, then run dots apply` | The configuration advanced but dotfiles were not applied. The lines under it are mise's error, captured when it happened (a later `dots apply` may no longer fail the same way); fix it, then run `dots apply`. `timed out` instead of `exit N` means the apply, with its bootstrap hooks, ran longer than 60 seconds. |
 | `RETIRED local declaration [TABLE] from FILE (source SOURCE no longer exists); deployed files left in place, backup PATH` | The merged configuration retires this table and the files it pointed into are gone, so the run removed exactly that table from the machine-local `FILE`; the deployed file and app data are untouched, and `PATH` holds the file as it was. Nothing to do; restore from `PATH` if you had customized the table. A manager from before this line existed cannot do this: it reports `INVALID merged config` instead, so remove the table by hand once there. |
 | `changed on disk: STAT` | Files the run updated. |
 | `dev moved outside sync (now COMMIT), or the index was staged to match COMMIT; ...` | The Git index matched an older commit, so local files were treated as based on it and merged onto `dev`. Nothing on disk is lost, but a revert staged by hand is undone; commit such a revert instead. |

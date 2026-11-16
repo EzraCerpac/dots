@@ -115,3 +115,26 @@ func TestCommandSummaryNeedsAttentionDespiteExitZero(t *testing.T) {
 		t.Fatalf("summary hid the attention result: %s", got)
 	}
 }
+
+func TestReportHighlightsCarryEachIssuesOutputLogAndNextStep(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "Breaks.log")
+	if err := os.WriteFile(log, []byte("step one\nboom: disk full\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	printReportHighlights(&b, Report{Events: []ui.Event{
+		{V: 1, Kind: "stage_start", ID: "Breaks", Label: "Breaks"},
+		{V: 1, Kind: "stage_end", ID: "Breaks", Status: "failed", Summary: "failed (exit 7)", Action: "Fix the error at the end of its output, then run dots up again", LogPath: log},
+	}})
+	for _, want := range []string{
+		"  Failed: Breaks — failed (exit 7)",
+		"    boom: disk full",
+		"  Full log: " + log,
+		"  Next: Fix the error at the end of its output, then run dots up again",
+	} {
+		if !strings.Contains(b.String(), want+"\n") {
+			t.Fatalf("highlights lack %q:\n%s", want, b.String())
+		}
+	}
+}

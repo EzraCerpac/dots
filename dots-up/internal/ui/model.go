@@ -43,6 +43,7 @@ type Model struct {
 	DurationMS                                                               int64
 	Running, Finished, ShowLog, RawLog, Help, DetailFocus, NoWait, Searching bool
 	AttentionExpanded                                                        bool
+	AgentMessage                                                             string
 	Diagnostics                                                              bool
 	SelectedIssue                                                            string
 	SearchQuery                                                              string
@@ -257,9 +258,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.AppliedSearch = ""
 				m.refreshDetail()
 			}
+		case "A":
+			if m.AttentionExpanded && m.selectedIssue() != nil {
+				// The hand-off and its messages belong to the issue details.
+				m.DetailFocus, m.ShowLog, m.RawLog = true, false, false
+				cmd := m.handToAgent()
+				m.refreshDetail()
+				return m, cmd
+			}
 		case "?":
 			m.Help = !m.Help
 		}
+	case agentDoneMsg:
+		m.AgentMessage = "Back from the agent."
+		if v.err != nil {
+			m.AgentMessage = "The agent command failed: " + v.err.Error()
+		}
+		m.refreshDetail()
 	case tickMsg:
 		if m.Running && !m.StartedAt.IsZero() {
 			m.Elapsed = time.Since(m.StartedAt)
@@ -676,10 +691,10 @@ func searchLog(path, query string) string {
 func (m Model) overview() bool { return !m.DetailFocus && !m.ShowLog && !m.RawLog }
 
 type issue struct {
-	key          string
-	stage        int
-	text, action string
-	notice       bool
+	key                   string
+	stage                 int
+	text, action, logPath string
+	notice                bool
 }
 
 func (m Model) issues() []issue {
@@ -697,7 +712,7 @@ func (m Model) issues() []issue {
 		if s.Summary != "" {
 			text += " — " + s.Summary
 		}
-		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, action: s.Action})
+		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, action: s.Action, logPath: s.LogPath})
 		if s.Summary != "" {
 			seen[strings.ToLower(s.Summary)] = true
 		}
@@ -720,7 +735,11 @@ func (m Model) issues() []issue {
 		if n.Severity == "error" {
 			prefix = "×"
 		}
-		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: -1, text: prefix + " " + n.Summary, action: n.Action, notice: true})
+		logPath := ""
+		if i := m.stageIndex(n.Stage); n.Stage != "" && i >= 0 {
+			logPath = m.Stages[i].LogPath
+		}
+		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: -1, text: prefix + " " + n.Summary, action: n.Action, logPath: logPath, notice: true})
 	}
 	return result
 }
@@ -769,13 +788,12 @@ func (m *Model) refreshDetail() {
 	}
 	if !m.overview() {
 		content = "Select a stage to see details."
-		if item := m.selectedIssue(); m.AttentionExpanded && item != nil && item.notice {
-			content = item.text
-			if item.action != "" {
-				content += "\n\nNext: " + item.action
+		if item := m.selectedIssue(); m.AttentionExpanded && item != nil && !m.ShowLog {
+			content = m.issueDetail(*item)
+			if m.AgentMessage != "" {
+				content += "\n\n" + m.AgentMessage
 			}
-		}
-		if m.Selected >= 0 && m.Selected < len(m.Stages) {
+		} else if m.Selected >= 0 && m.Selected < len(m.Stages) {
 			s := m.Stages[m.Selected]
 			if m.ShowLog {
 				if s.LogPath != "" {
@@ -1145,6 +1163,7 @@ func (m *Model) moveIssue(delta int) {
 	}
 	item := items[max(0, min(position+delta, len(items)-1))]
 	m.SelectedIssue, m.Selected = item.key, item.stage
+	m.AgentMessage = ""
 	m.refreshDetail()
 }
 func (m Model) attentionRows(capacity int) string {
@@ -1178,15 +1197,19 @@ func (m Model) footer() string {
 	if m.Searching {
 		return "Enter search  Esc back"
 	}
+	agent := ""
+	if m.AttentionExpanded && m.selectedIssue() != nil {
+		agent = "  A agent"
+	}
 	if m.DetailFocus || m.RawLog || m.ShowLog {
-		text := "↑↓ scroll  ←/Esc/q back"
+		text := "↑↓ scroll  ←/Esc/q back" + agent
 		if m.hasSelectedChild() {
 			text += "  l logs  s search  r captured"
 		}
 		return text
 	}
 	if m.AttentionExpanded || m.ExpandedGroup >= 0 {
-		text := "↑↓ items  Enter details  ←/Esc/q back"
+		text := "↑↓ items  Enter details  ←/Esc/q back" + agent
 		if m.hasSelectedChild() {
 			text += "  l logs"
 		}

@@ -36,9 +36,9 @@ def stage_start(id, group, label, handoff=False):
         if line.decode().strip() != f"go:{id}":
             raise RuntimeError("invalid terminal handoff")
 
-def stage_end(id, label, code, state=None, summary=None):
+def stage_end(id, label, code, state=None, summary=None, action=""):
     state = state or ("ok" if code == 0 else "attention" if code == 3 else "failed")
-    emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"))
+    emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action)
     return state
 
 # Sync always exits 0 and prints one block; the rule tasks/update applies to it:
@@ -51,10 +51,14 @@ def sync(argv, env, pass_fds):
     sys.stdout.flush()
     lines = result.stdout.decode(errors="replace").splitlines()
     attention = [line.strip() for line in lines if SYNC_ATTENTION.match(line)]
-    for line in attention:
-        emit("notice", severity="attention", summary=line)
     header = next((line for line in lines if line.startswith("dots sync: ")), None)
-    return result.returncode, stage_end("sync", "sync", result.returncode, "attention" if attention and result.returncode == 0 else None, header)
+    if not attention:
+        return result.returncode, stage_end("sync", "sync", result.returncode, None, header)
+    # One issue: the first attention line, with the rest and the output under
+    # each in the stage log.
+    summary = attention[0] + (f" (+{len(attention) - 1} more)" if len(attention) > 1 else "")
+    action = f"Fix what the sync output says, then run dots sync; {os.environ.get('DOTS_HOME', 'DOTS_HOME')}/docs/sync.md explains every line"
+    return result.returncode, stage_end("sync", "sync", result.returncode, "attention" if result.returncode == 0 else None, summary, action)
 
 def item(group, key, state, summary, action=""):
     emit("item_upsert", id=f"{group.lower()}:{key}", group=group, label=str(key), status=state, summary=str(summary), action=action, before="", after="")

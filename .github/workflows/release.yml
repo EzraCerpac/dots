@@ -29,7 +29,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           packaging/build-release "${TAG#v}" dist
-          # The formula for EzraCerpac/homebrew-tap, with this release's checksums.
+          # The formula for EzraCerpac/homebrew-tap, with this release's checksums;
+          # it is copied to the tap by hand.
           { printf '```ruby\n'; cat dist/dots.rb; printf '```\n'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish release

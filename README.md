@@ -318,7 +318,7 @@ DOTS_ROOT=/tmp/other-config dots help        # and another configuration
 
 Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then [`packaging/build-release`](packaging/build-release) builds `dots-X.Y.Z-{darwin,linux}-{arm64,amd64}.tar.gz`, `SHA256SUMS` and `dots.rb`, and publishes them as a GitHub release.
 The tag is the only place the version is written; the archives carry it in a `VERSION` file.
-`dots.rb` is [`packaging/homebrew/dots.rb`](packaging/homebrew/dots.rb) with the release's checksums; copy it to `Formula/dots.rb` in `EzraCerpac/homebrew-tap` to publish the release to Homebrew.
+`dots.rb` is [`packaging/homebrew/dots.rb`](packaging/homebrew/dots.rb) with the release's checksums. Nothing updates the tap automatically: copy the release's `dots.rb` by hand to `Formula/dots.rb` in `EzraCerpac/homebrew-tap` to publish the release to Homebrew.
 
 ## License
 

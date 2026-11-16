@@ -68,15 +68,15 @@ dots_skill_links() {
     fi
 }
 
-# Whether LINK is a symlink dots made: its target is the skill inside a dots
-# tree (one with bin/dots), or such a tree that no longer exists at all.
+# dots records each skill link it creates, so it replaces only those: a link
+# the user made, even one into another dots tree, is theirs.
+dots_skill_record() {
+    printf '%s/dots/skill-links\n' "${XDG_STATE_HOME:-$HOME/.local/state}"
+}
+
+# Whether LINK is a symlink dots made.
 dots_skill_link_is_ours() {
-    local link="$1" target root
-    [[ -L "$link" ]] || return 1
-    target="$(readlink "$link")"
-    [[ "$target" == /*/skills/dots ]] || return 1
-    root="${target%/skills/dots}"
-    [[ -f "$root/bin/dots" || ! -e "$root" ]]
+    [[ -L "$1" ]] && grep -qxF "$1" "$(dots_skill_record)" 2>/dev/null
 }
 
 # Link the bundled skill into every agent in use, pointing at HOME's skill.
@@ -84,18 +84,21 @@ dots_skill_link_is_ours() {
 # file, or another link) is left alone, with one notice per destination;
 # DOTS_SKILL_LINKS=0 turns linking off.
 dots_skill_refresh() {
-    local home="$1" source agent link notices notice
+    local home="$1" source agent link notices notice record
     [[ "${DOTS_SKILL_LINKS:-1}" != 0 && -n "${HOME:-}" ]] || return 0
     [[ -f "$home/skills/dots/SKILL.md" ]] || return 0
     source="$(dots_skill_source "$home")"
     notices="${XDG_STATE_HOME:-$HOME/.local/state}/dots/skill-notices"
+    record="$(dots_skill_record)"
     while IFS=$'\t' read -r agent link; do
         [[ -n "$link" ]] || continue
         [[ "$(readlink "$link" 2>/dev/null)" != "$source" ]] || continue
-        if [[ -L "$link" ]] && dots_skill_link_is_ours "$link"; then
+        if dots_skill_link_is_ours "$link"; then
             ln -sfn "$source" "$link" 2>/dev/null || true
         elif [[ ! -e "$link" && ! -L "$link" ]]; then
-            mkdir -p "${link%/*}" 2>/dev/null && ln -s "$source" "$link" 2>/dev/null || true
+            if mkdir -p "${link%/*}" 2>/dev/null && ln -s "$source" "$link" 2>/dev/null; then
+                { mkdir -p "${record%/*}" && printf '%s\n' "$link" >> "$record"; } 2>/dev/null || true
+            fi
         else
             notice="$link"
             if ! grep -qxF "$notice" "$notices" 2>/dev/null; then

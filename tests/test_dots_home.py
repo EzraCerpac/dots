@@ -28,7 +28,9 @@ class DotsHomeTests(unittest.TestCase):
         links.mkdir()
         self.dots = links / "dots"
         self.dots.symlink_to(os.path.relpath(self.home / "bin/dots", links))
-        self.env = {key: value for key, value in os.environ.items() if not key.startswith(("DOTS_", "MISE_"))}
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("DOTS_", "MISE_", "XDG_", "CLAUDE_", "CODEX_"))}
+        self.env["DOTS_SKILL_LINKS"] = "0"
         self.env["DOTS_ROOT"] = str(self.config)
         self.env["HOME"] = str(base / "home")
 

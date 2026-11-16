@@ -69,6 +69,15 @@ def write(path: Path, text: str, mode: int = 0o644) -> Path:
     return path
 
 
+def remove_git_marker(manager: Path) -> None:
+    """Drop the copied .git: a directory in a clone, a file in a linked worktree."""
+    marker = manager / ".git"
+    if marker.is_dir() and not marker.is_symlink():
+        shutil.rmtree(marker)
+    elif marker.exists() or marker.is_symlink():
+        marker.unlink()
+
+
 class Fixture:
     """A manager copy, a configuration, a fake mise and a private HOME."""
 
@@ -88,7 +97,7 @@ class Fixture:
                     if not key.startswith(("DOTS_", "MISE_", "SETUP_", "XDG_"))}
         self.env.update(HOME=str(self.home), DOTS_ROOT=str(self.config), DOTS_HOME=str(self.manager),
                         SETUP_MISE_BIN=str(self.mise), DOTS_MISE_BIN=str(self.mise), FAKE_MISE_LOG=str(self.log),
-                        DOTS_UP_BIN="/nonexistent/dots-up")
+                        DOTS_UP_BIN="/nonexistent/dots-up", DOTS_SKILL_LINKS="0")
         if profiles is not None:
             self.env["FAKE_VAR_dots_profiles"] = profiles
 
@@ -126,7 +135,7 @@ class UpdateHookTests(ContractTestCase):
         # A packaged manager (no .git) that a stage upgraded: the newer one is
         # first on PATH, the run keeps going on the old one, and Homebrew may
         # not delete the old keg meanwhile.
-        shutil.rmtree(self.f.manager / ".git", ignore_errors=True)
+        remove_git_marker(self.f.manager)
         (self.f.manager / "VERSION").write_text("0.3.0\n")
         newer = self.f.base / "installs/dots/0.3.1"
         shutil.copytree(self.f.manager, newer)
@@ -139,7 +148,8 @@ class UpdateHookTests(ContractTestCase):
         self.assertIn("== dots manager ==\ndots 0.3.0 -> 0.3.1, used from the next run.\nResult: completed", result.stdout)
 
     def test_update_leaves_a_checkout_manager_alone(self) -> None:
-        (self.f.manager / ".git").mkdir(exist_ok=True)
+        remove_git_marker(self.f.manager)
+        (self.f.manager / ".git").mkdir()
         result = self.f.update()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout, r"== dots manager ==\ndots \S+ runs from a checkout; update it with git\.\n")

@@ -153,12 +153,22 @@ class ManagerInstallTests(unittest.TestCase):
 
     def test_a_dangling_link_from_a_removed_install_is_replaced(self) -> None:
         self.agents(".claude")
-        gone = self.base / "removed-install"
+        old = self.mise_install("0.3.0")
+        self.dots(old / "bin/dots", "--version")
+        shutil.rmtree(old)  # mise prune or uninstall
+        new = self.mise_install("0.4.0")
+        self.dots(new / "bin/dots", "--version")
+        self.assertEqual(os.readlink(self.claude_link), str(new / "skills/dots"))
+
+    def test_a_link_the_user_made_into_another_dots_tree_is_left_alone(self) -> None:
+        self.agents(".claude")
+        development = install_tree(self.base / "development", "9.9.9")
         self.claude_link.parent.mkdir(parents=True)
-        self.claude_link.symlink_to(gone / "skills/dots")
+        self.claude_link.symlink_to(development / "skills/dots")
         mise = self.mise_install("0.3.0")
-        self.dots(mise / "bin/dots", "--version")
-        self.assertEqual(os.readlink(self.claude_link), str(mise / "skills/dots"))
+        result = self.dots(mise / "bin/dots", "--version")
+        self.assertIn("left ", result.stderr)
+        self.assertEqual(os.readlink(self.claude_link), str(development / "skills/dots"))
 
     def test_what_the_user_owns_is_left_alone_with_one_notice(self) -> None:
         self.agents(".claude", ".agents", ".codex")

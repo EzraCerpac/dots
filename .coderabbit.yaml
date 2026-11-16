@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Review settings for this repository. Linters CodeRabbit runs by default
+# (shellcheck, actionlint, gitleaks, golangci-lint, markdownlint) stay on.
+language: en-US
+reviews:
+  profile: chill
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "**"
+      instructions: |
+        dots is a generic dotfiles manager layered on mise. Nothing in this
+        repository may assume one person's configuration: machine- and
+        owner-specific behaviour comes only from the configuration contract
+        (`[vars] dots_*` in the mise config and the `dots/` directory).
+        It must work on macOS and Linux. Updates must never prune packages
+        or restart services. Prefer the smallest change; flag added
+        machinery that the behaviour does not need.
+    - path: "lib/source-*.mjs"
+      instructions: |
+        `dots sync` always exits 0 and prints one outcome block; anything
+        that needs attention is a line starting with an upper-case label
+        (NOT APPLIED, NOT SAVED, NOT PUSHED, INVALID merged config, ...).
+        It never force-pushes, never skips validation of the merged
+        configuration, and never discards uncommitted local edits.
+    - path: "tests/**"
+      instructions: |
+        Tests build their own configuration in a temporary directory or
+        copy `tests/fixtures`; they must not read the caller's HOME, Git
+        or mise configuration, and must pass from a copy of this
+        repository alone.

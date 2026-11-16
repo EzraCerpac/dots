@@ -98,3 +98,5 @@ Make new hooks and recipes executable (`chmod +x`), start them with `set -euo pi
 - Never force-push, rewrite `dev` or `main`, or merge `dev` wholesale into `main`.
 - Do not run machine-changing commands unless asked; say which command the user should run instead.
 - If the configuration has tests, run them: `dots test`, or `tests/run` in the configuration.
+- When `dots up` or `dots sync` reports an issue, start from what it printed: the output under the issue and its full log under `~/.local/state/dots/` (`dots up --last` reopens the last report).
+  A hand-off from the dashboard (`A`, `DOTS_AGENT_COMMAND`) gives you the same in the prompt.

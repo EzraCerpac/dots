@@ -226,13 +226,22 @@ if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
     if [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
         (umask 077; printf '%s\n' "$sync_output" > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true
     fi
-    # Attention: a header that did not complete, an uppercase notice line, or a crash.
-    sync_attention="$(printf '%s\n' "$sync_output" | grep -E '^dots sync: (stopped|skipped|failed)|^  [A-Z][A-Z ]+[ :(]' || true)"
+    # Attention: a header that did not complete, an uppercase notice line, or a
+    # crash, each with the deeper-indented output lines that explain it.
+    sync_attention="$(printf '%s\n' "$sync_output" | awk '
+        /^dots sync: (stopped|skipped|failed)/ || /^  [A-Z][A-Z ]+[ :(]/ { keep = 1; print; next }
+        keep && /^    / { print; next }
+        { keep = 0 }')"
     if [[ "$sync_result" -ne 0 && -z "$sync_attention" ]]; then sync_attention="dots sync exited $sync_result"; fi
     if [[ -n "$sync_attention" ]]; then
         if [[ "$plain_output" -eq 1 ]]; then printf 'Result: needs attention\n'; fi
-        emit_event "$(event_json --arg summary "Source sync: ${sync_attention%%$'\n'*}" '{v:1,kind:"notice",severity:"attention",summary:$summary}')"
-        emit_event "$(event_json --arg id source-sync --arg summary 'Source sync needs attention' '{v:1,kind:"stage_end",id:$id,status:"attention",exit_code:0,summary:$summary}')"
+        # One issue: the first attention line is its summary; the stage log
+        # holds every line and the output under it.
+        sync_summary="$(printf '%s\n' "$sync_attention" | grep -v '^    ' | sed 's/^  //')"
+        sync_more="$(printf '%s\n' "$sync_summary" | sed 1d | grep -c . || true)"
+        sync_summary="${sync_summary%%$'\n'*}"
+        [[ "$sync_more" -eq 0 ]] || sync_summary="$sync_summary (+$sync_more more)"
+        emit_event "$(event_json --arg id source-sync --arg summary "$sync_summary" --arg action "Fix what the sync output says, then run dots sync; $DOTS_HOME/docs/sync.md explains every line" '{v:1,kind:"stage_end",id:$id,status:"attention",exit_code:0,summary:$summary,action:$action}')"
     else
         if [[ "$plain_output" -eq 1 ]]; then printf 'Result: completed\n'; fi
         emit_event "$(event_json --arg id source-sync --arg summary "${sync_output%%$'\n'*}" '{v:1,kind:"stage_end",id:$id,status:"ok",exit_code:0,summary:$summary}')"
@@ -243,6 +252,7 @@ fi
 
 failures=()
 deferred=()
+attention_logs=()
 # run_stage LABEL [--terminal-handoff] [--hook | --changes] COMMAND...
 # A --hook stage follows the hook contract: exit 3 is deferred (needs
 # attention), 4 is skipped, and any other nonzero status is a failure.
@@ -283,7 +293,7 @@ run_stage() {
         fi
     fi
     if [[ "$plain_output" -eq 1 ]]; then printf 'Working: %s\n' "$label"; else printf '\n== %s ==\n' "$label"; fi
-    local result=0 changes_file=""
+    local result=0 changes_file="" action=""
     if [[ "$reports_changes" -eq 1 ]]; then
         if changes_file="$(mktemp "${TMPDIR:-/tmp}/dots-changes.XXXXXX")"; then
             export DOTS_CHANGES="$changes_file"
@@ -320,10 +330,17 @@ run_stage() {
         if [[ "$result" -eq 3 ]]; then
             status=attention summary="deferred; needs attention"
             deferred+=("$label")
+            action="Do what the hook's output asks, then run dots up again"
         fi
         printf 'Result: %s\n' "$summary"
+        if [[ "$status" == attention && -n "$stage_log" ]]; then
+            printf 'Recent output:\n'
+            tail -n 30 "$stage_log" || true
+            printf 'Full log: %s\n' "$stage_log"
+            attention_logs+=("$label: $stage_log")
+        fi
         if dots_up_event_sink_enabled; then
-            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg status "$status" --arg summary "$summary" --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:$status,exit_code:$code,summary:$summary}')"
+            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg status "$status" --arg summary "$summary" --arg action "${action:-}" --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:$status,exit_code:$code,summary:$summary,action:$action}')"
         fi
         return 0
     else
@@ -332,10 +349,11 @@ run_stage() {
             printf 'Recent output:\n' >&2
             tail -n 30 "$stage_log" >&2 || true
             printf 'Full log: %s\n' "$stage_log" >&2
+            attention_logs+=("$label: $stage_log")
         fi
         failures+=("$label")
         if dots_up_event_sink_enabled; then
-            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg summary "failed (exit $result)" --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:"failed",exit_code:$code,summary:$summary}')"
+            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg summary "failed (exit $result)" --arg action 'Fix the error at the end of its output, then run dots up again' --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:"failed",exit_code:$code,summary:$summary,action:$action}')"
         fi
         validate_update_config || abort_invalid_config
         return "$result"
@@ -630,7 +648,13 @@ fi
 
 if [[ -n "${DOTS_SOURCE_SYNC_ATTENTION:-}" ]]; then
     printf '\nSource sync needs attention:\n%s\n' "$DOTS_SOURCE_SYNC_ATTENTION"
+    [[ -z "${DOTS_UP_RUN_DIR:-}" ]] || printf 'Full log: %s\n' "$DOTS_UP_RUN_DIR/stages/source-sync.log"
+    printf 'Next: fix what the sync output says, then run dots sync; %s explains every line\n' "$DOTS_HOME/docs/sync.md"
     deferred+=("source sync")
+fi
+if [[ "${#attention_logs[@]}" -gt 0 ]]; then
+    printf '\nLogs of the steps that need attention:\n'
+    printf '  %s\n' "${attention_logs[@]}"
 fi
 if [[ "${#failures[@]}" -eq 0 ]]; then
     if [[ "${#deferred[@]}" -gt 0 ]]; then

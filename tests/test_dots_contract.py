@@ -362,6 +362,39 @@ class UpdateHookTests(ContractTestCase):
                 self.assertIn("Update report: completed; needs attention: source sync;", result.stdout)
 
 
+    def test_sync_attention_is_one_issue_that_carries_its_output(self) -> None:
+        import json
+        events = self.f.base / "events"
+        script = ("printf 'dots sync: no local changes · pulled dev +1, main +0 · nothing to push\\n"
+                  "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply\\n"
+                  "    mise ERROR pre-dotfiles hook failed\\n  changed on disk: 1 file changed\\n'")
+        result = subprocess.run(["bash", "-c", 'exec 3>>"$0"; exec bash "$1"', str(events), str(self.f.manager / "tasks/update")],
+                                cwd=self.f.config, env={**self.f.env, "SETUP_PROFILE": "laptop", "DOTS_SOURCE_SYNC_DONE": "0",
+                                                        "DOTS_UP_EVENT_FD": "3", "FAKE_SYNC": script},
+                                capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        parsed = [json.loads(line) for line in events.read_text().splitlines()]
+        self.assertEqual([e["summary"] for e in parsed if e["kind"] == "notice" and "sync" in e["summary"].lower()], [])
+        end = next(e for e in parsed if e["kind"] == "stage_end" and e["id"] == "source-sync")
+        self.assertEqual(end["status"], "attention")
+        self.assertTrue(end["summary"].startswith("APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), end)
+        self.assertIn("docs/sync.md", end["action"])
+        # The final summary repeats the attention line with the output under it.
+        summary = result.stdout.split("Source sync needs attention:\n", 1)[1]
+        self.assertTrue(summary.startswith("  APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), summary)
+        self.assertIn("\n    mise ERROR pre-dotfiles hook failed\nNext: fix what the sync output says", summary)
+        self.assertNotIn("changed on disk", summary)
+
+    def test_failed_and_deferred_stages_carry_their_output_in_plain_mode(self) -> None:
+        self.f.hook("update.d", "10-Waits", "echo 'needs a login: run gh auth login'\nexit 3\n")
+        self.f.hook("update.d", "20-Breaks", "echo 'step one'\necho 'boom: disk full' >&2\nexit 7\n")
+        result = self.f.update("--plain")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        output = result.stdout + result.stderr
+        self.assertRegex(output, r"Result: deferred; needs attention\nRecent output:\nneeds a login: run gh auth login\nFull log: \S+/stages/Waits\.log")
+        self.assertRegex(output, r"Recent output:\nstep one\nboom: disk full\nFull log: \S+/stages/Breaks\.log")
+        self.assertRegex(result.stdout, r"Logs of the steps that need attention:\n  Waits: \S+Waits\.log\n  Breaks: \S+Breaks\.log")
+
 class CommandBackendTests(ContractTestCase):
     def test_standalone_sync_reports_its_outcome_and_attention_lines(self) -> None:
         import json
@@ -382,9 +415,11 @@ class CommandBackendTests(ContractTestCase):
                 header = result.stdout.splitlines()[0]
                 self.assertTrue(header.startswith("dots sync: "), result.stdout)
                 parsed = [json.loads(line) for line in events.read_text().splitlines()]
-                self.assertEqual([e["summary"] for e in parsed if e["kind"] == "notice"], attention)
+                # One issue per sync: its summary is the first attention line, never a second notice.
+                self.assertEqual([e for e in parsed if e["kind"] == "notice"], [])
                 end = next(e for e in parsed if e["kind"] == "stage_end")
-                self.assertEqual((end["status"], end["exit_code"], end["summary"]), (status, 0, header))
+                self.assertEqual((end["status"], end["exit_code"], end["summary"]), (status, 0, attention[0] if attention else header))
+                self.assertEqual(bool(end["action"]), bool(attention))
                 self.assertEqual([(e["status"], e["exit_code"]) for e in parsed if e["kind"] == "run_end"], [(status, 0)])
 
 

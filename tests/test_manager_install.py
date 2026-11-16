@@ -231,6 +231,36 @@ class ManagerInstallTests(unittest.TestCase):
         self.dots(mise / "bin/dots", "--version", CLAUDE_CONFIG_DIR=str(config))
         self.assertEqual(os.readlink(config / "skills/dots"), str(mise / "skills/dots"))
 
+    def link_step(self, home: Path, link: Path) -> None:
+        """Run only the link step, as dots_skill_refresh does after its checks."""
+        script = f'source "{home}/lib/dots-manager.sh"; dots_skill_link "{link}" "{home}/skills/dots"'
+        subprocess.run(["bash", "-c", script], env=self.env, check=True, timeout=30)
+
+    def test_a_link_created_after_the_absence_check_is_not_clobbered(self) -> None:
+        # Between dots seeing no link and creating one, the user makes theirs.
+        self.agents(".claude")
+        mise = self.mise_install("0.3.0")
+        own = self.base / "own-skill"
+        own.mkdir()
+        self.claude_link.parent.mkdir(parents=True)
+        self.claude_link.symlink_to(own)
+        self.link_step(mise, self.claude_link)
+        self.assertEqual(os.readlink(self.claude_link), str(own))
+        self.dots(self.mise_install("0.4.0") / "bin/dots", "--version")
+        self.assertEqual(os.readlink(self.claude_link), str(own))
+
+    def test_a_link_repointed_after_the_ownership_check_is_not_clobbered(self) -> None:
+        # Between dots confirming its own link and replacing it, the user repoints it.
+        self.agents(".claude")
+        old = self.mise_install("0.3.0")
+        self.dots(old / "bin/dots", "--version")
+        own = self.base / "own-skill"
+        own.mkdir()
+        self.claude_link.unlink()
+        self.claude_link.symlink_to(own)
+        self.link_step(self.mise_install("0.4.0"), self.claude_link)
+        self.assertEqual(os.readlink(self.claude_link), str(own))
+
     def test_opt_out(self) -> None:
         self.agents(".claude", ".agents")
         mise = self.mise_install("0.3.0")

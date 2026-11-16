@@ -95,12 +95,26 @@ dots_skill_link_is_ours() {
 }
 
 # Point LINK at SOURCE and record it; without a record, undo the link so the
-# next run retries both instead of treating the link as the user's.
+# next run retries both instead of treating the link as the user's. Whatever
+# appeared at LINK since the caller looked stays: an absent LINK is created
+# without -f, so a file or link made meanwhile makes ln fail; a link dots made
+# is checked again just before ln -sfn replaces it, which leaves only the
+# instant between that check and ln's own unlink. A directory made meanwhile
+# would receive the link inside it (ln has no portable -T), so that link is
+# removed again.
 dots_skill_link() {
     local link="$1" source="$2" record kept
     record="$(dots_skill_record)"
     mkdir -p "${link%/*}" "${record%/*}" 2>/dev/null || return 0
-    ln -sfn "$source" "$link" 2>/dev/null || return 0
+    if dots_skill_link_is_ours "$link"; then
+        ln -sfn "$source" "$link" 2>/dev/null || return 0
+    else
+        ln -sn "$source" "$link" 2>/dev/null || return 0
+    fi
+    if [[ "$(readlink "$link" 2>/dev/null)" != "$source" ]]; then
+        [[ "$(readlink "$link/${source##*/}" 2>/dev/null)" != "$source" ]] || rm -f "$link/${source##*/}"
+        return 0
+    fi
     kept="$(LINK="$link" awk -F '\t' '$1 != ENVIRON["LINK"]' "$record" 2>/dev/null || true)"
     if ! { printf '%s\n' ${kept:+"$kept"} "$link"$'\t'"$source" > "$record.tmp" && mv -f "$record.tmp" "$record"; } 2>/dev/null; then
         rm -f "$link" "$record.tmp" 2>/dev/null || true

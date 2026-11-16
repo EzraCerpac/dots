@@ -229,7 +229,7 @@ def dots_command(home):
     if not (home / ".git").exists() and "/Cellar/" in str(home):
         return shlex.quote(str(home).split("/Cellar/", 1)[0] + "/bin/dots")
     if not (home / ".git").exists() and "/installs/" in str(home):
-        return '"$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots'
+        return '"${DOTS_MISE_BIN:-$(command -v mise || echo "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots'
     return shlex.quote(str(home / "bin/dots"))
 
 

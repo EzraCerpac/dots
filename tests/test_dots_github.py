@@ -46,7 +46,7 @@ class AppHookTest(unittest.TestCase):
             checkout: f"{checkout}/bin/dots",
             archive: f"{archive}/bin/dots",
             cellar: f"{self.base}/brew/bin/dots",
-            installs: '"$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots',
+            installs: '"${DOTS_MISE_BIN:-$(command -v mise || echo "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots',
         }
         for home, command in expected.items():
             with self.subTest(home=home):

@@ -12,6 +12,12 @@ class Dots < Formula
   version "0.3.0"
   license "MIT"
 
+  # dots runs every command through mise, and its configuration sync needs
+  # Git 2.43 or newer, which macOS does not ship. Node.js, uv, jq and the
+  # other tools come from the user's mise configuration.
+  depends_on "git"
+  depends_on "mise"
+
   on_macos do
     on_arm do
       url "https://github.com/EzraCerpac/dots/releases/download/v0.3.0/dots-0.3.0-darwin-arm64.tar.gz"
@@ -33,12 +39,6 @@ class Dots < Formula
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # linux-amd64
     end
   end
-
-  # dots runs every command through mise, and its configuration sync needs
-  # Git 2.43 or newer, which macOS does not ship. Node.js, uv, jq and the
-  # other tools come from the user's mise configuration.
-  depends_on "git"
-  depends_on "mise"
 
   def install
     libexec.install Dir["*"]

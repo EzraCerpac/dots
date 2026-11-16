@@ -66,13 +66,13 @@ Pin the manager in the configuration, so every machine runs the same release and
 version = "0.3.0"
 ```
 
-`mise bootstrap` installs `[tools]` late, after the `pre-dotfiles` hook (see `mise bootstrap --help`), so a hook cannot expect `dots` on `PATH` on a new machine.
-Run it through `mise x`, which installs the pinned version first when it is missing; the `bootstrap` task runs after the tools step and can call `dots` directly:
+`mise bootstrap` installs `[tools]` late, after the `pre-dotfiles` hook (see `mise bootstrap --help`), and hooks run with the caller's `PATH` only: neither `dots` nor, on a new machine, `mise` itself is on it.
+Run `dots` in a hook through `mise x`, which installs the pinned version first when it is missing, and fall back to the standalone mise path that `dots remote` installs; the `bootstrap` task runs after the tools step with the tools on its `PATH` and can call `dots` directly:
 
 ```toml
 # config.laptop.toml
 [bootstrap.hooks]
-pre-dotfiles = 'SETUP_PROFILE=laptop mise x github:EzraCerpac/dots -- dots internal persist-selected'
+pre-dotfiles = 'SETUP_PROFILE=laptop "$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots internal persist-selected'
 
 # config.toml
 [tasks.bootstrap]

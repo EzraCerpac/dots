@@ -34,6 +34,12 @@ packages, installs and upgrades declared mise tools (tools pinned to a
 revision keep it), runs installer exceptions and update hooks, and updates
 standalone mise last.
 
+The run stays on the manager it started from (`DOTS_HOME`), even when a stage
+installs a new `dots`: mise keeps replaced versions (`upgrade --no-prune`), and
+the task exports `HOMEBREW_NO_INSTALL_CLEANUP=1` so Homebrew keeps the old keg.
+The `dots manager` stage then reports `dots X -> Y, used from the next run`
+and links the agent skill to the new version; a checkout is left alone.
+
 Each stage's changes reach the report and the first screen as `change` events
 with an action (installed, updated, removed or changed). `dots up` derives
 package, tool and standalone mise changes from snapshots taken before and after

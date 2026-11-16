@@ -123,7 +123,7 @@ jobs:
           for platform in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
             name="dots-0.0.0-ci-$platform"
             listing="$(tar -tzf "$name.tar.gz")"
-            # One top-level directory, so mise strips it and finds bin/.
+            # One top-level directory: Homebrew strips it, mise finds its bin/.
             test "$(printf '%s\n' "$listing" | cut -d/ -f1 | sort -u)" = "$name"
             for file in VERSION bin/dots bin/dots-up lib/dots-manager.sh tasks/update skills/dots/SKILL.md LICENSE; do
               printf '%s\n' "$listing" | grep -qx "$name/$file" || { echo "$name lacks $file"; exit 1; }

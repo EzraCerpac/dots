@@ -33,8 +33,11 @@ fi
 # Built-in commands always win over configuration commands of the same name.
 builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall help internal init "
 
+# The configuration: DOTS_ROOT, else mise's config directory. lib/setup-common.sh
+# applies the same rule; it is repeated here so a bare bin/dots, or one whose
+# DOTS_HOME is an older release, needs nothing from lib/ to find it.
 config_root() {
-    printf '%s\n' "${DOTS_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}"
+    printf '%s\n' "${DOTS_ROOT:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}}"
 }
 
 # Print the names of the configuration commands in ROOT/dots/commands: plain
@@ -139,7 +142,7 @@ if [[ "${1:-}" == internal ]]; then
     internal_name="${1:-}"
     if (($#)); then shift; fi
     if [[ "$internal_name" == home ]]; then printf '%s\n' "$DOTS_HOME"; exit 0; fi
-    root="${MISE_CONFIG_DIR:-$(config_root)}"
+    root="$(config_root)"
     [[ -f "$root/config.toml" ]] || { echo "dots: setup not found at $root" >&2; exit 2; }
     root="$(cd "$root" && pwd -P)"
     export DOTS_ROOT="$root"
@@ -163,7 +166,7 @@ fi
 # init creates the configuration (and its [vars]), so it runs before both exist.
 if [[ "${1:-}" == init && "$backend_mode" -eq 0 ]]; then
     shift
-    exec bash "$DOTS_HOME/tasks/init" "$@"
+    DOTS_ROOT="$(config_root)" exec bash "$DOTS_HOME/tasks/init" "$@"
 fi
 root="$(config_root)"
 [[ -f "$root/config.toml" ]] || { echo "dots: setup not found at $root" >&2; exit 2; }

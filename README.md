@@ -218,7 +218,8 @@ Settings and app data stay where they are.
 
 ## Configuration
 
-`DOTS_ROOT` selects the configuration; it defaults to `${XDG_CONFIG_HOME:-~/.config}/mise`.
+`DOTS_ROOT` selects the configuration; it defaults to mise's config directory, `MISE_CONFIG_DIR` or `${XDG_CONFIG_HOME:-~/.config}/mise`.
+The manager's libraries find it the same way, wherever `dots` is installed, so a script can source `"$(dots internal home)/lib/setup-common.sh"` without setting `DOTS_ROOT`.
 Everything `dots` reads there:
 
 | Path | Purpose |

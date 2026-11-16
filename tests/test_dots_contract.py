@@ -401,6 +401,28 @@ class ProfileTests(ContractTestCase):
         self.assertIn("profile must be one of: laptop, server", unknown.stderr)
 
 
+class ConfigRootTests(ContractTestCase):
+    def root(self, **env: str) -> str:
+        # The manager copy sits beside the configuration, not inside it, like
+        # an installed release; run from elsewhere with only ENV selecting it.
+        environment = {key: value for key, value in self.f.env.items() if key != "DOTS_ROOT"}
+        result = subprocess.run(["bash", "-c", f'source "{self.f.manager}/lib/setup-common.sh"; setup_init && printf "%s\\n" "$SETUP_ROOT"'],
+                                cwd=self.f.base, env={**environment, "SETUP_PROFILE": "laptop", **env},
+                                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_library_outside_dots_finds_the_configuration_like_bin_dots(self) -> None:
+        self.assertEqual(self.root(MISE_CONFIG_DIR=str(self.f.config)), str(self.f.config))
+        default = self.f.home / ".config/mise"
+        shutil.copytree(self.f.config, default)
+        self.assertEqual(self.root(), str(default))
+        self.assertEqual(self.root(DOTS_ROOT=str(self.f.config), MISE_CONFIG_DIR=str(default)), str(self.f.config))
+        # bin/dots resolves callbacks by the same rule: DOTS_ROOT wins.
+        listed = self.f.dots("internal", "profiles", MISE_CONFIG_DIR=str(self.f.base))
+        self.assertEqual((listed.returncode, listed.stdout), (0, "laptop\nserver\n"), listed.stderr)
+
+
 class HookListingTests(ContractTestCase):
     def list(self, directory: Path, profile: str = "laptop") -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(self.f.manager / "lib/dots-hooks"), str(directory), profile, "laptop", "server"],

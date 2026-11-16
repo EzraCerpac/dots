@@ -186,11 +186,12 @@ func runDots(opts supervisor.Options, dotsArgs ...string) int {
 	}
 	return 0
 }
+// defaultRoot follows bin/dots: DOTS_ROOT, else mise's config directory.
 func defaultRoot() string {
-	if root := os.Getenv("MISE_CONFIG_DIR"); root != "" {
+	if root := os.Getenv("DOTS_ROOT"); root != "" {
 		return root
 	}
-	if root := os.Getenv("DOTS_ROOT"); root != "" {
+	if root := os.Getenv("MISE_CONFIG_DIR"); root != "" {
 		return root
 	}
 	configHome := os.Getenv("XDG_CONFIG_HOME")

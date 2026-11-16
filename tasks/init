@@ -10,7 +10,7 @@ set -euo pipefail
 
 templates="${DOTS_HOME:?run through dots}/init"
 case $# in
-    0) dir="${DOTS_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}" ;;
+    0) dir="${DOTS_ROOT:?run through dots}" ;;
     1) dir="$1" ;;
     *) echo 'usage: dots init [DIR]' >&2; exit 2 ;;
 esac

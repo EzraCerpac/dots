@@ -30,6 +30,7 @@ class DotsHomeTests(unittest.TestCase):
         self.dots.symlink_to(os.path.relpath(self.home / "bin/dots", links))
         self.env = {key: value for key, value in os.environ.items() if not key.startswith(("DOTS_", "MISE_"))}
         self.env["DOTS_ROOT"] = str(self.config)
+        self.env["HOME"] = str(base / "home")
 
     def run_dots(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(self.dots), *args], env=env or self.env, cwd=self.config,

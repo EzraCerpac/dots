@@ -17,38 +17,71 @@ You can declare all of these as tools in the configuration itself, so `dots up` 
 
 ## Install
 
-There is no package yet: `dots` runs from a checkout of this repository.
-Clone it anywhere and link `bin/dots` onto your `PATH`:
+With mise:
+
+```sh
+mise use -g github:EzraCerpac/dots
+dots --version
+```
+
+Each release has one archive per platform (macOS and Linux, arm64 and amd64) with `dots`, the files it runs from, and the prebuilt `dots-up` renderer; mise puts both on `PATH`.
+Pin a release with `github:EzraCerpac/dots@0.3.0`.
+
+With Homebrew:
+
+```sh
+brew install ezracerpac/tap/dots
+```
+
+The formula installs the same archive and depends on Homebrew's mise and Git.
+
+From a checkout, for development:
 
 ```sh
 git clone https://github.com/EzraCerpac/dots ~/.local/share/dots
 ln -s ~/.local/share/dots/bin/dots ~/.local/bin/dots
+(cd ~/.local/share/dots/dots-up && go build -o ../bin/dots-up ./cmd/dots-up)   # optional renderer
 ```
 
-`dots` follows that link to find the rest of its files; `dots internal home` prints the directory it found, and `DOTS_HOME` overrides it.
-`dots up` updates the configuration, not this checkout: pull it, or check out a release tag, to update `dots` itself.
+`dots --version` prints the version and how it was installed (`mise`, `homebrew`, `checkout` or `archive`); `dots internal home` prints the directory it runs from, and `DOTS_HOME` overrides it.
 
-### Optional renderer
+The `dots-up` renderer adds the interactive menu, live progress and saved reports; without it every command still works with plain output.
+`dots` uses the first renderer that reports the capability `dots-shared-cli/2` from `DOTS_UP_BIN`, its own `bin/dots-up`, `mise which dots-up` or `PATH`.
 
-The `dots-up` renderer adds the interactive menu, live progress and saved reports.
-Without it, every command still works with plain output.
-Each release publishes it as a standalone binary for macOS and Linux on arm64 and amd64, with `SHA256SUMS`.
-Install it with mise's GitHub backend, for example in the configuration itself:
+## Updating
+
+`dots up` updates `dots` only when the configuration declares it, as a mise tool or a Homebrew formula (see below); otherwise update it the way you installed it: `mise upgrade github:EzraCerpac/dots`, `brew upgrade dots`, or `git pull` in the checkout.
+`dots up` never updates a checkout.
+
+A `dots up` that installs a new `dots` finishes on the version it started with and reports `dots X -> Y, used from the next run`.
+The old version stays in place for that run: mise keeps it (`dots up` upgrades with `--no-prune`), and `dots up` sets `HOMEBREW_NO_INSTALL_CLEANUP=1`, so Homebrew keeps the old keg until your next `brew cleanup`.
+
+## Using dots from a configuration repository
+
+Pin the manager in the configuration, so every machine runs the same release and `dots up` installs the next one when you change the pin:
 
 ```toml
+# config.toml
 [tools."github:EzraCerpac/dots"]
-version = "latest"
-rename_exe = "dots-up"
-
-[tools."github:EzraCerpac/dots".platforms]
-macos-arm64 = { asset_pattern = "dots-up-darwin-arm64" }
-macos-x64 = { asset_pattern = "dots-up-darwin-amd64" }
-linux-arm64 = { asset_pattern = "dots-up-linux-arm64" }
-linux-x64 = { asset_pattern = "dots-up-linux-amd64" }
+version = "0.3.0"
 ```
 
-`dots` uses the renderer when `DOTS_UP_BIN`, `mise which dots-up` or `PATH` finds a `dots-up` that reports the capability `dots-shared-cli/2`.
-To build it from the checkout instead: `(cd dots-up && go build -o ~/.local/bin/dots-up ./cmd/dots-up)`.
+`mise bootstrap` installs `[tools]` late, after the `pre-dotfiles` hook (see `mise bootstrap --help`), so a hook cannot expect `dots` on `PATH` on a new machine.
+Run it through `mise x`, which installs the pinned version first when it is missing; the `bootstrap` task runs after the tools step and can call `dots` directly:
+
+```toml
+# config.laptop.toml
+[bootstrap.hooks]
+pre-dotfiles = 'SETUP_PROFILE=laptop mise x github:EzraCerpac/dots -- dots internal persist-selected'
+
+# config.toml
+[tasks.bootstrap]
+description = "Finish the dots bootstrap"
+run = 'dots internal complete'
+raw = true
+```
+
+A configuration that still uses `"$DOTS_HOME/bin/dots"` works when the machine is bootstrapped with `dots bootstrap`, which exports `DOTS_HOME`, but not with `dots remote`, whose target runs `mise bootstrap` without it.
 
 ## Quickstart
 
@@ -107,6 +140,7 @@ Read-only:
 | `dots help` | List the commands, including the configuration's own |
 | `dots reports [COMMAND]` | Browse saved command reports (needs the renderer) |
 | `dots internal home` | Print the manager directory (`DOTS_HOME`) |
+| `dots --version` | Print the manager version and how it was installed |
 
 Everyday:
 
@@ -223,19 +257,8 @@ dots_atuin_username = "you"                  # the only Atuin account enrollment
 ### Bootstrap
 
 `dots bootstrap` runs `mise bootstrap` with `DOTS_HOME` and `DOTS_ROOT` exported.
-Two pieces of mise configuration connect it to `dots`: a hook in each profile file that records the profile, and a `bootstrap` task, which mise runs as the last bootstrap step, for the completion step (private inputs, installer exceptions, `dots/hooks/bootstrap.d`, Atuin, history enrollment and Tailscale):
-
-```toml
-# config.laptop.toml
-[bootstrap.hooks]
-pre-dotfiles = 'SETUP_PROFILE=laptop "$DOTS_HOME/bin/dots" internal persist-selected'
-
-# config.toml
-[tasks.bootstrap]
-description = "Finish the dots bootstrap"
-run = '"$DOTS_HOME/bin/dots" internal complete'
-raw = true
-```
+Two pieces of mise configuration connect it to `dots`: a hook in each profile file that records the profile, and a `bootstrap` task, which mise runs as the last bootstrap step, for the completion step (private inputs, installer exceptions, `dots/hooks/bootstrap.d`, Atuin, history enrollment and Tailscale).
+[Using dots from a configuration repository](#using-dots-from-a-configuration-repository) shows both.
 
 ## Sync, dev and main
 
@@ -248,19 +271,26 @@ Machine-local files and secrets never enter the repository.
 ## Agent skill
 
 [`skills/dots/SKILL.md`](skills/dots/SKILL.md) teaches a coding agent to work in a `dots` configuration: which commands are read-only, how to add tools, hooks and commands, and which changes need a pull request.
-Link it into your agent's skill directory, for example:
 
-```sh
-mkdir -p ~/.agents/skills ~/.claude/skills
-ln -s "$(dots internal home)/skills/dots" ~/.agents/skills/dots
-ln -s "$(dots internal home)/skills/dots" ~/.claude/skills/dots
-```
+`dots` links it for the agents you use, every time it runs, so installing or updating `dots` by any method also installs or updates the skill:
+
+| Link | Read by | Made when |
+| --- | --- | --- |
+| `~/.claude/skills/dots` | Claude Code | `~/.claude` (or `CLAUDE_CONFIG_DIR`) exists |
+| `~/.agents/skills/dots` | Codex and other clients of the shared directory | `~/.agents` or `~/.codex` (or `CODEX_HOME`) exists |
+
+Each link points at `skills/dots` in the running installation: Homebrew's stable `opt` path, so a `brew upgrade` needs no relinking, or the version directory for mise and a checkout, which the next `dots` command or `dots up` moves to the new version.
+`dots` replaces only links it made; a directory, a file or another link at those paths is yours, and `dots` leaves it alone with a one-time notice.
+`dots status` shows each link.
+Set `DOTS_SKILL_LINKS=0` to turn linking off.
+To remove the skill, set that and delete the two links; after `brew uninstall dots` or removing a mise version, the links dangle until you delete them or install `dots` again.
 
 ## Development
 
 | Path | Contents |
 | --- | --- |
 | `bin/dots` | The command-line entry point |
+| `packaging/` | The release build and the Homebrew formula |
 | `docs/` | [The sync guide](docs/sync.md) |
 | `lib/`, `tasks/`, `bootstrap/` | The commands' implementation; [`tasks/README.md`](tasks/README.md) details `dots up` and `dots restore` |
 | `init/` | Templates for `dots init` |
@@ -286,7 +316,9 @@ DOTS_HOME=~/src/dots ~/src/dots/bin/dots status
 DOTS_ROOT=/tmp/other-config dots help        # and another configuration
 ```
 
-Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then publishes `dots-up-{darwin,linux}-{arm64,amd64}`, a source archive `dots-X.Y.Z.tar.gz` of the whole tree, and `SHA256SUMS` as a GitHub release.
+Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then [`packaging/build-release`](packaging/build-release) builds `dots-X.Y.Z-{darwin,linux}-{arm64,amd64}.tar.gz`, `SHA256SUMS` and `dots.rb`, and publishes them as a GitHub release.
+The tag is the only place the version is written; the archives carry it in a `VERSION` file.
+`dots.rb` is [`packaging/homebrew/dots.rb`](packaging/homebrew/dots.rb) with the release's checksums; copy it to `Formula/dots.rb` in `EzraCerpac/homebrew-tap` to publish the release to Homebrew.
 
 ## License
 

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Build the release assets: packaging/build-release VERSION [OUTDIR]
+#
+# For each of darwin and linux on arm64 and amd64, dots-VERSION-OS-ARCH.tar.gz
+# holds the manager's runtime files, a VERSION file and a prebuilt bin/dots-up,
+# under one top-level directory. Also writes SHA256SUMS and dots.rb, the
+# Homebrew formula rendered with those checksums. The release workflow and the
+# packaging test job both run this script. It packs the working tree's files
+# that Git tracks or would track, so a local build includes uncommitted edits.
+set -euo pipefail
+
+version="${1:-}"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || {
+    echo 'usage: packaging/build-release VERSION [OUTDIR]   (VERSION like 0.3.0, without v)' >&2
+    exit 2
+}
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+out="${2:-$root/dist}"
+mkdir -p "$out"
+out="$(cd "$out" && pwd -P)"
+platforms=(darwin-arm64 darwin-amd64 linux-arm64 linux-amd64)
+# Runtime files only: the Go sources, tests and CI files stay in the repository.
+runtime=(bin bootstrap docs init lib skills tasks LICENSE README.md)
+
+stage="$(mktemp -d "${TMPDIR:-/tmp}/dots-release.XXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+
+(
+    cd "$root/dots-up"
+    go mod verify >/dev/null
+    for platform in "${platforms[@]}"; do
+        CGO_ENABLED=0 GOOS="${platform%-*}" GOARCH="${platform#*-}" \
+            go build -mod=readonly -trimpath -o "$stage/dots-up-$platform" ./cmd/dots-up
+    done
+)
+
+tree="$stage/tree"
+mkdir -p "$tree"
+git -C "$root" ls-files -z --cached --others --exclude-standard -- "${runtime[@]}" | (cd "$root" && xargs -0 tar -cf - --) | tar -xf - -C "$tree"
+printf '%s\n' "$version" > "$tree/VERSION"
+
+: > "$out/SHA256SUMS"
+for platform in "${platforms[@]}"; do
+    name="dots-$version-$platform"
+    rm -rf "${stage:?}/$name"
+    cp -R "$tree" "$stage/$name"
+    install -m 0755 "$stage/dots-up-$platform" "$stage/$name/bin/dots-up"
+    (cd "$stage" && tar -cf - "$name") | gzip -n -9 > "$out/$name.tar.gz"
+    if command -v sha256sum >/dev/null 2>&1; then sum="$(sha256sum "$out/$name.tar.gz")"; else sum="$(shasum -a 256 "$out/$name.tar.gz")"; fi
+    printf '%s  %s\n' "${sum%% *}" "$name.tar.gz" >> "$out/SHA256SUMS"
+done
+
+# Render the formula from its reviewed source: the version on the version and
+# url lines, and each platform's checksum, matched by the platform comment on
+# its sha256 line.
+awk -v version="$version" -v sums="$out/SHA256SUMS" '
+    function replace(text, old, new,   at, done) {
+        while ((at = index(text, old)) > 0) {
+            done = done substr(text, 1, at - 1) new
+            text = substr(text, at + length(old))
+        }
+        return done text
+    }
+    BEGIN {
+        while ((getline line < sums) > 0) {
+            if (match(line, /(darwin|linux)-(arm64|amd64)[.]tar[.]gz$/)) {
+                sum[substr(line, RSTART, RLENGTH - 7)] = substr(line, 1, 64)
+            }
+        }
+    }
+    /^  version "/ { template = $2; gsub(/"/, "", template) }
+    /^  version "|^ *url "/ { $0 = replace($0, template, version) }
+    /sha256 "[0-9a-f]+" # / {
+        if (!($NF in sum)) { print "build-release: no checksum for " $NF > "/dev/stderr"; exit 1 }
+        sub(/"[0-9a-f]+"/, "\"" sum[$NF] "\"")
+    }
+    { print }
+' "$root/packaging/homebrew/dots.rb" > "$out/dots.rb"
+
+printf 'Built dots %s in %s:\n' "$version" "$out"
+(cd "$out" && ls -1 "dots-$version"-*.tar.gz SHA256SUMS dots.rb)

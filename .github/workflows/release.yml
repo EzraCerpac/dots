@@ -28,25 +28,13 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p dist
-          (
-            cd dots-up
-            test -f go.sum
-            go mod verify
-            for os in darwin linux; do
-              for arch in arm64 amd64; do
-                CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -mod=readonly -trimpath \
-                  -o "$GITHUB_WORKSPACE/dist/dots-up-$os-$arch" ./cmd/dots-up
-              done
-            done
-          )
-          # The whole tree at this tag, so a configuration can pin the manager by release.
-          version="${TAG#v}"
-          git archive --format=tar.gz --prefix="dots-$version/" -o "dist/dots-$version.tar.gz" "$TAG"
-          (cd dist && sha256sum dots-up-* "dots-$version.tar.gz" > SHA256SUMS)
+          packaging/build-release "${TAG#v}" dist
+          # The formula for EzraCerpac/homebrew-tap, with this release's checksums;
+          # it is copied to the tap by hand.
+          { printf '```ruby\n'; cat dist/dots.rb; printf '```\n'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/dots-up-* dist/dots-*.tar.gz dist/SHA256SUMS --verify-tag --title "$TAG" --generate-notes
+        run: gh release create "$TAG" dist/dots-*.tar.gz dist/SHA256SUMS dist/dots.rb --verify-tag --title "$TAG" --generate-notes

@@ -4,6 +4,7 @@ set -euo pipefail
 
 source "$(dirname "$0")/../lib/setup-common.sh"
 source "$(dirname "$0")/../lib/dots-up-events.sh"
+source "$(dirname "$0")/../lib/dots-manager.sh"
 include_mas=0
 plain_output="${DOTS_UP_PLAIN:-0}"
 verbose_output="${DOTS_UP_VERBOSE:-0}"
@@ -20,6 +21,12 @@ for argument in "$@"; do
     esac
 done
 setup_init || exit $?
+# This run keeps using the manager it started from (DOTS_HOME, a versioned
+# directory for mise and Homebrew installs), even when a stage upgrades dots.
+# mise keeps replaced versions (upgrade --no-prune below), but Homebrew's
+# install cleanup would delete the old keg mid-run; dots up removes no
+# installed version, so keep Homebrew's cleanup for later as well.
+export HOMEBREW_NO_INSTALL_CLEANUP=1
 if [[ "$plain_output" -eq 1 ]] && ! dots_up_event_sink_enabled && [[ -z "${DOTS_UP_RUN_DIR:-}" ]]; then
     state_root="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dots/up"
     mkdir -p "$state_root" || exit 1
@@ -55,7 +62,7 @@ event_group() {
     case "$1" in
         "Sync configuration"|*settings*checkpoint*) printf 'Source & settings' ;;
         "new Homebrew formulae"|"Homebrew formulae"|"new Homebrew casks"|"Homebrew casks"|"Mac App Store tool"|"Mac App Store authorization"|"Mac App Store result"|"newly declared host packages"|"declared host packages") printf 'Packages' ;;
-        "newly declared mise tools"|"declared mise tools"|"standalone mise") printf 'Tools' ;;
+        "newly declared mise tools"|"declared mise tools"|"standalone mise"|"dots manager") printf 'Tools' ;;
         "installer exception"*) printf 'Managed apps/local builds' ;;
         *) printf 'Final checks' ;;
     esac
@@ -557,9 +564,59 @@ if [[ "$include_mas" -eq 1 && "$app_store" -eq 1 ]]; then
     run_stage "Mac App Store result" finish_app_store_packages || true
 fi
 
-# Standalone mise updates last. A Homebrew-owned installation will report that
-# self-update is disabled; the migration will switch ownership before relying on it.
-run_stage "standalone mise" setup_mise self-update --yes || true
+# Whether mise may update itself. A package manager (Homebrew, a distribution)
+# marks its mise with a file next to the binary, and mise then refuses
+# self-update; check the same places mise does (mise src/env.rs), relative to
+# the parent of the real binary's directory, and honor its override variable.
+mise_self_update_available() {
+    local base marker
+    case "${MISE_SELF_UPDATE_AVAILABLE:-}" in
+        1|true|yes) return 0 ;;
+        0|false|no) return 1 ;;
+    esac
+    base="$(dots_manager_home_of "$(resolve_mise_bin)")" || return 0
+    for marker in lib/.disable-self-update lib/mise/.disable-self-update lib64/mise/.disable-self-update \
+        lib/mise-self-update-instructions.toml lib/mise/mise-self-update-instructions.toml lib64/mise/mise-self-update-instructions.toml; do
+        [[ ! -e "$base/$marker" ]] || return 1
+    done
+    [[ -z "${MISE_SELF_UPDATE_INSTRUCTIONS:-}" ]]
+}
+
+# Standalone mise updates last; a package-managed mise updates with its package.
+if mise_self_update_available; then
+    run_stage "standalone mise" setup_mise self-update --yes || true
+else
+    printf '\nSkipped: standalone mise is updated by the package manager that installed it.\n'
+    dots_up_emit_notice info 'Standalone mise skipped; the package manager that installed mise updates it.'
+fi
+
+# dots updates itself only when the configuration declares it (a mise tool or
+# a Homebrew formula) and a stage above installed a new version; this run
+# finishes on the old one. A checkout is never updated by dots up.
+report_manager_update() {
+    local installed home before after
+    before="$(dots_manager_version "$DOTS_HOME")"
+    if [[ "$(dots_manager_installer "$DOTS_HOME")" == checkout ]]; then
+        printf 'dots %s runs from a checkout; update it with git.\n' "$before"
+        return 0
+    fi
+    installed="$(setup_mise which dots 2>/dev/null || command -v dots 2>/dev/null || true)"
+    home=""
+    [[ -z "$installed" ]] || home="$(dots_manager_home_of "$installed" 2>/dev/null || true)"
+    if [[ -z "$home" || "$home" == "$DOTS_HOME" || ! -f "$home/lib/dots-manager.sh" ]]; then
+        printf 'dots %s is current.\n' "$before"
+        return 0
+    fi
+    after="$(dots_manager_version "$home")"
+    if [[ "$after" == "$before" ]]; then
+        printf 'dots %s is current.\n' "$before"
+        return 0
+    fi
+    printf 'dots %s -> %s, used from the next run.\n' "$before" "$after"
+    [[ -z "${DOTS_CHANGES:-}" ]] || printf 'dots\t%s\t%s\n' "$before" "$after" >> "$DOTS_CHANGES"
+    dots_skill_refresh "$home"
+}
+run_stage "dots manager" --changes report_manager_update || true
 
 if ! run_stage 'Post-update settings checkpoint' setup_mise bootstrap dotfiles save; then
     setup_error "post-update settings checkpoint failed"

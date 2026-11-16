@@ -28,8 +28,11 @@ class DotsHomeTests(unittest.TestCase):
         links.mkdir()
         self.dots = links / "dots"
         self.dots.symlink_to(os.path.relpath(self.home / "bin/dots", links))
-        self.env = {key: value for key, value in os.environ.items() if not key.startswith(("DOTS_", "MISE_"))}
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("DOTS_", "MISE_", "XDG_", "CLAUDE_", "CODEX_"))}
+        self.env["DOTS_SKILL_LINKS"] = "0"
         self.env["DOTS_ROOT"] = str(self.config)
+        self.env["HOME"] = str(base / "home")
 
     def run_dots(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(self.dots), *args], env=env or self.env, cwd=self.config,
@@ -53,6 +56,12 @@ class DotsHomeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str(other))
 
+
+    def test_a_missing_mise_is_named_in_one_line(self) -> None:
+        env = {**self.env, "PATH": "/usr/bin:/bin", "DOTS_MISE_BIN": str(self.home.parent / "no-mise")}
+        result = self.run_dots("status", env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["dots: mise is required but was not found; install it from https://mise.jdx.dev"])
 
 if __name__ == "__main__":
     unittest.main()

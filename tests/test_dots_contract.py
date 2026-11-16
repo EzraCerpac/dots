@@ -69,6 +69,15 @@ def write(path: Path, text: str, mode: int = 0o644) -> Path:
     return path
 
 
+def remove_git_marker(manager: Path) -> None:
+    """Drop the copied .git: a directory in a clone, a file in a linked worktree."""
+    marker = manager / ".git"
+    if marker.is_dir() and not marker.is_symlink():
+        shutil.rmtree(marker)
+    elif marker.exists() or marker.is_symlink():
+        marker.unlink()
+
+
 class Fixture:
     """A manager copy, a configuration, a fake mise and a private HOME."""
 
@@ -88,7 +97,7 @@ class Fixture:
                     if not key.startswith(("DOTS_", "MISE_", "SETUP_", "XDG_"))}
         self.env.update(HOME=str(self.home), DOTS_ROOT=str(self.config), DOTS_HOME=str(self.manager),
                         SETUP_MISE_BIN=str(self.mise), DOTS_MISE_BIN=str(self.mise), FAKE_MISE_LOG=str(self.log),
-                        DOTS_UP_BIN="/nonexistent/dots-up")
+                        DOTS_UP_BIN="/nonexistent/dots-up", DOTS_SKILL_LINKS="0")
         if profiles is not None:
             self.env["FAKE_VAR_dots_profiles"] = profiles
 
@@ -122,6 +131,41 @@ class ContractTestCase(unittest.TestCase):
 
 @requires("jq")
 class UpdateHookTests(ContractTestCase):
+    def test_update_finishes_on_its_manager_and_reports_a_new_one(self) -> None:
+        # A packaged manager (no .git) that a stage upgraded: the newer one is
+        # first on PATH, the run keeps going on the old one, and Homebrew may
+        # not delete the old keg meanwhile.
+        remove_git_marker(self.f.manager)
+        (self.f.manager / "VERSION").write_text("0.3.0\n")
+        newer = self.f.base / "installs/dots/0.3.1"
+        shutil.copytree(self.f.manager, newer)
+        (newer / "VERSION").write_text("0.3.1\n")
+        out = self.f.base / "cleanup"
+        self.f.hook("update.d", "10-env", f'printf "%s %s" "$HOMEBREW_NO_INSTALL_CLEANUP" "$DOTS_HOME" > {out}\n')
+        result = self.f.update(PATH=f"{newer}/bin:{self.f.env['PATH']}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(out.read_text(), f"1 {self.f.manager}")
+        self.assertIn("== dots manager ==\ndots 0.3.0 -> 0.3.1, used from the next run.\nResult: completed", result.stdout)
+
+    def test_update_skips_self_update_for_a_package_managed_mise(self) -> None:
+        # Homebrew's mise ships lib/.disable-self-update and refuses self-update.
+        package = self.f.base / "Cellar/mise/2026.11.7"
+        head, tail = FAKE_MISE.rsplit("    *) exit 0 ;;", 1)
+        refusing = head + "    self-update) echo 'mise: self-update is disabled' >&2; exit 1 ;;\n    *) exit 0 ;;" + tail
+        managed = write(package / "bin/mise", refusing, 0o755)
+        write(package / "lib/.disable-self-update", "")
+        result = self.f.update(SETUP_MISE_BIN=str(managed), DOTS_MISE_BIN=str(managed))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Skipped: standalone mise is updated by the package manager that installed it", result.stdout)
+        self.assertNotIn("self-update", self.f.log.read_text())
+
+    def test_update_leaves_a_checkout_manager_alone(self) -> None:
+        remove_git_marker(self.f.manager)
+        (self.f.manager / ".git").mkdir()
+        result = self.f.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"== dots manager ==\ndots \S+ runs from a checkout; update it with git\.\n")
+
     def test_hooks_run_in_name_order_with_contract_environment_and_statuses(self) -> None:
         out = self.f.base / "out"
         out.mkdir()

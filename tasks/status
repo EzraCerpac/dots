@@ -3,8 +3,11 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../lib/setup-common.sh"
+source "$(dirname "$0")/../lib/dots-manager.sh"
 setup_init || exit $?
 
+printf 'dots %s (%s): %s\n' "$(dots_manager_version "$DOTS_HOME")" "$(dots_manager_installer "$DOTS_HOME")" "$DOTS_HOME"
+dots_skill_status "$DOTS_HOME"
 printf 'Setup profile: %s\n' "$SETUP_PROFILE"
 printf 'Machine identity: %s\n' "${SETUP_MACHINE_ID:-not set}"
 printf 'History: dots backup saves and publishes this host; watcher health is shown below.\n'

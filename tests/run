@@ -55,6 +55,9 @@ run_fixture() (
     unset DOTS_HOME DOTS_ROOT
     unset DOTS_UP_EVENT_FD DOTS_UP_ACK_FD DOTS_UP_STREAM_NONCE DOTS_UP_EVENT_JQ
     unset DOTS_UP_RUN_DIR DOTS_UP_RUN_STARTED DOTS_UP_PLAIN DOTS_UP_VERBOSE
+    # A fixture that runs bin/dots must never link the skill into the real HOME;
+    # the skill-link tests turn linking back on inside their private HOME.
+    export DOTS_SKILL_LINKS=0
     "$@"
 )
 

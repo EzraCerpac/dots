@@ -15,12 +15,20 @@ resolve_dots_home() {
     directory="$(cd -P "$(dirname "$source")" && pwd)"
     cd -P "$directory/.." && pwd
 }
+own_home="$(resolve_dots_home)"
 if [[ -n "${DOTS_HOME:-}" ]]; then
     DOTS_HOME="$(cd "$DOTS_HOME" && pwd -P)" || { echo "dots: DOTS_HOME is not a directory: $DOTS_HOME" >&2; exit 2; }
 else
-    DOTS_HOME="$(resolve_dots_home)"
+    DOTS_HOME="$own_home"
 fi
 export DOTS_HOME
+# Keep the bundled agent skill linked to this installation, so installing or
+# upgrading dots by any method updates the skill too. A run with another
+# DOTS_HOME (development, or a child of such a run) leaves the links alone.
+if [[ -f "$own_home/lib/dots-manager.sh" ]]; then
+    source "$own_home/lib/dots-manager.sh"
+    [[ "$DOTS_HOME" != "$own_home" ]] || dots_skill_refresh "$DOTS_HOME"
+fi
 
 # Built-in commands always win over configuration commands of the same name.
 builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall help internal init "
@@ -47,6 +55,7 @@ usage() {
 Your machine setup, from any directory.
 
   dots                            Open the interactive command menu
+  dots --version                  Print the manager version and how it was installed
   dots [--plain|--verbose] [--no-wait] COMMAND [ARGS...]
   dots reports [COMMAND]          Browse saved command reports
 
@@ -115,7 +124,13 @@ if [[ " $frontend_flags " == *' --plain '* && " $frontend_flags " == *' --verbos
 fi
 backend_mode=0
 if [[ "${1:-}" == --backend ]]; then backend_mode=1; shift; fi
-case "${1:-}" in help|-h|--help) usage; exit 0 ;; esac
+case "${1:-}" in
+    help|-h|--help) usage; exit 0 ;;
+    --version)
+        printf 'dots %s (%s)\n' "$(dots_manager_version "$DOTS_HOME")" "$(dots_manager_installer "$DOTS_HOME")"
+        exit 0
+        ;;
+esac
 if [[ $# -eq 0 && ( ! -t 0 || ! -t 1 || "$backend_mode" -eq 1 ) ]]; then usage; exit 0; fi
 # Callbacks for configuration hooks and tasks. They run inside the caller's
 # mise environment, rooted where the caller's hook paths point.
@@ -188,7 +203,8 @@ if [[ "$backend_mode" -eq 0 && $# -gt 0 && "$builtin_commands" != *" $1 "* ]]; t
     exec "$command_path" "$@"
 fi
 mise_bin="${DOTS_MISE_BIN:-$HOME/.local/bin/mise}"
-[[ -x "$mise_bin" ]] || mise_bin="$(command -v mise)"
+[[ -x "$mise_bin" ]] || mise_bin="$(command -v mise || true)"
+[[ -n "$mise_bin" ]] || { echo 'dots: mise is required but was not found; install it from https://mise.jdx.dev' >&2; exit 2; }
 # Select the setup before mise loads any configuration. Discard a project's
 # environment selector; the setup's own miserc selects its role and host.
 unset MISE_ENV
@@ -215,6 +231,9 @@ resolve_renderer() {
         renderer="$DOTS_UP_BIN"
         return
     fi
+    # A release ships the renderer next to dots; a checkout may build it there.
+    renderer="$DOTS_HOME/bin/dots-up"
+    [[ ! -x "$renderer" ]] || return 0
     renderer="$(run_mise which dots-up 2>/dev/null || true)"
     if [[ -z "$renderer" || ! -x "$renderer" ]]; then
         renderer="$(command -v dots-up 2>/dev/null || true)"

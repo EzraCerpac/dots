@@ -110,3 +110,20 @@ func TestAgentGetsTheIssueAsItsLastArgument(t *testing.T) {
 		t.Fatalf("agent got %q", out)
 	}
 }
+
+func TestAgentMessageShowsFromTheIssueListAndTheLog(t *testing.T) {
+	t.Setenv(AgentCommandEnv, "")
+	m, _ := syncAttention(t)
+	m = send(m, Event{V: 1, Kind: "run_end"})
+	m = press(m, tea.KeyPressMsg{Code: tea.KeyUp})
+	m = press(m, tea.KeyPressMsg{Code: tea.KeyEnter}) // the issue list, details closed
+	for _, setup := range []func(Model) Model{
+		func(m Model) Model { return m },
+		func(m Model) Model { return press(m, tea.KeyPressMsg{Code: 'l', Text: "l"}) },
+	} {
+		updated, _ := setup(m).Update(tea.KeyPressMsg{Code: 'A', Text: "A"})
+		if got := updated.(Model).lastLog; !strings.Contains(got, "Set DOTS_AGENT_COMMAND") {
+			t.Fatalf("agent message hidden:\n%s", got)
+		}
+	}
+}

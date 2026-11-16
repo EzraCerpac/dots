@@ -259,7 +259,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshDetail()
 			}
 		case "A":
-			if m.AttentionExpanded {
+			if m.AttentionExpanded && m.selectedIssue() != nil {
+				// The hand-off and its messages belong to the issue details.
+				m.DetailFocus, m.ShowLog, m.RawLog = true, false, false
 				cmd := m.handToAgent()
 				m.refreshDetail()
 				return m, cmd

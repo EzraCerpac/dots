@@ -70,6 +70,12 @@ func run(args []string) int {
 		}
 		opts.Home = home
 	}
+	// The dashboard's agent hand-off, like every child, works in the selected
+	// configuration and manager, not ambient ones.
+	os.Setenv("DOTS_ROOT", opts.Root)
+	if opts.Home != "" {
+		os.Setenv("DOTS_HOME", opts.Home)
+	}
 	if opts.Command == "menu" {
 		if !term.IsTerminal(os.Stdin.Fd()) || !term.IsTerminal(os.Stdout.Fd()) {
 			fs.Usage()

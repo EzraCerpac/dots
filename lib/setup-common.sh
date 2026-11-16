@@ -7,22 +7,15 @@ setup_error() {
 }
 
 setup_init() {
-    # Resolve from this library; callers can sit at different depths.
-    local script_path="${BASH_SOURCE[0]}"
+    # The manager is the directory this library belongs to.
     local script_dir
-    script_dir="$(cd "$(dirname "$script_path")" && pwd -P)" || return 1
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
 
-    if [[ -n "${SETUP_CONFIG_ROOT:-}" && -d "$SETUP_CONFIG_ROOT" ]]; then
-        # Explicit override exists for disposable task fixtures. Normal runs
-        # use the configuration dots selected (DOTS_ROOT), even if the caller's
-        # global MISE_CONFIG_DIR points elsewhere.
-        SETUP_ROOT="$(cd "$SETUP_CONFIG_ROOT" && pwd -P)" || return 1
-    elif [[ -n "${DOTS_ROOT:-}" && -d "$DOTS_ROOT" ]]; then
-        SETUP_ROOT="$(cd "$DOTS_ROOT" && pwd -P)" || return 1
-    else
-        # Outside dots, the manager still sits inside its configuration checkout.
-        SETUP_ROOT="$(cd "$script_dir/../.." && pwd -P)" || return 1
-    fi
+    # The configuration follows bin/dots: DOTS_ROOT (what dots selected), else
+    # mise's config directory. The manager's own location says nothing about
+    # it. SETUP_CONFIG_ROOT exists for disposable task fixtures.
+    local root="${SETUP_CONFIG_ROOT:-${DOTS_ROOT:-${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}}}"
+    SETUP_ROOT="$(cd "$root" && pwd -P)" || { setup_error "configuration not found at $root"; return 2; }
     # Keep the manager that started this run for every child.
     if [[ -z "${DOTS_HOME:-}" ]]; then
         DOTS_HOME="$(cd "$script_dir/.." && pwd -P)" || return 1

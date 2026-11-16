@@ -221,6 +221,18 @@ def download_asset(asset, repo, destination):
         raise ValueError("GitHub release asset checksum mismatch")
 
 
+def dots_command(home):
+    """A command that runs dots from a mise hook, which has neither dots nor
+    mise on PATH. Avoid version directories: a Homebrew install runs its bin
+    link, a mise install asks mise, and a checkout or unpacked archive runs
+    its own bin/dots."""
+    if not (home / ".git").exists() and "/Cellar/" in str(home):
+        return shlex.quote(str(home).split("/Cellar/", 1)[0] + "/bin/dots")
+    if not (home / ".git").exists() and "/installs/" in str(home):
+        return '"${DOTS_MISE_BIN:-$(command -v mise || echo "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots'
+    return shlex.quote(str(home / "bin/dots"))
+
+
 def resolve(url, override=None):
     repo = repository(url)
     release = fetch_release(repo)
@@ -259,7 +271,7 @@ def resolve(url, override=None):
         if override:
             options.pop("asset_pattern")
             options[f"platform_{system}_{machine}_asset_pattern"] = override
-        hook = 'bash "${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}/manager/bin/dots" internal github-install-app ' + shlex.quote(repo)
+        hook = dots_command(Path(os.environ["DOTS_HOME"])) + " internal github-install-app " + shlex.quote(repo)
         options.update(strip_components=0, bin_path=".dots-no-bin", os=["macos"], postinstall={"run": hook, "when": "always"})
     if numeric_version and tag[:numeric_version.start()] not in {"", "v"}:
         options["version_prefix"] = tag[:numeric_version.start()]

@@ -12,9 +12,10 @@ bootstrap_init() {
         return 2
     fi
 
-    BOOTSTRAP_CONFIG_DIR="${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}"
+    # dots internal selected the configuration; never guess it here.
+    BOOTSTRAP_CONFIG_DIR="${DOTS_ROOT:?run through dots internal}"
     if [[ ! -d "$BOOTSTRAP_CONFIG_DIR" ]]; then
-        bootstrap_error "mise config directory does not exist: $BOOTSTRAP_CONFIG_DIR"
+        bootstrap_error "configuration does not exist: $BOOTSTRAP_CONFIG_DIR"
         return 2
     fi
     BOOTSTRAP_CONFIG_DIR="$(cd "$BOOTSTRAP_CONFIG_DIR" && pwd -P)" || return 1

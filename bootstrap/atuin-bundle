@@ -187,8 +187,8 @@ finish() {
 TOTAL_STAGES=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# The configuration dots selected; outside dots, the checkout holding the manager.
-ROOT_DIR="$(cd "${DOTS_ROOT:-$SCRIPT_DIR/../..}" && pwd -P)"
+# The configuration dots selected.
+ROOT_DIR="$(cd "${DOTS_ROOT:?run through dots atuin-bundle}" && pwd -P)"
 OUTPUT="$ROOT_DIR/encrypted/atuin.json.age"
 ENV_FILE=/dev/null
 RECIPIENTS=()

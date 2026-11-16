@@ -56,16 +56,30 @@ dots_skill_source() {
     printf '%s/skills/dots\n' "$home"
 }
 
-# Print "AGENT<TAB>LINK" for each agent whose configuration directory exists:
-# Claude Code reads ~/.claude/skills; Codex and other Agent Skills clients
-# read ~/.agents/skills. An agent's skills directory is created only when the
-# agent is in use, so dots never creates ~/.claude for someone without it.
+# Print "AGENT<TAB>LINK<TAB>BASE" for each agent whose configuration directory
+# exists: Claude Code reads ~/.claude/skills; Codex and other Agent Skills
+# clients read ~/.agents/skills. BASE is the agent directory the link must stay
+# inside. An agent's skills directory is created only when the agent is in
+# use, so dots never creates ~/.claude for someone without it.
 dots_skill_links() {
     local claude="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-    [[ ! -d "$claude" ]] || printf 'claude\t%s/skills/dots\n' "$claude"
+    [[ ! -d "$claude" ]] || printf 'claude\t%s/skills/dots\t%s\n' "$claude" "$claude"
     if [[ -d "$HOME/.agents" || -d "${CODEX_HOME:-$HOME/.codex}" ]]; then
-        printf 'agents\t%s/.agents/skills/dots\n' "$HOME"
+        printf 'agents\t%s/.agents/skills/dots\t%s/.agents\n' "$HOME" "$HOME"
     fi
+}
+
+# Whether LINK's directory resolves inside BASE, before anything is created.
+# BASE itself is taken as given (CLAUDE_CONFIG_DIR may be anywhere, and
+# ~/.claude may be a link); a skills directory that is a link leading
+# elsewhere is not, so dots never writes outside the agent's directory.
+dots_skill_parent_inside() {
+    local parent="${1%/*}" base="$2" real_base real_parent
+    [[ -e "$base" || -L "$base" ]] || return 0  # mkdir -p creates both as plain directories
+    real_base="$(cd -P "$base" 2>/dev/null && pwd)" || return 1
+    [[ -e "$parent" || -L "$parent" ]] || return 0
+    real_parent="$(cd -P "$parent" 2>/dev/null && pwd)" || return 1
+    [[ "$real_parent" == "$real_base" || "$real_parent" == "$real_base"/* ]]
 }
 
 # dots records each skill link it creates as LINK<TAB>TARGET, so it replaces
@@ -103,17 +117,18 @@ dots_skill_refresh() {
     [[ -f "$home/skills/dots/SKILL.md" ]] || return 0
     source="$(dots_skill_source "$home")"
     notices="${XDG_STATE_HOME:-$HOME/.local/state}/dots/skill-notices"
-    while IFS=$'\t' read -r agent link; do
+    while IFS=$'\t' read -r agent link base; do
         [[ -n "$link" ]] || continue
         [[ "$(readlink "$link" 2>/dev/null)" != "$source" ]] || continue
-        if dots_skill_link_is_ours "$link" || [[ ! -e "$link" && ! -L "$link" ]]; then
+        if dots_skill_parent_inside "$link" "$base" &&
+            { dots_skill_link_is_ours "$link" || [[ ! -e "$link" && ! -L "$link" ]]; }; then
             dots_skill_link "$link" "$source"
-        else
-            notice="$link"
-            if ! grep -qxF "$notice" "$notices" 2>/dev/null; then
-                printf 'dots: left %s alone; it is not a dots link (the %s skill stays unlinked)\n' "$link" "$agent" >&2
-                { mkdir -p "${notices%/*}" && printf '%s\n' "$notice" >> "$notices"; } 2>/dev/null || true
-            fi
+            continue
+        fi
+        notice="$link"
+        if ! grep -qxF "$notice" "$notices" 2>/dev/null; then
+            printf 'dots: left %s alone; it is not a dots link or its directory leads outside %s (the %s skill stays unlinked)\n' "$link" "$base" "$agent" >&2
+            { mkdir -p "${notices%/*}" && printf '%s\n' "$notice" >> "$notices"; } 2>/dev/null || true
         fi
     done < <(dots_skill_links)
 }
@@ -129,7 +144,7 @@ dots_skill_status() {
         printf 'Agent skill: no agent configuration found (~/.claude, ~/.agents or ~/.codex)\n'
         return 0
     fi
-    while IFS=$'\t' read -r agent link; do
+    while IFS=$'\t' read -r agent link _; do
         if dots_skill_link_is_ours "$link"; then state="-> $(readlink "$link")"
         elif [[ -e "$link" || -L "$link" ]]; then state="provided by you, not dots"
         else state="not linked"

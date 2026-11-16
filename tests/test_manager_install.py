@@ -212,6 +212,25 @@ class ManagerInstallTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.claude_link), str(shared))
         self.assertEqual((shared / "SKILL.md").read_text(), "deployed by my configuration\n")
 
+    def test_a_skills_directory_linked_outside_the_agent_directory_is_not_written(self) -> None:
+        self.agents(".claude", ".agents")
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        (self.home / ".claude/skills").symlink_to(elsewhere)
+        (self.home / ".agents/skills").symlink_to(elsewhere)
+        mise = self.mise_install("0.3.0")
+        result = self.dots(mise / "bin/dots", "--version")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(result.stderr.count("left "), 2, result.stderr)
+
+    def test_an_explicit_claude_config_dir_is_taken_as_given(self) -> None:
+        config = self.base / "claude-config"  # outside HOME
+        config.mkdir()
+        mise = self.mise_install("0.3.0")
+        self.dots(mise / "bin/dots", "--version", CLAUDE_CONFIG_DIR=str(config))
+        self.assertEqual(os.readlink(config / "skills/dots"), str(mise / "skills/dots"))
+
     def test_opt_out(self) -> None:
         self.agents(".claude", ".agents")
         mise = self.mise_install("0.3.0")

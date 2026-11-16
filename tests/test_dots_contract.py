@@ -122,6 +122,28 @@ class ContractTestCase(unittest.TestCase):
 
 @requires("jq")
 class UpdateHookTests(ContractTestCase):
+    def test_update_finishes_on_its_manager_and_reports_a_new_one(self) -> None:
+        # A packaged manager (no .git) that a stage upgraded: the newer one is
+        # first on PATH, the run keeps going on the old one, and Homebrew may
+        # not delete the old keg meanwhile.
+        shutil.rmtree(self.f.manager / ".git", ignore_errors=True)
+        (self.f.manager / "VERSION").write_text("0.3.0\n")
+        newer = self.f.base / "installs/dots/0.3.1"
+        shutil.copytree(self.f.manager, newer)
+        (newer / "VERSION").write_text("0.3.1\n")
+        out = self.f.base / "cleanup"
+        self.f.hook("update.d", "10-env", f'printf "%s %s" "$HOMEBREW_NO_INSTALL_CLEANUP" "$DOTS_HOME" > {out}\n')
+        result = self.f.update(PATH=f"{newer}/bin:{self.f.env['PATH']}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(out.read_text(), f"1 {self.f.manager}")
+        self.assertIn("== dots manager ==\ndots 0.3.0 -> 0.3.1, used from the next run.\nResult: completed", result.stdout)
+
+    def test_update_leaves_a_checkout_manager_alone(self) -> None:
+        (self.f.manager / ".git").mkdir(exist_ok=True)
+        result = self.f.update()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"== dots manager ==\ndots \S+ runs from a checkout; update it with git\.\n")
+
     def test_hooks_run_in_name_order_with_contract_environment_and_statuses(self) -> None:
         out = self.f.base / "out"
         out.mkdir()

@@ -22,11 +22,13 @@ else
     DOTS_HOME="$own_home"
 fi
 export DOTS_HOME
-source "$own_home/lib/dots-manager.sh"
 # Keep the bundled agent skill linked to this installation, so installing or
 # upgrading dots by any method updates the skill too. A run with another
 # DOTS_HOME (development, or a child of such a run) leaves the links alone.
-[[ "$DOTS_HOME" != "$own_home" ]] || dots_skill_refresh "$DOTS_HOME"
+if [[ -f "$own_home/lib/dots-manager.sh" ]]; then
+    source "$own_home/lib/dots-manager.sh"
+    [[ "$DOTS_HOME" != "$own_home" ]] || dots_skill_refresh "$DOTS_HOME"
+fi
 
 # Built-in commands always win over configuration commands of the same name.
 builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall help internal init "

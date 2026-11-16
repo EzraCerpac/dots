@@ -12,11 +12,11 @@ class Dots < Formula
   version "0.3.0"
   license "MIT"
 
-  # dots runs every command through mise, and its configuration sync needs
-  # Git 2.43 or newer, which macOS does not ship. Node.js, uv, jq and the
+  # The configuration sync needs Git 2.43 or newer, which macOS does not ship.
+  # dots also needs mise, which is not a dependency: most users run mise's own
+  # installer, which updates itself (see caveats). Node.js, uv, jq and the
   # other tools come from the user's mise configuration.
   depends_on "git"
-  depends_on "mise"
 
   on_macos do
     on_arm do
@@ -47,6 +47,9 @@ class Dots < Formula
 
   def caveats
     <<~EOS
+      dots runs everything through mise, which this formula does not install.
+      Install it from https://mise.jdx.dev, or with `brew install mise`.
+
       dots links its agent skill into ~/.claude/skills/dots and
       ~/.agents/skills/dots the first time it runs (set DOTS_SKILL_LINKS=0
       to opt out). After `brew uninstall dots`, remove those links:

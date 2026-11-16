@@ -57,5 +57,11 @@ class DotsHomeTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(other))
 
 
+    def test_a_missing_mise_is_named_in_one_line(self) -> None:
+        env = {**self.env, "PATH": "/usr/bin:/bin", "DOTS_MISE_BIN": str(self.home.parent / "no-mise")}
+        result = self.run_dots("status", env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.splitlines(), ["dots: mise is required but was not found; install it from https://mise.jdx.dev"])
+
 if __name__ == "__main__":
     unittest.main()

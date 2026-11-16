@@ -8,7 +8,7 @@ This repository, the manager, holds no personal settings and lives apart from th
 
 ## Requirements
 
-- mise with `mise bootstrap` and native dotfile history; the tests need 2026.9.7 or newer. No install method installs mise for you; `dots` stops with a message when it cannot find it.
+- mise with `mise bootstrap` and native dotfile history; 2026.11.8 or newer. No install method installs mise for you; `dots` stops with a message when it cannot find it.
 - Bash, Git 2.43 or newer, Node.js, [uv](https://docs.astral.sh/uv/) and jq.
 - [gitleaks](https://github.com/gitleaks/gitleaks) for `dots sync` and `dots publish`, and [age](https://age-encryption.org) for encrypted bundles and settings history.
 - [JJ](https://jj-vcs.github.io/jj/) only for `dots publish`, which runs in a colocated JJ workspace of the configuration repository, not in the live checkout.

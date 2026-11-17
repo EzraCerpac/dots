@@ -1451,6 +1451,86 @@ test('real mise applies a directory copy at its selected rendered variant destin
   assert(!fs.existsSync(path.join(a.home, '.variant-tree/skip')));
 });
 
+test('real mise preserves a competing file created inside the first takeover child', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  a.env.MISE_HISTORY_ENABLED = '1';
+  const config = read(f.a, 'config.toml');
+  const downstream = '"~/.consumer" = { mode = "template", source = "consumer.tera" }\n';
+  f.write(f.a, 'config.toml', config + '"~/.tree" = { source = "dir", mode = "copy" }\n' + downstream);
+  f.write(f.a, 'consumer.tera', '{{ "previous consumer" }}\n');
+  f.write(f.a, 'dir/leaf', 'original copy\n');
+  assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+  const target = path.join(a.home, '.tree/leaf'), saved = path.join(a.home, 'saved-leaf');
+  fs.renameSync(target, saved);
+  const next = config + '"~/.tree" = { source = "dir", mode = "copy", exclude = ["leaf"] }\n'
+    + downstream.replace('source = "consumer.tera"', 'source = "consumer.tera", depends = ["~/.tree/leaf"]');
+  const template = '"~/.tree/leaf" = { mode = "template", source = "takeover.tera", permissions = "0600" }\n';
+  f.write(f.a, 'config.toml', next + template);
+  const volatile = path.join(f.dir, 'handoff-volatile');
+  const cleanup = path.join(f.dir, 'handoff-cleanup-ran');
+  fs.writeFileSync(volatile, '');
+  f.write(f.a, 'takeover.tera', `{{ env.MISE_HISTORY_ENABLED }}:{{ read_file(path="handoff-value.txt") }}{{ read_file(path=${JSON.stringify(volatile)}) }}`);
+  f.write(f.a, 'handoff-value.txt', 'incoming template\n');
+  f.write(f.a, 'consumer.tera', '{{ "new consumer" }}\n');
+  const reloads = path.join(f.dir, 'handoff-reloads');
+  f.write(f.a, 'config.local.toml', '[history.reload]\n'
+    + `"~/.tree/leaf" = ${JSON.stringify(`cat "$HOME/.tree/leaf" >> '${reloads}'`)}\n`
+    + `"**/copy-handoff-*/output" = ${JSON.stringify(`echo stage >> '${reloads}'`)}\n`);
+
+  const shim = path.join(f.dir, 'mise-late-takeover'), marker = path.join(f.dir, 'native-child-ran');
+  fs.writeFileSync(shim, `#!/bin/sh
+set -eu
+if [ "\${3:-} \${4:-} \${5:-} \${6:-}" = 'bootstrap dotfiles apply --yes' ] && [ ! -f '${marker}' ]; then
+  for argument do
+    case "$argument" in
+      '~/.tree/leaf'|'${target}'|*/copy-handoff-*/output)
+        printf 'competing edit\\n' > '${target}'
+        touch '${marker}'
+        break ;;
+    esac
+  done
+fi
+if [ "\${3:-} \${4:-} \${5:-}" = 'bootstrap dotfiles unapply' ]; then
+  printf 'changed before cleanup' > '${volatile}'
+  touch '${cleanup}'
+fi
+exec '${f.miseBin}' "$@"
+`, { mode: 0o700 });
+  const result = a.sync({ miseBin: shim });
+  assert(fs.existsSync(marker), 'the native apply child must inject the competing file');
+  assert(fs.existsSync(cleanup), 'the native cleanup child must see a changed template input');
+  assert.equal(fs.readFileSync(target, 'utf8'), 'competing edit\n', result.text);
+  assert.match(result.text, /COPY KEPT: .*\.tree\/leaf: another file claimed the target/);
+  assert.match(result.text, /NOT APPLIED: ~\/\.consumer: dependency .*\.tree\/leaf was kept/);
+  assert.equal(read(a.home, '.consumer'), 'previous consumer\n');
+  assert(!fs.existsSync(reloads));
+  assert.match(a.sync().text, /would replace former directory copy/);
+  assert.equal(fs.readFileSync(saved, 'utf8'), 'original copy\n');
+
+  fs.renameSync(target, path.join(a.home, 'saved-competing'));
+  for (const unsupported of ['"~/.tree/leaf" = { mode = "symlink", source = "handoff-value.txt" }\n',
+    template.replace('permissions = "0600"', 'permissions = "0600", remove_empty = true')]) {
+    f.write(f.a, 'config.toml', next + unsupported);
+    assert.match(a.sync().text, /cannot safely stage this first takeover.*use a different target or restore the copy declaration/);
+    assert(!fs.existsSync(target));
+  }
+  f.write(f.a, 'config.toml', next + template);
+  fs.writeFileSync(volatile, '');
+  assert.doesNotMatch(a.sync({ miseBin: shim }).text, /COPY KEPT|APPLY FAILED|RELOAD FAILED/);
+  assert.equal(fs.readFileSync(target, 'utf8'), '1:incoming template\n');
+  assert.equal(fs.statSync(target).mode & 0o777, 0o600);
+  assert.equal(read(a.home, '.consumer'), 'new consumer\n');
+  assert.equal(fs.readFileSync(reloads, 'utf8'), '1:incoming template\n');
+  const nativeRecords = path.join(a.env.MISE_STATE_DIR, 'dotfiles', 'targets');
+  for (const entry of fs.readdirSync(nativeRecords)) assert.doesNotMatch(read(nativeRecords, entry), /copy-handoff-/);
+
+  f.write(f.a, 'handoff-value.txt', 'ordinary template update\n');
+  fs.writeFileSync(volatile, '');
+  assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED|RELOAD FAILED/);
+  assert.equal(fs.readFileSync(target, 'utf8'), '1:ordinary template update\n');
+  assert.equal(read(a.home, 'saved-competing'), 'competing edit\n');
+});
+
 test('real mise updates an applied directory from a pre-dotfiles source change', requires('git', 'jq', 'mise'), t => {
   const f = copiedFixture(t, { hooks: true }), a = f.machineA;
   const generated = path.join(f.dir, 'directory-input'), observed = path.join(f.dir, 'directory-post');

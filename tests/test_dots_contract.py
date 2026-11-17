@@ -65,9 +65,10 @@ print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(v
     exec)
         shift
         [[ "${1:-}" == -- ]] && shift
-        for argument in "$@"; do
-            if [[ "$argument" == */source-repo.mjs ]]; then
-                [[ -z "${FAKE_SYNC:-}" ]] || bash -c "$FAKE_SYNC"
+        for ((i = 1; i <= $#; i++)); do
+            if [[ "${!i}" == */source-repo.mjs ]]; then
+                # Keep any wrapper before node (env ...), so FAKE_SYNC sees sync's environment.
+                [[ -z "${FAKE_SYNC:-}" ]] || "${@:1:i-2}" bash -c "$FAKE_SYNC"
                 exit 0
             fi
         done
@@ -345,6 +346,17 @@ class UpdateHookTests(ContractTestCase):
         self.assertEqual(sum("source-repo.mjs sync" in call for call in calls), 1, calls)
         reexecs = [call for call in calls if call.endswith(f"exec -- bash {self.f.manager}/tasks/update")]
         self.assertEqual(len(reexecs), 1, calls)
+
+    def test_source_sync_keeps_the_callers_auto_install_for_the_hooks_it_applies(self) -> None:
+        # The apply's hooks may `mise x` a release the incoming configuration
+        # newly pins; setup_mise's MISE_AUTO_INSTALL=0 must not reach them.
+        sync = "echo \"dots sync: no local changes · auto-install=${MISE_AUTO_INSTALL-unset}\""
+        for caller, seen in ((None, "unset"), ("1", "1"), ("0", "0")):
+            with self.subTest(caller=caller):
+                result = self.f.update(DOTS_SOURCE_SYNC_DONE="0", FAKE_SYNC=sync,
+                                       **({"MISE_AUTO_INSTALL": caller} if caller else {}))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"auto-install={seen}\n", result.stdout)
 
     def test_update_continues_after_any_sync_outcome_and_repeats_attention(self) -> None:
         for name, script, attention in (

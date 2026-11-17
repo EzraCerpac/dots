@@ -221,7 +221,12 @@ if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
     if dots_up_event_sink_enabled; then
         start_event_stage source-sync 'Source & settings' 'Sync configuration' hidden
     fi
-    sync_output="$(setup_mise exec -- node "$DOTS_HOME/lib/source-repo.mjs" sync "$SETUP_ROOT" 2>&1)" || sync_result=$?
+    # setup_mise turns off auto-install for its own mise call only. Sync applies
+    # the incoming configuration, whose hooks may run a tool it newly pins with
+    # `mise x`, so sync keeps the caller's setting, as `dots sync` does.
+    restore=(-u MISE_AUTO_INSTALL)
+    [[ -z "${MISE_AUTO_INSTALL+set}" ]] || restore=("MISE_AUTO_INSTALL=$MISE_AUTO_INSTALL")
+    sync_output="$(setup_mise exec -- env "${restore[@]}" node "$DOTS_HOME/lib/source-repo.mjs" sync "$SETUP_ROOT" 2>&1)" || sync_result=$?
     printf '%s\n' "$sync_output"
     if [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
         (umask 077; printf '%s\n' "$sync_output" > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true

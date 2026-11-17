@@ -388,7 +388,8 @@ class UpdateHookTests(ContractTestCase):
         script = ("printf 'dots sync: no local changes · pulled dev +1, main +0 · nothing to push\\n"
                   "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply\\n"
                   "    mise $ dots internal persist-selected\\n    mise ERROR pre-dotfiles hook failed\\n"
-                  "  changed on disk: 1 file changed\\n  LATE EDIT: config.toml not updated; rerun\\n'")
+                  "  changed on disk: 1 file changed\\n  LATE EDIT: config.toml not updated; rerun\\n"
+                  "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots sync\\n'")
         result = subprocess.run(["bash", "-c", 'exec 3>>"$0"; exec bash "$1"', str(events), str(self.f.manager / "tasks/update")],
                                 cwd=self.f.config, env={**self.f.env, "SETUP_PROFILE": "laptop", "DOTS_SOURCE_SYNC_DONE": "0",
                                                         "DOTS_UP_EVENT_FD": "3", "FAKE_SYNC": script},
@@ -401,7 +402,8 @@ class UpdateHookTests(ContractTestCase):
         self.assertEqual(end["detail"], "mise $ dots internal persist-selected\nmise ERROR pre-dotfiles hook failed")
         notices = [e for e in parsed if e["kind"] == "notice" and e.get("stage") == "source-sync"]
         self.assertEqual([(e["summary"], e["detail"], e["action"]) for e in notices],
-                         [("LATE EDIT: config.toml not updated; rerun", "", "dots sync")])
+                         [("LATE EDIT: config.toml not updated; rerun", "", "dots sync"),
+                          ("APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots sync", "", "dots sync")])
         # The final summary repeats the attention line with the output under it.
         summary = result.stdout.split("Source sync needs attention:\n", 1)[1]
         self.assertTrue(summary.startswith("  APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), summary)

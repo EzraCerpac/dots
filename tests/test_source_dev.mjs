@@ -145,6 +145,18 @@ test('a clean checkout syncs as a no-op', available, t => {
   assert.equal(f.dev(f.a), before); assert.equal(f.remote(), before);
 });
 
+test('sync stops before snapshotting Git metadata stored inside the worktree', available, t => {
+  const f = fixture(t), before = f.remote();
+  const metadata = path.join(f.a, 'metadata');
+  git(f.a, 'init', '--separate-git-dir', metadata);
+  f.write(metadata, 'private-recovery', 'private bytes\n');
+  assert.match(git(f.a, 'status', '--porcelain'), /\?\? metadata\//);
+  const result = f.sync(f.a);
+  assert.equal(result.code, 0);
+  assert.match(result.text, /^dots sync: failed .*Git metadata at .*metadata is in the worktree; move it outside the worktree before rerunning sync$/);
+  assert.equal(f.remote(), before);
+});
+
 test('a local edit is shared and private files stay local', available, t => {
   const f = fixture(t);
   f.write(f.a, 'new', 'ordinary public edit\n');
@@ -908,8 +920,14 @@ exit 0
   assert.match(f.sync(f.a).text, INVALID_HERDR);
 });
 
-function copiedFixture(t, { hooks = false } = {}) {
+function copiedFixture(t, { hooks = false, linked = false } = {}) {
   const f = fixture(t), miseBin = miseBinary();
+  if (linked) {
+    git(f.a, 'switch', '--detach');
+    const worktree = path.join(f.dir, 'linked');
+    git(f.a, 'worktree', 'add', worktree, 'dev');
+    f.a = worktree;
+  }
   for (const key of Object.keys(process.env)) {
     if (key.startsWith('MISE_') || key.startsWith('__MISE_')) delete process.env[key];
   }
@@ -960,6 +978,49 @@ test('real mise captures a second edit while an incoming checkout stays blocked'
   }
 });
 
+test('real mise keeps a source saved just as capture replaces it', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  const source = path.join(f.a, 'copy.txt');
+  f.write(a.home, '.copied', 'deployed edit\n');
+  f.write(f.a, 'unrelated', 'share this too\n');
+  const rename = fs.renameSync;
+  let injected = false, result;
+  fs.renameSync = (from, to) => {
+    if (!injected && (from === source || to === source)) {
+      const saved = path.join(f.dir, 'editor-save');
+      fs.writeFileSync(saved, 'late editor save\n');
+      rename(saved, source);
+      injected = true;
+    }
+    return rename(from, to);
+  };
+  try { result = a.sync(); } finally { fs.renameSync = rename; }
+  assert(injected);
+  assert.equal(result.code, 0);
+  assert.equal(read(f.a, 'copy.txt'), 'late editor save\n', result.text);
+  assert.equal(read(a.home, '.copied'), 'deployed edit\n');
+  assert.match(result.text, /CAPTURE FAILED: .*copy\.txt: source changed before capture/);
+  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'late editor save');
+  assert.equal(git(f.origin, 'show', 'dev:unrelated'), 'share this too');
+
+  f.write(f.a, 'copy.txt', 'initial\n');
+  const fd = fs.openSync(source, 'r+'), link = fs.linkSync;
+  fs.linkSync = (from, to) => {
+    if (to === source && path.basename(from) === 'incoming') {
+      fs.ftruncateSync(fd, 0);
+      fs.writeSync(fd, 'late descriptor save\n');
+    }
+    return link(from, to);
+  };
+  try { result = a.sync(); } finally { fs.linkSync = link; fs.closeSync(fd); }
+  const recovery = result.text.match(/the displaced source was edited during capture; recover the previous source from (.*) and reconcile both versions/);
+  assert(recovery, result.text);
+  assert.equal(fs.readFileSync(recovery[1], 'utf8'), 'late descriptor save\n');
+  assert.equal(read(f.a, 'copy.txt'), 'deployed edit\n');
+  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'deployed edit');
+  assert.doesNotMatch(git(f.origin, 'log', '--format=', '--name-only', 'dev'), /\.dots-(copy|write)-/);
+});
+
 test('real mise leaves the source alone when it cannot record a capture', requires('git', 'jq', 'mise'), t => {
   const f = copiedFixture(t), a = f.machineA;
   const target = path.join(a.home, '.copied'), records = path.join(f.a, '.git/dots-copied.json');
@@ -980,27 +1041,66 @@ test('real mise leaves the source alone when it cannot record a capture', requir
   assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'edit to keep');
 });
 
-test('real mise retries capture after stopping between the record and source writes', requires('git', 'jq', 'mise'), t => {
-  const f = copiedFixture(t), a = f.machineA;
-  f.write(a.home, '.copied', 'interrupted copy edit\n');
-  const program = `import fs from 'node:fs';
+test('real mise retries interrupted capture before snapshot', requires('git', 'jq', 'mise'), async t => {
+  for (const afterMove of [false, true]) {
+    await t.test(afterMove ? 'after moving the source' : 'before moving the source', t => {
+      const f = copiedFixture(t), a = f.machineA;
+      f.write(a.home, '.copied', 'interrupted copy edit\n');
+      const program = `import fs from 'node:fs';
 import path from 'node:path';
 import { syncSource } from ${JSON.stringify(new URL('../lib/source-repo.mjs', import.meta.url).href)};
 const [root, expectedRemote, miseBin, gitleaks] = process.argv.slice(1);
 const rename = fs.renameSync;
 fs.renameSync = (from, to) => {
-  if (to === path.join(root, 'copy.txt')) process.exit(73);
+  if (from === path.join(root, 'copy.txt')) {
+    if (${afterMove}) rename(from, to);
+    process.exit(73);
+  }
   return rename(from, to);
 };
 process.exit(syncSource(root, { expectedRemote, miseBin, gitleaks }));
 `;
-  const stopped = spawnSync(process.execPath, ['--input-type=module', '-e', program, f.a, f.origin, f.miseBin, f.gitleaks],
-    { env: { ...process.env, ...a.env }, encoding: 'utf8' });
-  assert.equal(stopped.status, 73, stopped.stderr);
+      const stopped = spawnSync(process.execPath, ['--input-type=module', '-e', program, f.a, f.origin, f.miseBin, f.gitleaks],
+        { env: { ...process.env, ...a.env }, encoding: 'utf8' });
+      assert.equal(stopped.status, 73, stopped.stderr);
+      assert.equal(fs.existsSync(path.join(f.a, 'copy.txt')), !afterMove);
+      assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'initial');
+      assert.match(a.sync().text, /shared 1 file/);
+      assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'interrupted copy edit');
+      const commits = git(f.origin, 'log', '--format=', '--name-only', 'dev');
+      assert.doesNotMatch(commits, /\.dots-(copy|write)-/);
+      f.clean(f.a);
+    });
+  }
+});
+
+test('real mise keeps both copies when a linked worktree capture crosses devices', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t, { linked: true }), a = f.machineA;
+  const gitDir = git(f.a, 'rev-parse', '--absolute-git-dir');
+  const source = path.join(f.a, 'copy.txt');
+  f.write(a.home, '.copied', 'cross-device copy edit\n');
+  f.write(f.a, 'unrelated', 'still publish this\n');
+  const rename = fs.renameSync;
+  let injected = false, result;
+  fs.renameSync = (from, to) => {
+    if (from === source && to.startsWith(gitDir + path.sep)) {
+      injected = true;
+      throw Object.assign(new Error('injected EXDEV'), { code: 'EXDEV' });
+    }
+    return rename(from, to);
+  };
+  try { result = a.sync(); } finally { fs.renameSync = rename; }
+  assert(injected);
+  assert.equal(result.code, 0);
+  assert.equal(result.text.match(/^dots sync:/gm)?.length, 1);
+  assert.match(result.text, /CAPTURE FAILED: .*copy\.txt: Git metadata and the file are on different filesystems/);
   assert.equal(read(f.a, 'copy.txt'), 'initial\n');
+  assert.equal(read(a.home, '.copied'), 'cross-device copy edit\n');
+  assert.equal(git(f.origin, 'show', 'dev:unrelated'), 'still publish this');
+  assert(!fs.readdirSync(gitDir).some(name => /^\.dots-(copy|write)-|^index\.lock$/.test(name)));
   assert.match(a.sync().text, /shared 1 file/);
-  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'interrupted copy edit');
-  assert.doesNotMatch(git(f.origin, 'ls-tree', '-r', '--name-only', 'dev'), /\.dots-write-/);
+  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'cross-device copy edit');
+  assert.doesNotMatch(git(f.origin, 'log', '--format=', '--name-only', 'dev'), /\.dots-(copy|write)-/);
   f.clean(f.a);
 });
 
@@ -1134,7 +1234,8 @@ test('guarded copies run between real mise pre and post hooks', requires('git', 
 
 test('real mise sync installs hook-generated copy contents in the same run', requires('git', 'jq', 'mise'), t => {
   const f = copiedFixture(t, { hooks: true }), a = f.machineA;
-  let config = read(f.a, 'config.toml')
+  let config = read(f.a, 'config.toml').replace('source = "copy.txt", mode = "copy"',
+    'source = "copy.txt", mode = "copy", permissions = "0644"')
     + '"~/.pending-copy" = { source = "pending.txt", mode = "copy" }\n'
     + '"~/.kept-copy" = { source = "kept.txt", mode = "copy", create_if_missing = true }\n';
   f.write(f.a, 'pending.txt', 'initial\n');
@@ -1144,7 +1245,8 @@ test('real mise sync installs hook-generated copy contents in the same run', req
 
   const generated = path.join(f.dir, 'generated'), observation = path.join(f.dir, 'post-copy-contents');
   fs.writeFileSync(generated, 'generated by pre-hook\n');
-  const pre = `for source in copy.txt pending.txt kept.txt; do cat '${generated}' > "$source"; done`;
+  const pre = `for source in copy.txt pending.txt kept.txt; do cat '${generated}' > "$source"; done
+sed 's/permissions = "0644"/permissions = "0600"/' config.toml > '${generated}.config' && mv '${generated}.config' config.toml`;
   const post = `cat "$HOME/.copied" "$HOME/.pending-copy" "$HOME/.kept-copy" > '${observation}'`;
   config += `[bootstrap.hooks]\npre-dotfiles = ${JSON.stringify(pre)}\npost-dotfiles = ${JSON.stringify(post)}\n`;
   f.write(f.a, 'config.toml', config);
@@ -1156,6 +1258,7 @@ test('real mise sync installs hook-generated copy contents in the same run', req
 
   const target = path.join(a.home, '.copied');
   const before = fs.statSync(target, { bigint: true });
+  assert.equal(before.mode & 0o777n, 0o600n);
   const unchanged = a.sync();
   assert.doesNotMatch(unchanged.text, /previous copy of|APPLY FAILED|COPY KEPT/);
   const after = fs.statSync(target, { bigint: true });
@@ -1225,7 +1328,7 @@ test('real mise keeps both locally diverged files and reports a capture write fa
   const rename = fs.renameSync;
   let result;
   fs.renameSync = (from, to) => {
-    if (to === path.join(f.a, 'copy.txt')) throw new Error('injected copy write failure');
+    if (from === path.join(f.a, 'copy.txt')) throw new Error('injected copy write failure');
     return rename(from, to);
   };
   try { result = a.sync(); } finally { fs.renameSync = rename; }

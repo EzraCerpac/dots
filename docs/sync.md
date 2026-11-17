@@ -21,6 +21,9 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    Captures edits to regular copied files whose tracked source still matches the last common version.
    It remembers the captured version even if checkout is blocked.
    If both have changed, the source and deployed copy stay in place.
+   Capture uses the same guarded replacement as copy installation.
+   The previous source stays at the printed private path,
+   and an interrupted capture restores a missing source before snapshotting.
 2. Commits every tracked or unignored public file onto `dev` as `Save local setup (HOST)`.
    Machine-local files are always left out.
 3. Scans that commit with gitleaks. A flagged file stays on disk, unshared; the rest is shared.
@@ -48,6 +51,12 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    Mise runs the usual hooks and applies the other targets.
    It skips any copied target that still contains an edit and applies the other targets.
    If an incoming declaration replaces that copy, move the local file somewhere safe before applying the replacement.
+
+Capture and guarded installation within the worktree keep recovery files in
+that worktree's Git directory.
+If Git metadata and the file are on different filesystems,
+sync reports the affected path and preserves both versions.
+Use a checkout with Git metadata on the same filesystem to resume automatic capture.
 
 Commits pushed straight to `origin/dev` from a task worktree are fine: the next sync merges them.
 A `dev` moved with plumbing in another worktree of the live checkout is merged too, not reverted.

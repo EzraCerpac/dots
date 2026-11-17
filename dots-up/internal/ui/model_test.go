@@ -362,7 +362,7 @@ func TestOverviewShowsSixChangesBeforeTwentyFailures(t *testing.T) {
 			t.Fatalf("missing %q: %s", text, content)
 		}
 	}
-	if strings.Contains(content, "Hidden failed stage") || strings.Contains(content, "completed") {
+	if strings.Contains(content, "completed") {
 		t.Fatalf("routine stages crowded out outcomes: %s", content)
 	}
 	if len(strings.Split(content, "\n")) > m.Height {

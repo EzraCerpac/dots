@@ -65,9 +65,10 @@ print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(v
     exec)
         shift
         [[ "${1:-}" == -- ]] && shift
-        for argument in "$@"; do
-            if [[ "$argument" == */source-repo.mjs ]]; then
-                [[ -z "${FAKE_SYNC:-}" ]] || bash -c "$FAKE_SYNC"
+        for ((i = 1; i <= $#; i++)); do
+            if [[ "${!i}" == */source-repo.mjs ]]; then
+                # Keep any wrapper before node (env ...), so FAKE_SYNC sees sync's environment.
+                [[ -z "${FAKE_SYNC:-}" ]] || "${@:1:i-2}" bash -c "$FAKE_SYNC"
                 exit 0
             fi
         done
@@ -346,6 +347,17 @@ class UpdateHookTests(ContractTestCase):
         reexecs = [call for call in calls if call.endswith(f"exec -- bash {self.f.manager}/tasks/update")]
         self.assertEqual(len(reexecs), 1, calls)
 
+    def test_source_sync_keeps_the_callers_auto_install_for_the_hooks_it_applies(self) -> None:
+        # The apply's hooks may `mise x` a release the incoming configuration
+        # newly pins; setup_mise's MISE_AUTO_INSTALL=0 must not reach them.
+        sync = "echo \"dots sync: no local changes · auto-install=${MISE_AUTO_INSTALL-unset}\""
+        for caller, seen in ((None, "unset"), ("1", "1"), ("0", "0")):
+            with self.subTest(caller=caller):
+                result = self.f.update(DOTS_SOURCE_SYNC_DONE="0", FAKE_SYNC=sync,
+                                       **({"MISE_AUTO_INSTALL": caller} if caller else {}))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"auto-install={seen}\n", result.stdout)
+
     def test_update_continues_after_any_sync_outcome_and_repeats_attention(self) -> None:
         for name, script, attention in (
             ("stopped", "echo 'dots sync: stopped · HEAD is detached, not on dev. See docs'", "dots sync: stopped · HEAD is detached"),
@@ -362,27 +374,30 @@ class UpdateHookTests(ContractTestCase):
                 self.assertIn("Update report: completed; needs attention: source sync;", result.stdout)
 
 
-    def test_sync_attention_is_one_issue_that_carries_its_output(self) -> None:
+    def test_each_sync_attention_line_is_one_issue_with_its_output_and_command(self) -> None:
         import json
         events = self.f.base / "events"
         script = ("printf 'dots sync: no local changes · pulled dev +1, main +0 · nothing to push\\n"
                   "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply\\n"
-                  "    mise ERROR pre-dotfiles hook failed\\n  changed on disk: 1 file changed\\n'")
+                  "    mise $ dots internal persist-selected\\n    mise ERROR pre-dotfiles hook failed\\n"
+                  "  changed on disk: 1 file changed\\n  LATE EDIT: config.toml not updated; rerun\\n'")
         result = subprocess.run(["bash", "-c", 'exec 3>>"$0"; exec bash "$1"', str(events), str(self.f.manager / "tasks/update")],
                                 cwd=self.f.config, env={**self.f.env, "SETUP_PROFILE": "laptop", "DOTS_SOURCE_SYNC_DONE": "0",
                                                         "DOTS_UP_EVENT_FD": "3", "FAKE_SYNC": script},
                                 capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         parsed = [json.loads(line) for line in events.read_text().splitlines()]
-        self.assertEqual([e["summary"] for e in parsed if e["kind"] == "notice" and "sync" in e["summary"].lower()], [])
         end = next(e for e in parsed if e["kind"] == "stage_end" and e["id"] == "source-sync")
-        self.assertEqual(end["status"], "attention")
+        self.assertEqual((end["label"], end["status"], end["action"]), ("Sync configuration", "attention", "dots apply"))
         self.assertTrue(end["summary"].startswith("APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), end)
-        self.assertIn("docs/sync.md", end["action"])
+        self.assertEqual(end["detail"], "mise $ dots internal persist-selected\nmise ERROR pre-dotfiles hook failed")
+        notices = [e for e in parsed if e["kind"] == "notice" and e.get("stage") == "source-sync"]
+        self.assertEqual([(e["summary"], e["detail"], e["action"]) for e in notices],
+                         [("LATE EDIT: config.toml not updated; rerun", "", "dots sync")])
         # The final summary repeats the attention line with the output under it.
         summary = result.stdout.split("Source sync needs attention:\n", 1)[1]
         self.assertTrue(summary.startswith("  APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), summary)
-        self.assertIn("\n    mise ERROR pre-dotfiles hook failed\nNext: fix what the sync output says", summary)
+        self.assertIn("\n    mise ERROR pre-dotfiles hook failed\n  LATE EDIT", summary)
         self.assertNotIn("changed on disk", summary)
 
     def test_failed_and_deferred_stages_carry_their_output_in_plain_mode(self) -> None:

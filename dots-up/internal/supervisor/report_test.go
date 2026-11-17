@@ -125,13 +125,14 @@ func TestReportHighlightsCarryEachIssuesOutputLogAndNextStep(t *testing.T) {
 	var b strings.Builder
 	printReportHighlights(&b, Report{Events: []ui.Event{
 		{V: 1, Kind: "stage_start", ID: "Breaks", Label: "Breaks"},
-		{V: 1, Kind: "stage_end", ID: "Breaks", Status: "failed", Summary: "failed (exit 7)", Action: "Fix the error at the end of its output, then run dots up again", LogPath: log},
-	}})
+		{V: 1, Kind: "stage_end", ID: "Breaks", Status: "failed", Summary: "failed (exit 7)", Action: "Fix the error above, then run dots up", LogPath: log},
+	}}, dir)
 	for _, want := range []string{
-		"  Failed: Breaks — failed (exit 7)",
-		"    boom: disk full",
-		"  Full log: " + log,
-		"  Next: Fix the error at the end of its output, then run dots up again",
+		"    × Breaks — failed (exit 7)",
+		"        step one",
+		"        boom: disk full",
+		"        Next: Fix the error above, then run dots up",
+		"        Log: " + log,
 	} {
 		if !strings.Contains(b.String(), want+"\n") {
 			t.Fatalf("highlights lack %q:\n%s", want, b.String())

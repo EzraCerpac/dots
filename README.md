@@ -131,8 +131,8 @@ Run `dots help` for the full list with examples.
 In a terminal, `dots` alone opens a menu of the same commands.
 `--plain`, `--verbose` and `--no-wait` before a command choose how its output is shown, for example `dots --plain status`.
 
-Every step that fails or needs attention is one issue.
-Its details, in the dashboard, in `--plain` output and in the final report, show the end of the step's output, the path of its full log (under `~/.local/state/dots/`) and the next step where `dots` knows one.
+Every problem is one issue, listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
+Under it stand the last lines of the error, the command to run next and the path of the step's full log (under `~/.local/state/dots/`).
 In the dashboard, `A` on an issue hands it to a coding agent once the run has finished: `dots` suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument, for example `export DOTS_AGENT_COMMAND=claude` or `DOTS_AGENT_COMMAND=codex`.
 Without it, `A` says how to set it.
 

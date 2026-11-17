@@ -329,7 +329,9 @@ test('only pushes that keep losing the race say dev kept moving', available, t =
 test('a failed apply carries the output that explains it', available, t => {
   const f = fixture(t);
   f.write(f.b, 'remote', 'from b\n'); f.sync(f.b);
-  process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found';
+  // mise's footer (version, --verbose hint) is left out.
+  process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found\n'
+    + 'mise ERROR Version: 2026.11.9 macos-arm64 (2026-11-16)\nmise ERROR Run with --verbose or MISE_VERBOSE=1 for more information';
   const { text } = f.sync(f.a);
   assert.match(text, /\n {2}APPLY FAILED: mise bootstrap dotfiles apply \(exit 1\); fix the error below, then run dots apply\n {4}applying 3 dotfiles\n {4}mise ERROR pre-dotfiles hook failed: github:EzraCerpac\/dots@0\.3\.1 not found$/);
 });
@@ -772,7 +774,7 @@ test('upgrading an older host with real mise', requires('git', 'jq', 'mise'), as
         assert.doesNotMatch(text, /APPLY FAILED/);
         assert.equal(read(f.a, 'config.local.toml'), KEPT);
       } else {
-        assert.match(text, /\n {2}INVALID merged config: [^\n]*sources do not exist[^\n]*; nothing pushed or applied\n {4} *\[dotfiles\]\."~\/\.config\/herdr\/config\.toml": [^\n]*templates\/herdr\.tera\n/);
+        assert.match(text, /\n {2}INVALID merged config: [^\n]*sources do not exist[^\n]*; nothing pushed or applied\n {4} *\[dotfiles\]\."~\/\.config\/herdr\/config\.toml": [^\n]*templates\/herdr\.tera(\n|$)/);
         assert.equal(read(f.a, 'config.local.toml'), KEPT + HERDR);
         assert(fs.existsSync(path.join(f.a, 'templates/herdr.tera')));
       }

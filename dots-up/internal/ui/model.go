@@ -26,8 +26,8 @@ var (
 
 type Change struct{ Item, Before, After, Action string }
 type Stage struct {
-	ID, Group, Label, Terminal, Status, Summary, Action, LogPath string
-	Changes                                                      []Change
+	ID, Group, Label, Terminal, Status, Summary, Action, Detail, LogPath string
+	Changes                                                              []Change
 }
 
 type Model struct {
@@ -83,7 +83,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.WindowSizeMsg:
 		m.Width, m.Height = max(1, v.Width), max(1, v.Height)
-		m.resize()
+		m.refreshDetail() // issue lines wrap to the width
 	case tea.KeyPressMsg:
 		if m.Searching {
 			switch v.String() {
@@ -303,6 +303,7 @@ func (m *Model) apply(e Event) {
 		e.Group = "Source & settings"
 	}
 	e.Item, e.Before, e.After = cleanLine(e.Item), cleanLine(e.Before), cleanLine(e.After)
+	e.Detail = sanitizeLog(e.Detail)
 	switch e.Kind {
 	case "run_start":
 		m.RunID, m.Profile, m.Host, m.Running = e.ID, e.Profile, e.Host, true
@@ -354,7 +355,7 @@ func (m *Model) apply(e Event) {
 	case "stage_end":
 		if i := m.stageIndex(e.ID); i >= 0 {
 			s := &m.Stages[i]
-			s.Status, s.Summary, s.Action = e.Status, e.Summary, e.Action
+			s.Status, s.Summary, s.Action, s.Detail = e.Status, e.Summary, e.Action, e.Detail
 			if p := safeLogPath(m.StateDir, e.LogPath); p != "" {
 				s.LogPath = p
 			}
@@ -691,10 +692,10 @@ func searchLog(path, query string) string {
 func (m Model) overview() bool { return !m.DetailFocus && !m.ShowLog && !m.RawLog }
 
 type issue struct {
-	key                   string
-	stage                 int
-	text, action, logPath string
-	notice                bool
+	key                           string
+	stage                         int
+	text, detail, action, logPath string
+	notice                        bool
 }
 
 func (m Model) issues() []issue {
@@ -712,7 +713,7 @@ func (m Model) issues() []issue {
 		if s.Summary != "" {
 			text += " — " + s.Summary
 		}
-		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, action: s.Action, logPath: s.LogPath})
+		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, detail: s.Detail, action: s.Action, logPath: s.LogPath})
 		if s.Summary != "" {
 			seen[strings.ToLower(s.Summary)] = true
 		}
@@ -725,21 +726,16 @@ func (m Model) issues() []issue {
 		if seen[key] {
 			continue
 		}
-		if n.Stage != "" {
-			if i := m.stageIndex(n.Stage); i >= 0 && (m.Stages[i].Status == "attention" || m.Stages[i].Status == "failed") {
-				continue
-			}
-		}
 		seen[key] = true
 		prefix := "!"
 		if n.Severity == "error" {
 			prefix = "×"
 		}
-		logPath := ""
+		text, logPath, stage := n.Summary, "", -1
 		if i := m.stageIndex(n.Stage); n.Stage != "" && i >= 0 {
-			logPath = m.Stages[i].LogPath
+			text, logPath, stage = m.Stages[i].Label+" — "+n.Summary, m.Stages[i].LogPath, i
 		}
-		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: -1, text: prefix + " " + n.Summary, action: n.Action, logPath: logPath, notice: true})
+		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
 	}
 	return result
 }
@@ -760,10 +756,7 @@ func (m Model) overviewContent() string {
 		b.WriteString("  None\n")
 	}
 	for _, item := range issues {
-		b.WriteString(item.text + "\n")
-		if item.action != "" {
-			b.WriteString("    Next: " + item.action + "\n")
-		}
+		b.WriteString(m.issueDetail(item) + "\n")
 	}
 	changes := 0
 	for _, stage := range m.Stages {

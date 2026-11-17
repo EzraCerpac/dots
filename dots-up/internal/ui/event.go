@@ -16,6 +16,7 @@ type Event struct {
 	ExitCode   int    `json:"exit_code,omitempty"`
 	Summary    string `json:"summary,omitempty"`
 	Action     string `json:"action,omitempty"`
+	Detail     string `json:"detail,omitempty"` // the output lines that explain an issue
 	Stage      string `json:"stage,omitempty"`
 	Item       string `json:"item,omitempty"`
 	Before     string `json:"before,omitempty"`

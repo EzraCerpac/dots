@@ -1373,6 +1373,117 @@ test('real mise keeps dependents when every guarded copy is blocked', requires('
   assert.equal(read(a.home, '.rendered'), 'initial\n');
 });
 
+test('real mise applies an independent template at an excluded directory leaf', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  const config = read(f.a, 'config.toml')
+    + '"~/.tree" = { source = "dir", mode = "copy", exclude = ["custom"] }\n'
+    + '"~/.tree/custom" = { source = "child.tera", mode = "template" }\n';
+  f.write(f.a, 'config.toml', config);
+  f.write(f.a, 'dir/general', 'copied\n');
+  f.write(f.a, 'dir/custom', 'excluded\n');
+  f.write(f.a, 'child.tera', '{{ "native child" }}\n');
+  a.deploy();
+  assert.equal(read(a.home, '.tree/general'), 'copied\n');
+  assert.equal(read(a.home, '.tree/custom'), 'native child\n');
+  f.write(f.a, 'child.tera', '{{ "sync child" }}\n');
+  const result = a.sync();
+  assert.equal(read(a.home, '.tree/custom'), 'sync child\n', result.text);
+  assert.equal(read(a.home, '.tree/general'), 'copied\n');
+  f.write(f.a, 'config.toml', config.replace(', exclude = ["custom"]', ''));
+  assert.match(a.sync().text, /INVALID merged config/);
+  assert.equal(read(a.home, '.tree/custom'), 'sync child\n');
+});
+
+test('real mise protects a former directory leaf from native takeover', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t, { hooks: true }), a = f.machineA;
+  const config = read(f.a, 'config.toml');
+  f.write(f.a, 'config.toml', config + '"~/.tree" = { source = "dir", mode = "copy" }\n');
+  f.write(f.a, 'dir/leaf', 'deployed\n');
+  f.write(f.a, 'dir/sibling', 'initial\n');
+  assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+  f.write(a.home, '.tree/leaf', 'local edit\n');
+  const excluded = config + '"~/.tree" = { source = "dir", mode = "copy", exclude = ["leaf"] }\n';
+  f.write(f.a, 'config.toml', excluded + '"~/.tree/leaf" = { mode = "absent" }\n');
+  f.write(f.a, 'dir/sibling', 'independent update\n');
+  const kept = a.sync();
+  assert.match(kept.text, /COPY KEPT: .*\.tree\/leaf: would replace former directory copy .*move that file somewhere safe/);
+  assert.equal(read(a.home, '.tree/leaf'), 'local edit\n');
+  assert.equal(read(a.home, '.tree/sibling'), 'independent update\n');
+
+  fs.renameSync(path.join(a.home, '.tree/leaf'), path.join(a.home, 'recovered'));
+  const late = path.join(f.dir, 'late-recreation');
+  const pre = `if test -f '${late}'; then cat '${late}' > "$HOME/.tree/leaf"; fi`;
+  f.write(f.a, 'config.toml', excluded + '"~/.tree/leaf" = { mode = "template", source = "takeover.tera" }\n'
+    + `[bootstrap.hooks]\npre-dotfiles = ${JSON.stringify(pre)}\n`);
+  f.write(f.a, 'takeover.tera', '{{ "template" }}\n');
+  fs.writeFileSync(late, 'late recreation\n');
+  assert.match(a.sync().text, /COPY KEPT: .*\.tree\/leaf: former directory copy .*reappeared/);
+  assert.equal(read(a.home, '.tree/leaf'), 'late recreation\n');
+  fs.renameSync(path.join(a.home, '.tree/leaf'), path.join(a.home, 'recovered-late'));
+  fs.rmSync(late);
+  for (const value of ['first template', 'second template']) {
+    f.write(f.a, 'takeover.tera', `{{ ${JSON.stringify(value)} }}\n`);
+    assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+    assert.equal(read(a.home, '.tree/leaf'), `${value}\n`);
+  }
+  assert.equal(read(a.home, 'recovered'), 'local edit\n');
+  assert.equal(read(a.home, 'recovered-late'), 'late recreation\n');
+});
+
+test('real mise applies a directory copy at its selected rendered variant destination', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  a.env.MISE_ENV = 'selected';
+  f.write(f.a, 'config.toml', read(f.a, 'config.toml')
+    + '"~/.declaration-key" = { source = "./dir", mode = "copy", exclude = ["skip"], variants = [{ profile = "selected", target = "{{ env.HOME }}/.variant-tree" }] }\n');
+  f.write(f.a, 'dir/leaf', 'native variant\n');
+  f.write(f.a, 'dir/skip', 'excluded\n');
+  a.deploy();
+  assert.equal(read(a.home, '.variant-tree/leaf'), 'native variant\n');
+  assert(!fs.existsSync(path.join(a.home, '.declaration-key')));
+  // Establish the initial directory in the public tree without giving dots
+  // a deployment record for the copy that mise installed directly.
+  git(f.a, 'add', 'config.toml', 'dir');
+  git(f.a, 'commit', '-qm', 'Declare a rendered variant destination');
+  git(f.a, 'push', '-q', 'origin', 'dev');
+  f.write(f.a, 'dir/leaf', 'sync variant\n');
+  const result = a.sync();
+  assert.equal(read(a.home, '.variant-tree/leaf'), 'sync variant\n', result.text);
+  assert(!fs.existsSync(path.join(a.home, '.variant-tree/skip')));
+});
+
+test('real mise updates an applied directory from a pre-dotfiles source change', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t, { hooks: true }), a = f.machineA;
+  const generated = path.join(f.dir, 'directory-input'), observed = path.join(f.dir, 'directory-post');
+  const edit = path.join(f.dir, 'directory-edit');
+  const pre = `cat '${generated}' > dir/leaf
+if test -f '${edit}'; then cat '${edit}' > "$HOME/.tree/leaf"; fi`;
+  const post = `cat "$HOME/.tree/leaf" > '${observed}'`;
+  f.write(f.a, 'config.toml', read(f.a, 'config.toml') + '"~/.tree" = { source = "dir", mode = "copy" }\n'
+    + `[bootstrap.hooks]\npre-dotfiles = ${JSON.stringify(pre)}\npost-dotfiles = ${JSON.stringify(post)}\n`);
+  f.write(f.a, 'dir/leaf', 'initial\n');
+  fs.writeFileSync(generated, 'native generated\n');
+  a.deploy();
+  assert.equal(fs.readFileSync(observed, 'utf8'), 'native generated\n');
+
+  fs.writeFileSync(generated, 'sync generated\n');
+  const result = a.sync();
+  assert.equal(fs.readFileSync(observed, 'utf8'), 'sync generated\n', result.text);
+  const leaf = path.join(a.home, '.tree/leaf');
+  const before = fs.statSync(leaf, { bigint: true });
+  const unchanged = a.sync();
+  assert.doesNotMatch(unchanged.text, /previous copy of .*\.tree|COPY KEPT|APPLY FAILED/);
+  const after = fs.statSync(leaf, { bigint: true });
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.mtimeNs, before.mtimeNs);
+
+  fs.writeFileSync(generated, 'next source\n');
+  fs.writeFileSync(edit, 'late target edit\n');
+  assert.match(a.sync().text, /COPY KEPT: .*\.tree\/leaf/);
+  assert.equal(read(a.home, '.tree/leaf'), 'late target edit\n');
+  assert.equal(read(f.a, 'dir/leaf'), 'next source\n');
+  assert.equal(fs.readFileSync(observed, 'utf8'), 'late target edit\n');
+});
+
 test('real mise adopts directory bytes without treating Git archive permissions as deployed', requires('git', 'jq', 'mise'), t => {
   const f = copiedFixture(t), a = f.machineA;
   f.write(f.a, 'config.toml', read(f.a, 'config.toml') + '"~/.tree" = { source = "dir", mode = "copy" }\n');

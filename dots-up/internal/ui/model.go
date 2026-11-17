@@ -731,11 +731,11 @@ func (m Model) issues() []issue {
 		if n.Severity == "error" {
 			prefix = "×"
 		}
-		text, logPath := n.Summary, ""
+		text, logPath, stage := n.Summary, "", -1
 		if i := m.stageIndex(n.Stage); n.Stage != "" && i >= 0 {
-			text, logPath = m.Stages[i].Label+" — "+n.Summary, m.Stages[i].LogPath
+			text, logPath, stage = m.Stages[i].Label+" — "+n.Summary, m.Stages[i].LogPath, i
 		}
-		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: -1, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
+		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
 	}
 	return result
 }

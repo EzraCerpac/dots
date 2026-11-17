@@ -16,6 +16,24 @@ function run(bin, args, cwd, options = {}) {
 }
 const git = (cwd, ...args) => run('git', args, cwd);
 const read = (root, file) => fs.readFileSync(path.join(root, file), 'utf8');
+function failIndexInstall(root, sync, afterCheckout = () => {}) {
+  const index = path.join(git(root, 'rev-parse', '--absolute-git-dir'), 'index');
+  const rename = fs.renameSync;
+  let injected = false, result;
+  fs.renameSync = (from, to) => {
+    if (from === `${index}.lock` && to === index) {
+      afterCheckout();
+      injected = true;
+      throw new Error('injected index installation failure');
+    }
+    return rename(from, to);
+  };
+  try { result = sync(); } finally { fs.renameSync = rename; }
+  assert(injected);
+  assert.equal(result.code, 0);
+  assert.match(result.text, /NOT APPLIED: injected index installation failure; checkout pending/);
+  return result;
+}
 
 // Flags any added line containing FAKE_SECRET, reported like gitleaks' JSON.
 const FAKE_GITLEAKS = `#!/usr/bin/env node
@@ -61,6 +79,7 @@ function fixture(t) {
 set -eu
 case "$*" in
   *'dotfiles paths --json'*) if [ -n "\${DEV_TEST_PATHS:-}" ]; then echo "$DEV_TEST_PATHS"; else echo '{"entries": []}'; fi ;;
+  *'dotfiles status --json'*) echo '{"files": [], "edits": []}' ;;
   *'.encrypt'*) exit 1 ;;
   *'dotfiles save'*)
     if [ -n "\${DEV_TEST_SAVE_FAIL:-}" ]; then echo "$DEV_TEST_SAVE_FAIL" >&2; exit 1; fi
@@ -340,7 +359,7 @@ test('a failed save carries the output that explains it', available, t => {
   const f = fixture(t);
   process.env.DEV_TEST_SAVE_FAIL = 'mise ERROR cannot read ~/.config/app/state.json';
   const { text } = f.sync(f.a);
-  assert.match(text, /\n {2}SAVE FAILED: mise bootstrap dotfiles save \(exit 1\); copied dotfiles not captured\n {4}mise ERROR cannot read ~\/\.config\/app\/state\.json(\n|$)/);
+  assert.match(text, /\n {2}SAVE FAILED: mise bootstrap dotfiles save \(exit 1\); tracked history not saved\n {4}mise ERROR cannot read ~\/\.config\/app\/state\.json(\n|$)/);
 });
 
 test('a push retry merges main again over a racing dev change to the same hunk', available, t => {
@@ -482,6 +501,150 @@ test('a failed index install releases the index lock and leaves dev alone', avai
   assert(!fs.existsSync(path.join(f.a, '.git/index.lock')), 'the index lock is released');
   assert.equal(f.dev(f.a), before);
   assert.equal(git(f.a, 'status', '--porcelain'), 'M text');
+});
+
+test('post-checkout index failure in a linked worktree retries without publishing a snapshot', available, t => {
+  const f = fixture(t), before = f.dev(f.a);
+  const linked = path.join(f.dir, 'linked');
+  git(f.a, 'switch', '-q', 'main');
+  git(f.a, 'worktree', 'add', '-q', linked, 'dev');
+  const gitDir = git(linked, 'rev-parse', '--absolute-git-dir');
+  const mainIndex = fs.readFileSync(path.join(f.a, '.git/index'));
+  f.write(f.b, 'text', 'incoming\n');
+  f.write(f.b, 'incoming', 'new file\n');
+  assert.match(f.sync(f.b).text, /pushed/);
+  const published = f.remote();
+  const result = failIndexInstall(linked, () => f.sync(linked), () => {
+    assert.equal(read(linked, 'text'), 'incoming\n', 'inject after checkout has written');
+  });
+  assert.equal(result.text.match(/^dots sync: /gm).length, 1);
+  assert.match(result.text, /NOT APPLIED: injected index installation failure; checkout pending, rerun sync/);
+  assert.equal(f.dev(linked), before);
+  assert(!fs.existsSync(path.join(gitDir, 'index.lock')));
+  const lock = path.join(gitDir, 'index.lock');
+  fs.writeFileSync(lock, '');
+  const held = f.sync(linked);
+  assert(held.text.includes(`Git index is locked (${path.relative(linked, lock)}); finish any active Git operation, or remove that lock`), held.text);
+  assert(fs.existsSync(lock));
+  fs.rmSync(lock);
+  const retry = f.sync(linked);
+  assert.match(retry.text, /^dots sync: no local changes .* nothing to push/);
+  assert.equal(f.dev(linked), published);
+  assert.equal(f.remote(), published);
+  assert.equal(read(linked, 'incoming'), 'new file\n');
+  assert.deepEqual(fs.readFileSync(path.join(f.a, '.git/index')), mainIndex);
+  f.clean(linked);
+});
+
+test('a ref update failure after checkout and index install retries the same commit', available, t => {
+  const f = fixture(t), before = f.dev(f.a);
+  f.write(f.b, 'text', 'incoming\n');
+  f.sync(f.b);
+  const published = f.remote(), lock = path.join(f.a, '.git/refs/heads/dev.lock');
+  fs.writeFileSync(lock, '');
+  const { code, text } = f.sync(f.a);
+  assert.equal(code, 0);
+  assert.match(text, /NOT APPLIED: could not update dev/);
+  assert.equal(f.dev(f.a), before);
+  assert.equal(git(f.a, 'write-tree'), git(f.a, 'rev-parse', 'origin/dev^{tree}'));
+  fs.rmSync(lock);
+  assert.match(f.sync(f.a).text, /^dots sync: no local changes .* nothing to push/);
+  assert.equal(f.dev(f.a), published);
+  assert.equal(f.remote(), published);
+  f.clean(f.a);
+});
+
+test('a partial checkout retries without publishing incoming files as local edits', available, t => {
+  const f = fixture(t), before = f.dev(f.a);
+  f.write(f.b, '.gitattributes', 'z-filtered filter=fixture\n');
+  f.write(f.b, ' a-first', 'incoming first\n');
+  f.write(f.b, 'z-filtered', 'incoming last\n');
+  f.sync(f.b);
+  const published = f.remote();
+  git(f.a, 'config', 'filter.fixture.required', 'true');
+  git(f.a, 'config', 'filter.fixture.clean', 'cat');
+  // The incoming preview also runs smudge through git archive. Fail only
+  // while checkout is running against sync's temporary index.
+  git(f.a, 'config', 'filter.fixture.smudge', 'case "$GIT_INDEX_FILE" in */dots-index-*/index) exit 1 ;; *) cat ;; esac');
+  const { code, text } = f.sync(f.a);
+  assert.equal(code, 0);
+  assert.match(text, /NOT APPLIED: .*checkout pending/);
+  assert.equal(read(f.a, ' a-first'), 'incoming first\n');
+  assert(!fs.existsSync(path.join(f.a, 'z-filtered')));
+  assert.equal(f.dev(f.a), before);
+  git(f.a, 'config', 'filter.fixture.smudge', 'cat');
+  assert.match(f.sync(f.a).text, /^dots sync: no local changes .* nothing to push/);
+  assert.equal(f.dev(f.a), published);
+  assert.equal(f.remote(), published);
+  assert.equal(read(f.a, 'z-filtered'), 'incoming last\n');
+  f.clean(f.a);
+});
+
+test('incoming tracking preserves ignored obstructions while unrelated edits are shared', available, async t => {
+  for (const shape of ['file', 'directory', 'symlink parent', 'ignored child']) {
+    await t.test(shape, t => {
+      const f = fixture(t);
+      const incoming = shape === 'symlink parent' ? 'collision/item' : 'collision';
+      const blocked = shape === 'ignored child' ? 'collision/private' : 'collision';
+      if (shape === 'ignored child') {
+        f.write(f.b, 'collision/public', 'tracked child\n'); f.sync(f.b); f.sync(f.a);
+        fs.rmSync(path.join(f.b, 'collision'), { recursive: true });
+      }
+      f.write(f.a, '.git/info/exclude', `/${blocked}\n`);
+      if (shape === 'symlink parent') fs.symlinkSync('missing', path.join(f.a, blocked));
+      else if (shape === 'directory') fs.mkdirSync(path.join(f.a, blocked));
+      else f.write(f.a, blocked, 'local only\n');
+      f.write(f.b, incoming, 'incoming\n');
+      git(f.b, 'add', '-A'); git(f.b, 'commit', '-qm', 'Start tracking'); git(f.b, 'push', '-q', 'origin', 'dev');
+      f.write(f.a, 'unrelated', 'share this\n');
+      const { code, text } = f.sync(f.a);
+      assert.equal(code, 0);
+      assert(text.includes(`BLOCKED PATH: ${blocked} obstructs an incoming tracked path; move it aside, rerun sync`), text);
+      assert.equal(git(f.origin, 'show', 'dev:unrelated'), 'share this');
+      if (shape === 'symlink parent') assert.equal(fs.readlinkSync(path.join(f.a, blocked)), 'missing');
+      else if (shape === 'directory') assert(fs.lstatSync(path.join(f.a, blocked)).isDirectory());
+      else assert.equal(read(f.a, blocked), 'local only\n');
+      fs.renameSync(path.join(f.a, blocked), path.join(f.dir, 'kept'));
+      assert.match(f.sync(f.a).text, /pulled/);
+      assert.equal(read(f.a, incoming), 'incoming\n');
+      f.clean(f.a);
+    });
+  }
+});
+
+test('a case-only tracked rename can advance', available, t => {
+  const f = fixture(t);
+  // An intermediate name avoids Git case-folding the entry when staging.
+  git(f.b, 'mv', 'text', 'intermediate');
+  git(f.b, 'mv', 'intermediate', 'Text');
+  git(f.b, 'commit', '-qm', 'Change case');
+  git(f.b, 'push', '-q', 'origin', 'dev');
+  const { code, text } = f.sync(f.a);
+  assert.equal(code, 0);
+  assert.match(text, /pulled dev \+1/);
+  assert.doesNotMatch(text, /BLOCKED PATH/);
+  assert.deepEqual(fs.readdirSync(f.a).filter(name => name.toLowerCase() === 'text'), ['Text']);
+  assert.equal(f.dev(f.a), f.remote());
+  f.clean(f.a);
+});
+
+test('a case-only rename retries without publishing the incoming path as a deletion', available, t => {
+  const f = fixture(t);
+  const original = read(f.b, 'text');
+  for (const [from, to, expected] of [['text', 'Text', original], ['Text', 'text', 'incoming new contents\n']]) {
+    git(f.b, 'mv', from, 'intermediate');
+    f.write(f.b, 'intermediate', expected);
+    git(f.b, 'mv', 'intermediate', to);
+    git(f.b, 'commit', '-qam', 'Change case');
+    git(f.b, 'push', '-q', 'origin', 'dev');
+    const published = f.remote();
+    failIndexInstall(f.a, () => f.sync(f.a));
+    assert.match(f.sync(f.a).text, /^dots sync: no local changes .* nothing to push/);
+    assert.equal(f.remote(), published);
+    assert.equal(f.dev(f.a), published);
+    assert.equal(read(f.a, to), expected);
+    f.clean(f.a);
+  }
 });
 
 test('local edits are not reported saved when dev or the index cannot be recorded', available, t => {
@@ -743,6 +906,215 @@ exit 0
   assert.equal(read(f.a, 'config.local.toml'), local + VARIANT);
   assert(!fs.existsSync(path.join(f.a, '.git/dots-retired')));
   assert.match(f.sync(f.a).text, INVALID_HERDR);
+});
+
+function copiedFixture(t) {
+  const f = fixture(t), miseBin = miseBinary();
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('MISE_') || key.startsWith('__MISE_')) delete process.env[key];
+  }
+  const machine = (root, name) => {
+    const local = path.join(f.dir, name), home = path.join(local, 'home'), system = path.join(local, 'system');
+    fs.mkdirSync(home, { recursive: true }); fs.mkdirSync(system);
+    const env = { HOME: home, MISE_CONFIG_DIR: root, MISE_DATA_DIR: path.join(local, 'data'), MISE_STATE_DIR: path.join(local, 'state'),
+      MISE_CACHE_DIR: path.join(local, 'cache'), MISE_SYSTEM_CONFIG_DIR: system, MISE_TRUSTED_CONFIG_PATHS: root,
+      MISE_CEILING_PATHS: fs.realpathSync(os.tmpdir()), MISE_AUTO_INSTALL: '0', MISE_NO_HOOKS: '1', MISE_AUTO_UPDATE: '0' };
+    return {
+      home,
+      sync: () => { Object.assign(process.env, env); return f.sync(root, { miseBin }); },
+    };
+  };
+  const a = machine(f.a, 'machine-a'), b = machine(f.b, 'machine-b');
+  f.write(f.a, 'config.toml', '[dotfiles]\n"~/.copied" = { source = "copy.txt", mode = "copy" }\n'
+    + '"~/.linked" = { source = "link.txt", mode = "symlink" }\n'
+    + '"~/.rendered" = { source = "template.tera", mode = "template" }\n');
+  f.write(f.a, 'copy.txt', 'initial\n');
+  f.write(f.a, 'link.txt', 'linked\n');
+  f.write(f.a, 'template.tera', '{{ "rendered" }}\n');
+  for (const m of [a, b]) {
+    const result = m.sync();
+    assert.equal(result.code, 0);
+    assert(fs.existsSync(path.join(m.home, '.copied')), result.text);
+    assert.equal(read(m.home, '.copied'), 'initial\n', result.text);
+  }
+  return { ...f, machineA: a, machineB: b };
+}
+
+test('real mise copies converge with one sync per machine for each edit', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA, b = f.machineB;
+  for (const content of ['first edit\n', 'second edit\n']) {
+    f.write(a.home, '.copied', content);
+    const shared = a.sync(), pulled = b.sync();
+    assert.equal(shared.code, 0);
+    assert.equal(pulled.code, 0);
+    assert.match(shared.text, /^dots sync: shared 1 file .* pushed/);
+    assert.match(pulled.text, /^dots sync: no local changes .* nothing to push/);
+    for (const [root, machine] of [[f.a, a], [f.b, b]]) {
+      assert.equal(read(root, 'copy.txt'), content);
+      assert.equal(read(machine.home, '.copied'), content);
+      assert.equal(read(machine.home, '.rendered'), 'rendered\n');
+      assert.equal(fs.readlinkSync(path.join(machine.home, '.linked')), path.join(root, 'link.txt'));
+      f.clean(root);
+    }
+    assert.equal(f.dev(f.a), f.dev(f.b));
+    assert.equal(f.dev(f.a), f.remote());
+  }
+});
+
+test('real mise preserves a dirty copy across an incoming source edit and retry', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA, b = f.machineB;
+  f.write(a.home, '.copied', 'my dirty copy\n');
+  f.write(f.b, 'copy.txt', 'incoming edit\n');
+  f.write(f.b, 'template.tera', '{{ "incoming template" }}\n');
+  assert.match(b.sync().text, /^dots sync: shared 2 files/);
+  const { code, text } = a.sync();
+  assert.equal(code, 0);
+  assert.match(text, /COPY KEPT: ~\/\.copied.*compare it with its source/);
+  const found = text.match(/CONFLICT kept published: copy\.txt +\(yours: git show ([a-f0-9]+):copy\.txt\)/);
+  assert(found, text);
+  assert.equal(git(f.origin, 'show', `${found[1]}:copy.txt`), 'my dirty copy');
+  assert.equal(read(f.a, 'copy.txt'), 'incoming edit\n');
+  assert.equal(read(a.home, '.copied'), 'my dirty copy\n');
+  assert.equal(read(a.home, '.rendered'), 'incoming template\n');
+  assert.match(a.sync().text, /^dots sync: no local changes .* nothing to push/);
+  assert.equal(read(a.home, '.copied'), 'my dirty copy\n');
+  f.clean(f.a);
+});
+
+test('real mise keeps both locally diverged files and reports a capture write failure', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  f.write(a.home, '.copied', 'local target\n');
+  f.write(f.a, 'copy.txt', 'local source\n');
+  const diverged = a.sync();
+  assert.match(diverged.text, /COPY KEPT: ~\/\.copied: source .*copy\.txt also changed/);
+  assert.equal(read(a.home, '.copied'), 'local target\n');
+  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'local source');
+  f.write(f.a, 'copy.txt', 'initial\n');
+  f.write(f.a, 'unrelated', 'share this\n');
+  const rename = fs.renameSync;
+  let result;
+  fs.renameSync = (from, to) => {
+    if (to === path.join(f.a, 'copy.txt')) throw new Error('injected copy write failure');
+    return rename(from, to);
+  };
+  try { result = a.sync(); } finally { fs.renameSync = rename; }
+  assert.equal(result.code, 0);
+  assert.match(result.text, /CAPTURE FAILED: ~\/\.copied → .*copy\.txt: injected copy write failure/);
+  assert.equal(read(a.home, '.copied'), 'local target\n');
+  assert.equal(git(f.origin, 'show', 'dev:unrelated'), 'share this');
+  assert.match(a.sync().text, /^dots sync: shared 1 file/);
+  assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'local target');
+});
+
+test('real mise keeps a diverged copy after an incoming declaration replaces it', requires('git', 'jq', 'mise'), async t => {
+  for (const [mode, declaration, deployed] of [
+    ['absent', '{ mode = "absent" }', null],
+    ['template', '{ source = "template.tera", mode = "template" }', 'updated template\n'],
+    ['copy', '{ source = "new.txt", mode = "copy" }', 'initial\n'],
+  ]) {
+    await t.test(mode, t => {
+      const f = copiedFixture(t), a = f.machineA, b = f.machineB;
+      f.write(a.home, '.copied', 'keep my copy\n');
+      f.write(f.a, 'copy.txt', 'keep my source\n');
+      f.write(f.b, 'template.tera', '{{ "updated template" }}\n');
+      f.write(f.b, 'new.txt', 'initial\n');
+      const config = read(f.b, 'config.toml').replace('{ source = "copy.txt", mode = "copy" }', declaration);
+      f.write(f.b, 'config.toml', config);
+      assert.match(b.sync().text, /pushed/);
+      assert.match(a.sync().text, /COPY KEPT: .*\.copied/);
+      const shared = f.remote();
+      const retry = a.sync();
+      assert.match(retry.text, /COPY KEPT: .*\.copied.*move the deployed (?:copy|file) somewhere safe/);
+      assert.equal(f.remote(), shared, 'a retry must not publish the dirty target through a new source');
+      assert.equal(read(a.home, '.copied'), 'keep my copy\n');
+      assert.equal(git(f.origin, 'show', 'dev:copy.txt'), 'keep my source');
+      fs.renameSync(path.join(a.home, '.copied'), path.join(a.home, '.kept'));
+      assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+      if (deployed === null) assert(!fs.existsSync(path.join(a.home, '.copied')));
+      else assert.equal(read(a.home, '.copied'), deployed);
+      assert.equal(read(a.home, '.kept'), 'keep my copy\n');
+    });
+  }
+});
+
+test('real mise checks a former copy for edits before running a replacement declaration', requires('git', 'jq', 'mise'), async t => {
+  for (const interrupted of [false, true]) {
+    await t.test(interrupted ? 'edited after checkout failed' : 'edited before a local mode change', t => {
+      const f = copiedFixture(t), a = f.machineA, b = f.machineB;
+      const root = interrupted ? f.b : f.a;
+      const absent = read(root, 'config.toml').replace('{ source = "copy.txt", mode = "copy" }', '{ mode = "absent" }');
+      if (!interrupted) f.write(a.home, '.copied', 'keep my copy\n');
+      f.write(root, 'config.toml', absent);
+      if (interrupted) {
+        assert.match(b.sync().text, /pushed/);
+        failIndexInstall(f.a, a.sync);
+        f.write(a.home, '.copied', 'keep my copy\n');
+      }
+      const published = f.remote();
+      const { code, text } = a.sync();
+      assert.equal(code, 0);
+      assert.match(text, /COPY KEPT: .*\.copied.*move the deployed file somewhere safe/);
+      assert.equal(read(a.home, '.copied'), 'keep my copy\n');
+      if (interrupted) assert.equal(f.remote(), published);
+      f.clean(f.a);
+    });
+  }
+});
+
+test('real mise preserves edited deployed files when an absent declaration arrives later', requires('git', 'jq', 'mise'), async t => {
+  for (const remembered of [false, true]) {
+    await t.test(remembered ? 'after the clean declaration was removed' : 'with only mise deployment state', t => {
+      const f = copiedFixture(t), a = f.machineA;
+      const config = read(f.a, 'config.toml');
+      const copy = '"~/.copied" = { source = "copy.txt", mode = "copy" }\n';
+      const absent = config.replace(copy, '"~/.copied" = { mode = "absent" }\n');
+      if (remembered) {
+        f.write(f.a, 'config.toml', config.replace(copy, ''));
+        assert.match(a.sync().text, /^dots sync: shared 1 file/);
+        assert.equal(read(a.home, '.copied'), 'initial\n');
+      } else {
+        // Simulate a copy deployed by mise before dots had seen it.
+        fs.rmSync(path.join(f.a, '.git/dots-copied.json'));
+      }
+      f.write(a.home, '.copied', 'keep my copy\n');
+      f.write(f.a, 'config.toml', absent);
+      const first = a.sync(), retry = a.sync();
+      for (const result of [first, retry]) {
+        assert.equal(result.code, 0);
+        assert.match(result.text, /COPY KEPT: .*\.copied.*move the deployed file somewhere safe/);
+      }
+      assert.equal(read(a.home, '.copied'), 'keep my copy\n');
+      f.clean(f.a);
+    });
+  }
+});
+
+test('real mise can redeploy old bytes without reviving a stale copy baseline', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  f.write(a.home, '.copied', 'captured once\n');
+  assert.match(a.sync().text, /^dots sync: shared 1 file/);
+  for (const content of ['another deployment\n', 'initial\n']) {
+    f.write(f.a, 'copy.txt', content);
+    assert.match(a.sync().text, /^dots sync: shared 1 file/);
+    assert.equal(read(a.home, '.copied'), content);
+  }
+  f.write(a.home, '.copied', 'captured once\n');
+  const absent = read(f.a, 'config.toml').replace('{ source = "copy.txt", mode = "copy" }', '{ mode = "absent" }');
+  f.write(f.a, 'config.toml', absent);
+  assert.match(a.sync().text, /COPY KEPT: .*\.copied/);
+  assert.equal(read(a.home, '.copied'), 'captured once\n');
+});
+
+test('a successful copy-to-template replacement restores ordinary real mise template updates', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t), a = f.machineA;
+  const template = read(f.a, 'config.toml').replace('{ source = "copy.txt", mode = "copy" }', '{ source = "template.tera", mode = "template" }');
+  f.write(f.a, 'config.toml', template);
+  assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+  assert.equal(read(a.home, '.copied'), 'rendered\n');
+  f.write(a.home, '.copied', 'template output edited by hand\n');
+  f.write(f.a, 'template.tera', '{{ "next template" }}\n');
+  assert.doesNotMatch(a.sync().text, /COPY KEPT|APPLY FAILED/);
+  assert.equal(read(a.home, '.copied'), 'next template\n');
 });
 
 // The same upgrade against real mise: its own validation rejects the stale

@@ -12,12 +12,14 @@ The configuration repository has two shared branches on `origin`.
 - `main` changes only through reviewed pull requests. Every sync merges it into `dev`, so a merged pull request reaches each machine on its next `dots up`.
 
 The live checkout (`DOTS_ROOT`) is a plain Git checkout with `HEAD` on `dev`.
-Git refs and the files on disk are the only sync state: unpushed work is exactly `origin/dev..dev`.
+Unpushed work is exactly `origin/dev..dev`.
 Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, mise lockfiles, `locks/`, `.setup-state/`) never enter the repository.
 
 ## One run
 
-1. Runs `mise bootstrap dotfiles save`, so copied dotfiles flow back into the configuration.
+1. Saves tracked history with `mise bootstrap dotfiles save` after checking encryption.
+   Captures edits to regular copied files whose tracked source still matches the last common version.
+   If both have changed, the source and deployed copy stay in place.
 2. Commits every tracked or unignored public file onto `dev` as `Save local setup (HOST)`.
    Machine-local files are always left out.
 3. Scans that commit with gitleaks. A flagged file stays on disk, unshared; the rest is shared.
@@ -33,9 +35,14 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    A push that fails for any other reason is not retried, and one that takes longer than 60 seconds is stopped; Git never prompts for credentials here.
    Stopping it stops Git, not a hook or credential helper Git started, so a push may still land later; the next sync reconciles it.
    Output from failed commands is shown as they printed it, except that credentials in URLs (`https://user:secret@host`) are replaced with `***`.
-8. Moves the live files from the local commit to the merged one with a two-tree checkout, which refuses to overwrite a file edited during the run.
+8. Checks incoming tracked paths for local obstructions, including ignored files, directories and symlinks.
+   If a path is blocked, unrelated edits can still be shared.
+   The two-tree checkout also refuses to overwrite a file edited during the run.
    When it retires tables, it moves only while the local files are still the ones it validated.
-   Only then does it remove those retired tables from the local files, and runs `mise bootstrap dotfiles apply`.
+   If checkout, index installation or the branch update is interrupted, the next run finishes that checkout before taking a new snapshot.
+   Once the files, index and branch agree, sync removes the retired tables and runs `mise bootstrap dotfiles apply`.
+   It skips any copied target that still contains an edit and applies the other targets.
+   If an incoming declaration replaces that copy, move the local file somewhere safe before applying the replacement.
 
 Commits pushed straight to `origin/dev` from a task worktree are fine: the next sync merges them.
 A `dev` moved with plumbing in another worktree of the live checkout is merged too, not reverted.
@@ -75,13 +82,16 @@ Lower-case lines are information.
 | `OFFLINE: N commits unpushed, retried next run` | `origin` was unreachable. Local work is committed and applied; the next run pushes it. |
 | `INVALID merged config: ERROR; nothing pushed or applied` | The merged configuration fails mise's checks with this machine's local files. Fix the error (locally or upstream) and sync again; local work is already committed on `dev`. |
 | `LATE EDIT: PATH not updated; rerun` | A file changed while the run was updating files, so the run left it alone. Run sync again. |
-| `NOT APPLIED: the Git index is locked (.git/index.lock); files not updated, rerun` | Another Git command held the index, so the run left the files and `dev` alone; anything it pushed arrives on the next run. Run sync again once that command finishes; remove a lock left by a crashed Git command by hand. |
+| `BLOCKED PATH: PATH obstructs an incoming tracked path; move it aside, rerun sync, then reconcile it` | An addition from Git would overwrite local material. Move the printed path somewhere safe, sync again, then compare it with what arrived. |
+| `NOT APPLIED: the Git index is locked (PATH); ...` | Run sync again after the other Git operation finishes. If the printed lock was left by an interrupted run, remove that lock and sync again. |
 | `NOT APPLIED: FILE changed during sync; files not updated, rerun` | A machine-local config file changed after the merged configuration retiring a declaration was validated against it, so the run left the files and `dev` alone; anything it pushed arrives on the next run. Run sync again. |
 | `NOT RETIRED: local declaration [TABLE] in FILE, which changed during sync; rerun, or remove the table by hand` | `FILE` changed between the file update and the removal, so the run left it alone and the table may name a source that is gone. Run sync again; if it then reports `INVALID merged config`, remove the table from `FILE` by hand. |
-| `NOT RECORDED: dev moved during sync; files updated, rerun` | Another process moved `dev` during the run. Run sync again. |
+| `NOT APPLIED: ERROR; checkout pending, rerun sync to finish it` | Checkout, index installation or the branch update was interrupted. Fix the reported error and run sync again. If a path differs from both versions, move it aside first and reconcile it with what arrives. |
 | `SAVE REFUSED: history entry PATH in FILE is not encrypted; ...; nothing saved` | A tracked file is not declared with `encrypt = true` (or the tracked-path inventory could not be read), so nothing was saved. Fix the declaration and sync again. |
-| `SAVE FAILED: mise bootstrap dotfiles save (exit N); copied dotfiles not captured` | Copied dotfiles were not saved back. The lines under it are mise's error; fix it and sync again. |
-| `APPLY FAILED: mise bootstrap dotfiles apply (exit N); fix the error below, then run dots apply` | The configuration advanced but dotfiles were not applied. The lines under it are mise's error, captured when it happened (a later `dots apply` may no longer fail the same way); fix it, then run `dots apply`. `timed out` instead of `exit N` means the apply, with its bootstrap hooks, ran longer than 60 seconds. |
+| `SAVE FAILED: mise bootstrap dotfiles save (exit N); tracked history not saved` | The history checkpoint failed. Fix mise's error below the line and sync again. |
+| `COPY KEPT: TARGET: REASON; compare it with its source and reconcile the two files, then rerun` | The deployed copy still holds different bytes and sync left it in place. Compare the files and put the version you want in the source. Bring the target into agreement, then run sync. |
+| `CAPTURE FAILED: ERROR; fix the error and rerun sync` | Sync could not check or capture the copy. Fix the reported problem and rerun sync. |
+| `APPLY FAILED: mise bootstrap dotfiles apply (exit N); fix the error below, then run dots apply` | The configuration advanced but dotfiles were not applied. Fix mise's error below the line and run the printed command. Sync asks you to rerun sync itself when it skipped a copy or disabled history during apply. `timed out` means apply and its hooks ran longer than 60 seconds. |
 | `RETIRED local declaration [TABLE] from FILE (source SOURCE no longer exists); deployed files left in place, backup PATH` | The merged configuration retires this table and the files it pointed into are gone, so the run removed exactly that table from the machine-local `FILE`; the deployed file and app data are untouched, and `PATH` holds the file as it was. Nothing to do; restore from `PATH` if you had customized the table. A manager from before this line existed cannot do this: it reports `INVALID merged config` instead, so remove the table by hand once there. |
 | `changed on disk: STAT` | Files the run updated. |
 | `dev moved outside sync (now COMMIT), or the index was staged to match COMMIT; ...` | The Git index matched an older commit, so local files were treated as based on it and merged onto `dev`. Nothing on disk is lost, but a revert staged by hand is undone; commit such a revert instead. |

@@ -482,15 +482,21 @@ class ProfileTests(ContractTestCase):
     def test_init_uses_the_vars_table_and_preserves_a_linked_config(self) -> None:
         config = self.f.config / "config.toml"
         config.unlink()
-        target = write(self.f.base / "linked.toml", """
+        target = write(self.f.base / "other/settings.toml", """
             ["vars"] # vars header
             'dots_state_repo' = "example/private" # state
             [env]
             dots_profiles = "unrelated"
             """, 0o640)
-        config.symlink_to("../linked.toml")
+        child = target.parent / "child"
+        child.mkdir()
+        (self.f.config / "hop").symlink_to(child, target_is_directory=True)
+        decoy = write(self.f.config / "settings.toml", '# logical traversal lands here\n')
+        decoy_before = decoy.read_bytes()
+        config.symlink_to("hop/../settings.toml")
         result = self.dots("init")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(decoy.read_bytes(), decoy_before)
         self.assertEqual(tomllib.loads(target.read_text()), {
             "vars": {"dots_state_repo": "example/private", "dots_profiles": "default"},
             "env": {"dots_profiles": "unrelated"},

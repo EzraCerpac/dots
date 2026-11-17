@@ -12,7 +12,7 @@ mise_config_target() {
         printf 'dots: refusing non-regular configuration: %s\n' "$path" >&2
         return 2
     fi
-    directory="$(cd "$(dirname "$path")" && pwd -P)" || return 1
+    directory="$(cd -P "$(dirname "$path")" && pwd -P)" || return 1
     printf '%s/%s\n' "$directory" "${path##*/}"
 }
 

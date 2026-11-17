@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -38,6 +39,8 @@ def stage_start(id, group, label, handoff=False):
 
 def stage_end(id, label, code, state=None, summary=None, action=""):
     state = state or ("ok" if code == 0 else "attention" if code == 3 else "failed")
+    if state != "ok" and not action:
+        action = f"Review the stage log and rerun {shlex.join(['dots', command, *arguments])}."
     emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action)
     return state
 

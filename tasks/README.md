@@ -49,15 +49,17 @@ the stage; hooks and installer exception recipes report theirs as
 `ITEM<TAB>BEFORE<TAB>AFTER` lines in `DOTS_CHANGES`; source sync reports the
 configuration revision it adopted.
 
-On macOS, a host whose configuration declares `brew-cask:` or `mas:` packages
-gets separate Homebrew formula and cask stages; other hosts update their
-declared native packages in one pass. Mac App Store updates are skipped by
-default. `dots up --mas` includes them when `mas:` packages are declared: it
-prepares the Homebrew `mas` formula first, then runs App Store updates
-alongside the other updates and waits for them before updating standalone mise
-and saving the final checkpoint. The cask stage installs missing declared
-casks, then upgrades only casks without `auto_updates: true` and not listed in
-`dots_self_updating_casks`.
+Each available package manager with declarations for the selected host gets
+its own update pass. The cask stage installs missing declared casks and
+upgrades installed casks unless their metadata or `dots_self_updating_casks`
+marks them as self-updating.
+
+`dots up --mas` opts into Mac App Store updates on macOS hosts with
+declarations that select the MAS manager. After authorization, it prepares
+the Homebrew `mas` formula if the tool is missing and that manager is
+available. App Store updates run alongside tool updates and hooks.
+The updater waits for them before updating standalone mise and saving the
+final checkpoint. Ordinary updates, status and plan skip App Store queries.
 
 Later stages continue after an earlier stage fails; failures are collected and
 make the final result nonzero once the pre-update save succeeds. The task does

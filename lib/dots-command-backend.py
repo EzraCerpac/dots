@@ -116,7 +116,8 @@ def status():
     probes = [
         ("source", "Source", base + ["exec", "--", "node", home + "/lib/source-repo.mjs", "status", root, "--json"]),
         ("atuin", "Atuin", base + ["exec", "--", "uv", "run", "--no-project", "python", home + "/bootstrap/atuin.py", "status", "--json"]),
-        ("setup", "Declared setup", base + ["bootstrap", "status", "--json"]),
+        ("setup", "Declared setup", ["env", f"DOTS_ROOT={root}", f"SETUP_MISE_BIN={mise}",
+                                      "bash", home + "/tasks/status", "--setup-json"]),
         ("tools", "Tools", base + ["ls", "--current", "--json"]),
         ("history", "Files and history", base + ["bootstrap", "dotfiles", "status", "--json"]),
     ]

@@ -3,8 +3,14 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../lib/setup-common.sh"
+source "$(dirname "$0")/../lib/dots-packages.sh"
 source "$(dirname "$0")/../lib/dots-manager.sh"
 setup_init || exit $?
+
+if [[ "${1:-}" == --setup-json ]]; then
+    setup_package_inspect status --json
+    exit $?
+fi
 
 printf 'dots %s (%s): %s\n' "$(dots_manager_version "$DOTS_HOME")" "$(dots_manager_installer "$DOTS_HOME")" "$DOTS_HOME"
 dots_skill_status "$DOTS_HOME"
@@ -20,7 +26,7 @@ printf '\nAtuin:\n'
 setup_mise exec -- uv run --no-project python "$DOTS_HOME/bootstrap/atuin.py" status
 atuin_result=$?
 printf '\nDeclared setup state:\n'
-setup_mise bootstrap status
+setup_package_inspect status
 status_result=$?
 printf '\nDeclared tool state:\n'
 setup_mise ls --current

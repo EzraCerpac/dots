@@ -80,6 +80,7 @@ print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(v
         none='{"entries": []}'
         empty='{}'
         case "$*" in
+            'bootstrap packages status --json') printf '%s\n' "$empty" ;;
             'bootstrap dotfiles paths --json') printf '%s\n' "${FAKE_PATHS-$none}" ;;
             'bootstrap dotfiles status --json') printf '%s\n' "${FAKE_HISTORY_STATUS-$empty}" ;;
         esac
@@ -273,24 +274,6 @@ class UpdateHookTests(ContractTestCase):
                       [{k: e.get(k) for k in ("kind", "id", "status")} for e in parsed])
         # Every hook gets its own file, removed after the stage.
         self.assertFalse(Path((self.f.base / "path").read_text()).exists())
-
-    @unittest.skipUnless(sys.platform == "darwin", "the Homebrew app stages are macOS only")
-    def test_declared_casks_and_app_store_apps_select_the_homebrew_stages(self) -> None:
-        plain = self.f.update()
-        self.assertIn("== newly declared host packages ==", plain.stdout)
-        self.assertNotIn("Homebrew", plain.stdout)
-        write(self.f.config / "config.laptop.toml", '[bootstrap.packages]\n"mas:123" = { os = "macos/arm64" }\n')
-        apps = self.f.update()
-        self.assertIn("Skipped: Mac App Store updates (use dots up --mas to include them).", apps.stdout)
-        self.assertIn("== new Homebrew casks ==", apps.stdout)
-        self.assertNotIn("== newly declared host packages ==", apps.stdout)
-        write(self.f.config / "config.laptop.toml", '[bootstrap.packages."brew-cask:thing"]\nos = "macos/arm64"\n')
-        casks = self.f.update()
-        self.assertIn("== new Homebrew casks ==", casks.stdout)
-        self.assertNotIn("Mac App Store", casks.stdout)
-        # Another profile's declarations do not count.
-        server = self.f.update(SETUP_PROFILE="server")
-        self.assertIn("== newly declared host packages ==", server.stdout)
 
     def test_unknown_profile_suffix_runs_no_hooks_and_fails(self) -> None:
         marker = self.f.base / "ran"

@@ -3,6 +3,7 @@
 set -euo pipefail
 
 source "$(dirname "$0")/../lib/setup-common.sh"
+source "$(dirname "$0")/../lib/dots-packages.sh"
 source "$(dirname "$0")/../lib/dots-up-events.sh"
 source "$(dirname "$0")/../lib/dots-manager.sh"
 include_mas=0
@@ -61,29 +62,14 @@ start_event_stage() {
 event_group() {
     case "$1" in
         "Sync configuration"|*settings*checkpoint*) printf 'Source & settings' ;;
-        "new Homebrew formulae"|"Homebrew formulae"|"new Homebrew casks"|"Homebrew casks"|"Mac App Store tool"|"Mac App Store authorization"|"Mac App Store result"|"newly declared host packages"|"declared host packages") printf 'Packages' ;;
+        "new Homebrew formulae"|"Homebrew formulae"|"new Homebrew casks"|"Homebrew casks"|"Mac App Store tool"|"Mac App Store authorization"|"Mac App Store result"|*"declared host packages"*) printf 'Packages' ;;
         "newly declared mise tools"|"declared mise tools"|"standalone mise"|"dots manager") printf 'Tools' ;;
         "installer exception"*) printf 'Managed apps/local builds' ;;
         *) printf 'Final checks' ;;
     esac
 }
-# Whether this host's configuration files declare a package of MANAGER
-# (brew-cask, mas, ...). Package keys contain a colon, so TOML quotes them.
-declares_packages() {
-    local manager file
-    local -a configs=("$SETUP_ROOT/config.toml" "$SETUP_ROOT/config.$SETUP_PROFILE.toml")
-    [[ -z "$SETUP_MACHINE_ID" ]] || configs+=("$SETUP_ROOT/config.host-$SETUP_MACHINE_ID.toml")
-    configs+=("$SETUP_ROOT/config.local.toml")
-    for file in "${configs[@]}"; do
-        [[ -f "$file" ]] || continue
-        for manager in "$@"; do
-            grep -Eq "^[[:space:]]*(\[bootstrap\.packages\.)?[\"']$manager:" "$file" && return 0
-        done
-    done
-    return 1
-}
 snapshot_stage() {
-    local group="$1" label="$2" data declared
+    local group="$1" label="$2" manager="${3:-}" data
     if [[ "$label" == 'standalone mise' ]]; then
         local version
         version="$("$(resolve_mise_bin)" --version 2>/dev/null)" || return 1
@@ -102,35 +88,14 @@ snapshot_stage() {
             ' 2>/dev/null
             ;;
         Packages)
-            if command -v brew >/dev/null 2>&1; then
-                local -a configs=("$SETUP_ROOT/config.toml" "$SETUP_ROOT/config.$SETUP_PROFILE.toml")
-                [[ -n "$SETUP_MACHINE_ID" ]] && configs+=("$SETUP_ROOT/config.host-$SETUP_MACHINE_ID.toml")
-                [[ -f "$SETUP_ROOT/config.local.toml" ]] && configs+=("$SETUP_ROOT/config.local.toml")
-                declared="$(setup_mise exec -- python3 - "${configs[@]}" 2>/dev/null <<'PY'
-import json, sys, tomllib
-keys = set()
-for path in sys.argv[1:]:
-    try:
-        with open(path, "rb") as source:
-            packages = tomllib.load(source).get("bootstrap", {}).get("packages", {})
-        keys.update(key for key in packages if key.startswith(("brew:", "brew-cask:")))
-    except (OSError, tomllib.TOMLDecodeError):
-        pass
-print(json.dumps(sorted(keys), separators=(",", ":")))
-PY
-                )" || return 1
-                local formulas casks installed
-                formulas="$(brew list --versions --formula 2>/dev/null | awk '{print "brew:" $1 "\t" substr($0, index($0, $2))}')" || return 1
-                casks="$(brew list --versions --cask 2>/dev/null | awk '{print "brew-cask:" $1 "\t" substr($0, index($0, $2))}')" || return 1
-                installed="${formulas}${formulas:+$'\n'}${casks}"
-                printf '%s\n' "$installed" | setup_mise exec -- jq -Rn --argjson declared "$declared" '
-                    [inputs | split("\t") as $row | select(($row | length) == 2 and ($declared | index($row[0])))
-                        | {item:$row[0],value:$row[1]}]
-                    | sort_by(.item)
-                ' 2>/dev/null
-            else
-                printf '[]'
-            fi
+            [[ -n "$manager" ]] || { printf '[]'; return; }
+            data="$(package_status "$manager")" || return 1
+            printf '%s\n' "$data" | setup_mise exec -- jq -ce --arg manager "$manager" '
+                [.[$manager].packages[]?
+                    | select((.installed_version // "") != "")
+                    | {item:($manager + ":" + .package), value:.installed_version}]
+                | sort_by(.item)
+            '
             ;;
         *) printf '[]' ;;
     esac
@@ -263,16 +228,17 @@ fi
 failures=()
 deferred=()
 attention_logs=()
-# run_stage LABEL [--terminal-handoff] [--hook | --changes] COMMAND...
+# run_stage LABEL [--terminal-handoff] [--package-manager MANAGER | --hook | --changes] COMMAND...
 # A --hook stage follows the hook contract: exit 3 is deferred (needs
 # attention), 4 is skipped, and any other nonzero status is a failure.
 # --hook and --changes stages get a DOTS_CHANGES file for their change reports.
 run_stage() {
     local label="$1"
     shift
-    local terminal=hidden hook=0 reports_changes=0
+    local terminal=hidden hook=0 reports_changes=0 manager=""
     if [[ "${1:-}" == --terminal-handoff ]]; then terminal=handoff; shift; fi
-    if [[ "${1:-}" == --hook ]]; then hook=1 reports_changes=1; shift
+    if [[ "${1:-}" == --package-manager ]]; then manager="$2"; shift 2
+    elif [[ "${1:-}" == --hook ]]; then hook=1 reports_changes=1; shift
     elif [[ "${1:-}" == --changes ]]; then reports_changes=1; shift; fi
     local event_id="${label//[^a-zA-Z0-9]/-}"
     local group=Hooks
@@ -293,7 +259,7 @@ run_stage() {
         fi
     fi
     if dots_up_event_sink_enabled; then
-        before_snapshot="$(snapshot_stage "$group" "$label" 2>/dev/null)" && [[ "$before_snapshot" == \[*\] ]] && before_valid=1 || true
+        before_snapshot="$(snapshot_stage "$group" "$label" "$manager" 2>/dev/null)" && [[ "$before_snapshot" == \[*\] ]] && before_valid=1 || true
     fi
     if [[ "$plain_output" -eq 1 ]] && ! dots_up_event_sink_enabled && [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
         stage_log="$DOTS_UP_RUN_DIR/stages/$event_id.log"
@@ -324,7 +290,7 @@ run_stage() {
         rm -f -- "$changes_file"
     fi
     if dots_up_event_sink_enabled; then
-        after_snapshot="$(snapshot_stage "$group" "$label" 2>/dev/null)" && [[ "$after_snapshot" == \[*\] ]] && after_valid=1 || true
+        after_snapshot="$(snapshot_stage "$group" "$label" "$manager" 2>/dev/null)" && [[ "$after_snapshot" == \[*\] ]] && after_valid=1 || true
         if [[ "$before_valid" -eq 1 && "$after_valid" -eq 1 ]]; then
             emit_snapshot_changes "$event_id" "$before_snapshot" "$after_snapshot"
         fi
@@ -421,11 +387,11 @@ start_app_store_packages() {
     fi
     emit_event "$(event_json --arg id mac-app-store --arg group Packages --arg label 'Mac App Store updates' --arg status running --arg log_path "$app_store_log" '{v:1,kind:"app_store_start",id:$id,group:$group,label:$label,status:$status,log_path:$log_path}')"
     (
-        setup_mise bootstrap packages apply --manager mas --yes &&
-            setup_mise bootstrap packages upgrade --manager mas --yes
+        routine_packages apply --manager mas --yes "$@" &&
+            routine_packages upgrade --manager mas --yes "$@"
     ) > "$app_store_log" 2>&1 &
     app_store_pid=$!
-    printf 'Mac App Store updates started alongside Homebrew casks.\n'
+    printf 'Mac App Store updates started.\n'
 }
 
 finish_app_store_packages() {
@@ -444,103 +410,245 @@ finish_app_store_packages() {
     return "$result"
 }
 
-brew_formula_packages=()
-apply_other_homebrew_formulae() {
-    local status_json selected package
-    status_json="$(setup_mise bootstrap packages status --json)" || return $?
-    selected="$(printf '%s' "$status_json" | setup_mise exec -- jq -r '
-        (.brew.packages | if type == "array" then . else error("missing brew status") end)[]
-        | select(.package != "mas")
-        | (.package | if type == "string" and length > 0 then "brew:\(.)" else error("missing formula name") end)
-    ')" || return $?
-    brew_formula_packages=()
-    if [[ -z "$selected" ]]; then
-        printf 'No other Homebrew formulae are declared.\n'
-        return 0
-    fi
-    while IFS= read -r package; do
-        brew_formula_packages+=("$package")
-    done <<< "$selected"
-    setup_mise bootstrap packages apply --manager brew --yes "${brew_formula_packages[@]}"
+# With bare package keys, keep all eligible candidates in scope so mise
+# can still resolve them in its configured preference order.
+package_status() {
+    local scope="$1"
+    [[ "$has_bare_packages" -eq 0 ]] || scope="$active_package_scope"
+    MISE_SYSTEM_PACKAGES_MANAGERS="$scope" setup_mise bootstrap packages status --json
 }
 
-upgrade_other_homebrew_formulae() {
-    if [[ ${#brew_formula_packages[@]} -eq 0 ]]; then
-        printf 'No other Homebrew formulae need a routine upgrade.\n'
-        return 0
+routine_packages() {
+    MISE_SYSTEM_PACKAGES_MANAGERS="$active_package_scope" setup_mise bootstrap packages "$@"
+}
+
+# An exception owns a package it holds. When filtering a manager's
+# requests, explicit mise specs preserve only unpinned, present declarations.
+select_package_specs() {
+    local status="$1" manager="$2" mode="$3" rows package version desired self_updating=""
+    if [[ "$mode" == cask-upgrade ]]; then
+        self_updating="$(setup_dots_list dots_self_updating_casks optional)" || return $?
     fi
-    setup_mise bootstrap packages upgrade --manager brew --yes "${brew_formula_packages[@]}"
+    rows="$(printf '%s\n' "$status" | setup_mise exec -- jq -r --arg manager "$manager" \
+        --arg mode "$mode" --arg skip "$self_updating" '
+        ($skip | split("\n")) as $skip
+        | .[$manager].packages[]?
+        | select($mode != "cask-upgrade" or
+            (.state == "installed" and .auto_updates != true and (.package as $name | $skip | index($name) == null)))
+        | [.package, .requested_version, .desired_state] | @tsv
+    ')" || return $?
+    package_specs=()
+    restricted=0
+    uses_native_options=0
+    [[ -n "$rows" ]] || return 0
+    while IFS=$'\t' read -r package version desired; do
+        setup_exception_holder "$manager:$package" "$SETUP_PROFILE" || return $?
+        if [[ -n "$SETUP_HOLDER" ]]; then
+            restricted=1
+        elif [[ "$version" == latest && "$desired" == present ]]; then
+            package_specs+=("$manager:$package")
+        else
+            uses_native_options=1
+        fi
+    done <<< "$rows"
+}
+
+# Native manager-only passes keep package pins and absent declarations. Where
+# a hold requires explicit selection, reject a conflicting declaration set
+# before doing anything that would ignore those native options.
+select_routine_packages() {
+    local uses_native_options
+    select_package_specs "$1" "$2" apply || return $?
+    if [[ "$restricted" -eq 0 ]]; then
+        package_specs=()
+    elif [[ "$uses_native_options" -eq 1 ]]; then
+        setup_error "remove held $2 packages from [bootstrap.packages] so other declarations can keep their requested versions and states"
+        return 2
+    fi
 }
 
 upgrade_homebrew_casks() {
-    local status_json selected package self_updating
-    local -a packages
-
-    status_json="$(setup_mise bootstrap packages status --json)" || return $?
-    # Casks whose apps update themselves without auto_updates metadata are
-    # listed in the optional [vars] dots_self_updating_casks.
-    self_updating="$(setup_dots_list dots_self_updating_casks optional)" || return $?
-    selected="$(printf '%s' "$status_json" | setup_mise exec -- jq -r --arg skip "$self_updating" '
-        ($skip | split("\n") | map(select(length > 0))) as $skip
-        | (."brew-cask".packages | if type == "array" then . else error("missing brew-cask status") end)[]
-        | select(.state == "installed" and .auto_updates != true)
-        | select(.package as $package | $skip | index($package) | not)
-        | (.package | if type == "string" and length > 0 then "brew-cask:\(.)" else error("missing cask token") end)
-    ')" || return $?
-    if [[ -z "$selected" ]]; then
+    local status restricted uses_native_options
+    local -a package_specs
+    status="$(package_status brew-cask)" || return $?
+    select_package_specs "$status" brew-cask cask-upgrade || return $?
+    if [[ ${#package_specs[@]} -gt 0 ]]; then
+        routine_packages upgrade --manager brew-cask --yes "${package_specs[@]}"
+    else
         printf 'No ordinary Homebrew casks need a routine upgrade.\n'
-        return 0
     fi
-    while IFS= read -r package; do
-        packages+=("$package")
-    done <<< "$selected"
-    setup_mise bootstrap packages upgrade --manager brew-cask --yes "${packages[@]}"
 }
 
-# A macOS host that declares casks or App Store apps gets separate formula and
-# cask stages (casks honor self-updating apps) and the opt-in App Store
-# stages; every other host uses the native package manager in one pass.
-homebrew_apps=0 app_store=0
-if [[ "$(uname -s 2>/dev/null || true)" == Darwin ]]; then
-    if declares_packages mas; then app_store=1 homebrew_apps=1; fi
-    if declares_packages brew-cask; then homebrew_apps=1; fi
-fi
-if [[ "$homebrew_apps" -eq 1 ]]; then
-    if [[ "$app_store" -eq 1 && "$include_mas" -eq 1 ]]; then
-        if run_stage "Mac App Store tool" prepare_app_store_tool; then
-            if run_stage "Mac App Store authorization" --terminal-handoff authorize_app_store_packages; then
-                if start_app_store_packages; then
-                    :
-                else
-                    stage_result=$?
-                    emit_event "$(event_json --arg id mac-app-store --arg status failed --arg summary "could not start (exit $stage_result)" --argjson code "$stage_result" '{v:1,kind:"app_store_end",id:$id,status:$status,summary:$summary,exit_code:$code}')"
-                    printf 'Mac App Store updates could not start (exit %s).\n' "$stage_result"
-                    failures+=("Mac App Store packages")
-                fi
+update_package_manager() {
+    local manager="$1" status="$2" available apply_label upgrade_label restricted
+    local -a package_specs=() handoff=()
+    available="$(printf '%s\n' "$status" | setup_mise exec -- jq -r --arg manager "$manager" '
+        .[$manager] | .available == true and (.packages | length > 0)
+    ')" || return $?
+    [[ "$available" == true ]] || return 0
+
+    select_routine_packages "$status" "$manager" || return $?
+    if [[ "$restricted" -eq 1 && ${#package_specs[@]} -eq 0 ]]; then return 0; fi
+    case "$manager" in
+        brew|brew-cask)
+            if [[ "$manager" == brew ]]; then
+                apply_label="new Homebrew formulae"
+                upgrade_label="Homebrew formulae"
+            else
+                apply_label="new Homebrew casks"
+                upgrade_label="Homebrew casks"
+                handoff=(--terminal-handoff)
             fi
+            ;;
+        *)
+            apply_label="newly declared host packages ($manager)"
+            upgrade_label="declared host packages ($manager)"
+            # Native Linux managers may need direct terminal access for sudo.
+            if [[ "$platform" != Darwin ]]; then handoff=(--terminal-handoff); fi
+            ;;
+    esac
+
+    if run_stage "$apply_label" ${handoff[@]+"${handoff[@]}"} --package-manager "$manager" \
+        routine_packages apply --manager "$manager" --yes ${package_specs[@]+"${package_specs[@]}"}; then
+        if [[ "$manager" == brew-cask ]]; then
+            run_stage "$upgrade_label" --terminal-handoff --package-manager "$manager" upgrade_homebrew_casks || true
+        else
+            run_stage "$upgrade_label" ${handoff[@]+"${handoff[@]}"} --package-manager "$manager" \
+                routine_packages upgrade --manager "$manager" --yes ${package_specs[@]+"${package_specs[@]}"} || true
         fi
-    elif [[ "$app_store" -eq 1 ]]; then
-        printf '\nSkipped: Mac App Store updates (use dots up --mas to include them).\n'
-        emit_event "$(event_json --arg summary 'Mac App Store updates intentionally skipped; use --mas to include them.' '{v:1,kind:"notice",severity:"info",summary:$summary}')"
     fi
-    if run_stage "new Homebrew formulae" apply_other_homebrew_formulae; then
-        run_stage "Homebrew formulae" upgrade_other_homebrew_formulae || true
+}
+
+app_store_tool_available() {
+    local prefix candidate mise_bin
+    if setup_mise which mas >/dev/null 2>&1; then return 0; fi
+    # Search the formula before PATH, where an old mise shim can hide it.
+    if prefix="$(setup_mise bootstrap packages where brew:mas 2>/dev/null)" && [[ -x "$prefix/bin/mas" ]]; then
+        export PATH="$prefix/bin:$PATH"
+        return 0
     fi
-    if run_stage "new Homebrew casks" --terminal-handoff setup_mise bootstrap packages apply --manager brew-cask --yes; then
-        run_stage "Homebrew casks" --terminal-handoff upgrade_homebrew_casks || true
-    fi
-else
-    if [[ "$(uname -s 2>/dev/null || true)" != Darwin ]]; then
-        # Native Linux package managers may ask sudo for changes. Give them
-        # direct terminal access while they run so the dashboard cannot hide
-        # an authorization prompt.
-        if run_stage "newly declared host packages" --terminal-handoff setup_mise bootstrap packages apply --yes; then
-            run_stage "declared host packages" --terminal-handoff setup_mise bootstrap packages upgrade --yes || true
+    mise_bin="$(resolve_mise_bin)" || return $?
+    while IFS= read -r candidate; do
+        # Native mise rejects shims that dispatch back to itself.
+        [[ "$candidate" -ef "$mise_bin" ]] && continue
+        if [[ -L "$candidate" ]]; then
+            case "$(readlink "$candidate" 2>/dev/null)" in
+                mise|*/mise) continue ;;
+            esac
         fi
-    elif run_stage "newly declared host packages" setup_mise bootstrap packages apply --yes; then
-        run_stage "declared host packages" setup_mise bootstrap packages upgrade --yes || true
+        return 0
+    done < <(type -aP mas)
+    return 1
+}
+
+defer_app_store_tool() {
+    app_store_authorized=0
+    printf '\nDeferred: the Mac App Store update needs an installed mas tool.\n'
+    deferred+=("Mac App Store tool")
+    dots_up_emit_notice attention 'The Mac App Store update needs an installed mas tool.'
+}
+
+prepare_app_store() {
+    local settings="$1" missing_tool=0 mise_version
+    if ! app_store_tool_available; then
+        missing_tool=1
+        setup_exception_holder brew:mas "$SETUP_PROFILE" || return $?
+        mise_version="$(setup_mise --version)" || return $?
+        # Homebrew formula support follows the selected mise binary, which
+        # may be an x64 build even when the machine is Apple silicon.
+        if [[ -n "$SETUP_HOLDER" || "$mise_version" != *macos-arm64* ]] ||
+           ! setup_mise exec -- jq -en --argjson effective "$settings" '
+                $effective.system_packages.managers | . == null or index("brew") != null
+            ' >/dev/null; then
+            defer_app_store_tool
+            return 0
+        fi
     fi
+    run_stage "Mac App Store authorization" --terminal-handoff authorize_app_store_packages || return 0
+    if [[ "$app_store_authorized" -eq 1 && "$missing_tool" -eq 1 ]]; then
+        if ! run_stage "Mac App Store tool" prepare_app_store_tool; then
+            app_store_authorized=0
+        elif ! app_store_tool_available; then
+            defer_app_store_tool
+        fi
+    fi
+}
+
+update_app_store() {
+    local status="$1" result=0 restricted available
+    local -a package_specs=()
+    available="$(printf '%s\n' "$status" | setup_mise exec -- jq -r '
+        .mas | select((.packages | length) > 0) | .available
+    ')" || return $?
+    case "$available" in
+        true) ;;
+        false) defer_app_store_tool; return 0 ;;
+        *) return 0 ;;
+    esac
+    select_routine_packages "$status" mas || return $?
+    if [[ "$restricted" -eq 1 && ${#package_specs[@]} -eq 0 ]]; then return 0; fi
+    start_app_store_packages ${package_specs[@]+"${package_specs[@]}"} || result=$?
+    if [[ "$result" -ne 0 ]]; then
+        emit_event "$(event_json --arg id mac-app-store --arg status failed --arg summary "could not start (exit $result)" --argjson code "$result" '{v:1,kind:"app_store_end",id:$id,status:$status,summary:$summary,exit_code:$code}')"
+        printf 'Mac App Store updates could not start (exit %s).\n' "$result"
+        failures+=("Mac App Store packages")
+    fi
+}
+
+update_packages() {
+    local inventory settings package_scope routine_package_scope manager status bare_status="" store_status=""
+    inventory="$(setup_package_inventory)" || return $?
+    [[ "$inventory" != '{}' ]] || return 0
+    settings="$(setup_mise settings ls --all --json system_packages)" || return $?
+    package_scope="$(setup_package_scope "$inventory" "$settings")" || return $?
+    routine_package_scope="$(setup_package_scope_without_mas "$package_scope")"
+    active_package_scope="$routine_package_scope"
+    has_bare_packages="$(printf '%s\n' "$inventory" | setup_mise exec -- jq -r 'if .unprefixed then 1 else 0 end')" || return $?
+
+    if [[ "$platform" == Darwin && ",$package_scope," == *,mas,* ]]; then
+        if [[ "$include_mas" -eq 1 ]]; then
+            prepare_app_store "$settings" || return $?
+            if [[ "$app_store_authorized" -eq 1 ]]; then active_package_scope="$package_scope"; fi
+        else
+            printf '\nSkipped: Mac App Store updates (use dots up --mas to include them).\n'
+            dots_up_emit_notice info 'Mac App Store updates intentionally skipped; use --mas to include them.'
+        fi
+    fi
+
+    if [[ "$has_bare_packages" -eq 1 && -n "$active_package_scope" ]]; then
+        bare_status="$(package_status "$active_package_scope")" || return $?
+    fi
+    for manager in ${routine_package_scope//,/ }; do
+        if [[ "$has_bare_packages" -eq 1 ]]; then
+            status="$bare_status"
+        elif ! status="$(package_status "$manager")"; then
+            setup_error "could not inspect $manager packages"
+            failures+=("$manager package status")
+            dots_up_emit_notice error "Could not inspect $manager packages"
+            continue
+        fi
+        if ! update_package_manager "$manager" "$status"; then
+            failures+=("$manager package selection")
+            dots_up_emit_notice error "Could not select $manager packages for update"
+        fi
+    done
+    if [[ "$app_store_authorized" -eq 1 ]]; then
+        if [[ "$has_bare_packages" -eq 1 ]]; then
+            store_status="$bare_status"
+        else
+            store_status="$(package_status mas)" || return $?
+        fi
+        update_app_store "$store_status" || return $?
+    fi
+}
+
+platform="$(uname -s 2>/dev/null || true)"
+if ! update_packages; then
+    setup_error 'could not determine declared host packages'
+    failures+=("host package inventory")
+    dots_up_emit_notice error 'Could not determine declared host packages'
 fi
+
 # Upgrade declared tools without pruning; tools pinned to a revision keep it.
 upgrade_declared_tools() {
     local tool_state pinned_tools tool retained=""
@@ -564,7 +672,9 @@ upgrade_declared_tools() {
 
 # Hooks learn whether the tools stages succeeded.
 export DOTS_TOOLS_OK=0 DOTS_TOOLS_UPGRADED=0
-if run_stage "newly declared mise tools" setup_mise install; then
+# Explicit package stages already report package state. mise install's
+# separate missing-package hint would query managers again, including MAS.
+if MISE_DISABLE_HINTS="${MISE_DISABLE_HINTS:+$MISE_DISABLE_HINTS,}system_packages_missing"     run_stage "newly declared mise tools" setup_mise install; then
     DOTS_TOOLS_OK=1
     if run_stage "declared mise tools" upgrade_declared_tools; then DOTS_TOOLS_UPGRADED=1; fi
 fi
@@ -594,7 +704,7 @@ else
     failures+=("update hooks")
 fi
 
-if [[ "$include_mas" -eq 1 && "$app_store" -eq 1 ]]; then
+if [[ -n "$app_store_pid" ]]; then
     run_stage "Mac App Store result" finish_app_store_packages || true
 fi
 

@@ -19,6 +19,7 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
 
 1. Saves tracked history with `mise bootstrap dotfiles save` after checking encryption.
    Captures edits to regular copied files whose tracked source still matches the last common version.
+   It remembers the captured version even if checkout is blocked.
    If both have changed, the source and deployed copy stay in place.
 2. Commits every tracked or unignored public file onto `dev` as `Save local setup (HOST)`.
    Machine-local files are always left out.
@@ -40,7 +41,11 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    The two-tree checkout also refuses to overwrite a file edited during the run.
    When it retires tables, it moves only while the local files are still the ones it validated.
    If checkout, index installation or the branch update is interrupted, the next run finishes that checkout before taking a new snapshot.
-   Once the files, index and branch agree, sync removes the retired tables and runs `mise bootstrap dotfiles apply`.
+   Once the files, index and branch agree, sync removes the retired tables and applies dotfiles.
+   Sync installs regular copies by moving the actual target aside before checking it and creating its replacement only at an empty path.
+   If a writer claims that path, sync leaves it alone and prints the recovery path for any file it moved aside.
+   A successful replacement keeps the previous inode at the printed private path so an editor that still has it open can finish saving it.
+   Mise runs the usual hooks and applies the other targets.
    It skips any copied target that still contains an edit and applies the other targets.
    If an incoming declaration replaces that copy, move the local file somewhere safe before applying the replacement.
 
@@ -90,6 +95,7 @@ Lower-case lines are information.
 | `SAVE REFUSED: history entry PATH in FILE is not encrypted; ...; nothing saved` | A tracked file is not declared with `encrypt = true` (or the tracked-path inventory could not be read), so nothing was saved. Fix the declaration and sync again. |
 | `SAVE FAILED: mise bootstrap dotfiles save (exit N); tracked history not saved` | The history checkpoint failed. Fix mise's error below the line and sync again. |
 | `COPY KEPT: TARGET: REASON; compare it with its source and reconcile the two files, then rerun` | The deployed copy still holds different bytes and sync left it in place. Compare the files and put the version you want in the source. Bring the target into agreement, then run sync. |
+| `COPY KEPT: TARGET: REASON; recover the previous file from PATH; ...` | Sync kept a displaced file after an edit during installation or after another writer claimed the target. The file at `PATH` and the source are available for reconciliation. |
 | `CAPTURE FAILED: ERROR; fix the error and rerun sync` | Sync could not check or capture the copy. Fix the reported problem and rerun sync. |
 | `APPLY FAILED: mise bootstrap dotfiles apply (exit N); fix the error below, then run dots apply` | The configuration advanced but dotfiles were not applied. Fix mise's error below the line and run the printed command. Sync asks you to rerun sync itself when it skipped a copy or disabled history during apply. `timed out` means apply and its hooks ran longer than 60 seconds. |
 | `RETIRED local declaration [TABLE] from FILE (source SOURCE no longer exists); deployed files left in place, backup PATH` | The merged configuration retires this table and the files it pointed into are gone, so the run removed exactly that table from the machine-local `FILE`; the deployed file and app data are untouched, and `PATH` holds the file as it was. Nothing to do; restore from `PATH` if you had customized the table. A manager from before this line existed cannot do this: it reports `INVALID merged config` instead, so remove the table by hand once there. |

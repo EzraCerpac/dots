@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/setup-common.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/mise-config.sh"
 
 bootstrap_error() {
     printf 'bootstrap: %s\n' "$*" >&2
@@ -58,265 +59,170 @@ bootstrap_history_branch() {
     printf 'host-%s\n' "$SETUP_MACHINE_ID"
 }
 
-bootstrap_toml_quote() {
-    local escaped="$1"
-    escaped="${escaped//\\/\\\\}"
-    escaped="${escaped//\"/\\\"}"
-    printf '"%s"' "$escaped"
-}
-
 bootstrap_mise() {
     "$BOOTSTRAP_MISE_BIN" --quiet --cd "$BOOTSTRAP_CONFIG_DIR" --env "$BOOTSTRAP_MISE_ENV" "$@"
 }
 
 bootstrap_miserc_env_values() {
-    local path="$BOOTSTRAP_CONFIG_DIR/miserc.toml" scan selector_present env_table raw values
+    local path="${1:-$BOOTSTRAP_CONFIG_DIR/miserc.toml}" raw
+    local array='^\[("[A-Za-z0-9_.-]+"(, "[A-Za-z0-9_.-]+")*)?\]$'
     [[ -e "$path" || -L "$path" ]] || return 0
     if [[ -L "$path" || ! -f "$path" ]]; then
         bootstrap_error "refusing non-regular mise early config: $path"
         return 2
     fi
 
-    # Let mise validate the complete file, then ask its TOML reader for the
-    # early selector. This accepts multiline arrays and TOML single-quoted
-    # strings without parsing source syntax ourselves.
-    if ! "$BOOTSTRAP_MISE_BIN" --quiet --cd "$BOOTSTRAP_CONFIG_DIR" config get --file "$path" >/dev/null 2>&1; then
-        bootstrap_error "could not parse mise early config: $path"
+    # Ask mise for the root key. An env in a subtable is unrelated to this
+    # early selector. A missing root key is fine in a valid TOML document.
+    mise_config_file "$BOOTSTRAP_MISE_BIN" get "$path" >/dev/null || return $?
+    raw="$(mise_config_file "$BOOTSTRAP_MISE_BIN" get "$path" env 2>/dev/null)" || return 0
+    if [[ ! "$raw" =~ $array ]]; then
+        bootstrap_error 'miserc env must be an array of selector names'
         return 2
     fi
-    scan="$(awk '
-        BEGIN { in_table = 0; selector = 0; env_table = 0 }
-        /^[[:space:]]*\[/ {
-            header = $0
-            gsub(/[[:space:]]/, "", header)
-            if (header == "[env]" || header == "[[env]]" ||
-                header ~ /^\[env\./ || header ~ /^\[\[env\./) env_table = 1
-            in_table = 1
-            next
-        }
-        !in_table && /^[[:space:]]*env[[:space:]]*=/ { selector = 1 }
-        END { printf "%d %d\n", selector, env_table }
-    ' "$path")" || return 1
-    read -r selector_present env_table <<< "$scan"
-    if [[ "$env_table" -eq 1 ]]; then
-        bootstrap_error 'miserc [env] tables conflict with its early selector; use a bare env array'
-        return 2
-    fi
-    [[ "$selector_present" -eq 1 ]] || return 0
-
-    raw="$("$BOOTSTRAP_MISE_BIN" --quiet --cd "$BOOTSTRAP_CONFIG_DIR" config get --file "$path" env 2>/dev/null)" || {
-        bootstrap_error 'could not read the miserc early environment selector'
-        return 2
-    }
-    values="$(printf '%s\n' "$raw" | awk '
-        function skip_space() {
-            while (pos <= size && index(" \t\r\n", substr(text, pos, 1))) pos++
-        }
-        function invalid() { exit 2 }
-        { text = text $0 " " }
-        END {
-            size = length(text)
-            pos = 1
-            skip_space()
-            if (substr(text, pos, 1) != "[") invalid()
-            pos++
-            skip_space()
-            if (substr(text, pos, 1) == "]") {
-                pos++
-                skip_space()
-                if (pos <= size) invalid()
-                exit 0
-            }
-            while (pos <= size) {
-                if (substr(text, pos, 1) != "\"") invalid()
-                pos++
-                item = ""
-                while (pos <= size && substr(text, pos, 1) != "\"") {
-                    char = substr(text, pos, 1)
-                    if (char == "\\" || char ~ /[[:cntrl:]]/) invalid()
-                    item = item char
-                    pos++
-                }
-                if (pos > size || item !~ /^[A-Za-z0-9_.-]+$/) invalid()
-                print item
-                pos++
-                skip_space()
-                char = substr(text, pos, 1)
-                if (char == ",") {
-                    pos++
-                    skip_space()
-                    if (substr(text, pos, 1) == "]") { pos++; break }
-                    continue
-                }
-                if (char == "]") { pos++; break }
-                invalid()
-            }
-            skip_space()
-            if (pos <= size) invalid()
-        }
-    ' 2>/dev/null)" || {
-        bootstrap_error 'miserc env must be a simple array of selector names; refusing to rewrite it'
-        return 2
-    }
-    if [[ -n "$values" ]]; then
-        printf '%s\n' "$values"
-    fi
-    return 0
+    printf '%s\n' "$raw" | tr -d '[]" ' | tr ',' '\n'
 }
 
-bootstrap_set_miserc_env() {
-    local profile="$1" machine_id="$2" tmp selector values host_count=0 selector_line
-    local prior duplicate i
-    local path="$BOOTSTRAP_CONFIG_DIR/miserc.toml"
-    local -a selectors=() preserved=()
-    values="$(bootstrap_miserc_env_values)" || return $?
-    bootstrap_load_profiles || return $?
-    selectors=("$profile" "host-$machine_id")
+# mise config set treats env arrays as arrays of variable tables, so it cannot
+# edit an early selector. Use mise's reader to confirm the extent and scope of
+# the assignment before splicing it. Brackets in comments or strings and keys
+# in other tables are only possible locations, never proof of a match.
+bootstrap_miserc_range() {
+    local path="$1" staging="$2" start end
+    while read -r start end; do
+        sed -n "${start},${end}p" "$path" > "$staging/selector.toml" || return $?
+        mise_config_file "$BOOTSTRAP_MISE_BIN" get "$staging/selector.toml" env >/dev/null 2>&1 || continue
+        head -n "$end" "$path" > "$staging/prefix.toml" || return $?
+        mise_config_file "$BOOTSTRAP_MISE_BIN" get "$staging/prefix.toml" env >/dev/null 2>&1 || continue
+        printf '%s %s\n' "$start" "$end"
+        return 0
+    done < <(awk '
+        /^[[:blank:]]*(env|"([^"\\]|\\.)*"|\047[^\047]*\047)[[:blank:]]*=[[:blank:]]*\[/ { start = NR }
+        start && /]/ { print start, NR }
+    ' "$path")
+    bootstrap_error 'could not locate the top-level miserc env array'
+    return 2
+}
+
+bootstrap_stage_miserc() {
+    local path="$1" candidate="$2" values selector previous host_count=0 range start end line key
+    local -a selectors=("$SETUP_PROFILE" "host-$SETUP_MACHINE_ID")
+    values="$(bootstrap_miserc_env_values "$path")" || return $?
     while IFS= read -r selector; do
         [[ -n "$selector" ]] || continue
-        # A profile selector is replaced by the new profile.
         if setup_is_profile "$selector"; then continue; fi
         if [[ "$selector" =~ ^host-[a-z0-9][a-z0-9-]*$ ]]; then
             ((host_count += 1))
-            if [[ "$host_count" -gt 1 ]]; then
+            if ((host_count > 1)); then
                 bootstrap_error 'miserc has multiple host identities; resolve them before changing the profile'
                 return 2
             fi
             continue
         fi
-        duplicate=0
-        for prior in "${selectors[@]}"; do
-            [[ "$prior" == "$selector" ]] && duplicate=1
+        for previous in "${selectors[@]}"; do
+            [[ "$previous" != "$selector" ]] || continue 2
         done
-        if ((${#preserved[@]})); then
-            for prior in "${preserved[@]}"; do
-                [[ "$prior" == "$selector" ]] && duplicate=1
-            done
-        fi
-        [[ "$duplicate" -eq 1 ]] || preserved+=("$selector")
+        selectors+=("$selector")
     done <<< "$values"
-    if ((${#preserved[@]})); then
-        selectors+=("${preserved[@]}")
-    fi
 
-    selector_line='env = ['
-    for ((i = 0; i < ${#selectors[@]}; i++)); do
-        ((i == 0)) || selector_line+=", "
-        selector_line+="$(bootstrap_toml_quote "${selectors[$i]}")"
-    done
-    selector_line+=']'
-
-    if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
-        bootstrap_error "refusing non-regular mise early config: $path"
-        return 2
-    fi
-    tmp="$(mktemp "$BOOTSTRAP_CONFIG_DIR/.miserc.XXXXXX")" || return 1
-    {
-        # This bare array is mise's early config selector. It must be in the
-        # global miserc, before normal config discovery begins.
-        if [[ -f "$path" ]]; then
-            awk -v selector_line="$selector_line" '
-                function array_closed(s, i, c, quote, escaped) {
-                    quote = ""
-                    escaped = 0
-                    for (i = 1; i <= length(s); i++) {
-                        c = substr(s, i, 1)
-                        if (escaped) { escaped = 0; continue }
-                        if (quote == "\"" && c == "\\") { escaped = 1; continue }
-                        if (quote != "") {
-                            if (c == quote) quote = ""
-                            continue
-                        }
-                        if (c == "#") break
-                        if (c == "\"" || c == "\047") { quote = c; continue }
-                        if (c == "]") return 1
-                    }
-                    return 0
-                }
-                BEGIN { in_table = 0; skip_env = 0 }
-                skip_env {
-                    if (array_closed($0)) skip_env = 0
-                    next
-                }
-                /^[[:space:]]*\[/ {
-                    if (!wrote) { print selector_line; wrote = 1 }
-                    in_table = 1
-                    print
-                    next
-                }
-                !in_table && /^[[:space:]]*env[[:space:]]*=/ {
-                    if (!wrote) { print selector_line; wrote = 1 }
-                    value = $0
-                    sub(/^[[:space:]]*env[[:space:]]*=/, "", value)
-                    if (!array_closed(value)) skip_env = 1
-                    next
-                }
-                {
-                    if (!wrote && !in_table) { print selector_line; wrote = 1 }
-                    print
-                }
-                END { if (!wrote) print selector_line }
-            ' "$path"
-        else
-            printf '%s\n' "$selector_line"
+    if [[ -f "$path" ]] && mise_config_file "$BOOTSTRAP_MISE_BIN" get "$path" env >/dev/null 2>&1; then
+        range="$(bootstrap_miserc_range "$path" "$(dirname "$candidate")")" || return $?
+        read -r start end <<< "$range"
+        key="$(sed -n "${start}p" "$path" | cut -d= -f1)"
+        if [[ "$values" == "$(printf '%s\n' "${selectors[@]}")" ]]; then
+            mise_config_copy "$path" "$candidate"
+            return $?
         fi
-    } > "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+    else
+        start=1 end=0 key='env '
+    fi
+
+    printf -v line ', "%s"' "${selectors[@]}"
+    {
+        if ((start > 1)); then head -n "$((start - 1))" "$path" || return $?; fi
+        # Selector names contain no #, so keep any comments on the old array.
+        if ((start <= end)); then
+            sed -n "${start},${end}s/^[^#]*\(#.*\)$/\1/p" "$path" || return $?
+        fi
+        printf '%s= [%s]\n' "$key" "${line:2}"
+        tail -n "+$((end + 1))" "$path" || return $?
+    } > "$candidate"
 }
 
-bootstrap_set_local() {
-    local key="$1" value="$2" type="${3:-}"
-    local path="$BOOTSTRAP_CONFIG_DIR/config.local.toml"
-    touch "$path" || return 1
-    chmod 600 "$path" || return 1
-
-    if [[ -n "$type" ]]; then
-        bootstrap_mise config set --type "$type" --file "$path" "$key" "$value"
-    else
-        bootstrap_mise config set --file "$path" "$key" "$value"
-    fi
+bootstrap_local_value() {
+    local candidate="$1" key="$2" value="$3" type="${4:-string}"
+    local before="$candidate.before.toml"
+    cp "$candidate" "$before" || return $?
+    mise_config_file "$BOOTSTRAP_MISE_BIN" set "$candidate" --type "$type" -- "$key" "$value" || return $?
+    mise_config_keep_source "$BOOTSTRAP_MISE_BIN" "$before" "$candidate"
 }
 
 bootstrap_append_local() {
-    local key="$1" value="$2" type="${3:-}"
+    local key="$1" value="$2" type="$3"
     local path="$BOOTSTRAP_CONFIG_DIR/config.local.toml"
-    touch "$path" || return 1
-    chmod 600 "$path" || return 1
-
-    if [[ -n "$type" ]]; then
-        bootstrap_mise config set --append --type "$type" --file "$path" "$key" "$value"
-    else
-        bootstrap_mise config set --append --file "$path" "$key" "$value"
-    fi
+    bootstrap_mise config set --append --type "$type" --file "$path" "$key" "$value"
 }
 
-bootstrap_persist_local_profile() {
-    local identity_label="${1:-}" history_branch
+bootstrap_stage_local() {
+    local candidate="$1" identity_label="$2" history_branch
     history_branch="$(bootstrap_history_branch)" || return $?
-    bootstrap_set_local env.SETUP_PROFILE "$SETUP_PROFILE" || return $?
-    bootstrap_set_local env.SETUP_MACHINE_ID "$SETUP_MACHINE_ID" || return $?
-    bootstrap_set_local settings.history.sync manual || return $?
+    bootstrap_local_value "$candidate" 'env."SETUP_PROFILE"' "$SETUP_PROFILE" || return $?
+    bootstrap_local_value "$candidate" 'env."SETUP_MACHINE_ID"' "$SETUP_MACHINE_ID" || return $?
+    bootstrap_local_value "$candidate" 'settings."history".sync' manual || return $?
 
     if [[ -n "$identity_label" ]]; then
-        bootstrap_set_local env.SETUP_AGE_IDENTITY "$identity_label" || return $?
-        bootstrap_set_local settings.age.identity_files "$identity_label" list || return $?
+        bootstrap_local_value "$candidate" 'env."SETUP_AGE_IDENTITY"' "$identity_label" || return $?
+        bootstrap_local_value "$candidate" 'settings."age".identity_files' "$identity_label" list || return $?
     fi
 
     if [[ -n "${SETUP_HISTORY_ORIGIN:-}" ]]; then
-        bootstrap_set_local env.SETUP_HISTORY_ORIGIN "$SETUP_HISTORY_ORIGIN" || return $?
+        bootstrap_local_value "$candidate" 'env."SETUP_HISTORY_ORIGIN"' "$SETUP_HISTORY_ORIGIN" || return $?
         # A branch-only origin table is invalid; persist the URL first.
-        bootstrap_set_local history.origin.url "$SETUP_HISTORY_ORIGIN" || return $?
-        bootstrap_set_local history.origin.branch "$history_branch" || return $?
+        bootstrap_local_value "$candidate" 'history."origin".url' "$SETUP_HISTORY_ORIGIN" || return $?
+        bootstrap_local_value "$candidate" 'history."origin".branch' "$history_branch" || return $?
     fi
 }
 
-bootstrap_persist_profile() {
-    local identity_label="${1:-}"
+bootstrap_persist_profile() (
+    local identity_label="${1:-}" selector="${2:-update}" local_path local_candidate
+    local miserc_path miserc_candidate values
+    local_stage='' miserc_stage=''
     bootstrap_init || return $?
     bootstrap_validate_profile || return $?
+    miserc_path="$BOOTSTRAP_CONFIG_DIR/miserc.toml"
+    local_path="$(mise_config_target "$BOOTSTRAP_CONFIG_DIR/config.local.toml")" || return $?
+    if [[ "$local_path" == "$miserc_path" ]]; then
+        bootstrap_error 'config.local.toml and miserc.toml must be separate files'
+        return 2
+    fi
+    trap '[[ -z "$local_stage" ]] || rm -rf "$local_stage"; [[ -z "$miserc_stage" ]] || rm -rf "$miserc_stage"' EXIT
 
-    # Global miserc is read before mise discovers the profile config files.
-    bootstrap_set_miserc_env "$SETUP_PROFILE" "$SETUP_MACHINE_ID" || return $?
-    bootstrap_persist_local_profile "$identity_label"
-}
+    if [[ "$selector" == update ]]; then
+        miserc_stage="$(mktemp -d "$BOOTSTRAP_CONFIG_DIR/.dots-profile.XXXXXX")" || return 1
+        miserc_candidate="$miserc_stage/miserc.toml"
+        if [[ -e "$miserc_path" || -L "$miserc_path" ]]; then
+            bootstrap_stage_miserc "$miserc_path" "$miserc_candidate" || return $?
+        else
+            printf 'env = ["%s", "host-%s"]\n' "$SETUP_PROFILE" "$SETUP_MACHINE_ID" > "$miserc_candidate" || return $?
+        fi
+        values="$(bootstrap_miserc_env_values "$miserc_candidate")" || return $?
+        if [[ "$values" != "$SETUP_PROFILE"$'\n'"host-$SETUP_MACHINE_ID" && "$values" != "$SETUP_PROFILE"$'\n'"host-$SETUP_MACHINE_ID"$'\n'* ]]; then
+            bootstrap_error 'staged miserc does not select the requested profile and host'
+            return 2
+        fi
+        mise_config_mode "$miserc_path" "$miserc_candidate" 600 || return $?
+    fi
+
+    local_stage="$(mktemp -d "$(dirname "$local_path")/.dots-profile.XXXXXX")" || return 1
+    local_candidate="$local_stage/config.local.toml"
+    mise_config_copy "$local_path" "$local_candidate" || return $?
+    bootstrap_stage_local "$local_candidate" "$identity_label" || return $?
+    mise_config_file "$BOOTSTRAP_MISE_BIN" get "$local_candidate" >/dev/null || return $?
+    mise_config_mode "$local_path" "$local_candidate" 600 || return $?
+
+    # Both TOML candidates have been checked before either live file changes.
+    mise_config_install "$local_path" "$local_candidate" || return $?
+    if [[ "$selector" == update ]]; then
+        mise_config_install "$miserc_path" "$miserc_candidate" || return $?
+    fi
+)

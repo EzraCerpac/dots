@@ -253,18 +253,22 @@ setup_history_branch() {
     printf 'host-%s\n' "$SETUP_MACHINE_ID"
 }
 
-setup_require_history_branch() {
-    local expected configured
-    expected="$(setup_history_branch)" || return $?
-    configured="$(setup_mise config get --file "$SETUP_ROOT/config.local.toml" history.origin.branch 2>/dev/null)" || {
-        setup_error "history origin branch is not configured as $expected; enroll this host before publishing"
-        return 2
-    }
-    if [[ "$configured" != "$expected" ]]; then
-        setup_error "history origin branch is '$configured', expected '$expected'; refusing to publish"
+setup_history_state_repo() {
+    setup_dots_var dots_state_repo || return $?
+    if [[ ! "$SETUP_VAR_dots_state_repo" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]]; then
+        setup_error "dots_state_repo must be OWNER/NAME, not $SETUP_VAR_dots_state_repo"
         return 2
     fi
-    printf '%s\n' "$expected"
+}
+
+setup_history_destination_matches() {
+    local repo="$SETUP_VAR_dots_state_repo"
+    case "$1" in
+        "git@github.com:$repo"|"git@github.com:$repo.git"|\
+        "ssh://git@github.com/$repo"|"ssh://git@github.com/$repo.git"|\
+        "https://github.com/$repo"|"https://github.com/$repo.git") return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Print the target of every active mode = "track" entry, one per line, after

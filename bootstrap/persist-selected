@@ -58,17 +58,16 @@ if [[ -n "$persisted_role" ]]; then
     # Keep an existing role. Add a stable host id only when this older profile
     # has none, then make the local task environment agree with that selection.
     SETUP_PROFILE="$persisted_role"
+    selector=keep
     if [[ -n "$persisted_machine_id" ]]; then
         SETUP_MACHINE_ID="$persisted_machine_id"
     else
         if [[ -z "$SETUP_MACHINE_ID" ]]; then
             SETUP_MACHINE_ID="$(bootstrap_new_machine_id)" || exit $?
         fi
-        bootstrap_set_miserc_env "$SETUP_PROFILE" "$SETUP_MACHINE_ID"
+        selector=update
     fi
-    bootstrap_init
-    bootstrap_validate_profile
-    bootstrap_persist_local_profile
+    bootstrap_persist_profile '' "$selector"
     printf 'Kept existing mise role %s for host %s.\n' "$SETUP_PROFILE" "$SETUP_MACHINE_ID"
     exit 0
 fi

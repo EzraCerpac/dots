@@ -42,41 +42,58 @@ fi
 dir="$(cd "$dir" && pwd -P)"
 printf 'Configuration: %s\n' "$dir"
 
-# The settings dots requires, plus commented hints for the common optional ones.
-vars_lines=(
-    '# dots settings (see dots/README.md). mise vars are strings; lists are space-separated words.'
-    '# Profiles this configuration selects with mise -E; each may have a config.<profile>.toml.'
-    'dots_profiles = "default"'
-)
-config="$dir/config.toml"
-has_key() { [[ -f "$config" ]] && grep -Eq "^[[:space:]]*$1[[:space:]]*=" "$config"; }
-if has_key dots_profiles; then
-    report kept 'config.toml [vars] dots_profiles'
-else
-    hints=()
-    has_key dots_source_repo || hints+=('# dots_source_repo = "OWNER/NAME"   # GitHub repository of this configuration (sync, publish)')
-    has_key dots_state_repo || hints+=('# dots_state_repo = "OWNER/NAME"    # private settings history (restore, bootstrap)')
-    lines=("${vars_lines[@]}" ${hints[@]+"${hints[@]}"})
-    if [[ ! -f "$config" ]]; then
-        printf '[vars]\n' > "$config"
-        printf '%s\n' "${lines[@]}" >> "$config"
-        report created 'config.toml with [vars] dots_profiles'
-    elif grep -Eq '^[[:space:]]*\[vars\][[:space:]]*(#.*)?$' "$config"; then
-        # Insert directly below the existing [vars] header; TOML allows one.
-        # Rewrite in place so the file keeps its mode and any symlink.
-        temporary="$(mktemp "${TMPDIR:-/tmp}/dots-init.XXXXXX")"
-        DOTS_INIT_BLOCK="$(printf '%s\n' "${lines[@]}")" awk '
-            { print }
-            !done && /^[[:space:]]*\[vars\][[:space:]]*(#.*)?$/ { print ENVIRON["DOTS_INIT_BLOCK"]; done = 1 }
-        ' "$config" > "$temporary"
-        cat "$temporary" > "$config"
-        rm -f "$temporary"
+source "$DOTS_HOME/lib/mise-bin.sh"
+source "$DOTS_HOME/lib/mise-config.sh"
+
+init_config_hints() {
+    if [[ $# -eq 0 ]] || ! mise_config_file "$1" get "$2" 'vars."dots_source_repo"' >/dev/null 2>&1; then
+        printf '%s\n' '# dots_source_repo = "OWNER/NAME"   # GitHub repository of this configuration (sync, publish)'
+    fi
+    if [[ $# -eq 0 ]] || ! mise_config_file "$1" get "$2" 'vars."dots_state_repo"' >/dev/null 2>&1; then
+        printf '%s\n' '# dots_state_repo = "OWNER/NAME"    # private settings history (restore, bootstrap)'
+    fi
+}
+
+init_config() (
+    local config candidate mise hints
+    config="$(mise_config_target "$dir/config.toml")" || return $?
+    if [[ -f "$config" ]]; then
+        mise="${DOTS_MISE_BIN:-}"
+        [[ -x "$mise" ]] || mise="$(resolve_mise_bin)" || return $?
+        mise_config_file "$mise" get "$config" >/dev/null || return $?
+        if mise_config_file "$mise" get "$config" 'vars."dots_profiles"' >/dev/null 2>&1; then
+            report kept 'config.toml [vars] dots_profiles'
+            return 0
+        fi
+    fi
+
+    staging="$(mktemp -d "$(dirname "$config")/.dots-init.XXXXXX")" || return 1
+    trap 'rm -rf "$staging"' EXIT
+    candidate="$staging/config.toml"
+    if [[ -f "$config" ]]; then
+        mise_config_copy "$config" "$candidate" || return $?
+        mise_config_file "$mise" set "$candidate" --type string 'vars."dots_profiles"' default || return $?
+        hints="$(init_config_hints "$mise" "$candidate")" || return $?
+        if [[ -n "$hints" ]]; then
+            printf '\n# Copy these optional settings into [vars].\n%s\n' "$hints" >> "$candidate" || return $?
+        fi
+        mise_config_file "$mise" get "$candidate" >/dev/null || return $?
+        mise_config_mode "$config" "$candidate" 644 || return $?
+        mise_config_install "$config" "$candidate" || return $?
         report added 'config.toml [vars] dots_profiles'
     else
-        { [[ ! -s "$config" ]] || printf '\n'; printf '[vars]\n'; printf '%s\n' "${lines[@]}"; } >> "$config"
-        report added 'config.toml [vars] dots_profiles'
+        cat > "$candidate" <<'EOF' || return $?
+[vars]
+# dots settings (see dots/README.md). mise vars are strings; lists are space-separated words.
+# Profiles this configuration selects with mise -E; each may have a config.<profile>.toml.
+dots_profiles = "default"
+EOF
+        init_config_hints >> "$candidate" || return $?
+        mise_config_install "$config" "$candidate" || return $?
+        report created 'config.toml with [vars] dots_profiles'
     fi
-fi
+)
+init_config
 
 for directory in dots dots/hooks dots/hooks/update.d dots/hooks/bootstrap.d dots/commands dots/exceptions; do
     make_dir "$directory"

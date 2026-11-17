@@ -35,6 +35,13 @@ function fakeRun(root, calls, vars = { dots_profiles: 'laptop server' }) {
     if (at >= 0 && args[at + 1] === '--' && args[at + 2]?.startsWith(path.join(root, 'dots/hooks/'))) {
       return spawnSync(args[at + 2], args.slice(at + 3), { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
     }
+    if (args.includes(path.join(MANAGER, 'tasks/restore'))) {
+      return { status: Number(options.env.FAKE_RESTORE_CODE || 0), stdout: '', stderr: '' };
+    }
+    if (command === 'age-keygen') return { status: 0, stdout: 'fixture-recipient\n', stderr: '' };
+    if (args.includes('dot') && args.includes('status')) {
+      return { status: 0, stdout: '{"history":{"watcher":"running"}}', stderr: '' };
+    }
     const variable = args.find(arg => arg.startsWith('vars.'));
     if (args.includes('get') && variable) {
       const value = vars[variable.slice('vars.'.length)];
@@ -109,6 +116,31 @@ test('an unknown profile suffix fails the hook stage and runs no hooks', () => {
     assert.ok(!fs.existsSync(path.join(f.base, 'ran')));
   } finally {
     f.cleanup();
+  }
+});
+
+test('bootstrap hooks report restoration only if private recovery succeeded', () => {
+  for (const restoreCode of [7, 0]) {
+    const f = fixture();
+    try {
+      const identity = path.join(f.home, '.config/age/keys.txt');
+      fs.mkdirSync(path.dirname(identity), { recursive: true });
+      fs.writeFileSync(identity, 'fixture\n');
+      fs.writeFileSync(path.join(f.root, 'config.local.toml'), '');
+      const out = path.join(f.base, 'restored');
+      f.hook('10-recovery', `printf '%s\\n' "$DOTS_RESTORED" > "${out}"\n`);
+      const calls = [];
+      const { code, report } = bootstrap(f, calls, {
+        SETUP_RESTORE_MACHINE_ID: 'fixture-host', FAKE_RESTORE_CODE: String(restoreCode),
+      }, { dots_profiles: 'laptop server', dots_state_repo: 'fixture/private' });
+      assert.ok(calls.some(args => args.includes(path.join(MANAGER, 'tasks/restore'))));
+      assert.equal(code, restoreCode ? 1 : 0);
+      assert.equal(report.stages.find(stage => stage.stage === 'Restore private settings').status,
+        restoreCode ? 'failed' : 'completed');
+      assert.equal(fs.readFileSync(out, 'utf8').trim(), restoreCode ? '0' : '1');
+    } finally {
+      f.cleanup();
+    }
   }
 });
 

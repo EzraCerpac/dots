@@ -37,20 +37,12 @@ fi
 history_branch="$(setup_history_branch)" || exit $?
 
 # The private settings repository is [vars] dots_state_repo (GitHub OWNER/NAME).
-setup_dots_var dots_state_repo || exit $?
-state_repo="$SETUP_VAR_dots_state_repo"
-[[ "$state_repo" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { setup_error "dots_state_repo must be OWNER/NAME, not $state_repo"; exit 2; }
-case "$SETUP_HISTORY_ORIGIN" in
-    "git@github.com:$state_repo"|"git@github.com:$state_repo.git"|\
-    "ssh://git@github.com/$state_repo"|"ssh://git@github.com/$state_repo.git"|\
-    "https://github.com/$state_repo"|"https://github.com/$state_repo.git")
-        ;;
-    *)
-        setup_error "history origin must be the private $state_repo repository"
-        setup_error 'restore will not adopt or fetch private history into the public source repository'
-        exit 2
-        ;;
-esac
+setup_history_state_repo || exit $?
+if ! setup_history_destination_matches "$SETUP_HISTORY_ORIGIN"; then
+    setup_error "history origin must be the private $SETUP_VAR_dots_state_repo repository"
+    setup_error 'restore will not adopt or fetch private history into the public source repository'
+    exit 2
+fi
 
 history_store_path() {
     local state_dir

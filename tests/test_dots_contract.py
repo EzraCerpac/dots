@@ -14,10 +14,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
-from lib.prereq import requires
+from lib.prereq import mise_binary, requires
 
 MANAGER = Path(__file__).resolve().parents[1]
 
@@ -26,10 +27,13 @@ MANAGER = Path(__file__).resolve().parents[1]
 # simulates source sync with FAKE_SYNC, and succeeds for every other
 # subcommand without doing anything. For settings history it answers
 # `dotfiles paths --json` with FAKE_PATHS (default no entries), a dotfiles.*
-# key from the TOML in the --file it was given (which must exist), the origin
-# branch with FAKE_BRANCH and `settings get` with FAKE_SETTING.
+# key from the TOML in its --file, the effective history status with
+# FAKE_HISTORY_STATUS and `settings get` with FAKE_SETTING.
 FAKE_MISE = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_MISE_LOG"
+if [[ "${1:-} ${2:-}" == '--quiet --no-config' && -n "${FIXTURE_TOML_MISE:-}" ]]; then
+    exec "$FIXTURE_TOML_MISE" "$@"
+fi
 while [[ "${1:-}" == -C || "${1:-}" == -E ]]; do shift 2; done
 case "${1:-}" in
     config)
@@ -57,7 +61,6 @@ while isinstance(path, dict):
     value = value[part]
 print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(value, dict) else value)
 ' "$4" "$key" ;;
-                history.origin.branch) [[ -n "${FAKE_BRANCH:-}" ]] || exit 1; printf '%s\n' "$FAKE_BRANCH" ;;
                 *) exit 1 ;;
             esac
         fi
@@ -73,7 +76,14 @@ print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(v
             fi
         done
         exec "$@" ;;
-    bootstrap) none='{"entries": []}'; [[ "$*" != *'dotfiles paths --json'* ]] || printf '%s\n' "${FAKE_PATHS-$none}" ;;
+    bootstrap)
+        none='{"entries": []}'
+        empty='{}'
+        case "$*" in
+            'bootstrap dotfiles paths --json') printf '%s\n' "${FAKE_PATHS-$none}" ;;
+            'bootstrap dotfiles status --json') printf '%s\n' "${FAKE_HISTORY_STATUS-$empty}" ;;
+        esac
+        ;;
     ls) printf '{}\n' ;;
     settings) [[ "${2:-}" == get && -n "${FAKE_SETTING:-}" ]] || exit 1; printf '%s\n' "$FAKE_SETTING" ;;
     which) exit 1 ;;
@@ -453,17 +463,120 @@ class CommandBackendTests(ContractTestCase):
         self.assertEqual(end["action"], "Review the stage log and rerun dots apply missing-target.")
 
 
+@requires("mise")
 class ProfileTests(ContractTestCase):
+    def dots(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.f.dots(*args, SETUP_MISE_BIN=mise_binary(), DOTS_MISE_BIN=mise_binary(),
+                           MISE_CONFIG_DIR=str(self.f.config), MISE_AUTO_INSTALL="0")
+
     def test_internal_profile_selects_a_profile_of_the_configuration(self) -> None:
-        result = self.f.dots("internal", "profile", "--profile", "server", "--machine-id", "fx",
-                             MISE_CONFIG_DIR=str(self.f.config))
+        write(self.f.config / "config.toml", '["vars"]\n"dots_profiles" = "laptop server"\n')
+        result = self.dots("internal", "profile", "--profile", "server", "--machine-id", "fx")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Saved local setup profile server for host fx.", result.stdout)
         self.assertEqual((self.f.config / "miserc.toml").read_text(), 'env = ["server", "host-fx"]\n')
-        unknown = self.f.dots("internal", "profile", "--profile", "desktop", "--machine-id", "fx",
-                              MISE_CONFIG_DIR=str(self.f.config))
+        unknown = self.dots("internal", "profile", "--profile", "desktop", "--machine-id", "fx")
         self.assertEqual(unknown.returncode, 2)
         self.assertIn("profile must be one of: laptop, server", unknown.stderr)
+
+    def test_init_uses_the_vars_table_and_preserves_a_linked_config(self) -> None:
+        config = self.f.config / "config.toml"
+        config.unlink()
+        target = write(self.f.base / "linked.toml", """
+            ["vars"] # vars header
+            'dots_state_repo' = "example/private" # state
+            [env]
+            dots_profiles = "unrelated"
+            """, 0o640)
+        config.symlink_to("../linked.toml")
+        result = self.dots("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(tomllib.loads(target.read_text()), {
+            "vars": {"dots_state_repo": "example/private", "dots_profiles": "default"},
+            "env": {"dots_profiles": "unrelated"},
+        })
+        self.assertIn('["vars"] # vars header', target.read_text())
+        self.assertTrue(config.is_symlink())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+        original = target.read_bytes()
+        self.assertEqual(self.dots("init").returncode, 0)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_init_keeps_quoted_profiles_and_refuses_an_invalid_candidate(self) -> None:
+        config = self.f.config / "config.toml"
+        for content, code in [
+            (b'["vars"]\n"dots_profiles" = "laptop server"\n', 0),
+            (b'vars = "cannot hold the required key"\n', 1),
+        ]:
+            with self.subTest(content=content):
+                config.write_bytes(content)
+                result = self.dots("init")
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(config.read_bytes(), content)
+
+    def test_profile_preserves_quoted_tables_comments_and_local_symlink(self) -> None:
+        write(self.f.config / "config.toml", '["vars"]\n"dots_profiles" = "laptop server"\n')
+        miserc = write(self.f.config / "miserc.toml", """
+            "env" = [
+              'laptop', # role
+              'host-old',
+              'extra', # extra
+            ] # selectors
+            ["env_sets"]
+            env = ["other"] # unrelated
+            """, 0o640)
+        local = write(self.f.base / "local.toml", """
+            ["env"] # environment
+            "SETUP_PROFILE" = "server\\n" # profile comment
+            KEEP = "yes" # unrelated
+            """, 0o640)
+        link = self.f.config / "config.local.toml"
+        link.symlink_to("../local.toml")
+
+        args = ("internal", "profile", "--profile", "server", "--machine-id", "fx")
+        result = self.dots(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(tomllib.loads(miserc.read_text()), {
+            "env": ["server", "host-fx", "extra"], "env_sets": {"env": ["other"]},
+        })
+        self.assertIn('# extra', miserc.read_text())
+        self.assertIn('# selectors', miserc.read_text())
+        self.assertIn('env = ["other"] # unrelated', miserc.read_text())
+        self.assertEqual(tomllib.loads(local.read_text())["env"],
+                         {"SETUP_PROFILE": "server", "SETUP_MACHINE_ID": "fx", "KEEP": "yes"})
+        self.assertIn('# profile comment', local.read_text())
+        self.assertIn('KEEP = "yes" # unrelated', local.read_text())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(miserc.stat().st_mode), 0o640)
+        original = (miserc.read_bytes(), local.read_bytes())
+        self.assertEqual(self.dots(*args).returncode, 0)
+        self.assertEqual((miserc.read_bytes(), local.read_bytes()), original)
+
+    def test_profile_validation_leaves_both_files_untouched(self) -> None:
+        write(self.f.config / "config.toml", '[vars]\ndots_profiles = "laptop server"\n')
+        miserc = self.f.config / "miserc.toml"
+        local = self.f.config / "config.local.toml"
+        for selector, config in [
+            ('"env" = ["laptop"]\n', '[env]\nSETUP_PROFILE = "laptop"\n[history.origin]\nbranch = "host-old"\n'),
+            ('["env"]\nSETUP_PROFILE = "laptop"\n', '[env]\nSETUP_PROFILE = "laptop"\n'),
+        ]:
+            with self.subTest(selector=selector, config=config):
+                write(miserc, selector)
+                write(local, config)
+                original = (miserc.read_bytes(), local.read_bytes())
+                result = self.dots("internal", "profile", "--profile", "server", "--machine-id", "fx")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual((miserc.read_bytes(), local.read_bytes()), original)
+        local.unlink()
+        write(miserc, "# Early settings\n")
+        local.symlink_to("miserc.toml")
+        original = miserc.read_bytes()
+        result = self.dots("internal", "profile", "--profile", "server", "--machine-id", "fx")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("must be separate files", result.stderr)
+        self.assertTrue(local.is_symlink())
+        self.assertEqual(miserc.read_bytes(), original)
 
 
 class ConfigRootTests(ContractTestCase):
@@ -625,7 +738,7 @@ class ExceptionManifestTests(ContractTestCase):
         self.assertIn("brew:tap/x/pinned-tool@1 is held by installer exception 'pinned'", result.stderr)
 
 
-@requires("age-keygen", "jq")
+@requires("age-keygen", "jq", "mise")
 class EnrollHistoryTests(ContractTestCase):
     """enroll-history keeps the host's keys and secures its declared track entries."""
 
@@ -643,6 +756,7 @@ class EnrollHistoryTests(ContractTestCase):
             ["bash", str(self.f.manager / "bootstrap/enroll-history"), "--profile", "laptop", "--machine-id", "fx",
              "--identity", str(key), "--recipient", "age1peer"],
             cwd=self.f.config, env={**self.f.env, "MISE_CONFIG_DIR": str(self.f.config), "SETUP_MISE_BIN": str(fake),
+                                    "FIXTURE_TOML_MISE": mise_binary(),
                                     "FAKE_PATHS": history_paths(self.f.home, *paths, variant=variant, encrypt=encrypt)},
             capture_output=True, text=True, timeout=60, check=False)
 
@@ -695,13 +809,49 @@ class HistorySaveGuardTests(ContractTestCase):
     def test_backup_refuses_an_unencrypted_entry_before_saving(self) -> None:
         result = subprocess.run(["bash", str(self.f.manager / "tasks/backup")], cwd=self.f.config,
                                 env={**self.f.env, "SETUP_PROFILE": "laptop", "SETUP_MACHINE_ID": "fx",
-                                     "FAKE_SETTING": "manual", "FAKE_BRANCH": "host-fx",
+                                     "FAKE_SETTING": "manual", "FAKE_VAR_dots_state_repo": "example/private",
                                      "FAKE_PATHS": history_paths(self.f.home, "~/.config/app/state", encrypt=False)},
                                 capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("history entry ~/.config/app/state in ~/.config/mise/config.host-fx.toml is not encrypted",
                       result.stderr)
         self.assertNotIn("dotfiles save", self.f.log.read_text())
+
+    def test_backup_checks_effective_push_urls_and_branch_before_saving(self) -> None:
+        store = self.f.base / "history/repo.git"
+        other = self.f.base / "public.git"
+        git_config = write(self.f.base / "gitconfig", "")
+        env = {**self.f.env, "SETUP_PROFILE": "laptop", "SETUP_MACHINE_ID": "fx",
+               "FAKE_SETTING": "manual", "FAKE_VAR_dots_state_repo": "example/private",
+               "GIT_CONFIG_GLOBAL": str(git_config), "GIT_CONFIG_NOSYSTEM": "1"}
+        for repo in (store, other):
+            subprocess.run(["git", "init", "-q", "--bare", str(repo)], env=env, check=True)
+        https = "https://github.com/example/private.git"
+        wrong = "history push destination must be the private example/private repository"
+        for origin, branch, rewrite, error in [
+            (https, "host-fx", (), ""),
+            ("git@github.com:example/private", "host-fx", (), ""),
+            ("ssh://git@github.com/example/private.git", "host-fx", (), ""),
+            (str(other), "host-fx", (), wrong),
+            (https, "host-override", (), "effective history origin branch must be host-fx"),
+            (https, "host-fx\n", (), "effective history origin branch must be host-fx"),
+            (https + "\n", "host-fx", (), "could not read the effective history origin URL"),
+            (https, "host-fx", (f"url.{other}.pushInsteadOf", https), wrong),
+            (https, "host-fx", (f"remote.{https}.pushurl", str(other)), wrong),
+        ]:
+            with self.subTest(origin=origin, branch=branch, rewrite=rewrite):
+                worked = not error
+                self.f.log.write_text("")
+                git_config.write_text("")
+                if rewrite:
+                    subprocess.run(["git", "config", "--file", str(git_config), *rewrite], env=env, check=True)
+                status = {"history": {"sync": {"origin": origin, "branch": branch}, "history_repo": str(store)}}
+                result = self.f.dots("backup", **env, FAKE_HISTORY_STATUS=json.dumps(status))
+                self.assertEqual(result.returncode, 0 if worked else 2, result.stdout + result.stderr)
+                self.assertIn(error, result.stderr)
+                log = self.f.log.read_text()
+                self.assertEqual("dotfiles save" in log, worked)
+                self.assertEqual("dotfiles sync" in log, worked)
 
     def test_update_refuses_an_unencrypted_entry_before_its_checkpoint(self) -> None:
         result = self.f.update(FAKE_PATHS=history_paths(self.f.home, "~/.config/app/state", variant="", encrypt=False))
@@ -763,10 +913,13 @@ class MinimalConfigurationTests(ContractTestCase):
         self.assertIn("missing setting: add dots_profiles to [vars]", result.stderr)
 
 
+@requires("mise")
 class InitTests(ContractTestCase):
     def init(self, *args: str) -> subprocess.CompletedProcess[str]:
+        environment = {key: value for key, value in self.f.env.items() if key != "DOTS_ROOT"}
+        environment.update(SETUP_MISE_BIN=mise_binary(), DOTS_MISE_BIN=mise_binary(), MISE_AUTO_INSTALL="0")
         return subprocess.run([str(self.f.manager / "bin/dots"), "init", *args], cwd=self.f.base,
-                              env={key: value for key, value in self.f.env.items() if key != "DOTS_ROOT"},
+                              env=environment,
                               capture_output=True, text=True, timeout=60, check=False)
 
     def test_creates_a_working_minimal_configuration_and_is_idempotent(self) -> None:
@@ -804,10 +957,11 @@ class InitTests(ContractTestCase):
         result = self.init(str(config.parent))
         self.assertEqual(result.returncode, 0, result.stderr)
         text = config.read_text()
-        self.assertEqual(text.count("[vars]"), 1)
+        self.assertEqual(text.splitlines().count("[vars]"), 1)
         self.assertLess(text.index("[vars]"), text.index('dots_profiles = "default"'))
         self.assertLess(text.index('dots_profiles = "default"'), text.index("[tools]"))
         self.assertNotIn("# dots_source_repo", text)
+        self.assertIn("# Copy these optional settings into [vars].", text)
         self.assertIn("# dots_state_repo", text)
         self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
         no_vars = write(self.f.base / "plain/config.toml", '[tools]\njq = "1"\n')

@@ -227,7 +227,13 @@ func Run(opts Options) int {
 		}
 	}()
 
+	labels := map[string]string{} // a stage_end may name its stage only by ID
 	deliver := func(e ui.Event) {
+		if e.Kind == "stage_start" {
+			labels[e.ID] = e.Label
+		} else if e.Kind == "stage_end" && e.Label == "" {
+			e.Label = labels[e.ID]
+		}
 		if uiAlive && events != nil {
 			select {
 			case events <- e:
@@ -670,13 +676,13 @@ func Run(opts Options) int {
 	if plain && !opts.Verbose {
 		if files != nil {
 			fmt.Println(summary(files.report, files.runDir))
-			printReportHighlights(os.Stdout, files.report)
+			printReportHighlights(os.Stdout, files.report, files.runDir)
 		} else {
 			fmt.Printf("Update completed with exit code %d.\n", exitCode)
 		}
 	} else if dashboardStarted && files != nil {
 		fmt.Println(summary(files.report, files.runDir))
-		printReportHighlights(os.Stdout, files.report)
+		printReportHighlights(os.Stdout, files.report, files.runDir)
 	}
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)

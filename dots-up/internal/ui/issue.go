@@ -10,51 +10,46 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// issueOutputLines is how much of a stage log an issue shows; the full log
-// stays one path away.
-const issueOutputLines = 30
+// issueOutputLines is how many lines of the error an issue shows; the full
+// log stays one path away.
+const issueOutputLines = 6
 
-// IssueDetail is everything one attention item says: what happened, the end
-// of the output that explains it, where the full log is, and what to do next.
-// The dashboard, plain output and saved reports all show it.
-func IssueDetail(text, action, logPath string) string {
-	var b strings.Builder
-	b.WriteString(text + "\n")
-	if output := logTail(logPath, issueOutputLines); output != "" {
-		b.WriteString("\nOutput (end of the log):\n")
-		for _, line := range strings.Split(output, "\n") {
-			b.WriteString("  " + line + "\n")
+// IssueDetail is everything one attention item says, in this order: what
+// failed, the last lines of the error (DETAIL, the output the step reported
+// with it, or else the end of its log), the one command to run next, and the
+// log. The dashboard, plain output and saved reports all show it.
+func IssueDetail(text, detail, action, logPath string) string {
+	if detail == "" && logPath != "" {
+		if _, err := os.Stat(logPath); err == nil {
+			detail = readTail(logPath)
 		}
 	}
-	if logPath != "" {
-		b.WriteString("\nFull log: " + logPath + "\n")
+	lines := []string{text}
+	for _, line := range lastLines(detail, issueOutputLines) {
+		lines = append(lines, "    "+line)
 	}
 	if action != "" {
-		b.WriteString("Next: " + action + "\n")
+		lines = append(lines, "    Next: "+action)
 	}
-	return strings.TrimRight(b.String(), "\n")
+	if logPath != "" {
+		lines = append(lines, "    Log: "+logPath)
+	}
+	return strings.Join(lines, "\n")
 }
 
-// logTail returns the last LIMIT non-empty lines of a log, or "" when there is
-// none to show.
-func logTail(path string, limit int) string {
-	if path == "" {
-		return ""
-	}
-	if _, err := os.Stat(path); err != nil {
-		return ""
-	}
+// lastLines returns the last LIMIT non-empty lines of TEXT.
+func lastLines(text string, limit int) []string {
 	var lines []string
-	for _, line := range strings.Split(readTail(path), "\n") {
+	for _, line := range strings.Split(text, "\n") {
 		if strings.TrimSpace(line) != "" && line != "Waiting for output…" {
 			lines = append(lines, strings.TrimRight(line, " \t"))
 		}
 	}
-	return strings.Join(lines[max(0, len(lines)-limit):], "\n")
+	return lines[max(0, len(lines)-limit):]
 }
 
 func (m Model) issueDetail(item issue) string {
-	return IssueDetail(item.text, item.action, item.logPath)
+	return IssueDetail(item.text, item.detail, item.action, item.logPath)
 }
 
 // AgentCommandEnv names the shell command that receives an issue as its final

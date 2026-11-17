@@ -334,15 +334,17 @@ func ShowLast(opts Options) int {
 	}
 	fmt.Println(summary(report, dir))
 	if opts.Plain || opts.Verbose || !interactiveTerminal() {
-		printReportHighlights(os.Stdout, report)
+		printReportHighlights(os.Stdout, report, dir)
 	}
 	return report.ExitCode
 }
 
-func printReportHighlights(w io.Writer, report Report) {
+func printReportHighlights(w io.Writer, report Report, dir string) {
 	up := report.Command == "" || report.Command == "up"
 	if up {
-		fmt.Fprintln(w, ui.OutcomeReport(report.Events))
+		// The outcomes list each issue with its error, next command and log.
+		fmt.Fprintln(w, ui.OutcomeReport(report.Events, dir))
+		return
 	}
 	labels := map[string]string{}
 	for _, e := range report.Events {
@@ -353,20 +355,15 @@ func printReportHighlights(w io.Writer, report Report) {
 	for _, e := range report.Events {
 		switch e.Kind {
 		case "item_upsert":
-			if up {
-				continue
-			}
 			if report.Command == "status" && (e.Status == "ok" || e.Status == "skipped") {
 				continue
 			}
 			fmt.Fprintf(w, "  %s  %s — %s\n", e.Label, e.Status, e.Summary)
 		case "change":
-			if !up {
-				fmt.Fprintln(w, "  "+ui.ChangeLine(e.Action, e.Item, e.Before, e.After))
-			}
+			fmt.Fprintln(w, "  "+ui.ChangeLine(e.Action, e.Item, e.Before, e.After))
 		case "notice":
 			if e.Severity == "attention" || e.Severity == "error" {
-				printIssue(w, "Attention: "+e.Summary, e.Action, "")
+				printIssue(w, "Attention: "+e.Summary, e.Detail, e.Action, "")
 			}
 		case "stage_end":
 			if e.Status == "failed" || e.Status == "attention" {
@@ -378,7 +375,7 @@ func printReportHighlights(w io.Writer, report Report) {
 				if e.Status == "attention" {
 					kind = "Needs attention"
 				}
-				printIssue(w, fmt.Sprintf("%s: %s — %s", kind, label, e.Summary), e.Action, e.LogPath)
+				printIssue(w, fmt.Sprintf("%s: %s — %s", kind, label, e.Summary), e.Detail, e.Action, e.LogPath)
 			}
 		}
 	}
@@ -390,9 +387,9 @@ func printReportHighlights(w io.Writer, report Report) {
 	}
 }
 
-// printIssue prints one attention item with its output, log and next step.
-func printIssue(w io.Writer, text, action, logPath string) {
-	for _, line := range strings.Split(ui.IssueDetail(text, action, logPath), "\n") {
+// printIssue prints one attention item with its error, next step and log.
+func printIssue(w io.Writer, text, detail, action, logPath string) {
+	for _, line := range strings.Split(ui.IssueDetail(text, detail, action, logPath), "\n") {
 		fmt.Fprintln(w, strings.TrimRight("  "+line, " "))
 	}
 }

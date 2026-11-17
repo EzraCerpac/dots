@@ -9,8 +9,8 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// The sync stage as dots up reports it: one attention stage whose log holds
-// the block, with the failed command's output under its line.
+// The sync stage as dots up reports it: one attention stage that carries the
+// failed command's output and the command to run next; its log holds the block.
 func syncAttention(t *testing.T) (Model, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -29,7 +29,8 @@ func syncAttention(t *testing.T) (Model, string) {
 	m = send(m, Event{V: 1, Kind: "stage_start", ID: "source-sync", Group: "Source & settings", Label: "Sync configuration", LogPath: log})
 	m = send(m, Event{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", LogPath: log,
 		Summary: "APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply",
-		Action:  "Fix what the sync output says, then run dots sync"})
+		Detail:  "mise $ dots internal persist-selected\nmise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
+		Action:  "dots apply"})
 	return m, log
 }
 
@@ -48,16 +49,63 @@ func TestIssueDetailsShowTheErrorTheLogAndTheNextStep(t *testing.T) {
 	m = openFirstIssue(m)
 	for _, want := range []string{
 		"! Sync configuration — APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
-		"  mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
-		"Full log: " + log,
-		"Next: Fix what the sync output says, then run dots sync",
+		"    mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
+		"    Next: dots apply",
+		"    Log: " + log,
 	} {
 		if !strings.Contains(m.lastLog, want) {
 			t.Fatalf("issue details lack %q:\n%s", want, m.lastLog)
 		}
 	}
+	if strings.Contains(m.lastLog, "dots sync: no local changes") {
+		t.Fatalf("issue details repeat the log instead of the error:\n%s", m.lastLog)
+	}
 	if !strings.Contains(m.View().Content, "A agent") {
 		t.Fatal("footer does not offer the agent hand-off")
+	}
+}
+
+// Without pressing anything, the attention list shows each problem with its
+// error and the command to run next, on screen and in the printed report.
+func TestNeedsAttentionListShowsTheErrorAndTheNextCommand(t *testing.T) {
+	m, _ := syncAttention(t)
+	m = send(m, Event{V: 1, Kind: "notice", Stage: "source-sync", Severity: "attention", Summary: "LATE EDIT: config.toml not updated; rerun", Action: "dots sync"})
+	m = send(m, Event{V: 1, Kind: "run_end"})
+	m.Width, m.Height = 120, 40
+	m.resize()
+	m.refreshDetail()
+	events := []Event{
+		{V: 1, Kind: "stage_start", ID: "source-sync", Group: "Source & settings", Label: "Sync configuration"},
+		{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", Summary: m.Stages[0].Summary, Detail: m.Stages[0].Detail, Action: "dots apply"},
+		{V: 1, Kind: "notice", Stage: "source-sync", Severity: "attention", Summary: "LATE EDIT: config.toml not updated; rerun", Action: "dots sync"},
+		{V: 1, Kind: "run_end"},
+	}
+	for name, text := range map[string]string{"dashboard": m.View().Content, "report": OutcomeReport(events, "")} {
+		for _, want := range []string{
+			"Needs attention · 2",
+			"! Sync configuration — APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
+			"        mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
+			"        Next: dots apply",
+			"! Sync configuration — LATE EDIT: config.toml not updated; rerun",
+			"        Next: dots sync",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s lacks %q:\n%s", name, want, text)
+			}
+		}
+		if strings.Contains(text, "open for details") || name == "report" && strings.Contains(text, "Packages · no verified changes") {
+			t.Fatalf("%s keeps an element that does not help:\n%s", name, text)
+		}
+	}
+}
+
+func TestNarrowDashboardWrapsTheErrorInsteadOfCuttingIt(t *testing.T) {
+	m, _ := syncAttention(t)
+	m = send(m, Event{V: 1, Kind: "run_end"})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 40})
+	content := updated.(Model).View().Content
+	if !strings.Contains(content, "@0.3.1 not found") || !strings.Contains(content, "Next: dots apply") {
+		t.Fatalf("the error was cut:\n%s", content)
 	}
 }
 
@@ -93,7 +141,7 @@ func TestAgentGetsTheIssueAsItsLastArgument(t *testing.T) {
 	item := m.issues()[0]
 	prompt := m.agentPrompt(item)
 	for _, want := range []string{
-		"APPLY FAILED", "mise ERROR pre-dotfiles hook failed", "Full log: " + log,
+		"APPLY FAILED", "mise ERROR pre-dotfiles hook failed", "Log: " + log,
 		"Configuration root (DOTS_ROOT): " + root, "Host: mac, profile: laptop", "dots 0.3.1",
 	} {
 		if !strings.Contains(prompt, want) {

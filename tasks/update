@@ -229,7 +229,8 @@ if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
     sync_output="$(setup_mise exec -- env "${restore[@]}" node "$DOTS_HOME/lib/source-repo.mjs" sync "$SETUP_ROOT" 2>&1)" || sync_result=$?
     printf '%s\n' "$sync_output"
     if [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
-        (umask 077; printf '%s\n' "$sync_output" > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true
+        # The log keeps the output, not the event records it carries to the dashboard.
+        (umask 077; printf '%s\n' "$sync_output" | LC_ALL=C sed $'s/\036dots-up\\/1:[^\037]*\037//g' > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true
     fi
     # Attention: a header that did not complete, an uppercase notice line, or a
     # crash, each with the deeper-indented output lines that explain it.
@@ -240,16 +241,20 @@ if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
     if [[ "$sync_result" -ne 0 && -z "$sync_attention" ]]; then sync_attention="dots sync exited $sync_result"; fi
     if [[ -n "$sync_attention" ]]; then
         if [[ "$plain_output" -eq 1 ]]; then printf 'Result: needs attention\n'; fi
-        # One issue: the first attention line is its summary; the stage log
-        # holds every line and the output under it.
-        sync_summary="$(printf '%s\n' "$sync_attention" | grep -v '^    ' | sed 's/^  //')"
-        sync_more="$(printf '%s\n' "$sync_summary" | sed 1d | grep -c . || true)"
-        sync_summary="${sync_summary%%$'\n'*}"
-        [[ "$sync_more" -eq 0 ]] || sync_summary="$sync_summary (+$sync_more more)"
-        emit_event "$(event_json --arg id source-sync --arg summary "$sync_summary" --arg action "Fix what the sync output says, then run dots sync; $DOTS_HOME/docs/sync.md explains every line" '{v:1,kind:"stage_end",id:$id,status:"attention",exit_code:0,summary:$summary,action:$action}')"
+        # One issue per attention line, with the output under it and the one
+        # command to run next; the first ends the stage, the rest are notices.
+        while IFS= read -r sync_event; do emit_event "$sync_event"; done < <(event_json --arg text "$sync_attention" '
+            [$text | split("\n")[] | select(length > 0)]
+            | reduce .[] as $line ([]; if ($line | startswith("    ")) then .[-1].detail += [$line[4:]]
+                                       else . + [{summary: ($line | ltrimstr("  ")), detail: []}] end)
+            | to_entries[] | .key as $first | .value
+            | {v:1, summary, detail: (.detail | join("\n")),
+               action: (if (.summary | startswith("APPLY FAILED")) then "dots apply" else "dots sync" end)}
+            | if $first == 0 then . + {kind:"stage_end", id:"source-sync", label:"Sync configuration", status:"attention", exit_code:0}
+              else . + {kind:"notice", severity:"attention", stage:"source-sync"} end')
     else
         if [[ "$plain_output" -eq 1 ]]; then printf 'Result: completed\n'; fi
-        emit_event "$(event_json --arg id source-sync --arg summary "${sync_output%%$'\n'*}" '{v:1,kind:"stage_end",id:$id,status:"ok",exit_code:0,summary:$summary}')"
+        emit_event "$(event_json --arg id source-sync --arg summary "${sync_output%%$'\n'*}" '{v:1,kind:"stage_end",id:$id,label:"Sync configuration",status:"ok",exit_code:0,summary:$summary}')"
     fi
     export DOTS_SOURCE_SYNC_DONE=1 DOTS_SOURCE_SYNC_ATTENTION="$sync_attention"
     exec "$(resolve_mise_bin)" -C "$SETUP_ROOT" -E "$SETUP_ENVIRONMENTS" exec -- bash "$DOTS_HOME/tasks/update" "$@"
@@ -358,7 +363,7 @@ run_stage() {
         fi
         failures+=("$label")
         if dots_up_event_sink_enabled; then
-            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg summary "failed (exit $result)" --arg action 'Fix the error at the end of its output, then run dots up again' --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:"failed",exit_code:$code,summary:$summary,action:$action}')"
+            emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg summary "failed (exit $result)" --arg action 'Fix the error above, then run dots up' --argjson code "$result" '{v:1,kind:"stage_end",id:$id,label:$label,status:"failed",exit_code:$code,summary:$summary,action:$action}')"
         fi
         validate_update_config || abort_invalid_config
         return "$result"

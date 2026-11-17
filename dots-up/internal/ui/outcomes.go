@@ -49,14 +49,30 @@ func ChangeLine(action, item, before, after string) string {
 
 func (m Model) isUp() bool { return m.Command == "" || m.Command == "up" }
 
-// OutcomeReport shares the interactive area's action and version formatting.
-func OutcomeReport(events []Event) string {
-	m := NewModel("", false)
+// OutcomeReport is the printed form of the outcomes area of the run in
+// RUNDIR, without areas that have nothing to report.
+func OutcomeReport(events []Event, runDir string) string {
+	m := NewModel(runDir, false)
 	for _, event := range events {
 		m.apply(event)
 	}
-	text := strings.ReplaceAll(strings.ReplaceAll(m.outcomesContent(), "› > ", ""), "  > ", "")
-	return strings.ReplaceAll(text, " (open for details)", "")
+	m.Width = 0 // the terminal wraps printed lines
+	var lines []string
+	for _, line := range strings.Split(m.outcomesContent(), "\n") {
+		if area, ok := strings.CutPrefix(line, "› > "); ok {
+			line = area
+		} else if area, ok := strings.CutPrefix(line, "  > "); ok {
+			line = area
+		} else {
+			lines = append(lines, line)
+			continue
+		}
+		if strings.HasSuffix(line, " · no verified changes") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 func (m Model) outcomesView() bool {
 	return m.isUp() && !m.Diagnostics && !m.AttentionExpanded && m.overview()
@@ -138,22 +154,39 @@ func (m Model) outcomesContent() string {
 		if m.SelectedGroup < 0 {
 			prefix = "› > "
 		}
-		fmt.Fprintf(&b, "%s!  Needs attention · %d (open for details)", prefix, len(m.issues()))
+		issues := m.issues()
+		fmt.Fprintf(&b, "%s!  Needs attention · %d", prefix, len(issues))
+		for _, item := range issues {
+			for _, line := range strings.Split(m.issueDetail(item), "\n") {
+				b.WriteString("\n" + wrapIndented("    "+line, m.Width))
+			}
+		}
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func (m *Model) scrollToOutcomeGroup() {
-	if m.SelectedGroup < 0 {
-		m.viewport.GotoBottom()
-		return
+// wrapIndented wraps LINE to WIDTH (0: not at all), continuing under its
+// indentation, so an error line is read whole.
+func wrapIndented(line string, width int) string {
+	text := strings.TrimLeft(line, " ")
+	indent := strings.Repeat(" ", len(line)-len(text)+2)
+	if width <= len(indent)+20 || ansi.StringWidth(line) <= width {
+		return line
 	}
+	return line[:len(indent)-2] + strings.ReplaceAll(ansi.Wrap(text, width-len(indent), ""), "\n", "\n"+indent)
+}
+
+func (m *Model) scrollToOutcomeGroup() {
 	line := 0
 	for i, group := range m.groups() {
 		if i == m.SelectedGroup {
 			break
 		}
 		line += 1 + len(m.groupChanges(group))
+	}
+	if m.SelectedGroup < 0 {
+		m.viewport.SetYOffset(line) // the issues start at the top
+		return
 	}
 	if line >= m.viewport.Height() {
 		m.viewport.ScrollDown(line - m.viewport.Height() + 1)

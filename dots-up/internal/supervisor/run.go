@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,7 +70,10 @@ var (
 	runDashboard           = ui.Run
 )
 
-const startupStage = "startup"
+const (
+	startupStage      = "startup"
+	updateConfigStage = "update-config"
+)
 
 func startupFailure(command string, code int, detail string, log *os.File) (ui.Event, ui.Event) {
 	start := ui.Event{V: 1, Kind: "stage_start", ID: startupStage, Label: "Startup"}
@@ -83,7 +87,7 @@ func startupFailure(command string, code int, detail string, log *os.File) (ui.E
 	return start, end
 }
 
-func printStartupFailure(w io.Writer, e ui.Event) {
+func printFailedStage(w io.Writer, e ui.Event) {
 	printIssue(w, fmt.Sprintf("Failed: %s — %s", e.Label, e.Summary), e.Detail, e.Action, e.LogPath)
 }
 
@@ -155,7 +159,7 @@ func Run(opts Options) int {
 			_ = files.record(ui.Event{V: 1, Kind: "run_end", Status: "failed", ExitCode: code, DurationMS: time.Since(started).Milliseconds()})
 			_ = files.finish(code, "", "", time.Now())
 		}
-		printStartupFailure(os.Stderr, issue)
+		printFailedStage(os.Stderr, issue)
 		return code
 	}
 	if dashboard && !backend.pty {
@@ -218,7 +222,8 @@ func Run(opts Options) int {
 	var stageLog *os.File
 	var stageID, profile, host string
 	var runStarted, workReported, childFinished, outputFinished bool
-	var startupOutput []byte
+	var diagnosticOutput []byte
+	var consoleFailure *ui.Event
 	runEnd := ui.Event{V: 1, Kind: "run_end"}
 	eventFinished := backend.streamNonce != ""
 	var exitCode int
@@ -398,13 +403,24 @@ func Run(opts Options) int {
 		}
 	}
 	finishStage := func(e ui.Event) {
+		if e.ID == updateConfigStage && stageLog == nil {
+			e.LogPath = ""
+			if e.ID == stageID && e.Status == "failed" && len(diagnosticOutput) > 0 {
+				// Save the stage outcome and keep the excerpt for the console.
+				issue := e
+				if issue.Label == "" {
+					issue.Label = labels[issue.ID]
+				}
+				issue.Detail = string(diagnosticOutput)
+				consoleFailure = &issue
+			}
+		} else if e.LogPath == "" && files != nil {
+			e.LogPath = files.logPath(e.ID)
+		}
 		if stageLog != nil && stageID == e.ID {
 			_ = stageLog.Sync()
 			_ = stageLog.Close()
 			stageLog = nil
-		}
-		if e.LogPath == "" && files != nil {
-			e.LogPath = files.logPath(e.ID)
 		}
 		emit(e)
 		stageID = ""
@@ -456,6 +472,7 @@ func Run(opts Options) int {
 			emit(e)
 		case "stage_start":
 			workReported = true
+			diagnosticOutput = nil
 			if stageLog != nil {
 				_ = stageLog.Close()
 				stageLog = nil
@@ -464,6 +481,9 @@ func Run(opts Options) int {
 			if files != nil && !opts.Sensitive {
 				e.LogPath = files.logPath(e.ID)
 				stageLog = openStageLog(e.LogPath)
+				if e.ID == updateConfigStage && stageLog == nil {
+					e.LogPath = ""
+				}
 			}
 			if e.Terminal == "handoff" && backend.pty {
 				// Automatic prompts take ownership from a manual view. Stop its
@@ -619,18 +639,20 @@ func Run(opts Options) int {
 					}
 				}
 			}
+			configStage := stageID == updateConfigStage
+			captureDiagnostic := !workReported || (configStage && stageLog == nil && !opts.Verbose)
 			inputMayEcho := relaying && relay.inputSent.Load()
-			if !workReported {
+			if !workReported || configStage {
 				// A reopened relay can still drain echo from an earlier one.
 				inputMayEcho = relay.inputEverSent.Load()
 			}
 			if !inputMayEcho {
 				clean := cleanTerminalOutput(b)
-				if !workReported && !opts.Sensitive {
+				if captureDiagnostic && !opts.Sensitive {
 					const limit = 8 * 1024
-					startupOutput = append(startupOutput, clean...)
-					if len(startupOutput) > limit {
-						startupOutput = append(startupOutput[:0], startupOutput[len(startupOutput)-limit:]...)
+					diagnosticOutput = append(diagnosticOutput, clean...)
+					if len(diagnosticOutput) > limit {
+						diagnosticOutput = append(diagnosticOutput[:0], diagnosticOutput[len(diagnosticOutput)-limit:]...)
 					}
 				}
 				writeLog(stageLog, globalLog, clean)
@@ -727,15 +749,19 @@ func Run(opts Options) int {
 	if backendError != nil && exitCode == 0 {
 		exitCode = 1
 	}
-	var startupIssue *ui.Event
 	if exitCode != 0 && !cancelRequested && !workReported {
 		if !runStarted && opts.Command != "up" {
 			emit(ui.Event{V: 1, Kind: "run_start"})
 		}
-		start, issue := startupFailure(opts.Command, exitCode, string(startupOutput), globalLog)
-		startupIssue = &issue
+		start, issue := startupFailure(opts.Command, exitCode, string(diagnosticOutput), globalLog)
 		emit(start)
 		emit(issue)
+		if files == nil || opts.Verbose {
+			if opts.Verbose {
+				issue.Detail = "" // verbose output already showed the diagnostic
+			}
+			consoleFailure = &issue
+		}
 		runEnd.Status = "failed"
 	}
 	runEnd.ExitCode = exitCode
@@ -760,17 +786,25 @@ func Run(opts Options) int {
 	}
 	if (plain && !opts.Verbose) || dashboardStarted {
 		if files != nil {
-			fmt.Println(summary(files.report, files.runDir))
-			printReportHighlights(os.Stdout, files.report, files.runDir, plain)
+			report := files.report
+			if consoleFailure != nil && consoleFailure.ID == updateConfigStage {
+				report.Events = slices.Clone(report.Events)
+				for i, event := range report.Events {
+					if event.Kind == "stage_end" && event.ID == consoleFailure.ID {
+						report.Events[i] = *consoleFailure
+						consoleFailure = nil
+						break
+					}
+				}
+			}
+			fmt.Println(summary(report, files.runDir))
+			printReportHighlights(os.Stdout, report, files.runDir, plain)
 		} else {
 			fmt.Printf("Update completed with exit code %d.\n", exitCode)
 		}
 	}
-	if startupIssue != nil && (files == nil || opts.Verbose) {
-		if opts.Verbose {
-			startupIssue.Detail = "" // verbose output already showed the diagnostic
-		}
-		printStartupFailure(os.Stdout, *startupIssue)
+	if consoleFailure != nil {
+		printFailedStage(os.Stdout, *consoleFailure)
 	}
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)

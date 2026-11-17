@@ -335,7 +335,7 @@ func ShowLast(opts Options) int {
 	fmt.Println(summary(report, dir))
 	if opts.Plain || opts.Verbose || !interactiveTerminal() {
 		if report.Command == "status" {
-			for _, event := range report.Events {
+			for event := range replayEvents(report) {
 				printStatusEvent(event)
 			}
 		}

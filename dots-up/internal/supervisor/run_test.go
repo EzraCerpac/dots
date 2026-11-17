@@ -202,6 +202,67 @@ emit '{"v":1,"kind":"run_end","exit_code":0}'
 	}
 }
 
+func TestFailedUpdateConfigShowsDiagnosticWhenReportsAreUnavailable(t *testing.T) {
+	const diagnostic = "mise: invalid disposable configuration"
+	useTextRunner(t, runnerEvents+`
+emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture"}'
+emit '{"v":1,"kind":"stage_start","id":"update-config","label":"Validate update configuration"}'
+printf '%s\n' '`+diagnostic+`' >&2
+emit '{"v":1,"kind":"stage_end","id":"update-config","status":"failed","summary":"Cannot load configuration","action":"Fix the problem and rerun dots up."}'
+exit 1
+`)
+	state := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, output := captureRun(t, Options{StateDir: state, Plain: true})
+	if code != 1 || !strings.Contains(output, "reports unavailable") || strings.Count(output, diagnostic) != 1 ||
+		!strings.Contains(output, "Next: Fix the problem and rerun dots up.") || strings.Contains(output, "Log:") {
+		t.Fatalf("expected one actionable diagnostic without a log, got exit %d:\n%s", code, output)
+	}
+
+	t.Run("only stage log unavailable", func(t *testing.T) {
+		start := startUpdaterBackend
+		t.Cleanup(func() { startUpdaterBackend = start })
+		startUpdaterBackend = func(opts Options, files *runFiles, interactive bool) (*backend, *os.File, io.Reader, error) {
+			if err := os.Mkdir(files.logPath("update-config"), 0o700); err != nil {
+				return nil, nil, nil, err
+			}
+			return start(opts, files, interactive)
+		}
+		state := t.TempDir()
+		code, output := captureRun(t, Options{StateDir: state, Plain: true})
+		if code != 1 || strings.Count(output, diagnostic) != 1 || strings.Count(output, "Next: Fix the problem and rerun dots up.") != 1 ||
+			strings.Contains(output, "Log:") {
+			t.Fatalf("expected one actionable failure without a log, got exit %d:\n%s", code, output)
+		}
+		report, _, err := latestReport(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range report.Events {
+			if event.ID == "update-config" && (event.Detail != "" || event.LogPath != "") {
+				t.Fatalf("saved config event includes a transient detail or log path: %+v", event)
+			}
+		}
+	})
+
+	state = t.TempDir()
+	code, output = captureRun(t, Options{StateDir: state, Plain: true, Sensitive: true})
+	if code != 1 || strings.Contains(output, diagnostic) {
+		t.Fatalf("sensitive run exposed its diagnostic, exit %d:\n%s", code, output)
+	}
+	report, _, err := latestReport(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range report.Events {
+		if event.Detail != "" || event.LogPath != "" {
+			t.Fatalf("sensitive report saved a detail or log path: %+v", event)
+		}
+	}
+}
+
 func TestStatusDashboardFallbackPrintsEarlierAndLaterInventoryOnce(t *testing.T) {
 	t.Run("during inventory", func(t *testing.T) { testStatusDashboardFallback(t, false) })
 	t.Run("at completion", func(t *testing.T) { testStatusDashboardFallback(t, true) })

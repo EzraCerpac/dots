@@ -10,6 +10,35 @@ import (
 	"github.com/EzraCerpac/dots/dots-up/internal/ui"
 )
 
+func TestShowLastStatusUsesSavedCommandForOlderEvents(t *testing.T) {
+	for _, command := range []string{"", "explicit-status"} {
+		t.Run("event="+command, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Now()
+			files, err := newRunFiles(now, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := ui.Event{V: 1, Kind: "run_start", Command: command, Profile: "laptop", Host: "fixture-nas"}
+			if err := files.record(event); err != nil {
+				t.Fatal(err)
+			}
+			files.report.Command = "status"
+			if err := files.finish(0, event.Profile, event.Host, now); err != nil {
+				t.Fatal(err)
+			}
+			code, output := captureOutput(t, func() int { return ShowLast(Options{StateDir: root, Plain: true}) })
+			want := command
+			if want == "" {
+				want = "status"
+			}
+			if code != 0 || !strings.Contains(output, "dots "+want+" · laptop · fixture-nas") {
+				t.Fatalf("plain replay exited %d with the wrong heading:\n%s", code, output)
+			}
+		})
+	}
+}
+
 func TestRunReportsArePrivateAndRetentionPreservesActiveRun(t *testing.T) {
 	root := t.TempDir()
 	base := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)

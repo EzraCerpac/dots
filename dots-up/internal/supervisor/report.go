@@ -334,7 +334,12 @@ func ShowLast(opts Options) int {
 	}
 	fmt.Println(summary(report, dir))
 	if opts.Plain || opts.Verbose || !interactiveTerminal() {
-		printReportHighlights(os.Stdout, report, dir, false)
+		if report.Command == "status" {
+			for _, event := range report.Events {
+				printStatusEvent(event)
+			}
+		}
+		printReportHighlights(os.Stdout, report, dir, report.Command == "status")
 	}
 	return report.ExitCode
 }
@@ -402,8 +407,16 @@ func printReportHighlights(w io.Writer, report Report, dir string, statusInvento
 	}
 }
 
-func printStatusItem(w io.Writer, e ui.Event) {
-	fmt.Fprintf(w, "  %s · %s  %s — %s\n", e.Group, e.Label, e.Status, e.Summary)
+func printStatusEvent(e ui.Event) bool {
+	switch e.Kind {
+	case "run_start":
+		printProgress(e)
+	case "item_upsert":
+		fmt.Printf("  %s · %s  %s — %s\n", e.Group, e.Label, e.Status, e.Summary)
+	default:
+		return false
+	}
+	return true
 }
 
 // printIssue prints one attention item with its error, next step and log.

@@ -261,6 +261,9 @@ esac
 # Shared flags belong to the frontend, never to the maintenance backend.
 if [[ "$backend_mode" -eq 0 && "$command_name" != up && "$command_name" != update && "$command_name" != plan ]]; then
     if resolve_renderer; then
+        case "$command_name" in
+            sync|add) [[ " $frontend_flags " == *' --no-wait '* ]] || frontend_args+=(--no-wait) ;;
+        esac
         exec "$renderer" --root "$root" --home "$DOTS_HOME" --command "$command_name" ${frontend_args[@]+"${frontend_args[@]}"} -- "$@"
     fi
     case "$command_name" in

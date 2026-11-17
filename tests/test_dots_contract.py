@@ -37,6 +37,10 @@ fi
 while [[ "${1:-}" == -C || "${1:-}" == -E ]]; do shift 2; done
 case "${1:-}" in
     config)
+        if [[ "${2:-}" == ls && -n "${FAKE_CONFIG_FAILURE:-}" ]]; then
+            printf '%s\n' "$FAKE_CONFIG_FAILURE" >&2
+            exit 1
+        fi
         if [[ "${2:-}" == get ]]; then
             key="${5:-}"
             case "$key" in
@@ -175,6 +179,17 @@ class ContractTestCase(unittest.TestCase):
 
 @requires("jq")
 class UpdateHookTests(ContractTestCase):
+    def test_invalid_update_config_emits_one_failed_stage_with_diagnostic(self) -> None:
+        result = self.f.update(DOTS_UP_STREAM_NONCE="fixture", FAKE_CONFIG_FAILURE="mise: invalid fixture setting")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("mise: invalid fixture setting", result.stderr)
+        events = [json.loads(frame.split(":", 2)[2]) for frame in result.stdout.split("\x1f")
+                  if frame.startswith("\x1edots-up/1:fixture:")]
+        self.assertEqual([event["kind"] for event in events], ["run_start", "stage_start", "stage_end"])
+        self.assertEqual(events[1]["id"], events[2]["id"])
+        self.assertEqual(events[2]["status"], "failed")
+        self.assertIn("rerun dots up", events[2]["action"])
+
     def test_update_finishes_on_its_manager_and_reports_a_new_one(self) -> None:
         # A packaged manager (no .git) that a stage upgraded: the newer one is
         # first on PATH, the run keeps going on the old one, and Homebrew may
@@ -693,11 +708,17 @@ class CommandTests(ContractTestCase):
             """, 0o755)
         mise = write(self.f.base / "old-mise", f"#!/bin/sh\necho '{adjacent}'\n", 0o755)
         env = {"DOTS_MISE_BIN": str(mise), "PATH": f"{adjacent.parent}:{available.parent}:{self.f.env['PATH']}"}
-        result = self.f.dots("reports", DOTS_UP_BIN="", **env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), [
-            str(available), "--root", str(self.f.config), "--home", str(self.f.manager), "--command", "reports", "--",
-        ])
+        prefix = [str(available), "--root", str(self.f.config), "--home", str(self.f.manager)]
+        for command, flags, args, expected in (
+            ("reports", [], [], []),
+            ("sync", [], [], ["--no-wait"]),
+            ("add", [], ["fixture-tool"], ["--no-wait"]),
+            ("add", ["--no-wait"], ["fixture-tool"], ["--no-wait"]),
+        ):
+            with self.subTest(command=command, flags=flags):
+                result = self.f.dots(*flags, command, *args, DOTS_UP_BIN="", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), prefix + ["--command", command, *expected, "--", *args])
         result = self.f.dots("reports", DOTS_UP_BIN=str(adjacent), **env)
         self.assertEqual(result.returncode, 2)
         self.assertIn("report browser is unavailable", result.stderr)

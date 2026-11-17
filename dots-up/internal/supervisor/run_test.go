@@ -181,18 +181,89 @@ emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture-nas"}'
 emit '{"v":1,"kind":"item_upsert","label":"sample-tool@1","group":"Tools","status":"ok","summary":"1.2.3"}'
 emit '{"v":1,"kind":"item_upsert","label":"brew:sample-package","group":"Packages","status":"ok","summary":"2.3.4"}'
 emit '{"v":1,"kind":"item_upsert","label":"missing-tool","group":"Tools","status":"missing","summary":"not available"}'
+emit '{"v":1,"kind":"item_upsert","label":"settings history","group":"History","status":"skipped","summary":"disabled"}'
 emit '{"v":1,"kind":"run_end","exit_code":0}'
 `)
+	expect := []string{"laptop · fixture-nas", "sample-tool@1  ok — 1.2.3", "brew:sample-package  ok — 2.3.4", "missing-tool  missing", "settings history  skipped"}
 	for _, opts := range []Options{{}, {Plain: true}, {Verbose: true}} {
 		opts.Command, opts.StateDir = "status", t.TempDir()
 		code, output := captureRun(t, opts)
 		if code != 0 {
 			t.Fatalf("status exited %d:\n%s", code, output)
 		}
-		for _, want := range []string{"laptop · fixture-nas", "sample-tool@1  ok — 1.2.3", "brew:sample-package  ok — 2.3.4", "missing-tool  missing"} {
-			if strings.Count(output, want) != 1 {
-				t.Fatalf("expected one %q in status output:\n%s", want, output)
+		assertStatusInventory(t, output, expect...)
+		if opts.Plain {
+			code, output = captureOutput(t, func() int { return ShowLast(opts) })
+			if code != 0 {
+				t.Fatalf("status replay exited %d:\n%s", code, output)
 			}
+			assertStatusInventory(t, output, expect...)
+		}
+	}
+}
+
+func TestStatusDashboardFallbackPrintsEarlierAndLaterInventoryOnce(t *testing.T) {
+	t.Run("during inventory", func(t *testing.T) { testStatusDashboardFallback(t, false) })
+	t.Run("at completion", func(t *testing.T) { testStatusDashboardFallback(t, true) })
+}
+
+func testStatusDashboardFallback(t *testing.T, failAtEnd bool) {
+	t.Helper()
+	script := runnerEvents + `
+emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture-nas"}'
+emit '{"v":1,"kind":"item_upsert","id":"first","label":"earlier-tool","group":"Tools","status":"missing"}'
+`
+	if !failAtEnd {
+		script += `
+tries=0
+until grep -Fq 'continuing in concise mode' "$DOTS_TEST_CAPTURE"; do
+	tries=$((tries + 1))
+	[ "$tries" -lt 150 ] || exit 9
+	sleep 0.02
+done
+`
+	}
+	useTextRunner(t, script+`
+emit '{"v":1,"kind":"item_upsert","id":"later","label":"later-package","group":"Packages","status":"ok"}'
+`)
+	oldInteractive, oldSize := hasInteractiveTerminal, currentTerminalSize
+	oldStart, oldDashboard := startUpdaterBackend, runDashboard
+	t.Cleanup(func() {
+		hasInteractiveTerminal, currentTerminalSize = oldInteractive, oldSize
+		startUpdaterBackend, runDashboard = oldStart, oldDashboard
+	})
+	hasInteractiveTerminal = func() bool { return true }
+	currentTerminalSize = func() (int, int) { return 100, 30 }
+	startUpdaterBackend = func(opts Options, files *runFiles, _ bool) (*backend, *os.File, io.Reader, error) {
+		child, events, output, err := startBackend(opts, files, false)
+		if err == nil {
+			child.pty = true
+		}
+		return child, events, output, err
+	}
+	runDashboard = func(events <-chan ui.Event, _ io.Writer, _ string, _ bool) error {
+		for event := range events {
+			if (!failAtEnd && event.ID == "first") || (failAtEnd && event.Kind == "run_end") {
+				return errors.New("injected renderer failure after receiving inventory")
+			}
+		}
+		return errors.New("fixture never received inventory")
+	}
+	code, output := captureOutput(t, func() int {
+		t.Setenv("DOTS_TEST_CAPTURE", os.Stdout.Name())
+		return Run(Options{Command: "status", StateDir: t.TempDir()})
+	})
+	if code != 0 || !strings.Contains(output, "injected renderer failure after receiving inventory") {
+		t.Fatalf("expected dashboard fallback and exit 0, got %d:\n%s", code, output)
+	}
+	assertStatusInventory(t, output, "laptop · fixture-nas", "earlier-tool  missing", "later-package  ok")
+}
+
+func assertStatusInventory(t *testing.T, output string, expected ...string) {
+	t.Helper()
+	for _, want := range expected {
+		if strings.Count(output, want) != 1 {
+			t.Fatalf("expected one %q in status output:\n%s", want, output)
 		}
 	}
 }
@@ -215,6 +286,11 @@ func useTextRunner(t *testing.T, script string) {
 
 func captureRun(t *testing.T, opts Options) (int, string) {
 	t.Helper()
+	return captureOutput(t, func() int { return Run(opts) })
+}
+
+func captureOutput(t *testing.T, run func() int) (int, string) {
+	t.Helper()
 	output, err := os.CreateTemp(t.TempDir(), "output")
 	if err != nil {
 		t.Fatal(err)
@@ -223,7 +299,7 @@ func captureRun(t *testing.T, opts Options) (int, string) {
 	stdout, stderr := os.Stdout, os.Stderr
 	defer func() { os.Stdout, os.Stderr = stdout, stderr }()
 	os.Stdout, os.Stderr = output, output
-	code := Run(opts)
+	code := run()
 	data, err := os.ReadFile(output.Name())
 	if err != nil {
 		t.Fatal(err)

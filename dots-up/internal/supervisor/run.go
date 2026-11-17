@@ -55,10 +55,11 @@ type backend struct {
 }
 
 type relayState struct {
-	active    atomic.Bool
-	manual    atomic.Bool
-	inputSent atomic.Bool
-	inputMu   sync.Mutex
+	active        atomic.Bool
+	manual        atomic.Bool
+	inputSent     atomic.Bool
+	inputEverSent atomic.Bool
+	inputMu       sync.Mutex
 }
 
 var (
@@ -263,6 +264,13 @@ func Run(opts Options) int {
 	}()
 
 	labels := map[string]string{} // a stage_end may name its stage only by ID
+	var dashboardStatus []ui.Event
+	flushDashboardStatus := func() {
+		for _, event := range dashboardStatus {
+			printStatusEvent(event)
+		}
+		dashboardStatus = nil
+	}
 	deliver := func(e ui.Event) {
 		if e.Kind == "stage_start" {
 			labels[e.ID] = e.Label
@@ -277,13 +285,19 @@ func Run(opts Options) int {
 				fmt.Fprintln(os.Stderr, "dots up: dashboard stopped responding; continuing in concise mode")
 			}
 		}
-		if plain {
-			switch {
-			case opts.Command == "status" && e.Kind == "item_upsert":
-				printStatusItem(os.Stdout, e)
-			case (!opts.Verbose || (opts.Command == "status" && e.Kind == "run_start")) && e.ID != startupStage:
-				printProgress(e)
+		if !plain {
+			if opts.Command == "status" && (e.Kind == "run_start" || e.Kind == "item_upsert") {
+				dashboardStatus = append(dashboardStatus, e)
 			}
+			return
+		}
+		// On fallback, print the status rows that only the dashboard saw.
+		flushDashboardStatus()
+		if opts.Command == "status" && printStatusEvent(e) {
+			return
+		}
+		if !opts.Verbose && e.ID != startupStage {
+			printProgress(e)
 		}
 	}
 	emit := func(e ui.Event) {
@@ -594,15 +608,8 @@ func Run(opts Options) int {
 				continue
 			}
 			b := item.bytes
-			clean := cleanTerminalOutput(b)
-			if !workReported && !opts.Sensitive {
-				const limit = 8 * 1024
-				startupOutput = append(startupOutput, clean...)
-				if len(startupOutput) > limit {
-					startupOutput = append(startupOutput[:0], startupOutput[len(startupOutput)-limit:]...)
-				}
-			}
-			if relayKind != "" && backend.tty != nil {
+			relaying := relayKind != "" && backend.tty != nil
+			if relaying {
 				_, _ = backend.tty.Write(b)
 				if relayKind == "manual" {
 					manualOutputParser.Parse(b)
@@ -611,16 +618,24 @@ func Run(opts Options) int {
 						manualResizePending = false
 					}
 				}
-				// Before the first keypress, prompts and diagnostic text are useful.
-				// Once input begins, stop logging PTY output so terminal echo cannot
-				// persist anything the user typed.
-				if !relay.inputSent.Load() {
-					writeLog(stageLog, globalLog, clean)
-				}
-				continue
 			}
-			writeLog(stageLog, globalLog, clean)
-			if opts.Verbose && len(b) > 0 {
+			inputMayEcho := relaying && relay.inputSent.Load()
+			if !workReported {
+				// A reopened relay can still drain echo from an earlier one.
+				inputMayEcho = relay.inputEverSent.Load()
+			}
+			if !inputMayEcho {
+				clean := cleanTerminalOutput(b)
+				if !workReported && !opts.Sensitive {
+					const limit = 8 * 1024
+					startupOutput = append(startupOutput, clean...)
+					if len(startupOutput) > limit {
+						startupOutput = append(startupOutput[:0], startupOutput[len(startupOutput)-limit:]...)
+					}
+				}
+				writeLog(stageLog, globalLog, clean)
+			}
+			if !relaying && opts.Verbose && len(b) > 0 {
 				_, _ = os.Stdout.Write(b)
 			}
 		case err := <-eventErr:
@@ -740,6 +755,8 @@ func Run(opts Options) int {
 	}
 	if uiErr != nil {
 		fmt.Fprintf(os.Stderr, "dots up: dashboard ended with an error: %v\n", uiErr)
+		plain = true
+		flushDashboardStatus()
 	}
 	if (plain && !opts.Verbose) || dashboardStarted {
 		if files != nil {
@@ -1244,6 +1261,7 @@ func relayTerminalInput(tty, master *os.File, state *relayState, start <-chan st
 				}
 			}
 			if len(data) > 0 {
+				state.inputEverSent.Store(true)
 				state.inputSent.Store(true)
 				_, _ = master.Write(data)
 			}

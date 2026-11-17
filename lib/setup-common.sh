@@ -182,11 +182,12 @@ setup_exception_has_flag() {
 
 # Set SETUP_HOLDER to the installer exception whose hold=PACKAGE flag covers
 # package KEY (manager:name, with an optional tap prefix or @version), or to ""
-# when none does. Returns 2 for an invalid manifest.
+# when none does. PROFILE limits the lookup to that profile and base.
+# Returns 2 for an invalid manifest.
 setup_exception_holder() {
     SETUP_HOLD_KEY="$1"
     SETUP_HOLDER=""
-    setup_read_exceptions setup_match_hold ""
+    setup_read_exceptions setup_match_hold "${2:-}"
 }
 
 setup_match_hold() {

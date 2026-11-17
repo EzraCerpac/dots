@@ -380,7 +380,12 @@ case "$command_name" in
         done
         exec "$mise_bin" -C "$root" exec -- uv run --no-project python "$DOTS_HOME/bootstrap/atuin.py" "${login_args[@]}"
         ;;
-    plan) exec "$mise_bin" -C "$root" bootstrap plan ;;
+    plan)
+        source "$DOTS_HOME/lib/dots-packages.sh"
+        setup_mise() { MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 run_mise "$@"; }
+        setup_package_inspect plan
+        exit $?
+        ;;
     status|backup|restore) exec_in_setup bash "$DOTS_HOME/tasks/$command_name" "$@" ;;
     test) exec_in_setup bash "$root/tests/run" "$@" ;;
     bootstrap) exec bash "$DOTS_HOME/bootstrap/launch" "$mise_bin" "$root" "$@" ;;

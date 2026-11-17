@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -54,11 +55,25 @@ func TestManualTerminalPreservesSplitANSIAndUTF8DuringResize(t *testing.T) {
 	runTerminalPTYFixture(t, []string{"q"}, "", false, terminalFixtureOptions{beforeKeys: 350 * time.Millisecond, splitOutput: true})
 }
 
+func TestStartupFailureDoesNotPersistTypedTerminalEcho(t *testing.T) {
+	const marker = "harmless-typed-echo-fixture\n"
+	t.Run("single relay", func(t *testing.T) {
+		runTerminalPTYFixture(t, []string{marker}, marker, false, terminalFixtureOptions{startupFailure: true})
+	})
+	t.Run("relay reopened", func(t *testing.T) {
+		runTerminalPTYFixture(t, []string{marker, "q"}, marker, false, terminalFixtureOptions{startupFailure: true, reopenRelay: true})
+	})
+}
+
+const startupFixtureDiagnostic = "fixture: invalid setup before first stage"
+
 type terminalFixtureOptions struct {
-	tinyResize  bool
-	splitOutput bool
-	resizeRows  int
-	beforeKeys  time.Duration
+	tinyResize     bool
+	splitOutput    bool
+	startupFailure bool
+	reopenRelay    bool
+	resizeRows     int
+	beforeKeys     time.Duration
 }
 
 func TestAutomaticTerminalHandoffForwardsBackKeys(t *testing.T) {
@@ -107,6 +122,14 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 		if opts.splitOutput {
 			child.Env = append(child.Env, "DOTS_TERMINAL_FIXTURE_SPLIT="+fixtureReady)
 		}
+		var nonce string
+		if opts.startupFailure {
+			nonce = "0123456789abcdef0123456789abcdef"
+			child.Env = append(child.Env, "DOTS_TERMINAL_FIXTURE_STARTUP="+nonce)
+		}
+		if opts.reopenRelay {
+			child.Env = append(child.Env, "DOTS_TERMINAL_FIXTURE_REOPEN="+fixtureReady)
+		}
 		child.ExtraFiles = []*os.File{eventW}
 		master, err := pty.StartWithSize(child, &pty.Winsize{Cols: 100, Rows: 30})
 		_ = eventW.Close()
@@ -114,14 +137,16 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 			_ = eventR.Close()
 			return nil, nil, nil, err
 		}
-		return &backend{command: child, master: master, tty: tty, pty: true, processGroup: true}, eventR, master, nil
+		return &backend{command: child, master: master, tty: tty, pty: true, processGroup: true, streamNonce: nonce}, eventR, master, nil
 	}
 	ready := make(chan struct{})
+	reopened := make(chan struct{})
 	readDone := make(chan string, 1)
 	go func() {
 		var output strings.Builder
 		buf := make([]byte, 4096)
 		signaled := false
+		reopenSignaled := false
 		resizedANSI, resizedUTF8 := false, false
 		for {
 			n, err := terminal.Read(buf)
@@ -148,6 +173,10 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 					close(ready)
 					signaled = true
 				}
+				if opts.reopenRelay && !reopenSignaled && strings.Count(output.String(), marker) >= 2 {
+					close(reopened)
+					reopenSignaled = true
+				}
 			}
 			if err != nil {
 				readDone <- output.String()
@@ -160,7 +189,10 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 		encoder := json.NewEncoder(control)
 		for event := range events {
 			switch event.Kind {
-			case "stage_start":
+			case "stage_start", "run_start":
+				if (event.Kind == "run_start") != opts.startupFailure {
+					continue
+				}
 				// Reproduce returning to a primary screen whose cursor is at the bottom.
 				fmt.Fprint(tty, "\x1b[30;1H")
 				kind := "terminal_ready"
@@ -205,13 +237,28 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 				if automatic {
 					return fmt.Errorf("back keys ended automatic handoff")
 				}
-				if err := child.Process.Signal(syscall.Signal(0)); err != nil {
-					return fmt.Errorf("back key stopped updater: %w", err)
+				if !opts.startupFailure {
+					if err := child.Process.Signal(syscall.Signal(0)); err != nil {
+						return fmt.Errorf("back key stopped updater: %w", err)
+					}
 				}
-				returned = true
 				if err := encoder.Encode(controlRecord{V: 1, Kind: "terminal_ack"}); err != nil {
 					return err
 				}
+				if opts.reopenRelay && !returned {
+					if err := encoder.Encode(controlRecord{V: 1, Kind: "terminal_ready"}); err != nil {
+						return err
+					}
+					select {
+					case <-reopened:
+					case <-time.After(3 * time.Second):
+						return fmt.Errorf("terminal relay did not reopen")
+					}
+					if err := os.WriteFile(fixtureReady, nil, 0o600); err != nil {
+						return err
+					}
+				}
+				returned = true
 			case "handoff_end":
 				returned = true
 				if err := encoder.Encode(controlRecord{V: 1, Kind: "handoff_ack", ID: event.ID}); err != nil {
@@ -222,8 +269,18 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 		return nil
 	}
 	state := filepath.Join(t.TempDir(), "state")
-	if code := Run(Options{Root: t.TempDir(), StateDir: state}); code != 0 {
-		t.Fatalf("run exit code = %d", code)
+	runOpts := Options{Root: t.TempDir(), StateDir: state}
+	wantCode := 0
+	var code int
+	var reportText string
+	if opts.startupFailure {
+		wantCode = 2
+		code, reportText = captureRun(t, runOpts)
+	} else {
+		code = Run(runOpts)
+	}
+	if code != wantCode {
+		t.Fatalf("run exit code = %d, want %d", code, wantCode)
 	}
 	if !returned {
 		t.Fatal("dashboard was not restored")
@@ -235,12 +292,27 @@ func runTerminalPTYFixture(t *testing.T, keys []string, want string, automatic b
 	if string(input) != want {
 		t.Fatalf("child received %q, want %q", input, want)
 	}
-	report, _, err := latestReport(state)
-	if err != nil || report.ExitCode != 0 {
+	report, reportDir, err := latestReport(state)
+	if err != nil || report.ExitCode != wantCode {
 		t.Fatalf("update did not finish normally: report=%+v, err=%v", report, err)
 	}
 	_ = tty.Close()
 	output := <-readDone
+	if opts.startupFailure {
+		marker := strings.TrimSpace(want)
+		if !strings.Contains(output, marker) {
+			t.Fatalf("backend PTY never echoed the harmless input: %q", output)
+		}
+		if !strings.Contains(reportText, startupFixtureDiagnostic) || strings.Contains(reportText, marker) {
+			t.Errorf("unexpected console startup diagnostic: %q", reportText)
+		}
+		for _, name := range []string{"backend.log", "events.jsonl", "report.json"} {
+			data, err := os.ReadFile(filepath.Join(reportDir, name))
+			if err != nil || !strings.Contains(string(data), startupFixtureDiagnostic) || strings.Contains(string(data), marker) {
+				t.Errorf("unexpected diagnostic in %s: %q (%v)", name, data, err)
+			}
+		}
+	}
 	if capture := os.Getenv("DOTS_TERMINAL_SCREEN_CAPTURE"); capture != "" {
 		if err := os.WriteFile(capture, []byte(output), 0o600); err != nil {
 			t.Fatal(err)
@@ -270,6 +342,35 @@ func TestTerminalPTYFixtureProcess(t *testing.T) {
 	capture := os.Getenv("DOTS_TERMINAL_FIXTURE")
 	if capture == "" {
 		return
+	}
+	if nonce := os.Getenv("DOTS_TERMINAL_FIXTURE_STARTUP"); nonce != "" {
+		reopen := os.Getenv("DOTS_TERMINAL_FIXTURE_REOPEN")
+		if reopen != "" {
+			// Delay the echo of the first relay's input until the second relay is active.
+			if _, err := term.MakeRaw(os.Stdin.Fd()); err != nil {
+				os.Exit(3)
+			}
+		}
+		fmt.Println(startupFixtureDiagnostic)
+		fmt.Printf("%s%s:%s%c", streamEventStart, nonce, `{"v":1,"kind":"run_start"}`, streamEventEnd)
+		input, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil || os.WriteFile(capture, []byte(input), 0o600) != nil {
+			os.Exit(3)
+		}
+		if reopen != "" {
+			deadline := time.Now().Add(4 * time.Second)
+			for {
+				if _, err := os.Stat(reopen); err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					os.Exit(3)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			fmt.Print(input)
+		}
+		os.Exit(2)
 	}
 	if _, err := term.MakeRaw(os.Stdin.Fd()); err != nil {
 		os.Exit(2)

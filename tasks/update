@@ -160,9 +160,10 @@ validate_update_config() {
     if diagnostic="$(setup_mise config ls 2>&1)"; then
         return 0
     fi
+    start_event_stage update-config 'Source & settings' 'Validate update configuration'
     setup_error 'cannot load update configuration; dependent updates stopped. Review the diagnostic and rerun dots up.'
     printf '%s\n' "$diagnostic" >&2
-    emit_event "$(event_json --arg summary 'Cannot load update configuration; dependent updates stopped' --arg action 'Review the configuration diagnostic and rerun dots up' '{v:1,kind:"notice",severity:"error",summary:$summary,action:$action}')"
+    emit_event "$(event_json --arg id update-config --arg summary 'Cannot load update configuration; dependent updates stopped' --arg action 'Review the configuration diagnostic and rerun dots up' '{v:1,kind:"stage_end",id:$id,status:"failed",exit_code:1,summary:$summary,action:$action}')"
     return 1
 }
 

@@ -15,9 +15,49 @@ if [[ "$mode" != "manual" ]]; then
     exit 2
 fi
 
-history_branch="$(setup_require_history_branch)" || exit $?
+history_branch="$(setup_history_branch)" || exit $?
+setup_history_state_repo || exit $?
 # Refuse to save a tracked file that is not encrypted for this host.
 setup_tracked_history_paths setup_mise "$history_branch" >/dev/null || exit $?
+
+# Read the selected origin from mise, including overrides from other config files.
+status="$(setup_mise bootstrap dotfiles status --json)" || exit $?
+if ! jq -e --arg branch "$history_branch" '.history.sync.branch == $branch' <<< "$status" >/dev/null; then
+    setup_error "effective history origin branch must be $history_branch before publishing"
+    exit 2
+fi
+origin="$(jq -er '.history.sync.origin | strings | select(test("[\r\n]") | not)' <<< "$status")" || {
+    setup_error 'could not read the effective history origin URL'
+    exit 2
+}
+store="$(jq -er '.history.history_repo | strings | select(test("[\r\n]") | not)' <<< "$status")" || {
+    setup_error 'could not locate the native history repository'
+    exit 2
+}
+case "$store" in "~/"*) store="$HOME/${store#\~/}" ;; esac
+
+# Native mise passes this URL to Git in the history repository. Ask Git for
+# the same destinations without contacting them, including push URL rewrites.
+push_urls="$(
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE
+    LC_ALL=C git -C "$SETUP_ROOT" --git-dir="$store" remote show -n -- "$origin" 2>/dev/null
+)" || {
+    setup_error 'could not resolve the history push destination'
+    exit 2
+}
+push_urls="$(sed -n 's/^  Push  URL: //p' <<< "$push_urls")"
+if [[ -z "$push_urls" ]]; then
+    setup_error 'could not resolve the history push destination'
+    exit 2
+fi
+while IFS= read -r destination; do
+    if ! setup_history_destination_matches "$destination"; then
+        setup_error "history push destination must be the private $SETUP_VAR_dots_state_repo repository"
+        exit 2
+    fi
+done <<< "$push_urls"
+
 printf 'Saving tracked settings locally on %s...\n' "$history_branch"
 dots_up_emit_item backup:save "History" "Save settings" unknown "running"
 setup_mise bootstrap dotfiles save

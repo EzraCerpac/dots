@@ -163,7 +163,7 @@ export function complete({ root, dotsHome, home, miseBin, env = process.env, run
   const hookEnv = {
     ...childEnv,
     DOTS_PRIVATE_READY: privateReady && historyReady ? '1' : '0',
-    DOTS_RESTORED: restoreId ? '1' : '0',
+    DOTS_RESTORED: restoreId && historyReady ? '1' : '0',
   };
   let hooks = [];
   try { hooks = listHooks(dotsHome, path.join(root, 'dots/hooks/bootstrap.d'), role, dotsList(setting('dots_profiles'))); }

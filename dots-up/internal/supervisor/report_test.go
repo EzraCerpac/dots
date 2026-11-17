@@ -126,7 +126,7 @@ func TestReportHighlightsCarryEachIssuesOutputLogAndNextStep(t *testing.T) {
 	printReportHighlights(&b, Report{Events: []ui.Event{
 		{V: 1, Kind: "stage_start", ID: "Breaks", Label: "Breaks"},
 		{V: 1, Kind: "stage_end", ID: "Breaks", Status: "failed", Summary: "failed (exit 7)", Action: "Fix the error above, then run dots up", LogPath: log},
-	}}, dir)
+	}}, dir, false)
 	for _, want := range []string{
 		"    × Breaks — failed (exit 7)",
 		"        step one",

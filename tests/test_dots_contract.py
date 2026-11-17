@@ -681,6 +681,28 @@ class CommandTests(ContractTestCase):
         self.assertIn("  dots hello [ARGS...]", result.stdout)
         self.assertNotIn("dots status [ARGS...]", result.stdout)
 
+    def test_renderer_discovery_skips_incompatible_candidates_but_honors_override(self) -> None:
+        adjacent = write(self.f.manager / "bin/dots-up", "#!/bin/sh\necho dots-shared-cli/1\n", 0o755)
+        available = write(self.f.base / "bin/dots-up", r"""
+            #!/bin/sh
+            if [ "$1" = --capabilities ]; then
+                echo dots-shared-cli/2
+            else
+                printf '%s\n' "$0" "$@"
+            fi
+            """, 0o755)
+        mise = write(self.f.base / "old-mise", f"#!/bin/sh\necho '{adjacent}'\n", 0o755)
+        env = {"DOTS_MISE_BIN": str(mise), "PATH": f"{adjacent.parent}:{available.parent}:{self.f.env['PATH']}"}
+        result = self.f.dots("reports", DOTS_UP_BIN="", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            str(available), "--root", str(self.f.config), "--home", str(self.f.manager), "--command", "reports", "--",
+        ])
+        result = self.f.dots("reports", DOTS_UP_BIN=str(adjacent), **env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("report browser is unavailable", result.stderr)
+        self.assertEqual(result.stdout, "")
+
 
 class ExceptionManifestTests(ContractTestCase):
     def read(self, manifest: str) -> subprocess.CompletedProcess[str]:

@@ -68,6 +68,24 @@ var (
 	runDashboard           = ui.Run
 )
 
+const startupStage = "startup"
+
+func startupFailure(command string, code int, detail string, log *os.File) (ui.Event, ui.Event) {
+	start := ui.Event{V: 1, Kind: "stage_start", ID: startupStage, Label: "Startup"}
+	if log != nil {
+		start.LogPath = log.Name()
+	}
+	end := start
+	end.Kind, end.Status, end.ExitCode = "stage_end", "failed", code
+	end.Summary, end.Detail = fmt.Sprintf("exit %d", code), detail
+	end.Action = fmt.Sprintf("Fix the startup error, then rerun dots %s.", command)
+	return start, end
+}
+
+func printStartupFailure(w io.Writer, e ui.Event) {
+	printIssue(w, fmt.Sprintf("Failed: %s — %s", e.Label, e.Summary), e.Detail, e.Action, e.LogPath)
+}
+
 func Run(opts Options) int {
 	if opts.Command == "" {
 		opts.Command = "up"
@@ -109,10 +127,35 @@ func Run(opts Options) int {
 		fmt.Fprintln(os.Stderr, "dots up: terminal is too small for the dashboard; using concise output")
 	}
 
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(interrupts)
+	resizes := make(chan os.Signal, 1)
+	signal.Notify(resizes, syscall.SIGWINCH)
+	defer signal.Stop(resizes)
+
+	var globalLog *os.File
+	if !opts.Sensitive {
+		globalLog = openLog(files, "backend.log")
+		if globalLog != nil {
+			defer globalLog.Close()
+		}
+	}
 	backend, eventReader, outputReader, err := startUpdaterBackend(opts, files, interactive)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dots up: start updater: %v\n", err)
-		return 127
+		const code = 127
+		detail := string(cleanTerminalOutput([]byte(err.Error())))
+		writeLog(nil, globalLog, []byte(detail+"\n"))
+		start, issue := startupFailure(opts.Command, code, detail, globalLog)
+		if files != nil {
+			_ = files.record(ui.Event{V: 1, Kind: "run_start", Command: opts.Command})
+			_ = files.record(start)
+			_ = files.record(issue)
+			_ = files.record(ui.Event{V: 1, Kind: "run_end", Status: "failed", ExitCode: code, DurationMS: time.Since(started).Milliseconds()})
+			_ = files.finish(code, "", "", time.Now())
+		}
+		printStartupFailure(os.Stderr, issue)
+		return code
 	}
 	if dashboard && !backend.pty {
 		dashboard, plain = false, true
@@ -173,7 +216,9 @@ func Run(opts Options) int {
 
 	var stageLog *os.File
 	var stageID, profile, host string
-	var runEndSeen, childFinished, outputFinished bool
+	var runStarted, workReported, childFinished, outputFinished bool
+	var startupOutput []byte
+	runEnd := ui.Event{V: 1, Kind: "run_end"}
 	eventFinished := backend.streamNonce != ""
 	var exitCode int
 	var waitErr error
@@ -201,9 +246,6 @@ func Run(opts Options) int {
 	var uiErr error
 	manualEnd := make(chan struct{}, 1)
 	var inputStart chan struct{}
-	var signals = make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGWINCH)
-	defer signal.Stop(signals)
 	var relay relayState
 	if backend.pty && backend.tty != nil && backend.master != nil {
 		inputStart = make(chan struct{}, 1)
@@ -211,14 +253,7 @@ func Run(opts Options) int {
 		go relayTerminalInput(backend.tty, backend.master, &relay, inputStart, manualEnd)
 	}
 
-	var globalLog *os.File
-	if !opts.Sensitive {
-		globalLog = openLog(files, "backend.log")
-	}
 	defer func() {
-		if globalLog != nil {
-			_ = globalLog.Close()
-		}
 		if stageLog != nil {
 			_ = stageLog.Close()
 		}
@@ -242,8 +277,13 @@ func Run(opts Options) int {
 				fmt.Fprintln(os.Stderr, "dots up: dashboard stopped responding; continuing in concise mode")
 			}
 		}
-		if plain && !opts.Verbose {
-			printProgress(e)
+		if plain {
+			switch {
+			case opts.Command == "status" && e.Kind == "item_upsert":
+				printStatusItem(os.Stdout, e)
+			case (!opts.Verbose || (opts.Command == "status" && e.Kind == "run_start")) && e.ID != startupStage:
+				printProgress(e)
+			}
 		}
 	}
 	emit := func(e ui.Event) {
@@ -397,9 +437,11 @@ func Run(opts Options) int {
 		}
 		switch e.Kind {
 		case "run_start":
+			runStarted = true
 			profile, host = e.Profile, e.Host
 			emit(e)
 		case "stage_start":
+			workReported = true
 			if stageLog != nil {
 				_ = stageLog.Close()
 				stageLog = nil
@@ -427,6 +469,7 @@ func Run(opts Options) int {
 				}
 			}
 		case "stage_end":
+			workReported = true
 			if e.LogPath == "" && files != nil {
 				e.LogPath = files.logPath(e.ID)
 			}
@@ -452,9 +495,12 @@ func Run(opts Options) int {
 			}
 			finishStage(e)
 		case "run_end":
-			runEndSeen, exitCode = true, e.ExitCode
-			emit(e)
+			// The child can report its outcome before its output has drained.
+			runEnd, exitCode = e, e.ExitCode
 		default:
+			if e.Kind == "notice" && (e.Severity == "attention" || e.Severity == "error") {
+				workReported = true
+			}
 			if (e.Kind == "app_store_start" || e.Kind == "app_store_end") && e.LogPath != "" && files != nil && !inside(files.runDir, e.LogPath) {
 				e.LogPath = ""
 			}
@@ -549,6 +595,13 @@ func Run(opts Options) int {
 			}
 			b := item.bytes
 			clean := cleanTerminalOutput(b)
+			if !workReported && !opts.Sensitive {
+				const limit = 8 * 1024
+				startupOutput = append(startupOutput, clean...)
+				if len(startupOutput) > limit {
+					startupOutput = append(startupOutput[:0], startupOutput[len(startupOutput)-limit:]...)
+				}
+			}
 			if relayKind != "" && backend.tty != nil {
 				_, _ = backend.tty.Write(b)
 				if relayKind == "manual" {
@@ -616,8 +669,8 @@ func Run(opts Options) int {
 					startAutomaticRelay()
 				}
 			}
-		case sig := <-signals:
-			if sig == syscall.SIGWINCH && backend.pty && backend.tty != nil && backend.master != nil {
+		case <-resizes:
+			if !childFinished && backend.pty && backend.tty != nil && backend.master != nil {
 				_ = pty.InheritSize(backend.tty, backend.master)
 				if relayKind == "manual" {
 					// Reads can end inside ANSI controls or a UTF-8 rune. Keep the
@@ -627,9 +680,9 @@ func Run(opts Options) int {
 						redrawManualHint()
 					}
 				}
-				continue
 			}
-			if !childFinished {
+		case <-interrupts:
+			if !cancelRequested && !childFinished {
 				cancelRequested = true
 				cancelBackend(backend)
 			}
@@ -651,15 +704,30 @@ func Run(opts Options) int {
 		_ = stageLog.Sync()
 		_ = stageLog.Close()
 	}
-	if waitErr != nil && exitCode == 0 {
+	if cancelRequested {
+		exitCode = 130
+	} else if waitErr != nil && exitCode == 0 {
 		exitCode = childExitCode(waitErr)
 	}
 	if backendError != nil && exitCode == 0 {
 		exitCode = 1
 	}
-	if !runEndSeen {
-		emit(ui.Event{V: 1, Kind: "run_end", ExitCode: exitCode, DurationMS: time.Since(started).Milliseconds()})
+	var startupIssue *ui.Event
+	if exitCode != 0 && !cancelRequested && !workReported {
+		if !runStarted && opts.Command != "up" {
+			emit(ui.Event{V: 1, Kind: "run_start"})
+		}
+		start, issue := startupFailure(opts.Command, exitCode, string(startupOutput), globalLog)
+		startupIssue = &issue
+		emit(start)
+		emit(issue)
+		runEnd.Status = "failed"
 	}
+	runEnd.ExitCode = exitCode
+	if runEnd.DurationMS == 0 {
+		runEnd.DurationMS = time.Since(started).Milliseconds()
+	}
+	emit(runEnd)
 	if files != nil {
 		_ = files.finish(exitCode, profile, host, time.Now())
 	}
@@ -673,16 +741,19 @@ func Run(opts Options) int {
 	if uiErr != nil {
 		fmt.Fprintf(os.Stderr, "dots up: dashboard ended with an error: %v\n", uiErr)
 	}
-	if plain && !opts.Verbose {
+	if (plain && !opts.Verbose) || dashboardStarted {
 		if files != nil {
 			fmt.Println(summary(files.report, files.runDir))
-			printReportHighlights(os.Stdout, files.report, files.runDir)
+			printReportHighlights(os.Stdout, files.report, files.runDir, plain)
 		} else {
 			fmt.Printf("Update completed with exit code %d.\n", exitCode)
 		}
-	} else if dashboardStarted && files != nil {
-		fmt.Println(summary(files.report, files.runDir))
-		printReportHighlights(os.Stdout, files.report, files.runDir)
+	}
+	if startupIssue != nil && (files == nil || opts.Verbose) {
+		if opts.Verbose {
+			startupIssue.Detail = "" // verbose output already showed the diagnostic
+		}
+		printStartupFailure(os.Stdout, *startupIssue)
 	}
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)
@@ -691,6 +762,10 @@ func Run(opts Options) int {
 }
 
 func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *os.File, io.Reader, error) {
+	cmd, err := updaterCommand(opts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	eventR, eventW, err := os.Pipe()
 	if err != nil {
 		return nil, nil, nil, err
@@ -699,10 +774,6 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 	if err != nil {
 		_ = eventR.Close()
 		_ = eventW.Close()
-		return nil, nil, nil, err
-	}
-	cmd, err := updaterCommand(opts)
-	if err != nil {
 		return nil, nil, nil, err
 	}
 	if opts.MAS {
@@ -769,7 +840,6 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 			return &backend{command: cmd, master: master, tty: tty, ack: ackW, streamNonce: streamNonce, pty: true, processGroup: true}, eventR, master, nil
 		}
 		// Keep maintenance available even when the host cannot allocate a PTY.
-		fmt.Fprintf(os.Stderr, "dots up: pseudoterminal unavailable (%v); using the current terminal directly\n", startErr)
 		_ = tty.Close()
 		tty = nil
 		childEnv = setEnv(childEnv, "DOTS_UP_STREAM_NONCE", "")
@@ -785,6 +855,7 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 			_ = ackW.Close()
 			return nil, nil, nil, err
 		}
+		fmt.Fprintf(os.Stderr, "dots up: pseudoterminal unavailable (%v); using the current terminal directly\n", startErr)
 		_ = eventW.Close()
 		_ = ackR.Close()
 		_ = ackW.Close()

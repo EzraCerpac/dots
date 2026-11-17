@@ -108,3 +108,125 @@ func TestUpdaterCommandWithoutHomeUsesLegacySetupTask(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirectedResizeAndInterrupt(t *testing.T) {
+	for _, tc := range []struct {
+		signal string
+		code   int
+	}{
+		{"WINCH", 0},
+		{"INT", 130},
+		{"TERM", 130},
+	} {
+		t.Run(tc.signal, func(t *testing.T) {
+			useTextRunner(t, "kill -"+tc.signal+" \"$PPID\"\nsleep 0.3\n")
+			code, _ := captureRun(t, Options{StateDir: t.TempDir()})
+			if code != tc.code {
+				t.Fatalf("got exit %d after %s, want %d", code, tc.signal, tc.code)
+			}
+		})
+	}
+}
+
+func TestStartupFailureReportsOneIssue(t *testing.T) {
+	for _, tc := range []struct {
+		name, command, script, diagnostic string
+		code                              int
+	}{
+		{"launch", "up", "", "no such file or directory", 127},
+		{"before run start", "up", "echo 'setup: invalid profile' >&2\nexit 2", "setup: invalid profile", 2},
+		{"before first stage", "status", runnerEvents + `
+emit '{"v":1,"kind":"run_start","profile":"invalid","host":"fixture"}'
+echo 'setup: invalid profile' >&2
+emit '{"v":1,"kind":"run_end","status":"failed","exit_code":2}'
+exit 2
+`, "setup: invalid profile", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useTextRunner(t, tc.script)
+			state := t.TempDir()
+			code, output := captureRun(t, Options{Command: tc.command, StateDir: state})
+			if code != tc.code || strings.Count(output, tc.diagnostic) != 1 ||
+				!strings.Contains(output, "Next:") || !strings.Contains(output, "Log:") {
+				t.Fatalf("exit %d, expected %d and one actionable diagnostic:\n%s", code, tc.code, output)
+			}
+			report, dir, err := latestReport(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := report.Events
+			if report.ExitCode != code || len(events) < 2 || events[len(events)-1].Kind != "run_end" {
+				t.Fatalf("report did not finish: %+v", report)
+			}
+			var failures int
+			for _, e := range events {
+				if e.Kind == "stage_end" && e.Status == "failed" {
+					failures++
+					if !strings.Contains(e.Detail, tc.diagnostic) || e.LogPath != filepath.Join(dir, "backend.log") {
+						t.Fatalf("issue lost its diagnostic or log: %+v", e)
+					}
+				}
+			}
+			log, err := os.ReadFile(filepath.Join(dir, "backend.log"))
+			if failures != 1 || err != nil || !strings.Contains(string(log), tc.diagnostic) {
+				t.Fatalf("issues = %d, log = %q, error = %v", failures, log, err)
+			}
+		})
+	}
+}
+
+func TestStatusPrintsStructuredInventoryInTextModes(t *testing.T) {
+	useTextRunner(t, runnerEvents+`
+emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture-nas"}'
+emit '{"v":1,"kind":"item_upsert","label":"sample-tool@1","group":"Tools","status":"ok","summary":"1.2.3"}'
+emit '{"v":1,"kind":"item_upsert","label":"brew:sample-package","group":"Packages","status":"ok","summary":"2.3.4"}'
+emit '{"v":1,"kind":"item_upsert","label":"missing-tool","group":"Tools","status":"missing","summary":"not available"}'
+emit '{"v":1,"kind":"run_end","exit_code":0}'
+`)
+	for _, opts := range []Options{{}, {Plain: true}, {Verbose: true}} {
+		opts.Command, opts.StateDir = "status", t.TempDir()
+		code, output := captureRun(t, opts)
+		if code != 0 {
+			t.Fatalf("status exited %d:\n%s", code, output)
+		}
+		for _, want := range []string{"laptop · fixture-nas", "sample-tool@1  ok — 1.2.3", "brew:sample-package  ok — 2.3.4", "missing-tool  missing"} {
+			if strings.Count(output, want) != 1 {
+				t.Fatalf("expected one %q in status output:\n%s", want, output)
+			}
+		}
+	}
+}
+
+const runnerEvents = `
+emit() { printf '\036dots-up/1:%s:%s\037' "$DOTS_UP_STREAM_NONCE" "$1"; }
+`
+
+func useTextRunner(t *testing.T, script string) {
+	t.Helper()
+	t.Setenv("CI", "1")
+	runner := filepath.Join(t.TempDir(), "runner")
+	t.Setenv("DOTS_UP_RUNNER", runner)
+	if script != "" {
+		if err := os.WriteFile(runner, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func captureRun(t *testing.T, opts Options) (int, string) {
+	t.Helper()
+	output, err := os.CreateTemp(t.TempDir(), "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	stdout, stderr := os.Stdout, os.Stderr
+	defer func() { os.Stdout, os.Stderr = stdout, stderr }()
+	os.Stdout, os.Stderr = output, output
+	code := Run(opts)
+	data, err := os.ReadFile(output.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(data)
+}

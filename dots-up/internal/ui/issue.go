@@ -69,7 +69,9 @@ func (m Model) stageHasNotice(stage int) bool {
 		return false
 	}
 	for _, n := range m.Notices {
-		if n.Stage == m.Stages[stage].ID && (n.Severity == "attention" || n.Severity == "error") {
+		// A notice that only repeats the step's summary is not listed separately.
+		if n.Stage == m.Stages[stage].ID && (n.Severity == "attention" || n.Severity == "error") &&
+			!strings.EqualFold(n.Summary, m.Stages[stage].Summary) {
 			return true
 		}
 	}

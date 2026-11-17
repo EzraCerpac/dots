@@ -354,7 +354,11 @@ func printReportHighlights(w io.Writer, report Report, dir string) {
 	}
 	// Steps whose problems are listed as their own items.
 	noticed := map[string]bool{}
+	logs := map[string]string{}
 	for _, e := range report.Events {
+		if e.ID != "" && e.LogPath != "" {
+			logs[e.ID] = e.LogPath
+		}
 		if e.Kind == "notice" && e.Stage != "" && (e.Severity == "attention" || e.Severity == "error") {
 			noticed[e.Stage] = true
 		}
@@ -370,7 +374,7 @@ func printReportHighlights(w io.Writer, report Report, dir string) {
 			fmt.Fprintln(w, "  "+ui.ChangeLine(e.Action, e.Item, e.Before, e.After))
 		case "notice":
 			if e.Severity == "attention" || e.Severity == "error" {
-				printIssue(w, "Attention: "+e.Summary, e.Detail, e.Action, "")
+				printIssue(w, "Attention: "+e.Summary, e.Detail, e.Action, logs[e.Stage])
 			}
 		case "stage_end":
 			if e.Status == "failed" || e.Status == "attention" {

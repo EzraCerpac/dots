@@ -352,6 +352,13 @@ func printReportHighlights(w io.Writer, report Report, dir string) {
 			labels[e.ID] = e.Label
 		}
 	}
+	// Steps whose problems are listed as their own items.
+	noticed := map[string]bool{}
+	for _, e := range report.Events {
+		if e.Kind == "notice" && e.Stage != "" && (e.Severity == "attention" || e.Severity == "error") {
+			noticed[e.Stage] = true
+		}
+	}
 	for _, e := range report.Events {
 		switch e.Kind {
 		case "item_upsert":
@@ -375,7 +382,11 @@ func printReportHighlights(w io.Writer, report Report, dir string) {
 				if e.Status == "attention" {
 					kind = "Needs attention"
 				}
-				printIssue(w, fmt.Sprintf("%s: %s — %s", kind, label, e.Summary), e.Detail, e.Action, e.LogPath)
+				detail := e.Detail
+				if detail == "" && !noticed[e.ID] {
+					detail = ui.LogTail(e.LogPath)
+				}
+				printIssue(w, fmt.Sprintf("%s: %s — %s", kind, label, e.Summary), detail, e.Action, e.LogPath)
 			}
 		}
 	}

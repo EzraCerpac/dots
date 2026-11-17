@@ -175,3 +175,22 @@ func TestAgentMessageShowsFromTheIssueListAndTheLog(t *testing.T) {
 		}
 	}
 }
+
+func TestAnItemWithoutOutputDoesNotBorrowAnotherProblemsLog(t *testing.T) {
+	m, log := syncAttention(t)
+	m = send(m, Event{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", LogPath: log,
+		Summary: "SAVE REFUSED: history is not enrolled; nothing saved", Action: "dots sync"})
+	m = send(m, Event{V: 1, Kind: "notice", Stage: "source-sync", Severity: "attention",
+		Summary: "APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
+		Detail:  "mise ERROR pre-dotfiles hook failed", Action: "dots apply"})
+	items := m.issues()
+	if len(items) != 2 {
+		t.Fatalf("issues = %d, want 2", len(items))
+	}
+	if got := m.issueDetail(items[0]); strings.Contains(got, "mise ERROR") {
+		t.Fatalf("the refusal shows the apply failure's output:\n%s", got)
+	}
+	if got := m.issueDetail(items[1]); !strings.Contains(got, "mise ERROR pre-dotfiles hook failed") {
+		t.Fatalf("the apply failure lost its output:\n%s", got)
+	}
+}

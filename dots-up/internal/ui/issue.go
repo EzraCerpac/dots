@@ -16,14 +16,9 @@ const issueOutputLines = 6
 
 // IssueDetail is everything one attention item says, in this order: what
 // failed, the last lines of the error (DETAIL, the output the step reported
-// with it, or else the end of its log), the one command to run next, and the
+// with it), the one command to run next, and the
 // log. The dashboard, plain output and saved reports all show it.
 func IssueDetail(text, detail, action, logPath string) string {
-	if detail == "" && logPath != "" {
-		if _, err := os.Stat(logPath); err == nil {
-			detail = readTail(logPath)
-		}
-	}
 	lines := []string{text}
 	for _, line := range lastLines(detail, issueOutputLines) {
 		lines = append(lines, "    "+line)
@@ -35,6 +30,19 @@ func IssueDetail(text, detail, action, logPath string) string {
 		lines = append(lines, "    Log: "+logPath)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// LogTail is the end of a step's log, for a step that reported no output of
+// its own. A step whose problems are listed separately does not use it: the
+// log holds their output, not this item's.
+func LogTail(logPath string) string {
+	if logPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		return ""
+	}
+	return readTail(logPath)
 }
 
 // lastLines returns the last LIMIT non-empty lines of TEXT.
@@ -49,7 +57,23 @@ func lastLines(text string, limit int) []string {
 }
 
 func (m Model) issueDetail(item issue) string {
-	return IssueDetail(item.text, item.detail, item.action, item.logPath)
+	detail := item.detail
+	if detail == "" && !item.notice && !m.stageHasNotice(item.stage) {
+		detail = LogTail(item.logPath)
+	}
+	return IssueDetail(item.text, detail, item.action, item.logPath)
+}
+
+func (m Model) stageHasNotice(stage int) bool {
+	if stage < 0 || stage >= len(m.Stages) {
+		return false
+	}
+	for _, n := range m.Notices {
+		if n.Stage == m.Stages[stage].ID && (n.Severity == "attention" || n.Severity == "error") {
+			return true
+		}
+	}
+	return false
 }
 
 // AgentCommandEnv names the shell command that receives an issue as its final

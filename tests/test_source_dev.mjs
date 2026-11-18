@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { syncDev } from '../lib/source-dev.mjs';
 import { syncSource, withRepositoryLock } from '../lib/source-repo.mjs';
 import { miseBinary, requires } from './lib/prereq.mjs';
 
@@ -85,6 +86,7 @@ case "$*" in
     if [ -n "\${DEV_TEST_SAVE_FAIL:-}" ]; then echo "$DEV_TEST_SAVE_FAIL" >&2; exit 1; fi
     if [ -n "\${DEV_TEST_SAVED:-}" ]; then touch "$DEV_TEST_SAVED"; fi ;;
   *'config ls'*)
+    if [ -n "\${DEV_TEST_CONFIG_HOOK:-}" ]; then "$DEV_TEST_CONFIG_HOOK"; fi
     if [ -n "\${DEV_TEST_MUTATE:-}" ]; then echo late > "$DEV_TEST_MUTATE"; fi
     if grep -q INVALID "$2/config.toml"; then echo 'invalid config' >&2; exit 1; fi ;;
   *'dotfiles apply'*)
@@ -106,15 +108,131 @@ esac
   fs.chmodSync(gitleaks, 0o755);
   const sync = (root, options = {}) => {
     const lines = [];
-    const code = syncSource(root, { expectedRemote: origin, miseBin, gitleaks, print: text => lines.push(text), ...options });
+    const code = syncSource(root, { expectedRemote: origin, miseBin, gitleaks, verbose: true, print: text => lines.push(text), ...options });
     return { code, text: lines.join('\n') };
   };
+  const producer = (root, options = {}) => syncDev(root, { gitDir: git(root, 'rev-parse', '--absolute-git-dir'), miseBin, gitleaks, ...options });
   const write = (root, file, contents) => { fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), contents); };
   const dev = root => git(root, 'rev-parse', 'refs/heads/dev');
   const remote = () => git(origin, 'rev-parse', 'dev');
   const clean = root => assert.equal(git(root, 'status', '--porcelain'), '', `${root} has uncommitted changes`);
-  return { dir, a, b, origin, sync, write, dev, remote, clean, gitleaks };
+  return { dir, a, b, origin, sync, producer, write, dev, remote, clean, gitleaks };
 }
+
+function duringValidation(f, command) {
+  const hook = path.join(f.dir, 'validation-hook');
+  fs.writeFileSync(hook, `#!/bin/sh\nset -eu\n${command}\n`, { mode: 0o755 });
+  process.env.DEV_TEST_CONFIG_HOOK = hook;
+  return () => { delete process.env.DEV_TEST_CONFIG_HOOK; };
+}
+
+test('producer reports a clean sync with no changes or issues', available, t => {
+  const f = fixture(t), before = f.dev(f.a);
+  assert.deepEqual(f.producer(f.a), {
+    header: 'dots sync: no local changes · pulled dev +0, main +0 · nothing to push',
+    before, after: before, lines: [], groups: [], issues: [], notices: [],
+  });
+});
+
+test('producer reports queued edits as saved offline and shared on the next run', available, t => {
+  const f = fixture(t), before = f.remote();
+  fs.renameSync(f.origin, `${f.origin}.offline`);
+  f.write(f.a, 'local', 'save offline\n');
+  const offline = f.producer(f.a), snapshot = f.dev(f.a);
+  assert.deepEqual(offline.groups, [{ kind: 'saved', before, after: snapshot }]);
+  assert.deepEqual(offline.issues, [{ summary: 'Origin unreachable', detail: '1 commits unpushed', action: 'The next sync will retry.' }]);
+  fs.renameSync(`${f.origin}.offline`, f.origin);
+  const online = f.producer(f.a);
+  assert.deepEqual(online.groups, [{ kind: 'shared', before, after: snapshot }]);
+  assert.deepEqual(online.issues, []);
+  assert.equal(f.remote(), snapshot);
+});
+
+test('producer reports reviewed main as shared and received from their respective tips', available, t => {
+  const f = fixture(t), before = f.remote();
+  git(f.b, 'switch', '-qc', 'main', 'origin/main');
+  f.write(f.b, 'reviewed', 'reviewed change\n');
+  git(f.b, 'add', '.'); git(f.b, 'commit', '-qm', 'Reviewed'); git(f.b, 'push', '-q', 'origin', 'main');
+  const reviewed = git(f.b, 'rev-parse', 'main');
+  const result = f.producer(f.a);
+  assert.deepEqual(result.groups, [
+    { kind: 'shared', before, after: reviewed },
+    { kind: 'received', before, after: reviewed },
+  ]);
+  assert.deepEqual(result.issues, []);
+  assert.deepEqual(result.notices, [], 'the legacy checkout shortstat is replaced by the received group');
+  assert.equal(f.remote(), reviewed);
+  assert.equal(read(f.a, 'reviewed'), 'reviewed change\n');
+});
+
+test('producer uses the empty tree when it creates a missing remote branch', available, t => {
+  const f = fixture(t), tip = f.dev(f.a);
+  git(f.origin, 'update-ref', '-d', 'refs/heads/dev');
+  assert.equal(git(f.a, 'rev-parse', 'origin/dev'), tip, 'a stale tracking ref is still present');
+  const empty = run('git', ['mktree'], f.a, { input: '' });
+  const result = f.producer(f.a);
+  assert.deepEqual(result.groups, [{ kind: 'shared', before: empty, after: tip }]);
+  assert.equal(f.remote(), tip);
+});
+
+test('producer uses the remote tip actually replaced by the accepted push', available, t => {
+  const f = fixture(t), before = f.remote();
+  f.write(f.a, 'queued', 'queued first\n');
+  git(f.a, 'add', '.'); git(f.a, 'commit', '-qm', 'Queued');
+  const advanced = f.dev(f.a);
+  const stop = duringValidation(f, `git -C '${f.b}' fetch -q '${f.a}' '${advanced}'\ngit -C '${f.b}' push -q origin FETCH_HEAD:dev`);
+  f.write(f.a, 'local', 'saved second\n');
+  const result = f.producer(f.a);
+  stop();
+  assert.deepEqual(result.groups, [{ kind: 'shared', before: advanced, after: f.remote() }]);
+  assert.deepEqual(result.notices, [`origin/dev moved to ${advanced.slice(0, 12)} between fetch and push`]);
+  assert.equal(git(f.a, 'rev-parse', `${advanced}^`), before);
+  assert.equal(f.remote(), f.dev(f.a));
+});
+
+test('producer reports no share or local-only save when another push already published the snapshot', available, t => {
+  const f = fixture(t);
+  const stop = duringValidation(f, `git -C '${f.b}' fetch -q '${f.a}' dev\ngit -C '${f.b}' push -q origin FETCH_HEAD:dev`);
+  f.write(f.a, 'local', 'concurrently shared\n');
+  const result = f.producer(f.a);
+  stop();
+  assert.deepEqual(result.groups, []);
+  assert.deepEqual(result.issues, []);
+  assert.match(result.notices[0], /^origin\/dev already pointed to [0-9a-f]{12} /);
+  assert.match(result.header, /nothing to push$/);
+  assert.equal(f.remote(), f.dev(f.a));
+  assert.equal(git(f.origin, 'show', 'dev:local'), 'concurrently shared');
+});
+
+test('producer keeps a completed share when checkout stops and reports recovery separately', available, t => {
+  const f = fixture(t);
+  f.write(f.b, 'incoming', 'first incoming change\n'); f.sync(f.b);
+  const remoteBefore = f.remote(), lock = path.join(f.a, '.git/refs/heads/dev.lock');
+  const stop = duringValidation(f, `touch '${lock}'`);
+  f.write(f.a, 'local', 'local snapshot\n');
+  const partial = f.producer(f.a);
+  stop();
+  const snapshot = f.dev(f.a), pending = f.remote();
+  assert.deepEqual(partial.groups, [{ kind: 'shared', before: remoteBefore, after: pending }]);
+  assert.notEqual(snapshot, pending);
+  assert.match(partial.issues[0].detail, /could not update dev/);
+  assert.match(partial.issues[0].action, /checkout pending/);
+
+  fs.rmSync(lock);
+  git(f.b, 'pull', '-q', '--ff-only', 'origin', 'dev');
+  f.write(f.b, 'later', 'second incoming change\n'); f.sync(f.b);
+  const latest = f.remote();
+  process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR cannot apply file';
+  const retry = f.producer(f.a);
+  assert.deepEqual(retry.groups, [
+    { kind: 'recovered', before: snapshot, after: pending },
+    { kind: 'received', before: pending, after: latest },
+  ]);
+  assert.deepEqual(retry.issues, [{ summary: 'Dotfile apply failed',
+    detail: 'mise bootstrap dotfiles apply (exit 1)\napplying 3 dotfiles\nmise ERROR cannot apply file',
+    action: 'fix the error below, then run dots apply' }]);
+  assert.equal(f.dev(f.a), latest);
+});
 
 // An older host: its tree still has the Herdr template and its local config the
 // declaration an old setup script appended. The incoming commit archives the
@@ -1607,8 +1725,10 @@ test('real mise reloads changed guarded copies once before the post hook', requi
   f.write(a.home, 'events', '');
   f.write(f.a, 'copy.txt', 'sync copy\n');
   f.write(f.a, 'template.tera', '{{ "sync template" }}\n');
-  const updated = a.sync();
-  assert.doesNotMatch(updated.text, /APPLY FAILED|RELOAD FAILED/);
+  Object.assign(process.env, a.env);
+  const updated = f.producer(f.a, { miseBin: f.miseBin });
+  assert.deepEqual(updated.issues, []);
+  assert.match(updated.notices.find(line => line.startsWith('previous copy of ~/.copied: ')) ?? '', /\.dots-copy-.*\/previous$/);
   assert.equal(read(a.home, 'events'), 'pre\nsync copy\nnative\nboth\npost\n');
 
   f.write(a.home, 'events', '');

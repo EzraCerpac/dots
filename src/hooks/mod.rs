@@ -145,7 +145,7 @@ pub fn run(run: &Run<'_>, hook: &Hook, env: HookEnv<'_>) -> Outcome {
 
 fn run_stage(run: &Run<'_>, label: &str, path: &Path, args: &[&str], env: ChildEnv<'_>) -> Outcome {
     if run.cancelled() {
-        return Outcome::Skipped;
+        return Outcome::Cancelled;
     }
     let stage = run.start(label);
     let next = match env {
@@ -182,6 +182,11 @@ fn run_stage(run: &Run<'_>, label: &str, path: &Path, args: &[&str], env: ChildE
             }
             Outcome::Failed
         }
+    };
+    let outcome = if run.cancelled() {
+        Outcome::Cancelled
+    } else {
+        outcome
     };
     run.finish(stage, outcome);
     outcome

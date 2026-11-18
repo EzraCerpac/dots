@@ -238,7 +238,14 @@ fn show_programs(ctx: &Ctx, run: &Run<'_>) -> bool {
             None,
         );
     }
-    run.finish(stage, Outcome::Completed);
+    run.finish(
+        stage,
+        if run.cancelled() {
+            Outcome::Cancelled
+        } else {
+            Outcome::Completed
+        },
+    );
     mise_version_readable
 }
 

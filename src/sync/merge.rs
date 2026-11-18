@@ -117,6 +117,7 @@ fn conflict_root(path: &Path, parents: [&str; 2]) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::Git;
     use crate::sync::tests::{fixture_commit, git_fixture};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};

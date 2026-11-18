@@ -18,6 +18,12 @@ pub(super) struct Workspace<'a, 'ctx> {
     pub(super) slug: String,
 }
 
+pub(super) struct Origin {
+    raw_push: Vec<String>,
+    explicit_push: bool,
+    preferred_push: String,
+}
+
 impl<'a, 'ctx> Workspace<'a, 'ctx> {
     pub(super) fn open(
         ctx: &'ctx Ctx,
@@ -47,6 +53,11 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         let live = git_path(ctx, run, config, "--show-toplevel")?
             .filter(|path| path == config)
             .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
+        if root == live {
+            return Err(failure(
+                "use a separate colocated JJ workspace to publish from this configuration",
+            ));
+        }
         let workspace = Self {
             ctx,
             run,
@@ -96,7 +107,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(locks)
     }
 
-    pub(super) fn validate_origin(&self) -> Result<(), Fail> {
+    pub(super) fn validate_origin(&self) -> Result<Origin, Fail> {
         let raw = configured_urls(self.ctx, self.run, &self.root, "remote.origin.url")?
             .ok_or_else(|| failure("the JJ workspace has no origin remote"))?;
         self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
@@ -105,24 +116,34 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
                 .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
             self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
         }
-        if let Some(raw_push) =
-            configured_urls(self.ctx, self.run, &self.root, "remote.origin.pushurl")?
-            && !stdout(&raw_push)?
-                .split_terminator('\0')
-                .all(|url| RepoSetting::parse(url).is_ok())
-        {
+        let raw_push = configured_urls(self.ctx, self.run, &self.root, "remote.origin.pushurl")?;
+        let explicit_push = raw_push.is_some();
+        let raw_push: Vec<_> = stdout(raw_push.as_ref().unwrap_or(&raw))?
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect();
+        if !raw_push.iter().all(|url| RepoSetting::parse(url).is_ok()) {
             return Err(failure(
                 "origin has an invalid push URL; check Git configuration",
             ));
         }
-        for args in [
-            &["remote", "get-url", "origin"][..],
+        let fetch = self.git(&["remote", "get-url", "origin"], "resolve the fetch URL")?;
+        self.check_urls(stdout(&fetch)?.split_terminator('\n'))?;
+        let push = self.git(
             &["remote", "get-url", "--push", "--all", "origin"],
-        ] {
-            let urls = self.git(args, "resolve the origin URLs")?;
-            self.check_urls(stdout(&urls)?.split_terminator('\n'))?;
-        }
-        Ok(())
+            "resolve the push URLs",
+        )?;
+        let mut push_urls = stdout(&push)?.split_terminator('\n');
+        self.check_urls(push_urls.clone())?;
+        let preferred_push = push_urls
+            .next()
+            .ok_or_else(|| failure("origin has no push URL"))?
+            .to_owned();
+        Ok(Origin {
+            raw_push,
+            explicit_push,
+            preferred_push,
+        })
     }
 
     fn check_urls<'s>(&self, mut urls: impl Iterator<Item = &'s str>) -> Result<(), Fail> {
@@ -335,16 +356,14 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(names)
     }
 
-    pub(super) fn scan(&self, base: &str, commit: &str) -> Result<(), Fail> {
-        let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(&self.root))?;
-        sanitize_git_environment(&mut cmd);
-        // Include every commit in the range and diff merge commits against
-        // their first parent, including anything added by conflict resolution.
-        cmd.args(["git", "--no-banner", "--redact=100", "--exit-code=20"])
-            .arg(format!(
-                "--log-opts=--diff-merges=first-parent {base}..{commit}"
-            ))
-            .arg(&self.root);
+    pub(super) fn gitleaks(&self, root: &Path, rules: &Path) -> Result<(), Fail> {
+        let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(root))?;
+        cmd.args(["dir", "--no-banner", "--redact=100", "--exit-code=20"]);
+        cmd.arg("--config")
+            .arg(rules.join(".gitleaks.toml"))
+            .arg("--gitleaks-ignore-path")
+            .arg(rules)
+            .arg(".");
         let output = self.probe(cmd, "gitleaks")?;
         match output.status.code() {
             Some(0) => Ok(()),
@@ -384,20 +403,57 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(())
     }
 
-    pub(super) fn push(&self, name: &str, commit: &str) -> Result<(), Fail> {
-        self.git(
-            &[
-                "-c",
-                "remote.origin.mirror=false",
-                "push",
-                "--no-follow-tags",
-                "--recurse-submodules=no",
-                "origin",
-                &format!("{commit}:refs/heads/{name}"),
-            ],
-            "push the scanned commit without force; check origin and the remote bookmark",
-        )?;
-        Ok(())
+    pub(super) fn push(&self, origin: &Origin, name: &str, commit: &str) -> Result<(), Fail> {
+        // A command-local remote has one destination and no fetch mapping.
+        // Start with the raw URL so Git applies its rewrite exactly once.
+        let token = tempfile::Builder::new()
+            .prefix("dots-publish-")
+            .tempdir()
+            .map_err(|_| failure("could not prepare a private push target"))?;
+        let remote = token
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| failure("could not name the private push target"))?;
+        for raw in &origin.raw_push {
+            let url = format!("remote.{remote}.url={raw}");
+            let push_url = format!("remote.{remote}.pushurl={raw}");
+            let mut config = vec!["-c", url.as_str()];
+            if origin.explicit_push {
+                config.extend(["-c", push_url.as_str()]);
+            }
+            let target = self.git(
+                &[
+                    &config[..],
+                    &["remote", "get-url", "--push", "--all", remote],
+                ]
+                .concat(),
+                "verify the private push target",
+            )?;
+            if !stdout(&target)?
+                .split_terminator('\n')
+                .eq([origin.preferred_push.as_str()])
+            {
+                continue;
+            }
+            let refspec = format!("{commit}:refs/heads/{name}");
+            self.git(
+                &[
+                    &config[..],
+                    &[
+                        "push",
+                        "--no-follow-tags",
+                        "--recurse-submodules=no",
+                        remote,
+                        &refspec,
+                    ],
+                ]
+                .concat(),
+                "push the scanned commit without force; check origin and the remote bookmark",
+            )?;
+            return Ok(());
+        }
+        Err(failure("could not verify a single push URL for origin"))
     }
 
     pub(super) fn gh(&self, operation: &str, args: &[&str], action: &str) -> Result<Output, Fail> {
@@ -425,7 +481,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         self.checked(cmd, "jj", action)
     }
 
-    fn git(&self, args: &[&str], action: &str) -> Result<Output, Fail> {
+    pub(super) fn git(&self, args: &[&str], action: &str) -> Result<Output, Fail> {
         let mut cmd = git_command(self.ctx, &self.root)?;
         cmd.args(args);
         self.checked(cmd, "git", action)
@@ -503,9 +559,10 @@ fn sanitize_git_environment(cmd: &mut Command) {
         cmd.env_remove(name);
     }
     cmd.env("GIT_NO_REPLACE_OBJECTS", "1");
+    cmd.env("GIT_NO_LAZY_FETCH", "1");
 }
 
-fn stdout(output: &Output) -> Result<&str, Fail> {
+pub(super) fn stdout(output: &Output) -> Result<&str, Fail> {
     std::str::from_utf8(&output.stdout).map_err(|_| failure("received invalid command output"))
 }
 
@@ -520,7 +577,7 @@ fn stdout_path(output: &Output) -> Result<&Path, Fail> {
     Ok(Path::new(OsStr::from_bytes(bytes)))
 }
 
-fn object_id(value: &str) -> Result<&str, Fail> {
+pub(super) fn object_id(value: &str) -> Result<&str, Fail> {
     if matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(value)
     } else {

@@ -1,4 +1,5 @@
 mod repo;
+mod scan;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
@@ -117,6 +118,7 @@ fn publish_source(
         outgoing = outgoing_commits(&workspace, &base, &revision)?;
     }
 
+    scan::outgoing(&workspace, &base, &revision)?;
     let diff = workspace.jj(
         &["diff", "--git", "--from", &base, "--to", &revision],
         "preview changes",
@@ -126,7 +128,6 @@ fn publish_source(
             "there are no file changes to publish against main@origin",
         ));
     }
-    workspace.scan(&base, &revision)?;
     terminal.message("Secret scan: gitleaks found nothing in the commits to publish.\n")?;
     if terminal.input.is_some() {
         terminal.message("Proposed diff against main@origin:\n")?;
@@ -183,11 +184,11 @@ fn publish_source(
         return Err(repo::stale());
     }
     workspace.refuse_shared_dev(&base, &revision)?;
-    workspace.validate_origin()?;
+    let origin = workspace.validate_origin()?;
     if !matches!(selection, Selection::Bookmark(_)) {
         workspace.save_bookmark(&name, &revision)?;
     }
-    workspace.push(&name, &revision)?;
+    workspace.push(&origin, &name, &revision)?;
 
     let url = write_pull_request(&workspace, &name, &title, &body, existing.as_ref()).map_err(
         |error| {
@@ -345,7 +346,7 @@ fn write_pull_request(
         .path()
         .to_str()
         .ok_or_else(|| failure("could not pass the pull request body path to gh"))?;
-    let common = ["--title", title, "--body-file", path, "--base", "main"];
+    let common = ["--title", title, "--body-file", path];
     if let Some(request) = request {
         let number = request.number.to_string();
         workspace.gh(
@@ -357,7 +358,7 @@ fn write_pull_request(
     } else {
         let result = workspace.gh(
             "create",
-            &[&["--head", name][..], &common].concat(),
+            &[&["--head", name, "--base", "main"][..], &common].concat(),
             "create the pull request",
         )?;
         let stdout = String::from_utf8_lossy(&result.stdout);

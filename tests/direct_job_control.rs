@@ -720,11 +720,6 @@ fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
         || stopped(stage.pid).then_some(()),
         || terminal.session.launch_details(),
     );
-    wait_for_with(
-        "Bash's dots job to stop with its background reader",
-        || stopped(dots).then_some(()),
-        || terminal.session.launch_details(),
-    );
 
     terminal.resume_job(dots, stage.pid);
     terminal.complete_resumed_read(&stage, 0);

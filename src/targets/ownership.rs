@@ -16,6 +16,12 @@ pub struct OwnedApp {
     pub bundle_id: String,
 }
 
+impl OwnedApp {
+    pub(crate) fn read_marker(marker: &Path, applications: &Path) -> Result<Self, OwnershipError> {
+        read_record(marker, applications)?.app
+    }
+}
+
 /// Ownership is independent of declarations and can outlive one.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnershipError {
@@ -150,7 +156,7 @@ fn read_record(marker: &Path, applications: &Path) -> Result<Record, OwnershipEr
     })
 }
 
-pub(super) fn marker_filename(bundle: &str) -> String {
+pub(crate) fn marker_filename(bundle: &str) -> String {
     let mut filename = String::with_capacity(69);
     for byte in Sha256::digest(bundle.as_bytes()) {
         write!(filename, "{byte:02x}").expect("writing to a String cannot fail");

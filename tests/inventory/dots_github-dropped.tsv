@@ -1,0 +1,2 @@
+legacy_case	reason
+AppHookTest.test_each_install_kind_gets_a_path_that_survives_upgrades	The Python test mocked GitHub and called the internal resolver. The Rust hook-generation unit test checks all install layouts with synthetic paths. Public release lookup requires GitHub HTTPS.

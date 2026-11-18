@@ -362,7 +362,8 @@ fn new_brew_hold_formula() {
     fixture.write("version", "1 2");
     let output = fixture.run(&hold);
     status(&output, 1);
-    assert!(stderr(&output).contains("is 1 2"));
+    assert!(stderr(&output).contains("multiple installed versions (1 2)"));
+    status(&fixture.run(&["hold-formula", TOKEN, "1 2"]), 1);
     fixture.write("version", "2");
     let output = fixture.run(&["hold-formula", TOKEN, "2", "fixture hold"]);
     status(&output, 0);

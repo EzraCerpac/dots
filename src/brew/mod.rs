@@ -470,7 +470,8 @@ fn hold(ctx: &Ctx, operation: &str, args: &Args, token: &str) -> Result<u8, Fail
         .filter(|reason| !reason.is_empty())
         .unwrap_or("held version");
 
-    let installed = if operation == "hold-formula" {
+    let formula = operation == "hold-formula";
+    let installed = if formula {
         let brew = Brew::find(ctx)?.ok_or_else(|| {
             Fail::new(1, format!("a standard-prefix Homebrew installation is required to inspect held formula {token}"))
         })?;
@@ -482,6 +483,12 @@ fn hold(ctx: &Ctx, operation: &str, args: &Args, token: &str) -> Result<u8, Fail
         bundle_version(ctx, Path::new(app))?
     };
     match installed.as_deref() {
+        Some(versions) if formula && versions.chars().any(char::is_whitespace) => Err(Fail::new(
+            1,
+            format!(
+                "Held: {token} has multiple installed versions ({versions}). Refusing to change it."
+            ),
+        )),
         Some(version) if version == required => {
             println!("Held: {token} {required} ({reason}).");
             Ok(0)

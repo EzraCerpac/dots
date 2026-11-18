@@ -640,4 +640,49 @@ source = "dotfiles/duplicate"
             );
         }
     }
+
+    #[test]
+    fn invalid_herdr_rows_preserve_the_header_while_the_valid_neighbor_retires() {
+        let kept = "[dotfiles.herdr]\nsource = 'templates/herdr.tera'\n";
+        let local = format!("{kept}\n[dotfiles.neighbor]\nsource = 'templates/neighbor.tera'\n");
+        for invalid in [
+            "dotfiles.herdr",
+            "env.X\ttemplates/herdr.tera",
+            "dotfiles.herdr.child\ttemplates/herdr.tera",
+            "dotfiles.\ttemplates/herdr.tera",
+            "dotfiles.herdr\ttemplates/herdr.tera\textra",
+            "dotfiles.herdr\ttemplates/.",
+            "dotfiles.herdr\ttemplates/",
+            "dotfiles.herdr\t.",
+            "dotfiles.herdr\t../outside",
+            "dotfiles.herdr\t/outside",
+            "dotfiles.herdr\ttemplates\\herdr.tera",
+        ] {
+            assert!(retired_row(invalid).is_none(), "{invalid:?}");
+            let rows = format!("{invalid}\ndotfiles.neighbor\ttemplates/neighbor.tera\n");
+            let edits = retirement_fixture(&local, &rows).unwrap();
+            assert_eq!(edits.len(), 1);
+            assert_eq!(
+                edits[0].after,
+                Image::Regular {
+                    bytes: kept.as_bytes().to_vec(),
+                    mode: 0o600
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn exact_herdr_row_keeps_nested_and_array_headers_with_the_same_missing_source() {
+        let row = "dotfiles.herdr\ttemplates/herdr.tera\n";
+        for header in ["[dotfiles.herdr.more]", "[[dotfiles.herdr]]"] {
+            let local = format!("{header}\nsource = 'templates/herdr.tera'\n");
+            assert!(
+                retirement_fixture(&local, row).unwrap().is_empty(),
+                "{header}"
+            );
+        }
+        let exact = "[dotfiles.herdr]\nsource = 'templates/herdr.tera'\n";
+        assert_eq!(retirement_fixture(exact, row).unwrap().len(), 1);
+    }
 }

@@ -230,16 +230,6 @@ fn seams_cli_reaches_report_handlers_with_redirected_stdio() {
 
     // P-12 provides the listing and replay behind these entrypoints.
     assert_diagnostic(
-        invoke(cwd, &["reports"]),
-        1,
-        "dots reports is not implemented",
-    );
-    assert_diagnostic(
-        invoke(cwd, &["reports", "update"]),
-        1,
-        "dots reports is not implemented",
-    );
-    assert_diagnostic(
         invoke(cwd, &["up", "--last"]),
         1,
         "dots up --last is not implemented",

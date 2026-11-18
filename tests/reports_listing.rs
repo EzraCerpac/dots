@@ -13,6 +13,7 @@ fn dots(world: &World) -> Command {
     let mut command = world.dots();
     command
         .env("CODEX_HOME", home.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
         .env("MISE_CONFIG_DIR", home.join(".config/mise"))
         .env("MISE_DATA_DIR", home.join(".local/share/mise"))
         .env("MISE_STATE_DIR", home.join(".local/state/mise"))

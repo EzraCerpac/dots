@@ -1,7 +1,7 @@
 # dots 1.0 contract
 
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
-Amended 2026-11-18: shell completion, removal targets, the output of individual commands and cancellation, recording what 0.4.0 ships.
+Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation and shared agent skill directory creation, recording what 0.4.0 ships.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -1108,7 +1108,8 @@ On every invocation except `dots completions` and shell completion, `dots` keeps
 
 `dots` creates or replaces only links it made that still point where it left them, and only when the link's directory stays inside the agent's directory.
 A directory, a file or any other link at those paths belongs to the user; `dots` leaves it alone and says so once.
-`dots` never creates an agent directory.
+`dots` never creates either agent's configuration root, `${CLAUDE_CONFIG_DIR:-~/.claude}` or `${CODEX_HOME:-~/.codex}`.
+When the Codex configuration root exists, `dots` may create `~/.agents/skills` even if `~/.agents` is missing, provided the link's parent resolves inside `~/.agents`.
 `dots status` shows each link.
 `DOTS_SKILL_LINKS=0` turns linking off.
 

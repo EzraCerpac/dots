@@ -1,13 +1,8 @@
 mod repo;
 mod scan;
 
-use std::cell::OnceCell;
-use std::ffi::{CStr, OsStr};
-use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 
 use nix::libc;
 use serde::Deserialize;
@@ -47,7 +42,6 @@ pub fn publish(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
             BufReader::new(PromptInput {
                 run: &run,
                 stdin: stdin.as_fd(),
-                tty: OnceCell::new(),
             })
         }),
         output: &mut output,
@@ -465,7 +459,6 @@ impl Terminal<'_> {
 struct PromptInput<'a> {
     run: &'a Run<'a>,
     stdin: BorrowedFd<'a>,
-    tty: OnceCell<Option<File>>,
 }
 
 impl PromptInput<'_> {
@@ -484,13 +477,12 @@ impl Read for PromptInput<'_> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let stdin = self.stdin.as_raw_fd();
-        let mut tty = self
-            .tty
-            .get_or_init(|| open_prompt_tty(stdin).ok())
-            .as_ref();
+        let fd = self.stdin.as_raw_fd();
+        if tty_flags(fd)? & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
         let mut input = libc::pollfd {
-            fd: tty.map_or(stdin, AsRawFd::as_raw_fd),
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -508,11 +500,7 @@ impl Read for PromptInput<'_> {
                 continue;
             }
             self.check_cancelled()?;
-            let result = match &mut tty {
-                Some(tty) => tty.read(bytes),
-                None => read_inherited_tty(stdin, bytes),
-            };
-            match result {
+            match read_prompt_bytes(fd, bytes) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -524,32 +512,14 @@ impl Read for PromptInput<'_> {
     }
 }
 
-fn open_prompt_tty(stdin: RawFd) -> io::Result<File> {
-    let mut name = [0; libc::PATH_MAX as usize];
-    let result = unsafe { libc::ttyname_r(stdin, name.as_mut_ptr(), name.len()) };
-    if result != 0 {
-        return Err(io::Error::from_raw_os_error(result));
-    }
-    let path = unsafe { CStr::from_ptr(name.as_ptr()) };
-    // Ctrl-C can flush input between poll and read. Use a separate open
-    // description so nonblocking reads leave the caller's stdin flags alone.
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(OsStr::from_bytes(path.to_bytes()))
-}
-
-fn read_inherited_tty(fd: RawFd, bytes: &mut [u8]) -> io::Result<usize> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(io::Error::last_os_error());
-    }
+fn read_prompt_bytes(fd: RawFd, bytes: &mut [u8]) -> io::Result<usize> {
+    let flags = tty_flags(fd)?;
     let restore = flags & libc::O_NONBLOCK == 0;
+    // Ctrl-C can flush the input after poll. Temporarily use a nonblocking
+    // read and restore the caller's flags before returning to the wait loop.
     if restore {
         set_tty_flags(fd, flags | libc::O_NONBLOCK)?;
     }
-    // An inherited terminal may prohibit reopening. Change its shared flags
-    // only for this read and restore them before returning to the wait loop.
     let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
     let result = if count < 0 {
         Err(io::Error::last_os_error())
@@ -560,6 +530,15 @@ fn read_inherited_tty(fd: RawFd, bytes: &mut [u8]) -> io::Result<usize> {
         set_tty_flags(fd, flags)?;
     }
     result
+}
+
+fn tty_flags(fd: RawFd) -> io::Result<libc::c_int> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
 }
 
 fn set_tty_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
@@ -614,40 +593,52 @@ fn input_error(_: io::Error) -> Fail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{CStr, OsStr};
+    use std::fs::{File, OpenOptions};
     use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::PathBuf;
 
-    #[test]
-    fn prompt_reads_an_inherited_tty_when_reopening_fails() {
+    fn open_pty() -> (File, File, PathBuf) {
         let (mut master, mut slave) = (-1, -1);
-        let (mut master, slave) = unsafe {
+        let mut name = [0; libc::PATH_MAX as usize];
+        unsafe {
             assert_eq!(
                 libc::openpty(
                     &mut master,
                     &mut slave,
-                    std::ptr::null_mut(),
+                    name.as_mut_ptr(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 ),
                 0
             );
-            (File::from_raw_fd(master), File::from_raw_fd(slave))
-        };
-        let fd = slave.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert!(flags >= 0 && flags & libc::O_NONBLOCK == 0);
+            let path = OsStr::from_bytes(CStr::from_ptr(name.as_ptr()).to_bytes()).into();
+            (File::from_raw_fd(master), File::from_raw_fd(slave), path)
+        }
+    }
+
+    #[test]
+    fn prompts_use_only_the_inherited_terminal() {
+        let (mut master, _slave, path) = open_pty();
+        let mut opts = OpenOptions::new();
+        opts.custom_flags(libc::O_NOCTTY);
+        let stdin = opts.clone().read(true).open(&path).unwrap();
+        let write_only = opts.clone().write(true).open(&path).unwrap();
+        let fd = stdin.as_raw_fd();
+        let flags = tty_flags(fd).unwrap();
+        assert_eq!(flags & (libc::O_NONBLOCK | libc::O_ACCMODE), libc::O_RDONLY);
         #[cfg(target_os = "linux")]
-        let tty = {
+        {
             assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCEXCL) }, 0);
             assert_eq!(
-                open_prompt_tty(fd).unwrap_err().raw_os_error(),
+                opts.read(true).open(&path).unwrap_err().raw_os_error(),
                 Some(libc::EBUSY)
             );
-            OnceCell::new()
-        };
-        // macOS lets this test process reopen the terminal. Use its live
-        // inherited descriptor to exercise the same fallback directly.
-        #[cfg(not(target_os = "linux"))]
-        let tty = OnceCell::from(None);
+        }
+        let (mut other_master, mut other_slave, _) = open_pty();
+        other_master.write_all(b"yes\n").unwrap();
 
         let private = tempfile::tempdir().unwrap();
         let env = crate::Env {
@@ -660,22 +651,35 @@ mod tests {
             flags: crate::Flags::default(),
         };
         let run = Run::begin(&ctx, Sink::Unreported);
-        let mut transcript = Vec::new();
         let mut terminal = Terminal {
             input: Some(BufReader::new(PromptInput {
                 run: &run,
-                stdin: slave.as_fd(),
-                tty,
+                stdin: stdin.as_fd(),
             })),
-            output: &mut transcript,
+            output: &mut other_slave,
         };
-        master.write_all("Résumé\nyes\n".as_bytes()).unwrap();
+        master.write_all("Résumé\nno\nyes\n".as_bytes()).unwrap();
         assert_eq!(terminal.ask("Description").unwrap(), "Résumé");
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, flags);
+        let decline = terminal.confirm("Publish?").unwrap_err();
+        assert_eq!(
+            decline.diagnostic,
+            "publication cancelled; nothing was pushed"
+        );
         terminal.confirm("Publish?").unwrap();
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, flags);
+        assert_eq!(tty_flags(fd).unwrap(), flags);
         master.write_all(b"\x04").unwrap();
         assert_eq!(terminal.ask("Description").unwrap(), "");
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, flags);
+        assert_eq!(tty_flags(fd).unwrap(), flags);
+
+        terminal.input = Some(BufReader::new(PromptInput {
+            run: &run,
+            stdin: write_only.as_fd(),
+        }));
+        master.write_all(b"yes\n").unwrap();
+        let refusal = terminal.confirm("Publish?").unwrap_err();
+        assert_eq!(
+            refusal.diagnostic,
+            "could not read publication confirmation"
+        );
     }
 }

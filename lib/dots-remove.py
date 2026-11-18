@@ -159,12 +159,9 @@ def discover(paths):
 def resolve(targets, declarations, records):
     index = {}
     for identity, entries in declarations.items():
-        names = aliases(entries[0]["key"])
-        for marker, owner in records.get(identity, []):
-            if isinstance(owner.get("path"), str):
-                names.add(Path(owner["path"]).stem.casefold())
-        for name in names:
-            index.setdefault(name, set()).add(identity)
+        for entry in entries:
+            for name in aliases(entry["key"]):
+                index.setdefault(name, set()).add(identity)
     # Ownership survives --keep-installed, allowing a later full uninstall.
     for identity, owners in records.items():
         for name in aliases(identity) | {Path(owner["path"]).stem.casefold()

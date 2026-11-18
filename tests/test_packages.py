@@ -232,6 +232,18 @@ esac
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(source.read_bytes(), before)
 
+    def test_remove_accepts_alias_from_second_declaration(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        source = config / "config.toml"
+        declarations = BASE + '\n[bootstrap.packages]\n"brew:fd" = "latest"\n"brew:homebrew/core/fd" = "latest"\n'
+        source.write_text(declarations)
+        result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                              str(self.bin / "mise"), str(config), "--base", "--keep-installed",
+                              "--dry-run", "homebrew/core/fd")
+        self.assertIn("Forget brew:fd", self.succeeded(result))
+        self.assertEqual(source.read_text(), declarations)
+
     def local_tool(self) -> None:
         plugin = self.root / "plugin"
         scripts = plugin / "bin"

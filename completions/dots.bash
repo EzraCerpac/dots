@@ -49,7 +49,7 @@ _dots_complete() {
 
     COMPREPLY=()
     local reply value file_prefix='' file_word=$word
-    reply=$(MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 command dots internal shell-complete "${words[@]:1}" "$word" 2>/dev/null) || return
+    reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${words[@]:1}" "$word" 2>/dev/null) || return
     case $reply in
         :files|:dirs)
             if [[ $word == -*=* ]]; then file_prefix=${word%%=*}=; file_word=${word#*=}; fi

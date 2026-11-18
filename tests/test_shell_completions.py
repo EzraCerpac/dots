@@ -30,6 +30,12 @@ if args[:1] == ["completions"]:
     sys.stdout.write(Path(os.environ["DOTS_ADAPTER"]).read_text())
     raise SystemExit
 
+if args[:2] == ["internal", "shell-complete"]:
+    for key in ("MISE_SAFE", "MISE_NO_ENV", "MISE_NO_HOOKS", "MISE_OFFLINE"):
+        assert os.environ.get(key) == "1", key
+    for key in ("MISE_AUTO_INSTALL", "MISE_EXEC_AUTO_INSTALL", "MISE_AUTO_UPDATE"):
+        assert os.environ.get(key) == "0", key
+
 with open(os.environ["DOTS_CALLS"], "a") as log:
     print(json.dumps(args), file=log)
 

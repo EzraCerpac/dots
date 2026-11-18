@@ -168,13 +168,13 @@ exit 2
 			for _, e := range events {
 				if e.Kind == "stage_end" && e.Status == "failed" {
 					failures++
-					if !strings.Contains(e.Detail, tc.diagnostic) || e.LogPath != filepath.Join(dir, "backend.log") {
+					if tc.command == "up" && (!strings.Contains(e.Detail, tc.diagnostic) || e.LogPath != filepath.Join(dir, "backend.log")) {
 						t.Fatalf("issue lost its diagnostic or log: %+v", e)
 					}
 				}
 			}
 			log, err := os.ReadFile(filepath.Join(dir, "backend.log"))
-			if failures != 1 || err != nil || !strings.Contains(string(log), tc.diagnostic) {
+			if failures != 1 || (tc.command == "up" && (err != nil || !strings.Contains(string(log), tc.diagnostic))) {
 				t.Fatalf("issues = %d, log = %q, error = %v", failures, log, err)
 			}
 		})

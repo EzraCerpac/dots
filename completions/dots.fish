@@ -4,7 +4,7 @@ function __dots_complete
     set -l token (commandline -ct)
     set -l current (string unescape -- "$token")
 
-    set -l reply (MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 command dots internal shell-complete $prior[2..-1] "$current" 2>/dev/null)
+    set -l reply (MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete $prior[2..-1] "$current" 2>/dev/null)
     set -q reply[1]; or return
     switch "$reply"
         case :files

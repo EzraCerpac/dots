@@ -71,19 +71,38 @@ exit "$FIXTURE_EXIT"
 				t.Fatalf("saved run lost stage events: %+v", report.Events)
 			}
 			stage := report.Events[2]
-			logPath := filepath.Join(dir, "backend.log")
-			if tc.sensitive {
-				if _, err := os.Stat(logPath); !os.IsNotExist(err) || stage.LogPath != "" {
-					t.Fatalf("sensitive command saved a transcript: event = %+v, log error = %v", stage, err)
-				}
-				logPath = ""
-			} else if log := readScrollbackFile(t, logPath); log != tc.output+tc.diagnostic {
-				t.Fatalf("saved backend output = %q", log)
+			if _, err := os.Stat(filepath.Join(dir, "backend.log")); !os.IsNotExist(err) {
+				t.Fatalf("unexpected scrollback transcript, log error = %v", err)
 			}
-			if stage.Status != status || stage.LogPath != logPath {
+			if stage.Status != status || stage.LogPath != "" {
 				t.Fatalf("saved stage = %+v", stage)
 			}
 		})
+	}
+}
+
+func TestScrollbackStreamsToSlowReader(t *testing.T) {
+	useTextRunner(t, "dd if=/dev/zero bs=1024 count=128 2>/dev/null")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestScrollbackFixtureProcess$")
+	cmd.Env = append(os.Environ(), "DOTS_SCROLLBACK_FIXTURE="+t.TempDir(), "DOTS_SCROLLBACK_COMMAND=remove")
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd.Stdout = w
+	if err := cmd.Start(); err != nil {
+		w.Close()
+		t.Fatal(err)
+	}
+	w.Close()
+	time.Sleep(400 * time.Millisecond)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil || len(data) != 128*1024 {
+		t.Fatalf("received %d bytes, process error %v", len(data), err)
 	}
 }
 
@@ -177,7 +196,11 @@ emit '{"v":1,"kind":"stage_end","id":"bootstrap","status":"ok"}'
 func TestScrollbackFixtureProcess(t *testing.T) {
 	state := os.Getenv("DOTS_SCROLLBACK_FIXTURE")
 	if state != "" {
-		os.Exit(Run(Options{Command: "bootstrap", StateDir: state, Sensitive: true}))
+		command := os.Getenv("DOTS_SCROLLBACK_COMMAND")
+		if command == "" {
+			command = "bootstrap"
+		}
+		os.Exit(Run(Options{Command: command, StateDir: state, Sensitive: command == "bootstrap"}))
 	}
 }
 

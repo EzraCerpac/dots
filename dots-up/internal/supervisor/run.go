@@ -55,7 +55,6 @@ type backend struct {
 	master         *os.File
 	tty            *os.File
 	ack            *os.File
-	scrollbackLog  *os.File
 	streamNonce    string
 	pty            bool
 	processGroup   bool
@@ -231,18 +230,12 @@ func Run(opts Options) int {
 	go func() {
 		err := backend.command.Wait()
 		if scrollback {
-			if errors.Is(err, exec.ErrWaitDelay) {
-				err = nil // The command succeeded and only inherited output pipes remained open.
-			}
 			// A background descendant can inherit the event descriptor.
 			// Leave time to drain any queued events without waiting for its exit.
 			_ = eventReader.SetReadDeadline(time.Now().Add(scrollbackDrain))
 		}
 		waitCh <- err
 	}()
-	if backend.scrollbackLog != nil {
-		defer backend.scrollbackLog.Close()
-	}
 
 	var stageLog *os.File
 	var stageID, profile, host string
@@ -330,8 +323,6 @@ func Run(opts Options) int {
 		}
 		if opts.Sensitive {
 			e.LogPath = ""
-		} else if scrollback && e.LogPath == "" && backend.scrollbackLog != nil && e.ID == opts.Command {
-			e.LogPath = backend.scrollbackLog.Name()
 		}
 		if files != nil {
 			if err := files.record(e); err != nil {
@@ -779,12 +770,7 @@ func Run(opts Options) int {
 		if !runStarted && opts.Command != "up" {
 			emit(ui.Event{V: 1, Kind: "run_start"})
 		}
-		log, detail := globalLog, string(diagnosticOutput)
-		if backend.scrollbackLog != nil {
-			log = backend.scrollbackLog
-			detail = ui.LogTail(log.Name())
-		}
-		start, issue := startupFailure(opts.Command, exitCode, detail, log)
+		start, issue := startupFailure(opts.Command, exitCode, string(diagnosticOutput), globalLog)
 		emit(start)
 		emit(issue)
 		if !scrollback && (files == nil || opts.Verbose) {
@@ -886,7 +872,7 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 
 	if opts.scrollback() {
 		cmd.Env, cmd.ExtraFiles = childEnv, []*os.File{eventW}
-		child, err := startScrollback(cmd, files, opts.Sensitive)
+		child, err := startScrollback(cmd)
 		_ = eventW.Close()
 		if err != nil {
 			_ = eventR.Close()

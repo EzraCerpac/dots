@@ -4,10 +4,10 @@ S-02 decisions; [the contract](contract.md) wins, the oracle is v0.4.0 at `f5c8a
 
 ## Toolchain and release
 
-Root package `dots-cli`, binary `dots`, committed `Cargo.lock`, release `panic = "unwind"`; crates (checked 2026-11-18) arrive with their first users: clap 4.6.8, serde 1.0.229, serde_json 1.0.154, toml_edit 0.25.19+spec-1.1.0, nix 0.32.0, tempfile 3.27.0 (R-01); ureq 3.5.2 on rustls (P-01); ratatui 0.30.2, crossterm 0.29.0 (P-11, P-12).
-`mise.toml` pins Rust 1.100.0; its `--locked` tasks run `rustup run 1.100.0 cargo`, `check` and `test -- FILTER` are the small local checks, and `format` touches only changed or named files.
-CI's `rust.yml` runs the full suite, clippy and `cargo fmt --check` for all four (musl) targets; Q-02 adds its distribution and first-run jobs.
-D-01 releases four `dots-VERSION-{darwin,linux}-{amd64,arm64}.tar.gz` archives holding only `dots`, static on Linux, plus separate `SHA256SUMS` and a completion-installing Homebrew formula that C-01 publishes to the tap.
+Root package `dots-cli`, binary `dots`, committed `Cargo.lock`, release `panic = "unwind"`; crates (checked 2026-11-18) arrive with first users: clap 4.6.8, serde 1.0.229, serde_json 1.0.154, toml_edit 0.25.19+spec-1.1.0, nix 0.32.0, tempfile 3.27.0 (R-01); ureq 3.5.2 on rustls (P-01); ratatui 0.30.2, crossterm 0.29.0 (P-11, P-12).
+`mise.toml` pins Rust 1.100.0; `--locked` `check`, `test -- FILTER`, `build` and `clippy` use `rustup run 1.100.0 cargo`, the first two as small local checks, and `format` touches only changed or named files.
+CI's `rust.yml` runs the full suite, clippy and `cargo fmt --check` on x86_64 and aarch64 for macOS and musl Linux; Q-02 adds distribution and first-run jobs.
+D-01 ships four `dots-VERSION-{darwin,linux}-{amd64,arm64}.tar.gz` archives of only `dots`, static on Linux, plus separate `SHA256SUMS` and a Homebrew formula with completions for C-01's tap.
 
 ## Modules and shared code
 

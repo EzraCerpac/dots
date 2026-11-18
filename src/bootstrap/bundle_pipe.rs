@@ -141,6 +141,18 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_that_exits_without_reading_can_leave_no_blocked_writer() {
+        let pipe = BundlePipe::new(&vec![b'x'; 1024 * 1024]).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        pipe.attach(&mut command).unwrap();
+        let mut hook = command.spawn().unwrap();
+        hook.kill().unwrap();
+        hook.wait().unwrap();
+        drop(pipe);
+    }
+
+    #[test]
     fn dropping_a_full_pipe_does_not_wait_for_a_hook() {
         let pipe = BundlePipe::new(&vec![b'x'; 1024 * 1024]).unwrap();
         let mut unspawned = Command::new("/does-not-exist");

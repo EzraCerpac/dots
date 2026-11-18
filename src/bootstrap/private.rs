@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
@@ -150,6 +151,7 @@ pub(super) fn open_bundle(
                 )
             })?;
             set(&mut local.document, BUNDLE_IDENTITY, Value::from(identity))?;
+            local.make_private();
             local.install()?;
         }
         return Ok((Outcome::Completed, Some(bundle)));
@@ -197,24 +199,14 @@ pub(super) fn persistence_origin(ctx: &Ctx) -> Result<Option<String>, Fail> {
         return Ok(None);
     };
     let doc = local(ctx)?;
-    let proposed = RepoSetting::parse(provided)?;
-    let mut has_origin = false;
-    for key in [HISTORY_ORIGIN, HISTORY_URL] {
-        if let Some(recorded) = string(&doc.document, key)? {
-            if !proposed.matches(recorded) {
-                return Err(Fail::usage(
-                    "the recorded history origin differs from SETUP_HISTORY_ORIGIN",
-                ));
-            }
-            has_origin = true;
-        }
+    if string(&doc.document, HISTORY_ORIGIN)?.is_some()
+        || string(&doc.document, HISTORY_URL)?.is_some()
+    {
+        // Restore and enrollment check this value before making history changes.
+        return Ok(None);
     }
-    if has_origin {
-        // Leave existing spellings to the history stage, which fills missing fields.
-        Ok(None)
-    } else {
-        Ok(Some(source::repository_url(provided)))
-    }
+    RepoSetting::parse(provided)?;
+    Ok(Some(source::transport_url(provided)))
 }
 
 pub(super) struct ResolvedHistory {
@@ -269,8 +261,8 @@ pub(super) fn resolve_history(
         }
     }
     let url = match recorded_url.or(recorded_origin).or(provided) {
-        Some(url) => source::repository_url(url),
-        None => source::configured_url(ctx, "dots_state_repo")?,
+        Some(value) => source::transport_url(value),
+        None => source::configured_transport(ctx, "dots_state_repo")?,
     };
     let origin = RepoSetting::parse(&url)?;
     if restoring {
@@ -313,6 +305,7 @@ pub(super) fn resolve_history(
             &["settings", "history", "sync"],
             Value::from("manual"),
         )?;
+        local.make_private();
         local.install()?;
     }
     Ok(Some(ResolvedHistory { origin, identity }))
@@ -390,14 +383,57 @@ pub(super) fn enroll(
         ));
     }
     set(&mut local.document, service, Value::from("history-watch"))?;
+    let settings = &[
+        "bootstrap",
+        "services",
+        "mise-history",
+        "environment",
+        "MISE_CONFIG_DIR",
+    ];
+    let root = ctx.root.path().to_str().ok_or_else(|| {
+        Fail::usage("the configuration root path must be UTF-8 to install the history watcher")
+    })?;
+    set(&mut local.document, settings, Value::from(root))?;
     set(
         &mut local.document,
         &["settings", "history", "sync"],
         Value::from("manual"),
     )?;
+
+    // Native apply has no service selector. Load only the watcher declaration
+    // for this invocation, so enrollment cannot reconcile unrelated services.
+    let mut watcher = DocumentMut::new();
+    let service_config = find(&local.document, &service[..3])
+        .expect("watcher table")
+        .clone();
+    let mut services = Table::new();
+    services.insert("mise-history", service_config);
+    let mut bootstrap = Table::new();
+    bootstrap.insert("services", Item::Table(services));
+    watcher
+        .as_table_mut()
+        .insert("bootstrap", Item::Table(bootstrap));
+    let scratch = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(watcher_error)?;
+    let config = scratch.path().join("watcher.toml");
+    let system = scratch.path().join("system.toml");
+    fs::write(&config, watcher.to_string()).map_err(watcher_error)?;
+    fs::write(&system, "").map_err(watcher_error)?;
+    local.make_private();
     local.install()?;
     let mise = Mise::new(ctx)?;
-    let apply = mise.command(["bootstrap", "services", "apply", "--yes"])?;
+    let mut apply = mise.command(["bootstrap", "services", "apply", "--yes"])?;
+    apply
+        .current_dir(scratch.path())
+        .env(
+            "MISE_CEILING_PATHS",
+            scratch.path().parent().expect("scratch parent"),
+        )
+        .env("MISE_GLOBAL_CONFIG_FILE", config)
+        .env("MISE_SYSTEM_CONFIG_FILE", system)
+        .env("MISE_HISTORY_ENABLED", "0");
     if !run
         .run(stage, apply, Policy::Ordinary)
         .is_ok_and(|status| status.success())
@@ -424,7 +460,7 @@ fn machine_identity(ctx: &Ctx, run: &Run<'_>) -> Result<PathBuf, Fail> {
     use crate::process::Cwd;
     use std::fs::{DirBuilder, Permissions};
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::fs::DirBuilderExt as _;
 
     let home = ctx
         .env
@@ -459,17 +495,6 @@ fn machine_identity(ctx: &Ctx, run: &Run<'_>) -> Result<PathBuf, Fail> {
         .mode(0o700)
         .create(&physical_dir)
         .map_err(key_file_error)?;
-    if fs::metadata(&physical_dir)
-        .map_err(key_file_error)?
-        .permissions()
-        .mode()
-        & 0o777
-        != 0o700
-    {
-        return Err(Fail::usage(
-            "the machine age identity directory must have mode 0700",
-        ));
-    }
     let mut pending = tempfile::NamedTempFile::new_in(&physical_dir).map_err(key_file_error)?;
     pending
         .as_file()
@@ -503,4 +528,11 @@ fn age_keygen_error(error: io::Error) -> Fail {
             format!("could not run age-keygen for encrypted history enrollment: {error}"),
         )
     }
+}
+
+fn watcher_error(error: io::Error) -> Fail {
+    Fail::new(
+        1,
+        format!("could not prepare the mise history watcher: {error}"),
+    )
 }

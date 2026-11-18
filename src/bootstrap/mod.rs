@@ -1,5 +1,5 @@
 mod bundle;
-pub mod bundle_pipe;
+pub(crate) mod bundle_pipe;
 mod private;
 mod source;
 
@@ -317,7 +317,7 @@ fn complete(ctx: &Ctx) -> Result<u8, Fail> {
         match Exceptions::read(&ctx.root)
             .and_then(|settings| exceptions::run(&run, &settings, exceptions::Mode::InstallOnly))
         {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(error) => {
                 stage::<()>(&run, "Installer exceptions", |_| Err(error));
             }
@@ -443,7 +443,11 @@ fn print_summary(run: &Run<'_>) -> u8 {
 
 pub fn remote(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let vars = Vars::read(&ctx.root)?;
-    let host = args.get_one::<String>("HOST").expect("required by CLI");
+    let host = args
+        .get_one::<OsString>("HOST")
+        .expect("required by CLI")
+        .to_str()
+        .ok_or_else(|| Fail::usage("the SSH host must be UTF-8"))?;
     if host.is_empty()
         || host.starts_with('-')
         || host.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -459,11 +463,11 @@ pub fn remote(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     }
     let run = Run::begin(ctx, Sink::Report(ReportCommand::Remote));
     let from_origin = vars.source_repo.is_none();
-    let url = match from_origin {
-        true => source::origin(ctx, &run)?.ok_or_else(|| {
+    let url = match &vars.source_repo {
+        None => source::origin(ctx, &run)?.ok_or_else(|| {
             Fail::usage("set dots_source_repo or configure a Git origin for dots remote")
         })?,
-        false => source::configured_url(ctx, "dots_source_repo")?,
+        Some(_) => source::configured_transport(ctx, "dots_source_repo")?,
     };
     let expected = crate::config::RepoSetting::parse(&url)?;
     source::validate_destination(ctx, &run, &url, &expected, from_origin)?;

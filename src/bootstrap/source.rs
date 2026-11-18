@@ -51,24 +51,25 @@ fn text(output: Output, diagnostic: &str) -> Result<String, Fail> {
     Ok(result.strip_suffix('\n').unwrap_or(&result).to_owned())
 }
 
-pub(super) fn configured_url(ctx: &Ctx, key: &str) -> Result<String, Fail> {
-    // R-01 owns RepoSetting. Until it exposes the original URL spelling, read
-    // the already-validated setting from the same base configuration.
-    let doc = passive::toml(&ctx.root.path().join("config.toml"))?;
-    let value = doc
-        .get("vars")
-        .and_then(|item| item.get(key))
-        .and_then(|item| item.as_str())
-        .ok_or_else(|| Fail::usage(format!("config.toml is missing [vars] {key}")))?;
-    Ok(repository_url(value))
-}
-
-pub(super) fn repository_url(value: &str) -> String {
+// P-06 owns RepoSetting::transport_url. Keep the conversion local until that
+// accessor is in the base branch.
+pub(super) fn transport_url(value: &str) -> String {
     if value.contains(':') {
         value.to_owned()
     } else {
         format!("https://github.com/{value}")
     }
+}
+
+pub(super) fn configured_transport(ctx: &Ctx, key: &str) -> Result<String, Fail> {
+    let doc = passive::toml(&ctx.root.path().join("config.toml"))?;
+    let raw = doc
+        .get("vars")
+        .and_then(|table| table.get(key))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| Fail::usage(format!("config.toml is missing [vars] {key}")))?;
+    RepoSetting::parse(raw)?;
+    Ok(transport_url(raw))
 }
 
 pub(super) fn validate_destination(
@@ -78,41 +79,83 @@ pub(super) fn validate_destination(
     expected: &RepoSetting,
     from_origin: bool,
 ) -> Result<(), Fail> {
-    // Give a literal destination a temporary name without writing Git config.
-    // This asks Git to apply both insteadOf and pushInsteadOf.
-    let remote = format!("dots-bootstrap-check-{}", std::process::id());
-    let scratch = if !from_origin && !ctx.root.path().join(".git").exists() {
-        let dir = tempfile::tempdir().map_err(|error| {
-            Fail::new(1, format!("cannot prepare repository URL checks: {error}"))
-        })?;
-        let mut init = git(ctx)?;
-        init.current_dir(dir.path())
-            .args(["init", "--bare", "--template="]);
-        text(probe(run, init)?, "could not prepare repository URL checks")?;
-        Some(dir)
+    if from_origin {
+        for mode in [None, Some("--push")] {
+            let mut command = git(ctx)?;
+            command.args(["remote", "get-url", "--all"]);
+            command.args(mode);
+            command.arg("origin");
+            let urls = text(
+                probe(run, command)?,
+                "could not resolve bootstrap repository URLs",
+            )?;
+            for effective in urls.split('\n') {
+                check_url(effective, expected)?;
+            }
+        }
     } else {
-        None
-    };
-    for mode in [None, Some("--push")] {
-        let mut command = git(ctx)?;
-        if let Some(dir) = &scratch {
-            command.current_dir(dir.path());
-        }
-        if !from_origin {
-            command.args(["-c", &format!("remote.{remote}.url={url}")]);
-        }
-        command.args(["remote", "get-url", "--all"]);
-        command.args(mode);
-        command.arg(if from_origin { "origin" } else { &remote });
-        let output = probe(run, command)?;
-        let urls = text(output, "could not resolve bootstrap repository URLs")?;
-        if urls.is_empty() || urls.lines().any(|effective| !expected.matches(effective)) {
-            return Err(Fail::usage(
-                "a Git URL rewrite or push URL points outside the expected bootstrap repository",
-            ));
+        let output = git_text(ctx, run, ["ls-remote", "--get-url", "--", url])?;
+        let fetch = text(output, "could not resolve the bootstrap fetch URL")?;
+        check_url(&fetch, expected)?;
+        let rules = git_text(
+            ctx,
+            run,
+            [
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^url\..*\.pushinsteadof$",
+            ],
+        )?;
+        if rules.status.code() != Some(1) {
+            let rules = text(rules, "could not read bootstrap Git push URL rewrites")?;
+            if let Some(push) = push_url(url, &rules)? {
+                check_url(&push, expected)?;
+            }
         }
     }
     Ok(())
+}
+
+fn check_url(url: &str, expected: &RepoSetting) -> Result<(), Fail> {
+    if expected.matches(url) {
+        Ok(())
+    } else {
+        Err(Fail::usage(
+            "a Git URL rewrite or push URL points outside the expected bootstrap repository",
+        ))
+    }
+}
+
+fn push_url(url: &str, rules: &str) -> Result<Option<String>, Fail> {
+    // For a literal remote URL, Git uses the longest pushInsteadOf match.
+    // With no match, the effective push URL is the fetch URL we already checked.
+    let mut rewrites: Vec<(&str, Vec<&str>)> = Vec::new();
+    for rule in rules.split_terminator('\0') {
+        let (key, prefix) = rule
+            .split_once('\n')
+            .ok_or_else(|| Fail::new(1, "could not parse bootstrap Git push URL rewrites"))?;
+        let base = key
+            .strip_prefix("url.")
+            .and_then(|key| key.strip_suffix(".pushinsteadof"))
+            .ok_or_else(|| Fail::new(1, "could not parse bootstrap Git push URL rewrites"))?;
+        if let Some((_, prefixes)) = rewrites.iter_mut().find(|(seen, _)| *seen == base) {
+            prefixes.push(prefix);
+        } else {
+            rewrites.push((base, vec![prefix]));
+        }
+    }
+    let mut longest = None;
+    for (base, prefixes) in rewrites {
+        for prefix in prefixes {
+            if let Some(suffix) = url.strip_prefix(prefix)
+                && longest.is_none_or(|(length, _, _)| prefix.len() > length)
+            {
+                longest = Some((prefix.len(), base, suffix));
+            }
+        }
+    }
+    Ok(longest.map(|(_, base, suffix)| format!("{base}{suffix}")))
 }
 
 pub(super) fn validate_native_source(
@@ -123,7 +166,7 @@ pub(super) fn validate_native_source(
 ) -> Result<(), Fail> {
     let (repo, _) = value.rsplit_once("?ref=").unwrap_or((value, ""));
     let setting = RepoSetting::parse(repo)?;
-    let url = repository_url(repo);
+    let url = transport_url(repo);
     let expected = vars.source_repo.as_ref().unwrap_or(&setting);
     if !expected.matches(&url) {
         return Err(Fail::usage(

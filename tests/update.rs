@@ -1,8 +1,8 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -31,6 +31,19 @@ impl Fixture {
         .unwrap();
         fixture.executable(&fixture.bin.join("mise"), include_str!("fixtures/up/mise"));
         fixture.executable(&fixture.bin.join("brew"), include_str!("fixtures/up/brew"));
+        let caller_path = std::env::var_os("PATH").unwrap_or_default();
+        // node and jq are only needed by the v0.4.0 executable.
+        for tool in ["git", "node", "jq"] {
+            if let Some(path) = std::env::split_paths(&caller_path)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.join(tool))
+                .find(|path| {
+                    path.is_file() && path.metadata().unwrap().permissions().mode() & 0o111 != 0
+                })
+            {
+                symlink(path, fixture.bin.join(tool)).unwrap();
+            }
+        }
         fixture
     }
 
@@ -38,18 +51,16 @@ impl Fixture {
         fs::write(self.world.root().join(path), data).unwrap();
     }
 
-    fn executable(&self, path: &std::path::Path, data: &str) {
+    fn executable(&self, path: &Path, data: &str) {
         fs::write(path, data).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     fn command(&self, mut command: Command) -> Command {
-        let mut paths = vec![self.bin.clone()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
+        let paths = [self.bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")];
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("GIT_ALLOW_PROTOCOL", "file")
             .env("SETUP_PROFILE", "laptop")
             .env("SETUP_MACHINE_ID", "fixture")
             .env("DOTS_MISE_BIN", self.bin.join("mise"))
@@ -318,6 +329,7 @@ printf '%s\tnot installed\t1\n%s\t1\t2\n%s\t3\t\n%s\t4\t4\n' \
 #[ignore = "P-06"]
 fn unchanged_package_apply_keeps_an_explicit_absent_only_scope() {
     let fixture = Fixture::new();
+    fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'pacman:retired' = { state = 'absent' }\n");
     fixture.write(
         "packages.json",
         r#"{"pacman":{"available":true,"packages":[
@@ -338,6 +350,7 @@ fn unchanged_package_apply_keeps_an_explicit_absent_only_scope() {
 #[ignore = "P-06"]
 fn unchanged_mixed_hold_and_pin_preserves_the_manager_state() {
     let fixture = Fixture::new();
+    fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'apt:held' = 'latest'\n'apt:pinned' = '2'\n");
     fixture.recipe("held-package", "#!/bin/sh\nexit 0\n");
     fixture.write("dots/exceptions.tsv", "base\theld-package\thold=apt:held\n");
     fixture.write("packages.json", r#"{"apt":{"available":true,"packages":[
@@ -395,4 +408,76 @@ fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     assert_eq!(stages.last().unwrap()["outcome"], "skipped");
     assert_eq!(fixture.calls().matches("checkpoint inventory").count(), 2);
     assert!(!fixture.calls().contains("checkpoint save"));
+}
+
+#[cfg(target_os = "macos")]
+fn store_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'mas:42' = 'latest'\n",
+    );
+    fixture.write(
+        "packages.json",
+        r#"{"mas":{"available":true,"packages":[
+        {"package":"42","requested_version":"latest","desired_state":"present",
+         "state":"installed","installed_version":"1"}
+    ]}}"#,
+    );
+    fixture.executable(
+        &fixture.bin.join("sudo"),
+        r#"#!/bin/sh
+[ "$*" = "-n -v" ] || { touch "$DOTS_ROOT/authorization-prompt"; exit 74; }
+if [ -f "$DOTS_ROOT/expire-authorization" ]; then
+    [ ! -f "$DOTS_ROOT/authorization-used" ] || exit 1
+    touch "$DOTS_ROOT/authorization-used"
+fi
+"#,
+    );
+    fixture
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "P-11"]
+fn new_app_store_overlaps_tools_and_joins_before_standalone_mise() {
+    let fixture = store_fixture();
+    fixture.write("expect-store-overlap", "");
+    let report = fixture.run_args(&["--plain", "up", "--mas"], 0);
+    let stages = report["stages"].as_array().unwrap();
+    let store = stages
+        .iter()
+        .find(|s| s["label"] == "Mac App Store updates")
+        .unwrap();
+    assert_eq!(store["alongside"], true);
+    assert_eq!(store["outcome"], "completed");
+    let calls = fixture.calls();
+    assert!(
+        calls.find("packages upgrade --manager mas").unwrap() < calls.find("self-update").unwrap()
+    );
+    assert!(!fixture.world.root().join("authorization-prompt").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "P-11"]
+fn new_app_store_defers_expired_authorization_without_reprompting() {
+    let fixture = store_fixture();
+    fixture.write("expire-authorization", "");
+    let report = fixture.run_args(&["--plain", "up", "--mas"], 0);
+    let stages = report["stages"].as_array().unwrap();
+    let store = stages
+        .iter()
+        .find(|s| s["label"] == "Mac App Store updates")
+        .unwrap();
+    assert_eq!(store["outcome"], "deferred");
+    assert!(
+        store["issues"][0]["next"]
+            .as_str()
+            .unwrap()
+            .contains("sudo -v")
+    );
+    assert!(!fixture.calls().contains("packages apply --manager mas"));
+    assert!(fixture.calls().contains("self-update"));
+    assert!(!fixture.world.root().join("authorization-prompt").exists());
 }

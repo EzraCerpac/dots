@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::Ctx;
 use crate::process::{Cwd, Mise};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId};
+use crate::targets::{Kind, Scope, Targets};
 
 use super::{Config, Step, Versions, child, json, mise_command, probe, record_changes, step};
 
@@ -83,12 +84,13 @@ pub(super) fn update(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> (bool, bool) 
         run_and_record(run, id, mise, before, cmd)
     }) == Some(Outcome::Completed);
 
-    let upgraded = step(run, "Upgrade declared mise tools", |id| {
-        let before = list(run, mise)?;
-        let args = upgrade_args(&before);
-        run_and_record(run, id, mise, Some(before), mise_command(mise, &args))
-    }) == Some(Outcome::Completed);
-    (installed, installed && upgraded)
+    let upgraded = installed
+        && step(run, "Upgrade declared mise tools", |id| {
+            let before = list(run, mise)?;
+            let args = upgrade_args(&before);
+            run_and_record(run, id, mise, Some(before), mise_command(mise, &args))
+        }) == Some(Outcome::Completed);
+    (installed, upgraded)
 }
 
 fn upgrade_args(tools: &ToolList) -> Vec<String> {
@@ -139,18 +141,22 @@ fn self_update_enabled(ctx: &Ctx, path: &Path) -> bool {
 }
 
 pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
-    step(run, "Standalone mise", |id| {
-        let cmd = mise_command(mise, ["self-update", "--yes", "--no-plugins"]);
-        if let Ok(cmd) = &cmd
-            && !self_update_enabled(ctx, Path::new(cmd.get_program()))
-        {
-            return Ok(Outcome::Skipped);
-        }
-        let help = text(run, mise_command(mise, ["self-update", "--help"]));
-        if help.is_some_and(|help| help.contains("This build of mise has self-update disabled.")) {
-            return Ok(Outcome::Skipped);
-        }
+    let cmd = mise_command(mise, ["self-update", "--yes", "--no-plugins"]);
+    let package_managed = cmd.as_ref().is_ok_and(|cmd| {
+        !self_update_enabled(ctx, Path::new(cmd.get_program()))
+            || text(run, mise_command(mise, ["self-update", "--help"]))
+                .is_some_and(|help| help.contains("This build of mise has self-update disabled."))
+    });
+    if package_managed {
+        step(
+            run,
+            "Standalone mise (updated by its package manager)",
+            |_| Ok(Outcome::Skipped),
+        );
+        return;
+    }
 
+    step(run, "Standalone mise", |id| {
         let before = text(run, mise_command(mise, ["--version"]));
         let result = child(run, id, cmd, Policy::Ordinary);
         if !run.cancelled()
@@ -174,6 +180,11 @@ pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
 #[derive(Eq, PartialEq)]
 pub(super) struct ManagerVersion(String);
 
+pub(super) enum ManagerSource {
+    Tool,
+    Formula(String),
+}
+
 fn manager_tool(name: &str) -> bool {
     name == "dots"
         || name
@@ -190,25 +201,38 @@ fn path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-pub(super) fn manager_version(
+pub(super) fn manager_source(
     ctx: &Ctx,
     run: &Run<'_>,
     mise: &Mise<'_>,
     config: &Config,
-) -> Option<ManagerVersion> {
+) -> Option<ManagerSource> {
     if run.cancelled() {
         return None;
     }
-    let selected_tool = list(run, mise)
+    let declared_tool = Targets::read(&ctx.root, Scope::Active, ctx.env.cwd())
         .ok()
-        .is_some_and(|tools| tools.keys().any(|name| manager_tool(name)));
-    let executable = if selected_tool {
-        path(run, mise, &["which", "dots"])
-    } else {
-        super::packages::declared_dots_formula(run, mise, config).and_then(|formula| {
-            path(run, mise, &["bootstrap", "packages", "where", &formula])
-                .map(|prefix| prefix.join("bin/dots"))
-        })
+        .is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|tool| tool.kind == Kind::Tool && manager_tool(&tool.id))
+        });
+    if declared_tool {
+        return Some(ManagerSource::Tool);
+    }
+    super::packages::declared_dots_formula(run, mise, config).map(ManagerSource::Formula)
+}
+
+pub(super) fn manager_version(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    source: &ManagerSource,
+) -> Option<ManagerVersion> {
+    let executable = match source {
+        ManagerSource::Tool => path(run, mise, &["which", "dots"]),
+        ManagerSource::Formula(name) => path(run, mise, &["bootstrap", "packages", "where", name])
+            .map(|prefix| prefix.join("bin/dots")),
     }?;
     let cmd = ctx.command(executable, Cwd::Root).map(|mut cmd| {
         cmd.arg("--version");
@@ -224,11 +248,14 @@ pub(super) fn report_manager(
     ctx: &Ctx,
     run: &Run<'_>,
     mise: &Mise<'_>,
-    config: &Config,
+    source: Option<ManagerSource>,
     before: Option<ManagerVersion>,
 ) {
     step(run, "dots manager", |id| {
-        let Some(ManagerVersion(after)) = manager_version(ctx, run, mise, config) else {
+        let Some(ManagerVersion(after)) = source
+            .as_ref()
+            .and_then(|source| manager_version(ctx, run, mise, source))
+        else {
             return Ok(Outcome::Skipped);
         };
         if before.as_ref().is_some_and(|version| version.0 == after) {

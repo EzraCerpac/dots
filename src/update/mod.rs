@@ -10,7 +10,7 @@ use crate::config::{Exceptions, Vars, selection};
 use crate::history::{self, Checkpoint};
 use crate::process::Mise;
 use crate::report;
-use crate::run::{Change, Issue, Outcome, Policy, Run, Sink, StageId};
+use crate::run::{Change, Issue, Outcome, Policy, Run, Sink, StageId, exit_code};
 use crate::{Args, Ctx, Fail, exceptions, hooks, sync};
 
 const NEXT: &str = "Fix the problem above, then rerun dots up.";
@@ -92,7 +92,10 @@ fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
     });
     let Some((config, mise)) = loaded else { return };
 
-    let manager_before = tools::manager_version(ctx, run, &mise, &config);
+    let manager = tools::manager_source(ctx, run, &mise, &config);
+    let manager_before = manager
+        .as_ref()
+        .and_then(|source| tools::manager_version(ctx, run, &mise, source));
     let mut package_update = None;
     step(run, "Inspect declared packages", |_| {
         package_update = Some(packages::Update::inspect(ctx, run, &mise, &config, mas)?);
@@ -113,6 +116,9 @@ fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
 
         let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise);
 
+        if !validate_configuration(ctx, run) {
+            return false;
+        }
         if !run.cancelled()
             && let Err(error) = exceptions::run(run, &config.exceptions, exceptions::Mode::Update)
         {
@@ -155,7 +161,7 @@ fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
     }
 
     tools::update_mise(ctx, run, &mise);
-    tools::report_manager(ctx, run, &mise, &config, manager_before);
+    tools::report_manager(ctx, run, &mise, manager, manager_before);
     step(run, "Post-update settings checkpoint", |id| {
         checkpoint(ctx, run, id)
     });
@@ -249,7 +255,10 @@ fn child(
     if status.success() {
         Ok(())
     } else {
-        Err(issue(format!("Command exited with {status}.")))
+        Err(issue(format!(
+            "Command failed (exit {}).",
+            exit_code(status)
+        )))
     }
 }
 

@@ -30,7 +30,19 @@ case "${1-}" in
         if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
         if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
         ;;
-    install) printf 'install tools\n' >> calls; : > installed ;;
+    install)
+        printf 'install tools\n' >> calls
+        if [ -f expect-store-overlap ]; then
+            attempts=0
+            until [ -f store-started ]; do
+                [ "$attempts" -lt 100 ] || exit 71
+                attempts=$((attempts + 1))
+                sleep 0.02
+            done
+            : > tools-started
+        fi
+        : > installed
+        ;;
     upgrade) printf '%s\n' "$*" >> calls ;;
     settings)
         printf '{"system_packages":{"managers":null}}\n'
@@ -49,6 +61,19 @@ case "${1-}" in
             packages:apply|packages:upgrade)
                 shift 2
                 printf 'packages %s\n' "$*" >> calls
+                if [ -f expect-store-overlap ] && [ "$3" = mas ]; then
+                    if [ "$1" = apply ]; then
+                        : > store-started
+                        attempts=0
+                        until [ -f tools-started ]; do
+                            [ "$attempts" -lt 100 ] || exit 72
+                            attempts=$((attempts + 1))
+                            sleep 0.02
+                        done
+                    else
+                        : > store-finished
+                    fi
+                fi
                 ;;
             *) exit 1 ;;
         esac
@@ -58,7 +83,11 @@ case "${1-}" in
         if [ -f updated ]; then printf '2026.11.9 macos-x64\n'; else printf '2026.11.8 macos-x64\n'; fi
         ;;
     self-update)
-        if [ "$2" != "--help" ]; then printf 'self-update\n' >> calls; : > updated; fi
+        if [ "$2" != "--help" ]; then
+            if [ -f expect-store-overlap ]; then [ -f store-finished ] || exit 73; fi
+            printf 'self-update\n' >> calls
+            : > updated
+        fi
         ;;
     *) exit 1 ;;
 esac

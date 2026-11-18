@@ -9,7 +9,7 @@ use crate::config::Exceptions;
 use crate::process::{Cwd, Mise};
 use crate::run::{Issue, Outcome, Policy, Run, StageId};
 
-use super::{Config, Step, Versions, child, issue, json, mise_command, record_changes, step};
+use super::{Config, Step, Versions, child, json, mise_command, record_changes, step};
 
 type Status = BTreeMap<String, Manager>;
 
@@ -285,7 +285,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             }
         };
         for action in ["apply", "upgrade"] {
-            step(self.run, &format!("{name} packages: {action}"), |id| {
+            let outcome = step(self.run, &format!("{name} packages: {action}"), |id| {
                 let status = self.scope.status(self.run, self.mise, include_mas)?;
                 let Some(manager) = status.get(name).filter(|manager| manager.available) else {
                     return Ok(Outcome::Skipped);
@@ -325,6 +325,9 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 self.record(id, name, include_mas, before);
                 result.map(|()| Outcome::Completed)
             });
+            if outcome != Some(Outcome::Completed) {
+                break;
+            }
         }
     }
 
@@ -400,6 +403,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
     }
 }
 
+#[derive(Debug)]
 struct Specs(Vec<String>);
 
 fn select(
@@ -440,13 +444,16 @@ fn select_rows(
     }
     // Positional specs are new, desired-present requests. Mise retains pinned
     // versions for macos-app only.
-    if requested.iter().any(|(pkg, _)| {
+    if let Some((_, spec)) = requested.iter().find(|(pkg, _)| {
         pkg.desired_state != "present"
             || (manager != "macos-app" && pkg.requested_version != "latest")
     }) {
-        return Err(issue(format!(
-            "Cannot update {manager}: mise cannot preserve configured versions and desired states while excluding packages from this pass."
-        )));
+        return Err(Issue::new(
+            format!(
+                "Cannot update {manager}: mise cannot preserve configured versions and desired states for {spec} while excluding packages from this pass."
+            ),
+            "Review the manager's declarations and installer exception holds, then rerun dots up.",
+        ));
     }
     Ok(Some(Specs(
         requested.into_iter().map(|(_, spec)| spec).collect(),
@@ -483,4 +490,81 @@ pub(super) fn declared_dots_formula(
     })?;
     let spec = format!("brew:{}", pkg.package);
     config.exceptions.held_by(&spec).is_none().then_some(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Env, config::Root};
+    use std::fs;
+
+    fn exceptions(manifest: &str) -> Exceptions {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Env {
+            vars: [("DOTS_ROOT".into(), temp.path().as_os_str().into())].into(),
+            cwd: temp.path().into(),
+        };
+        fs::write(
+            temp.path().join("config.toml"),
+            "[vars]\ndots_profiles = 'test'\n",
+        )
+        .unwrap();
+        let config = Root::resolve(&env).unwrap();
+        fs::create_dir(temp.path().join("dots")).unwrap();
+        fs::write(temp.path().join("dots/exceptions.tsv"), manifest).unwrap();
+        Exceptions::read(&config).unwrap()
+    }
+
+    fn package(name: &str, version: &str, desired: &str) -> Package {
+        Package {
+            package: name.to_owned(),
+            requested_version: version.to_owned(),
+            desired_state: desired.to_owned(),
+            state: "installed".to_owned(),
+            installed_version: "1".to_owned(),
+            auto_updates: false,
+        }
+    }
+
+    #[test]
+    fn native_only_selection_preserves_explicit_absence_and_pins() {
+        let absent = package("retired", "latest", "absent");
+        let pinned = package("pinned", "2", "present");
+        let exceptions = exceptions("");
+        for packages in [vec![absent], vec![pinned]] {
+            assert!(
+                select(&packages, &exceptions, "pacman", false)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_package_cannot_turn_a_pin_or_absence_into_latest() {
+        let exceptions = exceptions("base\thold\thold=pacman:held\n");
+        let held = package("held", "latest", "present");
+        let ordinary = package("ordinary", "latest", "present");
+        assert_eq!(
+            select_rows(&[&held, &ordinary], &exceptions, "pacman", false)
+                .unwrap()
+                .unwrap()
+                .0,
+            ["pacman:ordinary"]
+        );
+        for unsafe_explicit in [
+            package("pinned", "2", "present"),
+            package("absent", "latest", "absent"),
+        ] {
+            let rejected =
+                select_rows(&[&held, &unsafe_explicit], &exceptions, "pacman", false).unwrap_err();
+            assert!(
+                rejected
+                    .diagnostic
+                    .contains(&format!("pacman:{}", unsafe_explicit.package))
+            );
+        }
+    }
 }

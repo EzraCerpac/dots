@@ -20,8 +20,12 @@ pub struct Mise<'a> {
 
 impl<'a> Mise<'a> {
     pub fn new(ctx: &'a Ctx) -> Result<Self, Fail> {
-        let binary = mise_binary(&ctx.env)?;
         let selected = selection::read(&ctx.root, &ctx.env)?;
+        Self::with_selection(ctx, selected)
+    }
+
+    pub fn with_selection(ctx: &'a Ctx, selected: Selection) -> Result<Self, Fail> {
+        let binary = mise_binary(&ctx.env)?;
         Ok(Self {
             ctx,
             binary,

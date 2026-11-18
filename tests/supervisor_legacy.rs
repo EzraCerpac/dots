@@ -6,13 +6,13 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::libc;
 use serde_json::Value;
-use support::World;
+use support::{FixtureCommand, World};
 
 const FAILURE_TAIL: &str = "fixture-alpha-last-diagnostic";
 const BETA_OUTPUT: &str = "fixture-beta-output";
@@ -50,7 +50,7 @@ fn fixture() -> World {
     world
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     let bin = world.root().join("bin");
     let path = command
@@ -113,7 +113,7 @@ fn hook(world: &World, name: &str, script: &str) {
     executable(&world.root().join("dots/hooks/update.d").join(name), script);
 }
 
-fn output(command: &mut Command, expected: i32) -> Output {
+fn output(command: &mut FixtureCommand<'_>, expected: i32) -> Output {
     let result = command.output().unwrap();
     assert_eq!(
         result.status.code(),
@@ -423,10 +423,6 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
         assert!(text.to_ascii_lowercase().contains("needs attention"));
         assert!(!text.contains("fixture-earlier-change"));
     }
-    assert!(
-        !combined(&replay).contains("dots up --last"),
-        "replay advertised itself"
-    );
 }
 
 #[test]

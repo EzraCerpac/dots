@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -38,11 +38,31 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.command_for(args, false)
+    }
+
+    pub(crate) fn command_active<I, S>(&self, args: I) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command_for(args, true)
+    }
+
+    fn command_for<I, S>(&self, args: I, active: bool) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<S> = args.into_iter().collect();
         let mut command = self.raw_command()?;
+        if active {
+            command.env("MISE_ENV", self.selected.active_environments());
+        }
         #[cfg(target_os = "macos")]
         if matches!(args.as_slice(), [command, sub, ..] if command.as_ref() == "bootstrap"
-            && matches!(sub.as_ref().to_str(), Some("status" | "packages")))
+            && (matches!(sub.as_ref().to_str(), Some("status" | "packages"))
+                || active && sub.as_ref() == "plan"))
         {
             self.expose_ruby(&mut command)?;
         }
@@ -56,8 +76,7 @@ impl<'a> Mise<'a> {
         S: AsRef<OsStr>,
     {
         let output = self
-            .command(args)?
-            .env("MISE_ENV", self.selected.active_environments())
+            .command_active(args)?
             .output()
             .map_err(|error| Fail::new(1, format!("could not run mise: {error}")))?;
         if !output.status.success() {
@@ -138,7 +157,11 @@ impl<'a> Mise<'a> {
     fn expose_ruby(&self, command: &mut Command) -> Result<(), Fail> {
         use std::os::unix::ffi::OsStrExt;
 
-        let Ok(output) = self.raw_command()?.args(["which", "ruby"]).output() else {
+        let mut probe = self.raw_command()?;
+        if let Some((_, Some(selected))) = command.get_envs().find(|(key, _)| *key == "MISE_ENV") {
+            probe.env("MISE_ENV", selected);
+        }
+        let Ok(output) = probe.args(["which", "ruby"]).output() else {
             return Ok(());
         };
         let ruby = PathBuf::from(OsStr::from_bytes(
@@ -303,33 +326,44 @@ pub(crate) fn validate_selection(
         Ok(())
     };
     stage().map_err(|error| Fail::new(1, format!("could not stage mise validation: {error}")))?;
-    let mut command = quiet_probe(&mise, &root, &scratch_path, env);
-    let keys: Vec<OsString> = env
-        .vars
-        .keys()
-        .filter(|key| {
-            key.as_encoded_bytes().starts_with(b"MISE_")
-                || key.as_encoded_bytes().starts_with(b"__MISE_")
-        })
-        .cloned()
-        .collect();
-    let overrides = command
-        .get_envs()
-        .map(|(key, _)| key.to_os_string())
-        .collect::<Vec<_>>();
-    for key in keys {
-        if !overrides.contains(&key) {
-            command.env_remove(key);
-        }
-    }
+    let mut staged_env = Env {
+        vars: env.vars.clone(),
+        cwd: root.clone(),
+    };
+    staged_env.vars.retain(|key, _| {
+        let key = key.as_encoded_bytes();
+        !key.starts_with(b"MISE_") && !key.starts_with(b"__MISE_")
+    });
+    let mut command = quiet_probe(&mise, &root, &scratch_path, &staged_env);
     command
         .env("HOME", &scratch_path)
+        .env("TMPDIR", &scratch_path)
         .env("XDG_CONFIG_HOME", scratch_path.join("xdg-config"))
         .env("XDG_DATA_HOME", scratch_path.join("xdg-data"))
         .env("XDG_STATE_HOME", scratch_path.join("xdg-state"))
         .env("XDG_CACHE_HOME", scratch_path.join("xdg-cache"))
-        .env("MISE_SYSTEM_CONFIG_DIR", scratch_path.join("system"))
+        .env("CODEX_HOME", scratch_path.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", scratch_path.join(".claude"))
+        .env("MISE_SYSTEM_CONFIG_DIR", scratch_path.join("system/config"))
+        .env("MISE_SYSTEM_DATA_DIR", scratch_path.join("system/data"))
+        .env(
+            "MISE_SYSTEM_PLUGINS_DIRS",
+            scratch_path.join("system/data/plugins"),
+        )
+        .env(
+            "MISE_SYSTEM_INSTALLS_DIR",
+            scratch_path.join("system/data/installs"),
+        )
+        .env(
+            "MISE_SYSTEM_SHIMS_DIR",
+            scratch_path.join("system/data/shims"),
+        )
         .env("MISE_DATA_DIR", scratch_path.join("data"))
+        .env("MISE_INSTALLS_DIR", scratch_path.join("data/installs"))
+        .env("MISE_INSTALL_STORE_DIR", scratch_path.join("data/store"))
+        .env("MISE_PLUGINS_DIR", scratch_path.join("data/plugins"))
+        .env("MISE_DOWNLOADS_DIR", scratch_path.join("data/downloads"))
+        .env("MISE_SHIMS_DIR", scratch_path.join("data/shims"))
         .env("MISE_CEILING_PATHS", &scratch_path)
         .env("MISE_TRUSTED_CONFIG_PATHS", &root);
     let active = config_paths(command, Duration::from_secs(10)).map_err(|error| {

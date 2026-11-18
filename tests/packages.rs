@@ -6,9 +6,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 use toml_edit::DocumentMut;
 
 const BASE: &str = "[vars]\ndots_profiles = \"desktop server\"\n";
@@ -46,7 +46,7 @@ fn bin(world: &World) -> PathBuf {
     bin
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut cmd = world.dots(); // World clears the caller's environment.
     let home = world.home();
     let scratch = world.root().parent().unwrap();
@@ -125,11 +125,10 @@ fn dots(world: &World) -> Command {
     cmd
 }
 
-fn fixture_child(world: &World, program: &Path) -> Command {
+fn fixture_child<'a>(world: &'a World, program: &Path) -> FixtureCommand<'a> {
     let environment = dots(world);
-    let mut child = Command::new(program);
+    let mut child = world.command(program);
     child
-        .env_clear()
         .envs(
             environment
                 .get_envs()
@@ -629,6 +628,7 @@ fi"#,
         r#"
 printf '%s\n' "$*" >> "$HOME/mas.log"
 case "$*" in
+    "version") echo 'mas 1.0.0';;
     "list --json")
         if [ -e "$HOME/mas-installed" ]; then
             printf '[{"adamID":123,"name":"Fixture App","version":"1"}]\n'
@@ -650,7 +650,7 @@ fn installed(world: &World, key: &str) -> bool {
     world.home().join("installed").join(key).is_file()
 }
 
-fn up(world: &World) -> Command {
+fn up(world: &World) -> FixtureCommand<'_> {
     let mut command = dots(world);
     command
         .args(["--verbose", "up"])
@@ -845,7 +845,7 @@ fn unchanged_mas_tool_formula_keeps_its_normal_brew_pass() {
     assert!(!world.home().join("mas.log").exists());
 }
 
-fn no_path_mas(world: &World) -> Command {
+fn no_path_mas(world: &World) -> FixtureCommand<'_> {
     let mut command = up(world);
     let fallback = env::var_os("PATH").unwrap_or_default();
     let mut path = vec![bin(world)];
@@ -924,7 +924,6 @@ fn unchanged_mas_can_use_the_brew_tool_outside_path() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_status_and_plan_do_not_probe_the_app_store() {
     if !cfg!(target_os = "macos") {
         return;
@@ -960,9 +959,23 @@ fn unchanged_status_and_plan_do_not_probe_the_app_store() {
             .output()
             .unwrap(),
     );
-    for command in ["status", "plan"] {
-        success(dots(&world).arg(command).output().unwrap());
-        assert!(!world.home().join("mas.log").exists(), "{command}");
+    let log = world.home().join("mas.log");
+    for (command, allowed_call) in [("status", Some("version")), ("plan", None)] {
+        success(
+            dots(&world)
+                .arg(command)
+                .env("FIXTURE_NATIVE_MAS", "1")
+                .output()
+                .unwrap(),
+        );
+        if log.exists() {
+            let calls = fs::read_to_string(&log).unwrap();
+            assert!(
+                calls.lines().all(|call| Some(call) == allowed_call),
+                "{command} queried the App Store: {calls}"
+            );
+            fs::remove_file(&log).unwrap();
+        }
     }
 }
 
@@ -1173,7 +1186,6 @@ esac"#
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_status_lists_the_adopted_target() {
     let world = fixture("");
     let target = world.home().join("status-fixture");

@@ -3,7 +3,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::{Value, json};
 use support::World;
@@ -83,7 +83,7 @@ exec git "$@"
         .unwrap();
     }
 
-    fn dots(&self) -> Command {
+    fn dots(&self) -> support::FixtureCommand<'_> {
         let mut command = self.world.dots();
         let real_path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
         let path = std::env::join_paths(
@@ -183,7 +183,7 @@ exec git "$@"
             .unwrap()
     }
 
-    fn selected(&self) -> Command {
+    fn selected(&self) -> support::FixtureCommand<'_> {
         fs::write(
             self.world.root().join("miserc.toml"),
             "env = [\"laptop\", \"host-fx\"]\n",

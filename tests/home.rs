@@ -2,7 +2,6 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::process::Command;
 use support::World;
 
 #[test]
@@ -37,16 +36,7 @@ fn unchanged_help_runs_through_a_relative_link_to_a_separate_manager() {
     let entry = bin.join("dots");
     symlink("../tools/manager/dots", &entry).unwrap();
 
-    let output = Command::new(entry)
-        .env_clear()
-        .envs(
-            dots.get_envs()
-                .filter_map(|(name, value)| value.map(|value| (name, value))),
-        )
-        .current_dir(world.root())
-        .arg("help")
-        .output()
-        .unwrap();
+    let output = world.command(entry).arg("help").output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(

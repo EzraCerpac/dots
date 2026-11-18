@@ -187,9 +187,24 @@ jobs:
           adduser -D smoke
           su -l smoke <<'SMOKE'
           set -eu
-          mkdir -p "$HOME/.local/bin"
+          fixture=$(mktemp -d /tmp/dots-first-run.XXXXXXXX)
+          export HOME="$fixture/home" TMPDIR="$fixture/tmp"
+          export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
+          export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
+          export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
+          export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
+          export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
+          export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
+          export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
+          export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
+          export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
+          export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
+          export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
+          mkdir -p "$HOME/.local/bin" "$TMPDIR"
           cp /seed/mise /seed/dots "$HOME/.local/bin/"
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.local/bin:/usr/bin:/bin"
+          cd "$HOME"
           dots init </dev/null
           dots up </dev/null
           SMOKE

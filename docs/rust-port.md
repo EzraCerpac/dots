@@ -33,7 +33,10 @@ P-12 formats plain step, outcome and report-list lines from `snapshot()` and R-0
 No run uses a PTY or relays the terminal, and one writer owns it at a time.
 Hooks, recipes and known prompts like `sudo -v` run under `Interactive`, inheriting the caller's stdin, stdout, stderr and controlling terminal from spawn, redirected or not; `dots` never reads their input, logs their output or keeps a tail.
 `Ordinary` stages write to private logs that feed issue tails, and a quiet stage finishes its progress line before the next `Interactive` spawn.
-Ctrl-C, even mid-drain, escalates on every stage group and probe, leaderless included, self-detached exempt, blocks new spawns and finishes cleanup before saving; a separate guard restores termios on exit, cancellation and unwinding panic.
+An observed Ctrl-C starts cancellation across active groups and probes, including during drain, and blocks new spawns.
+A direct foreground child that ignores that interrupt can continue until it exits.
+The supervisor then cleans up owned remnants, including leaderless groups, before saving the report and applying the contract’s exit-status order.
+Self-detached processes are outside that scope. A guard restores the caller’s terminal on exit, cancellation and unwinding panic.
 Native mise runs `dots bootstrap complete` as a separate, direct process in its stage's group and cancellation scope; `DOTS_STAGES`, set only on that stage, names a unique private file its `Sink::Fragment` run alone atomically rewrites with stage metadata before each hook starts and after it finishes.
 After native exit the parent calls `run.fold(path)` even on failure, marking the active hook cancelled on interruption; standalone `complete` prints outcomes without saving a report.
 `--mas` runs `sudo -v` as an `Interactive` stage when needed on a TTY, before `mas` starts alongside as `Ordinary`, else defers; the parent reports its result at the next stage boundary and joins it before standalone mise, and expired access defers without prompting again.

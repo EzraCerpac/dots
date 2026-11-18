@@ -387,7 +387,7 @@ Each issue shows the last lines of the error, the command to run next, and where
 Reports and logs are private to the user and live under `${XDG_STATE_HOME:-~/.local/state}/dots/`.
 Recent completed reports are kept for `dots reports` and `--last`.
 `dots help` and bare `dots` both list the configuration's commands.
-**Changed from 0.4.0:** an issue no longer offers a handoff to a coding agent, and `DOTS_AGENT_COMMAND` is not read.
+**Changed from 0.4.0:** the `A` key on a finished issue no longer offers a handoff to a coding agent, and `DOTS_AGENT_COMMAND` is not read.
 
 **Changed from 0.4.0:** `dots` has no full-screen interface.
 In an interactive terminal, the full `dots up`, also run as `dots update`, writes to the terminal's ordinary scrollback:
@@ -402,7 +402,7 @@ In an interactive terminal, the full `dots up`, also run as `dots update`, write
 It uses no alternate screen, navigation keys, spinner, minimum terminal size or cursor motion across child output.
 A step whose output is recorded privately may update its own progress line once, and finishes that line before any child can print or prompt.
 `--plain` prints concise progress, and `--verbose` prints full child output.
-The full `dots up` keeps its stage logs and the "Needs attention" guidance above.
+The full `dots up` keeps its captured stage logs and the "Needs attention" guidance above.
 
 `dots reports`, `dots up --last`, `dots plan`, the sync receipt and the `dots sync --last` pager keep their own displays, and the rest of this paragraph does not apply to them.
 Every other individual command that `dots` supervises, `dots status` included, writes directly to the terminal's scrollback.
@@ -415,7 +415,7 @@ A report for a failure or an issue that needs attention gives the command to rer
 `dots sync` may log its backends' output privately, and shows file contents only as [Receipt](#receipt) allows.
 When any report cannot be written or finished, `dots` says so on stderr, naming the command, and still exits with the command's own result.
 
-Hooks, recipes and steps that `dots` knows are interactive, such as its own `sudo` authorization, run in the foreground and may prompt.
+Hooks, recipes and steps that `dots` knows are interactive, such as its own `sudo` authorization, run in the foreground during `dots up` and may prompt.
 **Changed from 0.4.0:** a foreground step gets the caller's stdin, stdout, stderr and controlling terminal from its start, with no handoff, and streams the caller redirected stay redirected.
 Only one step at a time writes to the terminal, and `dots` never reads a reply to a prompt.
 `dots` does not detect prompts; every other stage's output is recorded privately, and its issues keep their last lines and log location.
@@ -481,8 +481,8 @@ The stages run in this order:
 **Changed from 0.3.5:** the pre-update checkpoint is the first stage; 0.3.5 ran it after sync and reload (`tasks/update:186-216,346`).
 With `--mas` on macOS and declarations that select `mas`, App Store updates run alongside stages 5 to 7, and stage 8 waits for them.
 Without cached administrator access, a noninteractive run defers the App Store stage.
-**Changed from 0.4.0:** an interactive run asks for administrator access in the foreground, when it is needed, before the App Store stage starts.
-The App Store stage then runs without the terminal, and its output goes to its log.
+An interactive run asks for administrator access in the foreground, when it is needed, before the App Store stage starts.
+**Changed from 0.4.0:** the App Store worker runs noninteractively, and its output goes to its log.
 `dots up` reports its result at the next stage boundary.
 When its administrator access expires, the stage is deferred with a next action and never prompts again while another step owns the terminal.
 Homebrew keeps the old version of anything `dots up` upgrades until the user's next cleanup.
@@ -1201,7 +1201,7 @@ An implementation may choose and change these freely; nothing outside `dots` may
 | The sourced libraries in `lib/` | Replaced by subcommands, so hooks need no Bash |
 | The separate `dots-up` renderer, its build from a checkout, path search and fallback, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend`, its event protocol and its event, acknowledgement and stream-nonce variables | `dots` is one executable and has no full-screen interface |
 | From 0.4.0: the `dots up` dashboard and its size check, the `menu` built-in, and the report browser with its forms, diagnostics tree, log search and replay navigation | Ordinary scrollback is simpler to read and keep, needs less machinery, and nothing depends on the old interface |
-| From 0.4.0: `--no-wait`, the agent handoff on a finished issue and `DOTS_AGENT_COMMAND` | As above |
+| From 0.4.0: `--no-wait`, the `A` key for agent handoff on a finished issue and `DOTS_AGENT_COMMAND` | As above |
 | From 0.4.0: `dots internal shell-complete`, `dots-up complete` and the completion scripts in the support tree | The completion protocol is internal; `dots completions` prints the scripts |
 | From 0.4.0: the quiet `uv run` wrapper of `dots remove` | The executable needs no Python or uv |
 | The Bash updater fallback and its logs | There is nothing to fall back from |

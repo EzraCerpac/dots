@@ -2,12 +2,14 @@
 
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
 Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation, the 1.0 guarantee for the running `dots` on children's `PATH`, file adoption and removal, software version syntax, status program versions, history enrollment and restore, retired declarations, and publish validation.
+Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
 Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish origin and `dev` ancestry checks.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
 **New in 1.0** marks behaviour that 0.3.5 does not have.
 **Changed from 0.3.5** marks behaviour that differs from 0.3.5 and says how.
+**Changed from 0.4.0** marks behaviour that 0.4.0 ships and 1.0 changes, and says how.
 **New in 0.4.0** and **Changed in 0.4.0** mark such a difference that 0.4.0 already ships; the other labels mark changes that arrive with 1.0.
 Where 0.3.5 files are cited, as `bin/dots:233`, they are historical evidence for such a label, not a specification.
 [Internal and subject to change](#internal-and-subject-to-change) lists what an implementation may choose freely.
@@ -51,7 +53,7 @@ The configuration is a mise config directory.
 
 `dots` resolves the result to its physical path and exports it to every child as `DOTS_ROOT`.
 A command that needs the configuration stops with exit status 2 and a line naming the path when `config.toml` does not exist there.
-The exceptions are `init`, `help`, `menu`, `--version`, `completions`, `bundle`, `brew`, `install-release-app`, `status` (which prints its program list first), and `sync` (which always exits 0).
+The exceptions are bare `dots`, `init`, `help`, `--version`, `completions`, `bundle`, `brew`, `install-release-app`, `status` (which prints its program list first), and `sync` (which always exits 0).
 Every other built-in command, helper subcommand and configuration command needs the configuration.
 mise children run rooted in the configuration, with `MISE_CONFIG_DIR` set to the root.
 **Changed from 0.3.5:** every command except `dots bootstrap persist-selected` ignores the caller's `MISE_ENV`, so a project's environment selector never leaks in; the machine's own selection comes from its persisted files.
@@ -254,14 +256,14 @@ A local-only configuration may keep settings history in a state repository.
 ### Global syntax
 
 ```text
-dots [--plain | --verbose] [--no-wait] COMMAND [ARGS...]
+dots [--plain | --verbose] COMMAND [ARGS...]
 ```
 
-`--plain` prints concise progress lines instead of the dashboard.
+`--plain` prints concise progress lines.
 `--verbose` shows full child output.
 `--plain` with `--verbose` exits 2.
-`--no-wait` closes the dashboard as soon as the command finishes; `up` does this by default.
-Only `dots up` has a dashboard; for every other command these flags neither wrap its output nor wait for the user, as [Output and reports](#output-and-reports) describes.
+**Changed from 0.4.0:** `--no-wait` is gone and exits 2 as an unknown option.
+For commands other than `dots up`, these flags neither wrap the output nor wait for the user, as [Output and reports](#output-and-reports) describes.
 These flags apply only to built-in commands; before a configuration command they exit 2.
 Without a terminal on stdout, output is plain.
 `dots COMMAND -h` and `dots COMMAND --help` print a built-in command's usage and exit 0.
@@ -289,16 +291,16 @@ Read-only commands never install tools.
 
 | Command | Effects | Notes |
 | --- | --- | --- |
-| `dots`, `dots menu` | R/O | In a terminal, the command menu; otherwise the help text and exit 0 |
+| `dots` | R/O | **Changed from 0.4.0:** the help text and exit 0, in a terminal too |
 | `dots help`, `-h`, `--help` | R/O | Built-in commands, the helpers, then the configuration's commands |
 | `dots --version` | R/O | Version and install method |
-| `dots reports [COMMAND]` | R/O | Report browser; without a terminal, exit 2 |
+| `dots reports [COMMAND]` | R/O | **Changed from 0.4.0:** lists recent reports; without a terminal, exit 2 |
 | `dots completions bash\|zsh\|fish` | R/O | **New in 0.4.0.** Prints a completion script |
 | `dots status` | R/O, report | Programs, profile, source, packages, tools, dotfiles, history, exceptions |
 | `dots plan` | R/O, report | mise's bootstrap plan for this profile and machine; **New in 1.0:** the report |
 | `dots sync --last` | R/O | Replays the latest sync receipt |
 | `dots up [--mas]`, `dots update` | M, C, (R: pushes `dev` when shared), (D: hooks and recipes), report | [`dots up`](#dots-up) |
-| `dots up --last` | R/O | Reopens the last `dots up` report |
+| `dots up --last` | R/O | **Changed from 0.4.0:** prints the last `dots up` report and exits with its recorded status |
 | `dots sync` | C, M, (R: pushes `dev` when shared), report | [`dots sync`](#dots-sync) |
 | `dots apply [TARGET...]` | M, report | Applies declared dotfiles and templates |
 | `dots test [ARGS...]` | D, report | Runs `tests/run` |
@@ -333,6 +335,9 @@ Read-only commands never install tools.
 Built-in names win over configuration commands of the same name.
 **Changed from 0.3.5:** `root`, `profile`, `mise`, `retire-dotfiles`, `exceptions`, `enroll-history`, `install-release-app` and `brew` are new built-in names, so a configuration command with one of these names is no longer reachable.
 **Changed in 0.4.0:** `completions` is a built-in name, with the same effect.
+**Changed from 0.4.0:** `menu` is no longer a built-in name, and no alias is reserved for it.
+An executable configuration command named `menu` runs and completes under the ordinary rules of [Configuration commands](#configuration-commands).
+Without one, `dots menu` is an unknown command and exits 2.
 
 ### Exit status
 
@@ -378,21 +383,29 @@ A cancelled `dots remote` says on stderr and in its report that the remote host'
 
 ### Output and reports
 
-Every problem of `dots up` is one issue, listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
-Each issue shows the last lines of the error, the command to run next, and where the step's full log is.
+Every problem of `dots up` is one issue, listed under "Needs attention" in its terminal output, in `--plain` output and in the final report.
+Each issue shows the last lines of the error, the command to run next, and where the step's full log is, except for a foreground step as described below.
 Reports and logs are private to the user and live under `${XDG_STATE_HOME:-~/.local/state}/dots/`.
 Recent completed reports are kept for `dots reports` and `--last`.
-In the dashboard, `A` on an issue hands it to a coding agent once the run has finished.
-`dots` then suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument.
-Without `DOTS_AGENT_COMMAND`, `A` says how to set it.
-`dots help` and the menu both list the configuration's commands.
+`dots help` and bare `dots` both list the configuration's commands.
+**Changed from 0.4.0:** the `A` key on a finished issue no longer offers a handoff to a coding agent, and `DOTS_AGENT_COMMAND` is not read.
 
-**Changed in 0.4.0:** only the full `dots up`, also run as `dots update`, shows the live progress dashboard, and only in an interactive terminal large enough for it.
-In a smaller interactive terminal it warns on stderr and prints concise progress instead.
-`--plain` prints concise progress, and `--verbose` prints full child output; neither shows the dashboard.
-The full `dots up` keeps its stage logs and the "Needs attention" guidance above.
+**Changed from 0.4.0:** `dots` has no full-screen interface.
+In an interactive terminal, the full `dots up`, also run as `dots update`, writes to the terminal's ordinary scrollback:
 
-The menu, the report browser, `dots up --last`, `dots plan`, the sync receipt and the `dots sync --last` pager keep their own displays, and the rest of this paragraph does not apply to them.
+- a line when each step starts;
+- the output of a foreground step, which owns the terminal while it runs;
+- one line with each step's result;
+- a final outcome line, such as `dots up · Complete` or `dots up · Failed (exit 1)`;
+- "Needs attention", with each issue, its next action and, when its output was captured, its log location;
+- `Details and logs · dots up --last`.
+
+It uses no alternate screen, navigation keys, spinner, minimum terminal size or cursor motion across child output.
+A step whose output is recorded privately may update its own progress line once, and finishes that line before any child can print or prompt.
+`--plain` prints concise progress, and `--verbose` prints full child output.
+The full `dots up` keeps its captured stage logs and the "Needs attention" guidance above.
+
+`dots reports`, `dots up --last`, `dots plan`, the sync receipt and the `dots sync --last` pager keep their own displays, and the rest of this paragraph does not apply to them.
 Every other individual command that `dots` supervises, `dots status` included, writes directly to the terminal's scrollback.
 Its child runs in the caller's foreground, so a native prompt such as `sudo` or `ssh` reads the terminal as usual.
 It reads the caller's stdin, which may be redirected, and its stdout and stderr reach the caller's separately and byte for byte, even when the reader is slow.
@@ -403,11 +416,11 @@ A report for a failure or an issue that needs attention gives the command to rer
 `dots sync` may log its backends' output privately, and shows file contents only as [Receipt](#receipt) allows.
 When any report cannot be written or finished, `dots` says so on stderr, naming the command, and still exits with the command's own result.
 
-A hook, a recipe or any other running stage may prompt.
-While the dashboard is shown, it tells the user how to open the running stage's terminal to answer and how to return to the dashboard; the keys for this are not part of the contract.
-`dots` hands the terminal to a stage by itself only for a step it knows is interactive, such as its own `sudo` authorization.
-It does not detect prompts inside a hook or recipe.
-With `--plain`, or without a terminal for the dashboard, the child reads the caller's stdin, which may be redirected.
+Hooks, recipes and steps that `dots` knows are interactive, such as its own `sudo` authorization, run in the foreground during `dots up` and may prompt.
+**Changed from 0.4.0:** a foreground step gets the caller's stdin, stdout, stderr and controlling terminal from its start, with no handoff, and streams the caller redirected stay redirected.
+Only one step at a time writes to the terminal, and `dots` never reads a reply to a prompt.
+`dots` does not detect prompts; every other stage's output is recorded privately, and its issues keep their last lines and log location.
+A failed foreground step reports its outcome, exit status and next action, and says `Output was shown on the terminal`; its issue has no captured lines or log location.
 `dots` restores the caller's terminal after a normal exit, a cancellation or an unwinding panic.
 A `SIGKILL` or an abort gives it no chance to do so.
 
@@ -447,7 +460,7 @@ It runs `ROOT/tests/run ARGS...` in the configuration's mise environment.
 
 ### `dots up`
 
-`--mas` includes Mac App Store updates; `--last` reopens the last report; both together exit 2.
+`--mas` includes Mac App Store updates; `--last` prints the last saved `dots up` report and exits with the status it records; both together exit 2.
 The stages run in this order:
 
 1. **Pre-update checkpoint.** Saves tracked settings, after checking that every tracked entry is encrypted.
@@ -476,7 +489,11 @@ The stages run in this order:
 
 **Changed from 0.3.5:** the pre-update checkpoint is the first stage; 0.3.5 ran it after sync and reload (`tasks/update:186-216,346`).
 With `--mas` on macOS and declarations that select `mas`, App Store updates run alongside stages 5 to 7, and stage 8 waits for them.
-Without cached administrator access, a noninteractive run defers the App Store stage; an interactive one can prompt.
+Without cached administrator access, a noninteractive run defers the App Store stage.
+An interactive run asks for administrator access in the foreground, when it is needed, before the App Store stage starts.
+**Changed from 0.4.0:** the App Store worker runs noninteractively, and its output goes to its log.
+`dots up` reports its result at the next stage boundary.
+When its administrator access expires, the stage is deferred with a next action and never prompts again while another step owns the terminal.
 Homebrew keeps the old version of anything `dots up` upgrades until the user's next cleanup.
 The run finishes on the `dots` version it started with.
 A failing stage does not stop later ones; Ctrl-C does, as [Exit status](#exit-status) describes.
@@ -782,7 +799,9 @@ It exits 3 when conflicts stop it, and 1 on other failures.
 
 ### `dots reports [COMMAND]`
 
-It opens the report browser, optionally on one command's reports.
+**Changed from 0.4.0:** it prints recent completed reports, newest first, optionally only one command's.
+Each line gives the command, time, outcome, exit status and the report's location.
+As in 0.4.0, without a terminal it exits 2.
 
 ### `dots completions bash|zsh|fish`
 
@@ -813,7 +832,7 @@ A dynamic input that is unavailable, such as an unreadable file or a mise that d
 Completion draws candidates only from these sources, and does not promise one for every argument:
 
 - Commands: the public built-in commands, the aliases `update` and `uninstall`, and each configuration command that [Configuration commands](#configuration-commands) would run, only where that command could start; a configuration command's arguments are not completed.
-- Global flags: `--plain` or `--verbose`, and `--no-wait`, before the command and after `up` or `update`; `-h`, `--help` and `--version` only as the first word.
+- Global flags: `--plain` or `--verbose`, before the command and after `up` or `update`; `-h`, `--help` and `--version` only as the first word.
 - A command's options, with short forms such as `-n`, only where it accepts them: never one that conflicts with an option already given, a second copy of an option that may appear only once, or any option after `--` where the command accepts `--`.
   A repeatable option, such as `dots bundle create --recipient` or `dots bootstrap --env`, `--only` and `--skip`, stays on offer as the grammar allows.
 - An option's value, inline as `--option=VALUE` or as a comma-separated list, only where the option accepts that form.
@@ -1143,7 +1162,6 @@ Read by `dots`:
 | `MISE_CONFIG_DIR`, `XDG_CONFIG_HOME` | Fallbacks for the configuration root |
 | `DOTS_MISE_BIN` | The mise executable; else `~/.local/bin/mise`, else `mise` on `PATH` |
 | `DOTS_SKILL_LINKS` | `0` turns agent skill linking off |
-| `DOTS_AGENT_COMMAND` | Shell command for the dashboard's agent handoff |
 | `DOTS_PUBLISH_MODEL` | Model named in the `dots publish` note |
 | `DOTS_PROFILE` | Kept for configuration commands when already set |
 | `SETUP_PROFILE`, `SETUP_MACHINE_ID` | Override the persisted profile and machine ID |
@@ -1195,7 +1213,7 @@ An implementation may choose and change these freely; nothing outside `dots` may
 - Lock files, pending markers, backup and recovery file names, temporary files, and other metadata under the configuration's Git directory or `dots`' state directory.
 - Where the extracted agent skill and the embedded templates' working copies live, and how they are laid out.
 - Where `dots` records the skill links and the GitHub apps it installed.
-- How stages are supervised: processes, pseudo-terminals, threads and any internal protocol between them.
+- How stages are supervised: processes, threads and any internal protocol between them, within the foreground rules of [Output and reports](#output-and-reports).
 - How children reach the running `dots` on `PATH`.
 - The variables `dots bootstrap` uses to pass options, such as `--restore`, to its own callbacks, `persist-selected` and `complete`.
 - The exact Git and mise commands `dots` runs to produce the behaviour described here.
@@ -1209,7 +1227,9 @@ An implementation may choose and change these freely; nothing outside `dots` may
 | `DOTS_HOME` and `dots internal home` | One executable has no manager directory |
 | The `dots internal` namespace | Replaced by public commands; see [Replacing 0.3.5 interfaces](#replacing-035-interfaces) |
 | The sourced libraries in `lib/` | Replaced by subcommands, so hooks need no Bash |
-| The separate `dots-up` renderer, its build from a checkout, path search and fallback, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend`, its event protocol and its event, acknowledgement and stream-nonce variables | The dashboard is part of the one executable |
+| The separate `dots-up` renderer, its build from a checkout, path search and fallback, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend`, its event protocol and its event, acknowledgement and stream-nonce variables | `dots` is one executable and has no full-screen interface |
+| From 0.4.0: the `dots up` dashboard and its size check, the `menu` built-in, and the report browser with its forms, diagnostics tree, log search and replay navigation | Ordinary scrollback is simpler to read and keep, needs less machinery, and nothing depends on the old interface |
+| From 0.4.0: `--no-wait`, the `A` key for agent handoff on a finished issue and `DOTS_AGENT_COMMAND` | As above |
 | From 0.4.0: `dots internal shell-complete`, `dots-up complete` and the completion scripts in the support tree | The completion protocol is internal; `dots completions` prints the scripts |
 | From 0.4.0: the quiet `uv run` wrapper of `dots remove` | The executable needs no Python or uv |
 | The Bash updater fallback and its logs | There is nothing to fall back from |

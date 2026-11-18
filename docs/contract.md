@@ -1,6 +1,6 @@
 # dots 1.0 contract
 
-Status: 1.0 candidate, not frozen.
+Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -343,6 +343,10 @@ Configuration commands, `dots test` and `dots mise` exit with their child's stat
 `dots up` and `dots bootstrap` exit 0 when every stage completed, was skipped or was deferred, and 1 when any stage failed.
 `dots sync` with valid arguments exits 0 every time, including a missing configuration, a missing mise or gitleaks, and a stopped run; its receipt carries the problem.
 `dots sync` with invalid arguments exits 2.
+Ctrl-C cancels the current stage's entire process group, and no later stage starts.
+A cancellation is not a stage failure, so the rule above for `dots up` and `dots bootstrap` does not apply to it.
+A cancelled run exits with the cancelled child's own status, unchanged, when the child exits with one; otherwise it exits 130, the shell's status for an interrupt.
+`dots sync` still exits 0, and its receipt records the stopped run.
 **Changed from 0.3.5:** `dots bundle` usage errors exit 2, not 1.
 
 ### Hook and recipe outcomes
@@ -366,6 +370,14 @@ In the dashboard, `A` on an issue hands it to a coding agent once the run has fi
 `dots` then suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument.
 Without `DOTS_AGENT_COMMAND`, `A` says how to set it.
 `dots help` and the menu both list the configuration's commands.
+
+A hook, a recipe or any other running stage may prompt.
+While the dashboard is shown, it tells the user how to open the running stage's terminal to answer and how to return to the dashboard; the keys for this are not part of the contract.
+`dots` hands the terminal to a stage by itself only for a step it knows is interactive, such as its own `sudo` authorization.
+It does not detect prompts inside a hook or recipe.
+With `--plain`, or without a terminal for the dashboard, the child reads the caller's stdin, which may be redirected.
+`dots` restores the caller's terminal after a normal exit, a cancellation or an unwinding panic.
+A `SIGKILL` or an abort gives it no chance to do so.
 
 ## Command reference
 
@@ -422,7 +434,7 @@ With `--mas` on macOS and declarations that select `mas`, App Store updates run 
 Without cached administrator access, a noninteractive run defers the App Store stage; an interactive one can prompt.
 Homebrew keeps the old version of anything `dots up` upgrades until the user's next cleanup.
 The run finishes on the `dots` version it started with.
-A failing stage does not stop later ones.
+A failing stage does not stop later ones; Ctrl-C does, as [Exit status](#exit-status) describes.
 A configuration that becomes invalid during the run stops it with exit status 1.
 `dots up` never prunes software, restarts services or updates project dependencies.
 Its sync stage pushes `dev` like `dots sync`; `dots up` never pushes `main` or opens a pull request.
@@ -718,7 +730,7 @@ A failed hook does not stop later ones.
 The stage label is the name without its `@PROFILE` suffix, a leading number followed by `-` or `_`, and a final extension, with dashes and underscores as spaces: `20-Login-shell.sh` reports as `Login shell`.
 A name ending in `@PROFILE` applies only to that profile; other profiles do not list it.
 A suffix that names a profile outside `dots_profiles` fails the listing before any hook in that directory runs.
-A hook keeps the caller's stdin, so it can prompt.
+A hook can prompt, as [Output and reports](#output-and-reports) describes.
 
 Update hooks also get:
 
@@ -745,7 +757,8 @@ The recipe is the executable `exceptions/NAME`, with `NAME` matching `^[A-Za-z0-
 `hold=MANAGER:NAME` records that the recipe pins that package, so `dots add` refuses it; the value matches `^[a-z][a-z0-9-]*:[A-Za-z0-9@._/+-]+$`, and a request matches after dropping any tap prefix or `@version`.
 Bootstrap always passes `--install-only`.
 Under `dots up`, a recipe also gets `DOTS_CHANGES`.
-A recipe updates exactly its own app with its own package-manager command, never a whole-environment update, and keeps the caller's stdin.
+A recipe updates exactly its own app with its own package-manager command, never a whole-environment update.
+A recipe can prompt, as [Output and reports](#output-and-reports) describes.
 
 ### Retired dotfiles and retired declarations
 
@@ -877,7 +890,7 @@ Selection:
 - Values arrive intact, including newlines.
 - `dots` writes no value to a plaintext file, an environment variable or an argument, and prints none.
 - No other stage or command that `dots` launches gets the descriptor; what the hook's own children inherit is the hook's responsibility.
-- The hook's stdin is unchanged, so it can still prompt.
+- The descriptor leaves the hook's prompt channel available, so it can still prompt as [Output and reports](#output-and-reports) describes.
 - The hook is responsible for what it prints, where it writes values, preserving files that already exist, and closing the descriptor before starting long-lived children.
 
 Example: a hook that only checks that a value is present, and prints nothing secret.

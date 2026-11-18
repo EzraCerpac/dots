@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::report::{Outcome, Report, Stage};
+use crate::report::{Change, Outcome, Report, Stage};
 
 use super::reports::{attention_disposition, display_path, needs_attention, needs_terminal_escape};
 
@@ -46,16 +46,12 @@ pub fn write_report(out: &mut impl Write, report: &Report, saved: bool) -> io::R
 
     for stage in &report.stages {
         for change in &stage.changes {
-            let before = terminal_text(&change.before);
-            let after = terminal_text(&change.after);
             if stage.label == "dots manager" && change.item == "dots" {
+                let before = terminal_text(&change.before);
+                let after = terminal_text(&change.after);
                 writeln!(out, "dots {before} -> {after}")?;
             } else {
-                writeln!(
-                    out,
-                    "    {}: {before} -> {after}",
-                    terminal_text(&change.item),
-                )?;
+                write_change(out, change)?;
             }
         }
     }
@@ -101,6 +97,24 @@ pub fn write_report(out: &mut impl Write, report: &Report, saved: bool) -> io::R
         writeln!(out, "Details and logs · dots up --last")?;
     }
     out.flush()
+}
+
+fn write_change(out: &mut impl Write, change: &Change) -> io::Result<()> {
+    let missing = |value: &str| matches!(value, "" | "not installed" | "not present");
+    let item = terminal_text(&change.item);
+    let before = terminal_text(&change.before);
+    let after = terminal_text(&change.after);
+    match (missing(&change.before), missing(&change.after)) {
+        (true, false) => writeln!(out, "    installed  {item}  {after}"),
+        (false, true) => writeln!(out, "    removed  {item}  {before}"),
+        (false, false) if change.before != change.after => {
+            writeln!(out, "    updated  {item}  {before} → {after}")
+        }
+        _ if change.before.is_empty() && change.after.is_empty() => {
+            writeln!(out, "    changed  {item}")
+        }
+        _ => writeln!(out, "    changed  {item}  {before} → {after}"),
+    }
 }
 
 fn stage_label(stage: &Stage) -> impl fmt::Display {

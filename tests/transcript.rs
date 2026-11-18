@@ -31,7 +31,13 @@ fn example_report() -> Report {
                 "label": "Printer setup",
                 "alongside": false,
                 "outcome": "completed",
-                "changes": [{"item": "driver", "before": "1.2", "after": "1.3"}],
+                "changes": [
+                    {"item": "driver", "before": "1.2", "after": "1.3"},
+                    {"item": "cartridge", "before": "not installed", "after": "2.0"},
+                    {"item": "old-driver", "before": "0.9", "after": "not present"},
+                    {"item": "defaults", "before": "", "after": ""},
+                    {"item": "fonts", "before": "5", "after": "5"}
+                ],
                 "issues": []
             },
             {
@@ -90,12 +96,12 @@ fn example_transcript(saved: bool) -> Vec<u8> {
 }
 
 // The approved design leaves line wrapping to the terminal. These fixtures
-// use ASCII and a middle dot, each occupying one column in the fixture.
+// use ASCII, a middle dot and an arrow, each occupying one column in the fixture.
 fn terminal_rows(bytes: &[u8], columns: usize) -> String {
     let mut rows = String::new();
     let mut column = 0;
     for ch in std::str::from_utf8(bytes).unwrap().chars() {
-        assert!(ch.is_ascii() || ch == '·');
+        assert!(ch.is_ascii() || matches!(ch, '·' | '→'));
         if ch == '\n' {
             column = 0;
         } else {
@@ -123,7 +129,11 @@ fn new_wide_scrollback() {
             "==> dots manager\n",
             "dots manager: completed\n",
             "dots up: Completed with issues (exit 0)\n",
-            "    driver: 1.2 -> 1.3\n",
+            "    updated  driver  1.2 → 1.3\n",
+            "    installed  cartridge  2.0\n",
+            "    removed  old-driver  0.9\n",
+            "    changed  defaults\n",
+            "    changed  fonts  5 → 5\n",
             "dots 1.0 -> 1.1, used from the next run\n",
             "Needs attention\n",
             "  App Store (alongside): Authorization expired\n",
@@ -150,7 +160,11 @@ fn new_narrow_scrollback() {
             "dots manager: completed\n",
             "dots up: Completed with issues (\n",
             "exit 0)\n",
-            "    driver: 1.2 -> 1.3\n",
+            "    updated  driver  1.2 → 1.3\n",
+            "    installed  cartridge  2.0\n",
+            "    removed  old-driver  0.9\n",
+            "    changed  defaults\n",
+            "    changed  fonts  5 → 5\n",
             "dots 1.0 -> 1.1, used from the n\n",
             "ext run\n",
             "Needs attention\n",
@@ -306,7 +320,7 @@ fn new_terminal_controls_in_metadata_are_visible_text() {
     for expected in [
         "==> Café\\r\\u{1b}[2J\\u{202e} (alongside)",
         "Café\\r\\u{1b}[2J\\u{202e} (alongside): deferred",
-        "driver\\nLabel: 1\\t2 -> 3\\u{7}",
+        "updated  driver\\nLabel  1\\t2 → 3\\u{7}",
         "bad\\u{9b}2J",
         "Next: try\\u{2028}again",
         "    | one\\rupdated\n    | two\\u{1b}]0;name\\u{7}",

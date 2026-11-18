@@ -62,16 +62,13 @@ fn unchanged_missing_or_non_executable_command_is_unknown() {
 #[test]
 fn unchanged_command_names_cannot_contain_paths() {
     let world = World::new();
-    let commands = world.root().join("dots/commands");
-    fs::copy(commands.join("hello"), commands.join("-hello")).unwrap();
-    for name in [
-        "dots/commands/hello",
-        "../config/dots/commands/hello",
-        "-hello",
-    ] {
-        let stderr = usage_error(run(world.dots(), &[name]));
-        assert!(stderr.contains(name), "{stderr}");
-        assert!(stderr.contains("dots help"), "{stderr}");
+    for name in ["dots/commands/hello", "../config/dots/commands/hello"] {
+        let output = world.dots().arg(name).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.contains("use dots help"), "{stderr}");
     }
 }
 

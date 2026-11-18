@@ -37,6 +37,7 @@ impl Fixture {
         let world = World::new();
         let control = world.home().join("direct");
         fixture::install(world.root(), &control);
+        fs::create_dir(control.join("tmp")).unwrap();
         Self {
             world,
             control,
@@ -46,10 +47,17 @@ impl Fixture {
 
     fn dots(&self) -> Command {
         let mut command = self.world.dots();
+        let home = self.world.home();
         command
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .env("LC_ALL", "C")
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("MISE_CONFIG_DIR", self.world.root())
+            .env("MISE_DATA_DIR", home.join(".local/share/mise"))
+            .env("MISE_STATE_DIR", home.join(".local/state/mise"))
+            .env("MISE_CACHE_DIR", home.join(".cache/mise"))
+            .env("TMPDIR", self.control.join("tmp"))
             .env("DOTS_MISE_BIN", self.control.join("mise"))
             .env("DIRECT_DIR", &self.control)
             .env("DIRECT_EXE", env::current_exe().unwrap());

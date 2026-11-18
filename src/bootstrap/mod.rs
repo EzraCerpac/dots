@@ -150,13 +150,36 @@ fn native_args(args: &Args) -> Vec<OsString> {
 
 fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let run = Run::begin(ctx, Sink::Report(ReportCommand::Bootstrap));
-    for key in ["from", "adopt"] {
-        if let Some(value) = args.get_one::<String>(key) {
-            source::validate_native_source(ctx, &run, value, &Vars::read(&ctx.root)?)?;
-        }
+    let mut native = native_args(args);
+    let vars = Vars::read(&ctx.root)?;
+    let from = args.get_one::<String>("from");
+    let adopt = args.get_one::<String>("adopt");
+    if from.is_some() && adopt.is_some() {
+        return Err(Fail::usage("choose either --from or --adopt"));
+    }
+    let source = [("from", from), ("adopt", adopt)]
+        .into_iter()
+        .find_map(|(key, value)| value.map(|value| (key, value)));
+    let source = source
+        .map(|(key, value)| {
+            source::validate_native_source(ctx, &run, value, &vars).map(|url| (key, url))
+        })
+        .transpose()?;
+    if args.get_flag("update") {
+        source::validate_update(
+            ctx,
+            &run,
+            &vars,
+            source.as_ref(),
+            args.get_one::<OsString>("from-dir"),
+        )?;
+    }
+    if let Some((key, url)) = source {
+        native.extend([format!("--{key}").into(), url.into()]);
     }
 
-    let mut command = Mise::new(ctx)?.command(native_args(args))?;
+    let mut command = Mise::new(ctx)?.command(native)?;
+    source::clear_git_checkout_override(&mut command);
     // Native bootstrap owns installation. Its pre-dotfiles callback may use
     // mise x to install the pinned dots before the rest of the declared tools.
     command

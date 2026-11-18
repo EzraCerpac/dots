@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::config::{RepoSetting, Vars, passive};
@@ -6,16 +8,21 @@ use crate::process::Cwd;
 use crate::run::{Outcome, Run};
 use crate::{Ctx, Fail};
 
-fn git(ctx: &Ctx) -> Result<Command, Fail> {
-    let mut command = ctx.command("git", Cwd::Root)?;
+pub(super) fn clear_git_checkout_override(command: &mut Command) {
     for key in [
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
         "GIT_COMMON_DIR",
+        "GIT_CONFIG",
     ] {
         command.env_remove(key);
     }
+}
+
+fn git(ctx: &Ctx) -> Result<Command, Fail> {
+    let mut command = ctx.command("git", Cwd::Root)?;
+    clear_git_checkout_override(&mut command);
     Ok(command)
 }
 
@@ -36,6 +43,9 @@ fn git_text<const N: usize>(ctx: &Ctx, run: &Run<'_>, args: [&str; N]) -> Result
 }
 
 pub(super) fn origin(ctx: &Ctx, run: &Run<'_>) -> Result<Option<String>, Fail> {
+    if !ctx.root.path().join(".git").exists() {
+        return Ok(None);
+    }
     let output = git_text(ctx, run, ["config", "--get", "remote.origin.url"])?;
     if output.status.code() == Some(1) {
         return Ok(None);
@@ -80,19 +90,7 @@ pub(super) fn validate_destination(
     from_origin: bool,
 ) -> Result<(), Fail> {
     if from_origin {
-        for mode in [None, Some("--push")] {
-            let mut command = git(ctx)?;
-            command.args(["remote", "get-url", "--all"]);
-            command.args(mode);
-            command.arg("origin");
-            let urls = text(
-                probe(run, command)?,
-                "could not resolve bootstrap repository URLs",
-            )?;
-            for effective in urls.split('\n') {
-                check_url(effective, expected)?;
-            }
-        }
+        validate_remote(ctx, run, ctx.root.path(), "origin", expected)?;
     } else {
         let output = git_text(ctx, run, ["ls-remote", "--get-url", "--", url])?;
         let fetch = text(output, "could not resolve the bootstrap fetch URL")?;
@@ -163,8 +161,10 @@ pub(super) fn validate_native_source(
     run: &Run<'_>,
     value: &str,
     vars: &Vars,
-) -> Result<(), Fail> {
-    let (repo, _) = value.rsplit_once("?ref=").unwrap_or((value, ""));
+) -> Result<String, Fail> {
+    let (repo, reference) = value
+        .split_once("?ref=")
+        .map_or((value, None), |(repo, reference)| (repo, Some(reference)));
     let setting = RepoSetting::parse(repo)?;
     let url = transport_url(repo);
     let expected = vars.source_repo.as_ref().unwrap_or(&setting);
@@ -173,7 +173,126 @@ pub(super) fn validate_native_source(
             "the requested bootstrap source does not match dots_source_repo",
         ));
     }
-    validate_destination(ctx, run, &url, expected, false)
+    validate_destination(ctx, run, &url, expected, false)?;
+    Ok(match reference {
+        Some(reference) => format!("{url}?ref={reference}"),
+        None => url,
+    })
+}
+
+fn validate_remote(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    checkout: &Path,
+    remote: &str,
+    expected: &RepoSetting,
+) -> Result<(), Fail> {
+    for mode in [None, Some("--push")] {
+        let mut command = git(ctx)?;
+        command
+            .arg("-C")
+            .arg(checkout)
+            .args(["remote", "get-url", "--all"]);
+        command.args(mode).arg("--").arg(remote);
+        let urls = text(
+            probe(run, command)?,
+            "could not resolve bootstrap repository URLs",
+        )?;
+        for effective in urls.split('\n') {
+            check_url(effective, expected)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_update(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    vars: &Vars,
+    source: Option<&(&str, String)>,
+    from_dir: Option<&OsString>,
+) -> Result<(), Fail> {
+    let root = ctx.root.path();
+    let checkout = match source {
+        Some(("from", _)) => {
+            let path = if let Some(path) = from_dir {
+                PathBuf::from(path)
+            } else if let Some(data) = ctx.env.get("MISE_DATA_DIR").filter(|dir| !dir.is_empty()) {
+                PathBuf::from(data).join("bootstrap-repo")
+            } else {
+                let data = ctx
+                    .env
+                    .get("XDG_DATA_HOME")
+                    .filter(|dir| !dir.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| ctx.env.home().map(|home| home.join(".local/share")))
+                    .ok_or_else(|| {
+                        Fail::usage(
+                            "set HOME or MISE_DATA_DIR before updating a bootstrap checkout",
+                        )
+                    })?;
+                data.join("mise/bootstrap-repo")
+            };
+            root.join(path)
+        }
+        _ => root.to_owned(),
+    };
+    if !checkout.join(".git").exists() {
+        return Ok(());
+    }
+    let query = |args: &[&str]| {
+        let mut command = git(ctx)?;
+        command.arg("-C").arg(&checkout).args(args);
+        probe(run, command)
+    };
+    if source.is_none()
+        && !query(&["rev-parse", "--symbolic-full-name", "@{upstream}"])?
+            .status
+            .success()
+    {
+        // Unadorned mise bootstrap skips the global checkout when it has no upstream.
+        return Ok(());
+    }
+
+    let selected = if let Some((_, url)) = source {
+        Some(RepoSetting::parse(
+            url.split_once("?ref=").map_or(url, |(repo, _)| repo),
+        )?)
+    } else if vars.source_repo.is_none() {
+        Some(RepoSetting::parse(&origin(ctx, run)?.ok_or_else(
+            || {
+                Fail::usage(
+                    "set dots_source_repo or configure the source origin before bootstrap --update",
+                )
+            },
+        )?)?)
+    } else {
+        None
+    };
+    let expected = vars
+        .source_repo
+        .as_ref()
+        .or(selected.as_ref())
+        .expect("configured source");
+    if source.is_some_and(|(_, url)| url.contains("?ref=")) {
+        return validate_remote(ctx, run, &checkout, "origin", expected);
+    }
+
+    // A reused checkout without a requested ref uses git pull, just like
+    // mise's global-checkout update. Git chooses the branch remote, else origin.
+    let branch = query(&["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    let remote = if branch.status.success() {
+        let branch = text(branch, "could not identify the bootstrap update branch")?;
+        let setting = query(&["config", "--get", &format!("branch.{branch}.remote")])?;
+        if setting.status.code() == Some(1) {
+            "origin".to_owned()
+        } else {
+            text(setting, "could not resolve the bootstrap update remote")?
+        }
+    } else {
+        "origin".to_owned()
+    };
+    validate_remote(ctx, run, &checkout, &remote, expected)
 }
 
 fn reference(ctx: &Ctx, run: &Run<'_>, name: &str) -> Result<Option<String>, Fail> {

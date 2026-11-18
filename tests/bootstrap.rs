@@ -983,3 +983,45 @@ fn unchanged_remote_delegates_native_adoption_and_connection_options() {
         );
     }
 }
+
+#[test]
+fn new_bootstrap_update_checks_the_effective_upstream_before_running_mise() {
+    let world = World::new();
+    minimal(&world);
+    let expected = "https://expected.invalid/config";
+    write(
+        &world.root().join("config.toml"),
+        &format!("{MINIMAL}dots_source_repo = \"{expected}\"\n"),
+        0o644,
+    );
+    let git = |args: &[&str]| {
+        let mut command = world.git();
+        isolate(&world, &mut command);
+        assert_success(&run(command.args(args)));
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["add", "--all"]);
+    git(&["commit", "-m", "Seed fixture"]);
+    git(&["remote", "add", "origin", expected]);
+    git(&["remote", "add", "alternate", expected]);
+    git(&["update-ref", "refs/remotes/alternate/main", "HEAD"]);
+    git(&["branch", "--set-upstream-to=alternate/main"]);
+    git(&[
+        "config",
+        "--add",
+        "remote.alternate.pushurl",
+        "https://other.invalid/config",
+    ]);
+    let output = run(fake(&world).args(["bootstrap", "--update"]));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("outside the expected bootstrap repository")
+    );
+
+    git(&["config", "--unset-all", "remote.alternate.pushurl"]);
+    let output = run(fake(&world).args(["bootstrap", "--update"]));
+    assert_success(&output);
+    assert!(stdout(&output).contains("--update"), "{output:?}");
+}

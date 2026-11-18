@@ -1,0 +1,82 @@
+name: Rust
+
+on:
+  pull_request:
+  push:
+    branches: [rust, main]
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.100.0"
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+            target: x86_64-apple-darwin
+          - os: macos-15
+            arch: arm64
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-musl
+    env:
+      ARCH: ${{ matrix.arch }}
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install musl C tools and shells
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools bash zsh fish
+          printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
+            "$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
+
+      - name: Install Fish on macOS
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: Verify shell executables
+        run: |
+          bash --version
+          zsh --version
+          fish --version
+
+      - name: Install the pinned Rust toolchain and target
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --target "$CARGO_BUILD_TARGET"
+
+      - name: Install standalone mise
+        shell: bash
+        env:
+          MISE_VERSION: v2026.11.9
+        run: |
+          curl -fsSL https://mise.run | sh
+          "$HOME/.local/bin/mise" --version
+          test "$("$HOME/.local/bin/mise" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
+          printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check formatting
+        run: rustup run "$RUST_VERSION" cargo fmt --all -- --check
+
+      - name: Lint
+        run: mise run clippy
+
+      - name: Run all tests natively
+        run: mise run test

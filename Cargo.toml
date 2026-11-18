@@ -1,0 +1,23 @@
+[package]
+name = "dots-cli"
+version = "1.0.0-rc.1"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "A dotfiles and machine setup manager for mise"
+repository = "https://github.com/EzraCerpac/dots"
+
+[[bin]]
+name = "dots"
+path = "src/main.rs"
+
+[dependencies]
+clap = "4.6.8"
+nix = { version = "0.32.0", features = ["user"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+toml_edit = "0.25.19"
+
+[profile.release]
+panic = "unwind"

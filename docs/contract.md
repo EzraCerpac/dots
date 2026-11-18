@@ -172,28 +172,35 @@ Then, in order:
 
 The seed commit:
 
+- It is a root commit, with no parents.
 - It contains exactly the files at embedded template paths that are regular files, not ignored by the repository or the user, whose bytes and file mode equal the embedded template, whichever run of `init` wrote them.
 - Every other file stays out of it and on disk as it is, including a `config.toml` that differs from its template because it existed before `init` or was edited since.
 - Without a configured Git identity, `init` supplies a synthetic author for that one commit only, on the command line; it never writes Git configuration.
 - `main` and `dev` both point at it, and `HEAD` is on `dev`.
 
-The seed is **pristine** while all of these hold: `main` and `dev` exist and point at one root commit whose tree is exactly embedded template content, `HEAD` is on `dev`, there is no `origin`, and nothing has been committed since.
+The seed is **pristine** while all of these hold:
+
+- `main` and `dev` exist and point at the same commit, which has no parents, so no unrelated commit is part of it.
+- Its tree contains only zero or more embedded template files, each at its template path with the template's bytes and file mode; any subset of the templates, including none, qualifies.
+- `HEAD` is on `dev`, there is no `origin`, and nothing has been committed since.
 
 The remote step:
 
 1. `init` offers to create a remote only in the run that created the seed, and only when stdin and stdout are terminals, `gh` is on `PATH`, and `gh` reports a signed-in account.
 2. The offer is a private GitHub repository named `dotfiles`; the default answer is no.
-3. On yes, `init` creates the repository, adds it as `origin`, and pushes `main` and `dev` from the seed, without force.
-4. When any part fails, `init` keeps the local configuration, reports what did and did not happen, and prints only the remaining commands: no `git remote add` when `origin` was already added.
+3. On yes, `init` creates the repository, adds it as `origin`, and pushes the verified seed without force, as below.
+4. When any part fails, `init` keeps the local configuration, reports what did and did not happen, and prints only the remaining commands; when `origin` was already added, that is only the push of the verified seed.
    It still exits 0.
 5. A noninteractive run never creates a remote, and a later run never asks again.
 6. In every run where the seed is still pristine and no remote was created, `init` prints the two commands for a new, empty remote repository:
 
    ```sh
    git -C DIR remote add origin URL
-   git -C DIR push origin main:main main:dev
+   git -C DIR push origin SEED_OID:refs/heads/main SEED_OID:refs/heads/dev
    ```
 
+   Every seed push, automatic or printed, uses the full commit ID of the seed, captured after verifying that it is pristine, as each source, and fully qualified branch names as destinations.
+   A printed command shows that ID literally in place of `SEED_OID`, never a branch name that could move later.
 7. It says that these publish only the seed, and that later changes are shared with `dots sync`, which scans them first.
 8. For any other repository without `origin`, it prints only `git -C DIR remote add origin URL`, followed by `dots sync` on `dev`, which scans every local commit before it pushes `dev`.
    It never prints a push for such a repository, so a new remote is never seeded with unscanned files, and `main` on the remote stays as the user leaves it.
@@ -211,7 +218,8 @@ The remote step:
 | set | present, not matching | Diagnostic: `origin` is not the configured repository |
 
 In local-only mode, the sync stage of `dots up` is skipped with one line, and `dots sync` prints a one-line receipt saying how to add a remote, then exits 0.
-Local-only sync makes no network call, runs no scan and makes no commit.
+Local-only `dots sync` skips its whole pipeline: it saves no history, captures no copies, makes no network call, scan or commit, and applies nothing.
+`dots apply` applies declarations locally, and `dots up` still runs its own checkpoints.
 A configuration that names a remote, or has an `origin`, is never local-only: an unreachable remote is reported as offline and work waits for the next run.
 A reachable `origin` without `dev` or `main` is online, not offline.
 Sync then scans every local commit that no published branch contains, creates `dev` with an ordinary push, and treats a missing `main` as empty; sync never creates or moves `main`.
@@ -496,6 +504,9 @@ The selectors are `--base` (`config.toml`), `--profile P` (`config.P.toml`) and 
 Without a selector, `dots add` writes to the selected profile's file, and stops with exit status 2 when no profile is selected.
 A selected file that does not exist, such as a new `config.PROFILE.toml`, is created only once a request succeeds; a failed request leaves no new or empty file.
 `--asset` or `--keep-installed` with a file request exits 2.
+For a file request, `dots add` and `dots remove` accept only a selected file that is `ROOT/config.toml` or `ROOT/config.PROFILE.toml` for a profile in `dots_profiles`, after resolving `--path` and any symlinks.
+Any other selected file, including one a symlink leads out of that set, is refused with exit status 2 before anything changes, so every adoption can be reversed through the selector that made it.
+For a software request, `--path FILE` keeps its usual meaning.
 
 ### `dots add SOFTWARE...`
 
@@ -664,6 +675,7 @@ It first checks that the repository is on GitHub; otherwise it exits 1 with one 
 By default it publishes exactly one unpublished working change directly above `main@origin`.
 `--bookmark NAME` publishes an existing private `wip/...` bookmark.
 `--all` publishes the current stack, offering to merge `main@origin` into it first.
+It fails with exit status 1 before any push or pull request when `main` does not exist on the remote.
 It scans the outgoing commits with gitleaks, asks for confirmation, pushes a bookmark without force, and opens or updates the pull request.
 When `dots_publish_on_behalf_of` names a person, the pull request text notes that a model, named by `DOTS_PUBLISH_MODEL` when set, wrote it on that person's behalf.
 It exits 3 when conflicts stop it, and 1 on other failures.
@@ -1007,7 +1019,7 @@ An implementation may choose and change these freely; nothing outside `dots` may
 - Where `dots` records the skill links and the GitHub apps it installed.
 - How stages are supervised: processes, pseudo-terminals, threads and any internal protocol between them.
 - How children reach the running `dots` on `PATH`.
-- The variables `dots bootstrap` uses to pass options to its own completion task.
+- The variables `dots bootstrap` uses to pass options, such as `--restore`, to its own callbacks, `persist-selected` and `complete`.
 - The exact Git and mise commands `dots` runs to produce the behaviour described here.
 - The wording of messages, beyond what each line must say.
 

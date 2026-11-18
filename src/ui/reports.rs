@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 
@@ -23,11 +24,12 @@ pub(super) fn list(env: &Env, command: Option<Command>, out: &mut impl Write) ->
         };
         let path = report::path(env, &entry.id)
             .map_err(|error| Fail::new(1, format!("could not locate saved report: {error}")))?;
-        let path: String = path
-            .to_string_lossy()
-            .chars()
-            .flat_map(char::escape_debug)
-            .collect();
+        let path = path.to_string_lossy();
+        let path = if path.contains(char::is_control) {
+            Cow::Owned(path.escape_debug().to_string())
+        } else {
+            path
+        };
         writeln!(
             out,
             "dots {}  {}  {} (exit {})\n  {path}",

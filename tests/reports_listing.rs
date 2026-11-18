@@ -41,7 +41,7 @@ fn new_reports_list_newest_first_in_pipes_and_redirects() {
     let world = World::new();
     let old = save(
         &world,
-        "z-old.json",
+        "z-old's report.json",
         "remove",
         1_704_067_200_000,
         0,

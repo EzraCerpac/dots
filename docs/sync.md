@@ -45,7 +45,7 @@ Any other URL matches only an `origin` with exactly the same string.
 `dots` refuses a URL carrying a password or token, a remote-helper form such as `ext::`, and a value starting with `-`.
 
 Credentials come from your normal Git setup: SSH keys, or a configured credential helper.
-Git never prompts for credentials during sync, so check that `git push origin dev` works in the checkout without a prompt.
+Sync needs credentials that work without a prompt. Use the action in the sync receipt if authentication fails.
 A repository that needs authentication belongs on `https://` or SSH, not `http://`.
 Before contacting a remote, `dots` resolves the effective fetch URL and every push URL after Git's URL rewrites on this machine, and stops unless each one matches the expected repository.
 
@@ -130,6 +130,7 @@ Otherwise the receipt leads with any issue and its next action, then lists up to
 - **Updated in this checkout**: files that reached the configuration checkout; a later failure to deploy a dotfile is reported separately.
 - **Finished after an interruption**: an update the previous run left pending.
 
+For live and replayed patches, gitleaks must clear both file versions and the displayed text.
 When stdin and stdout are terminals, standalone sync may show a complete small text diff for up to two paths and twelve displayed lines.
 Piped output, `--plain` output and saved reports carry metadata only, never file contents.
 When recording the receipt fails, sync still prints it and warns that it could not save it for replay.
@@ -152,7 +153,7 @@ Each issue names what happened and the next action; start from what the receipt 
 | Not pushed: an unsafe outgoing commit | An unpushed commit on `dev` contains a finding, or once tracked a machine-local file. Rewrite that commit out of `origin/dev..dev` by hand (it was never published), then sync again. |
 | Not pushed: `origin/dev` kept moving | Three pushes in a row lost a race. Nothing to do; the next run retries. |
 | Not pushed: the push failed or timed out | Git's own error, such as rejected credentials or a protected branch, or a credential helper waiting for input. Local work is committed on `dev`; fix the cause and sync again. |
-| Offline | `origin` was unreachable. Local work is committed and applied; the next run pushes it. |
+| Offline | `origin` was unreachable. Check the receipt for what was saved or applied locally. Retry when online so sync can scan, validate and push eligible work. |
 | Invalid merged configuration | The merged configuration fails mise's checks with this machine's local files, so nothing was pushed or applied. Fix the error locally or upstream and sync again. |
 | Late edit | A file changed while sync was updating files, so sync left it alone. Sync again. |
 | Blocked path | Local material sits where an incoming tracked path goes. Move it somewhere safe, sync again, then compare it with what arrived. |
@@ -166,15 +167,16 @@ Each issue names what happened and the next action; start from what the receipt 
 ## Exit status
 
 `dots sync` with valid arguments always exits 0, including a missing configuration, a missing mise or gitleaks, a stopped run and a cancelled one; the receipt carries the problem.
-With any argument other than `--last`, it exits 2.
-Inside `dots up`, a sync problem makes the sync stage deferred: it is listed under "Needs attention", later stages still run, and on its own it never makes `dots up` exit 1.
+Invalid sync arguments exit 2. The help flags print usage.
+Inside `dots up`, a sync problem makes the sync stage deferred: it is listed under "Needs attention", independent later stages can still run, and on its own it never makes `dots up` exit 1.
+Cancellation prevents any further stage from starting.
 
 ## Requirements
 
 - Git 2.43 or newer; sync checks this itself and skips on an older Git.
 - gitleaks, for every share and push, and for patches in `dots sync --last`.
 - Credentials that work without a prompt, as above.
-- A `.gitignore` that ignores the machine-local files, and a `.gitleaks.toml`; `dots init` writes both.
+- Git ignore rules that protect machine-local files. `dots init` writes a `.gitignore` and also provides `.gitleaks.toml` to configure the scan.
 
 ## Reviewed changes into main
 

@@ -117,7 +117,8 @@ Bootstrap hooks also get:
 - `DOTS_BUNDLE_FD`: the number of a read-only file descriptor holding the bundle's `secrets` object as UTF-8 JSON.
 
 Each hook gets its own descriptor, readable from the start.
-The object is `{}` when no bundle was requested and when private recovery is not ready, so `{}` with `DOTS_PRIVATE_READY=1` means nothing was requested.
+The object is `{}` when recovery is not ready, when no bundle was requested, or when a valid bundle has no secrets.
+Check `DOTS_PRIVATE_READY` for readiness and check the object for each secret your hook needs.
 `dots` never writes a value to a plaintext file, an environment variable or an argument, and never prints one.
 The hook is responsible for what it prints, where it writes values, keeping files that already exist, and closing the descriptor before it starts long-lived children.
 
@@ -144,6 +145,7 @@ Writing app files, credential helpers or service enrollment from bundle values b
 ## Commands
 
 `dots NAME ARGS...` runs `commands/NAME` when `NAME` is not a built-in command, starts with a letter or digit and continues with letters, digits, `.`, `_` or `-`, and the file is a regular executable.
+The name `internal` is reserved even when an executable has that name.
 Built-in commands win, so a command named `root`, `profile`, `mise` or `brew`, for example, is never reached.
 
 - The arguments reach it unchanged, `--help` included.
@@ -187,10 +189,11 @@ A recipe can prompt, as a hook can.
 | `hold-formula TOKEN VERSION [REASON]` | Succeeds when exactly that version is installed, else refuses with exit 1 |
 | `hold-cask TOKEN VERSION APP_PATH [REASON]` | The same, reading the version from the app bundle at `APP_PATH` |
 | `path`, `version formula\|cask TOKEN` | Print the Homebrew executable, or a package's installed version |
-| `admin-available` | Exits 0 when administrator access is available without a prompt, else 1 |
+| `admin-available` | Exits 0 for root, cached sudo access, or terminal stdin and stdout where authorization can prompt. Otherwise exits 1 |
 | `defer-for-admin TOKEN` | Says `TOKEN` needs interactive administrator access and exits 3 |
 | `record formula\|cask TOKEN installed\|updated [BEFORE]` | Appends a change line to `DOTS_CHANGES` |
 
+`--auto-updates` opts into upgrading a self-updating cask.
 `update-cask` and `update-formula` record each verified installation or upgrade themselves.
 On a system other than macOS, the first four print that the package is macOS-only and exit 4, which reports the recipe as skipped.
 Hold commands never install, upgrade or remove anything.

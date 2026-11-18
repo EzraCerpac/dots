@@ -13,17 +13,18 @@ Find the configuration and this machine's selection before changing anything:
 dots root            # the configuration root
 dots profile         # this machine's profile
 dots help            # every command, including the configuration's own
-dots COMMAND --help  # one built-in command's usage
+dots add --help      # usage for the built-in add command
 ```
 
 `$(dots root)/dots/README.md` documents hooks, commands, installer exceptions and retired dotfiles for this configuration.
-If it describes sourcing shell libraries from a manager directory, it predates 1.0; trust `dots help` and `dots COMMAND --help` instead.
+If it describes sourcing shell libraries from a manager directory, it predates 1.0; use `dots help` for the current command list.
+`dots test` and `dots mise` pass `--help` to the child, as do configuration commands.
 
 > TODO(R-01): Confirm this skill reads correctly once extracted on its own, with nothing else from the dots repository beside it.
 
 ## Safe and unsafe commands
 
-Read-only, run freely:
+These commands inspect the configuration or preview an action. Some save a private report, and invocation can refresh agent skill links.
 
 ```sh
 dots status                     # programs, profile, source, packages, tools, dotfiles, history, skill links
@@ -35,10 +36,10 @@ dots remove --dry-run TARGET    # what removing TARGET would do
 
 These change the machine, the configuration or a remote repository.
 Run them only when the user asks for that action, and otherwise say which command the user should run:
-`dots up`, `dots sync`, `dots apply`, `dots add`, `dots remove`, `dots init`, `dots bootstrap`, `dots remote`, `dots backup`, `dots restore`, `dots publish`, `dots profile --profile`, `dots exceptions`, `dots retire-dotfiles`, `dots enroll-history`.
+`dots up`, `dots sync`, `dots apply`, `dots add`, `dots remove`, `dots init`, `dots bootstrap`, `dots remote`, `dots backup`, `dots restore`, `dots publish`, `dots profile --profile PROFILE --machine-id ID`, `dots exceptions`, `dots retire-dotfiles`, `dots enroll-history`.
 `dots mise ARGS...` and configuration commands do whatever they run.
 
-When the configuration has a remote, `dots up` and `dots sync` commit every public edit in the live checkout and push it to the shared `dev` branch.
+In shared mode, `dots sync` and the sync stage of `dots up` can publish eligible edits to `dev` once scanning, validation, checkout and remote checks pass.
 Do not run them while someone else has uncommitted edits there, and do not leave half-finished edits there yourself.
 
 ## Profiles
@@ -56,7 +57,8 @@ Prefer `dots add`, which installs first and records only what worked:
 dots add ripgrep                       # the selected profile's config.PROFILE.toml
 dots add --base ripgrep                # config.toml, every profile
 dots add --profile server ripgrep      # another profile's file
-dots add npm:prettier cargo:hexyl brew-cask:firefox
+dots add npm:prettier cargo:hexyl
+dots add brew-cask:firefox             # macOS only
 dots add https://github.com/OWNER/REPO
 dots remove --dry-run ripgrep
 dots remove ripgrep
@@ -96,13 +98,17 @@ When you remove a source that a setup script once declared in machines' `config.
 App-written files that must not be shared in plain text go in encrypted settings history, one stream per machine:
 
 ```toml
-"~/.config/app/state.json" = { mode = "track", encrypt = true, variants = [{ profile = "host-MACHINE_ID" }] }
+[dotfiles]
+"~/.config/app/state.json" = { mode = "track", encrypt = true, variants = [{ profile = "host-my-laptop" }] }
 ```
 
 - Every tracked entry is `encrypt = true`; `dots` refuses to save one that is not.
-- List each machine that keeps the file as its own `{ profile = "host-MACHINE_ID" }` variant.
+- List each machine that keeps the file as its own `{ profile = "host-my-laptop" }` variant.
   Never rename or remove an existing variant: it names that machine's stream in history.
-- `dots backup` saves and publishes to the private `dots_state_repo`; `dots restore` only fetches.
+- `dots restore` fetches private history and uses mise to apply it to the actual tracked files.
+  Mise can checkpoint live content locally for undo, encrypted to the configured recipients.
+  If both sides changed the same lines, restore exits 1 and keeps the live edit.
+  Only an explicit `dots backup` publishes those checkpoints as part of the private history.
 - Bootstrap secrets come from an age-encrypted bundle and reach bootstrap hooks only through the file descriptor in `DOTS_BUNDLE_FD`.
   Never print a value, write it to a shared file, or pass it as an argument or environment variable.
 
@@ -140,7 +146,7 @@ Make them executable (`chmod +x`), keep them safe to rerun, and check their synt
 - `dots up --last` prints the saved update report and returns its recorded exit status.
   Captured stages have private logs under `${XDG_STATE_HOME:-~/.local/state}/dots/`. A failed step that had the terminal gives its exit status and next action, with its output in scrollback.
 - `dots sync --last` replays the last sync receipt.
-  The sync guide, `docs/sync.md` in the dots repository, explains each kind of sync issue.
+  The [sync guide](https://github.com/EzraCerpac/dots/blob/main/docs/sync.md) explains each kind of sync issue.
 - In a terminal, `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
 - Run `dots` for help, including the configuration's commands.
 

@@ -8,16 +8,16 @@ For anyone reviewing a pull request here, human or automated.
 - `dots` is a generic dotfiles manager layered on mise.
   Nothing here may assume one person's configuration: owner- and machine-specific behaviour comes only from the configuration (`[vars] dots_*` and the `dots/` directory).
 - An ordinary `dots up` never prunes software, restarts services or updates project dependencies.
-- `dots` never overwrites a file or an edit it did not make, and replaces the files it owns atomically.
+- During guarded writes and rollback, preserve concurrent edits and files that obstruct the operation. Replace owned files atomically where the contract requires it.
   When a step of `dots add` or `dots remove` fails, it puts back only what it changed.
 - A command checks only the programs its requested action uses; a missing one fails that action with one line naming it, without failing an inspection command or a stage with nothing to do.
 - Ctrl-C cancels every active stage's process group, starts no further stage, and waits for cleanup before saving the report or exiting, with the statuses the contract gives.
 - `dots up` prints each step and its result in terminal scrollback. Hooks, recipes and known interactive steps own the terminal from the start, and `dots` never reads their replies.
   Ordinary steps keep private logs. A failed step that had the terminal gives its status and next action and points to scrollback without saving a tail or log.
-  A supervised individual command runs its child in the caller's foreground with direct stdin, stdout and stderr, byte for byte, so native prompts such as `sudo` or `ssh` work, and adds no banner or footer around that output.
+  An individual command covered by the contract’s direct-output rules runs its child in the caller's foreground with direct stdin, stdout and stderr, byte for byte, so native prompts such as `sudo` or `ssh` work, and adds no banner or footer around that output.
 - A child that `dots` starts directly has the running `dots` first on `PATH`, after the configuration environment.
   An explicit `dots mise exec` or `dots mise run` follows mise's own `PATH` rules, and mise's native bootstrap callbacks use the configuration's pinned `dots`; neither is that guarantee.
-- A tracked history file is never saved unless it is declared `encrypt = true`, and bundle values never reach a file, argument, environment variable or output from `dots`.
+- A tracked history file is never saved unless it is declared `encrypt = true`, and `dots` keeps plaintext bundle values out of files, arguments, environment variables and its output.
 - `dots sync` with valid arguments always exits 0 and prints a receipt.
   The receipt records verified sharing, local saves and checkout updates, and each issue carries a diagnostic and recovery action.
   Patch contents appear only on a terminal, after a clean gitleaks screen; piped, `--plain` and saved receipts carry metadata only.

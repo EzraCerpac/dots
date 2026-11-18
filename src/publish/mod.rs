@@ -11,7 +11,7 @@ use crate::report;
 use crate::run::{Outcome, Run, Sink};
 use crate::{Args, Ctx, Fail};
 
-use repo::Workspace;
+use repo::{Workspace, jj_commit};
 
 const MERGE_DESCRIPTION: &str = "Merge main into unpublished setup stack";
 const AGGREGATE_PREFIX: &str = "wip/dotfiles-all-";
@@ -92,7 +92,10 @@ fn publish_source(
     let mut outgoing = outgoing_commits(&workspace, &base, &revision)?;
     if matches!(selection, Selection::Working)
         && (outgoing.len() != 1
-            || workspace.revisions(&format!("{working}-"))?.as_slice() != [base.as_str()])
+            || workspace
+                .revisions(&format!("{}-", jj_commit(&working)))?
+                .as_slice()
+                != [base.as_str()])
     {
         return Err(failure(
             "default publishing requires exactly one unpublished working change directly above main@origin; use --all or --bookmark",
@@ -104,13 +107,23 @@ fn publish_source(
 
     if matches!(selection, Selection::All)
         && !workspace
-            .revisions(&format!("{base} ~ ::{revision}"))?
+            .revisions(&format!(
+                "{} ~ ::{}",
+                jj_commit(&base),
+                jj_commit(&revision)
+            ))?
             .is_empty()
     {
         terminal.confirm("Merge main@origin into the current unpublished stack?")?;
         workspace.require_unchanged(&base, "@", &working)?;
         workspace.jj(
-            &["new", "-m", MERGE_DESCRIPTION, &revision, &base],
+            &[
+                "new",
+                "-m",
+                MERGE_DESCRIPTION,
+                &jj_commit(&revision),
+                &jj_commit(&base),
+            ],
             "merge main into the stack",
         )?;
         working = workspace.one_revision("@")?;
@@ -120,7 +133,14 @@ fn publish_source(
 
     scan::outgoing(&workspace, &base, &revision)?;
     let diff = workspace.jj(
-        &["diff", "--git", "--from", &base, "--to", &revision],
+        &[
+            "diff",
+            "--git",
+            "--from",
+            &jj_commit(&base),
+            "--to",
+            &jj_commit(&revision),
+        ],
         "preview changes",
     )?;
     if diff.stdout.is_empty() && matches!(selection, Selection::Working | Selection::All) {
@@ -130,7 +150,20 @@ fn publish_source(
     }
     terminal.message("Secret scan: gitleaks found nothing in the commits to publish.\n")?;
     if terminal.input.is_some() {
-        terminal.message("Proposed diff against main@origin:\n")?;
+        terminal.message("Proposed changes, commit by commit (from main@origin):\n")?;
+        for commit in &outgoing {
+            let description = workspace.description(commit)?;
+            let patch = workspace.jj(
+                &["diff", "--git", "-r", &jj_commit(commit)],
+                "preview an outgoing commit",
+            )?;
+            terminal.message(&format!("\nCommit {}\n{description}\n", &commit[..12]))?;
+            terminal
+                .output
+                .write_all(&patch.stdout)
+                .map_err(output_error)?;
+        }
+        terminal.message("\nFinal pull request diff against main@origin:\n")?;
         terminal
             .output
             .write_all(&diff.stdout)
@@ -160,7 +193,7 @@ fn publish_source(
 
     let (name, existing) = match selection {
         Selection::Bookmark(name) => (name.to_owned(), open_request(&workspace, name)?),
-        Selection::All => aggregate_request(&workspace, &base, &revision)?,
+        Selection::All => aggregate_request(&workspace, &revision)?,
         Selection::Working => {
             let name = format!("wip/dotfiles-{}", workspace.change_id(&revision)?);
             let request = open_request(&workspace, &name)?;
@@ -204,7 +237,10 @@ fn publish_source(
     )?;
     terminal.message(&format!("Published {name}: {url}\n"))?;
     if !matches!(selection, Selection::Bookmark(_)) && workspace.one_revision("@")? == revision {
-        workspace.jj(&["new", &revision], "create an empty working change")?;
+        workspace.jj(
+            &["new", &jj_commit(&revision)],
+            "create an empty working change",
+        )?;
     }
     Ok(())
 }
@@ -214,7 +250,8 @@ fn outgoing_commits(
     base: &str,
     head: &str,
 ) -> Result<Vec<String>, Fail> {
-    let range = format!("{base}..{head}");
+    let head = jj_commit(head);
+    let range = format!("{}..{head}", jj_commit(base));
     if !workspace
         .revisions(&format!("({range} | {head}) & conflicts()"))?
         .is_empty()
@@ -309,11 +346,10 @@ fn open_request(workspace: &Workspace<'_, '_>, name: &str) -> Result<Option<Pull
 
 fn aggregate_request(
     workspace: &Workspace<'_, '_>,
-    base: &str,
     head: &str,
 ) -> Result<(String, Option<PullRequest>), Fail> {
     let mut prior = None;
-    for name in workspace.aggregate_bookmarks(base, head)? {
+    for name in workspace.aggregate_bookmarks(head)? {
         if let Some(request) = find_request(workspace, &name)?
             && request.state == "OPEN"
             && prior.replace((name, Some(request))).is_some()

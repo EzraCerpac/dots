@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -196,7 +197,12 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             Some(0) => {
                 let dev = object_id(stdout(&out)?.trim())?;
                 if !self
-                    .revisions(&format!("({dev} & ::{head}) ~ ::{base}"))?
+                    .revisions(&format!(
+                        "({} & ::{}) ~ ::{}",
+                        jj_commit(dev),
+                        jj_commit(head),
+                        jj_commit(base)
+                    ))?
                     .is_empty()
                 {
                     return Err(failure(
@@ -251,7 +257,14 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
 
     pub(super) fn description(&self, commit: &str) -> Result<String, Fail> {
         let out = self.jj(
-            &["log", "--no-graph", "-r", commit, "-T", "description"],
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &jj_commit(commit),
+                "-T",
+                "description",
+            ],
             "read the change description",
         )?;
         Ok(stdout(&out)?.trim().to_owned())
@@ -260,12 +273,13 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
     pub(super) fn stack_head(&self, working: &str) -> Result<String, Fail> {
         let mut head = working.to_owned();
         loop {
+            let revision = jj_commit(&head);
             let out = self.jj(
                 &[
                     "log",
                     "--no-graph",
                     "-r",
-                    &head,
+                    &revision,
                     "-T",
                     "if(empty, \"yes\", \"no\") ++ \"\\n\" ++ description",
                 ],
@@ -277,7 +291,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             if empty != "yes" || !description.trim().is_empty() {
                 break;
             }
-            let parents = self.revisions(&format!("{head}-"))?;
+            let parents = self.revisions(&format!("{revision}-"))?;
             let [parent] = parents.as_slice() else { break };
             head = parent.clone();
         }
@@ -286,7 +300,14 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
 
     pub(super) fn change_id(&self, commit: &str) -> Result<String, Fail> {
         let out = self.jj(
-            &["log", "--no-graph", "-r", commit, "-T", "change_id"],
+            &[
+                "log",
+                "--no-graph",
+                "-r",
+                &jj_commit(commit),
+                "-T",
+                "change_id",
+            ],
             "read the change ID",
         )?;
         let id = stdout(&out)?.trim();
@@ -325,13 +346,13 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         }
     }
 
-    pub(super) fn aggregate_bookmarks(&self, base: &str, head: &str) -> Result<Vec<String>, Fail> {
+    pub(super) fn aggregate_bookmarks(&self, head: &str) -> Result<Vec<String>, Fail> {
         let out = self.jj(
             &[
                 "bookmark",
                 "list",
                 "-r",
-                &format!("{base}..{head}"),
+                &format!("::{}", jj_commit(head)),
                 "-T",
                 "name ++ \"\\n\"",
             ],
@@ -351,14 +372,15 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(names)
     }
 
-    pub(super) fn gitleaks(&self, root: &Path, rules: &Path) -> Result<(), Fail> {
+    pub(super) fn gitleaks(&self, root: &Path, target: &OsStr, rules: &Path) -> Result<(), Fail> {
         let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(root))?;
         cmd.args(["dir", "--no-banner", "--redact=100", "--exit-code=20"]);
         cmd.arg("--config")
             .arg(rules.join(".gitleaks.toml"))
             .arg("--gitleaks-ignore-path")
             .arg(rules)
-            .arg(".");
+            .arg("--")
+            .arg(target);
         let output = self.probe(cmd, "gitleaks")?;
         match output.status.code() {
             Some(0) => Ok(()),
@@ -373,18 +395,20 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
 
     pub(super) fn save_bookmark(&self, name: &str, commit: &str) -> Result<(), Fail> {
         let previous = self.revisions(&Self::bookmark_expression(name))?;
+        let target = jj_commit(commit);
         match previous.as_slice() {
             [] => self.jj(
-                &["bookmark", "create", name, "-r", commit],
+                &["bookmark", "create", name, "-r", &target],
                 "create the publish bookmark",
             )?,
             [old] if old == commit => return Ok(()),
             [old] => {
-                if !self.revisions(&format!("{old} ~ ::{commit}"))?.is_empty() {
+                let old = jj_commit(old);
+                if !self.revisions(&format!("{old} ~ ::{target}"))?.is_empty() {
                     return Err(stale());
                 }
                 self.jj(
-                    &["bookmark", "move", name, "--from", old, "--to", commit],
+                    &["bookmark", "move", name, "--from", &old, "--to", &target],
                     "advance the publish bookmark",
                 )?
             }
@@ -423,7 +447,19 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         if stdout(&target)?.strip_suffix('\n') != Some(origin.preferred_push.as_str()) {
             return Err(failure("could not verify a single push URL for origin"));
         }
-        let refspec = format!("{commit}:refs/heads/{name}");
+        let reference = format!("refs/heads/{name}");
+        // A valid full-hex ref name must not override the approved object.
+        let source = git_commit(commit);
+        let resolved = self.git(
+            &["rev-parse", "--verify", &source],
+            "verify the approved commit",
+        )?;
+        if stdout(&resolved)?.strip_suffix('\n') != Some(commit) {
+            return Err(failure(
+                "Git did not resolve the approved commit for publication",
+            ));
+        }
+        let refspec = format!("{source}:{reference}");
         self.git(
             &[
                 config.as_slice(),
@@ -438,6 +474,19 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             .concat(),
             "push the scanned commit without force; check origin and the remote bookmark",
         )?;
+        let advertised = self.git(
+            &[
+                config.as_slice(),
+                &["ls-remote", "--exit-code", "--refs", remote, &reference],
+            ]
+            .concat(),
+            "verify the published bookmark; check the remote before retrying",
+        )?;
+        if stdout(&advertised)? != format!("{commit}\t{reference}\n") {
+            return Err(failure(
+                "the remote bookmark does not match the approved commit; inspect it before retrying",
+            ));
+        }
         Ok(())
     }
 
@@ -560,6 +609,14 @@ fn stdout_path(output: &Output) -> Result<&Path, Fail> {
         return Err(workspace_required());
     }
     Ok(Path::new(OsStr::from_bytes(bytes)))
+}
+
+pub(super) fn jj_commit(commit: &str) -> String {
+    format!("commit_id({commit})")
+}
+
+pub(super) fn git_commit(commit: &str) -> String {
+    format!("{commit}^{{commit}}")
 }
 
 pub(super) fn object_id(value: &str) -> Result<&str, Fail> {

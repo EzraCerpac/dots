@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::Fail;
 
 use super::failure;
-use super::repo::{Workspace, object_id, stdout};
+use super::repo::{Workspace, git_commit, object_id, stdout};
 
 pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) -> Result<(), Fail> {
     let staging = tempfile::tempdir().map_err(|_| stage_error())?;
@@ -16,13 +16,19 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
     copy_rules(workspace, head, &rules)?;
 
     let history = workspace.git(
-        &["rev-list", "--parents", &format!("{base}..{head}")],
+        &[
+            "rev-list",
+            "--parents",
+            &format!("{}..{}", git_commit(base), git_commit(head)),
+        ],
         "list the outgoing commits for screening",
     )?;
     let mut screened = false;
     for revision in stdout(&history)?.lines() {
         let mut ids = revision.split_ascii_whitespace();
         let commit = object_id(ids.next().ok_or_else(stage_error)?)?;
+        let revision = git_commit(commit);
+        let parent = ids.next().map(object_id).transpose()?.map(git_commit);
         let mut args = vec![
             "diff-tree",
             "--root",
@@ -36,10 +42,10 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
         ];
         // Against the first parent, a merge includes any blob added by its
         // resolution. The other outgoing commits are screened independently.
-        if let Some(parent) = ids.next() {
-            args.push(object_id(parent)?);
+        if let Some(parent) = &parent {
+            args.push(parent);
         }
-        args.push(commit);
+        args.push(&revision);
         let changed = workspace.git(&args, "enumerate the outgoing changed blobs")?;
         if changed.stdout.is_empty() {
             continue;
@@ -49,6 +55,7 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
         fs::create_dir(&root).map_err(|_| stage_error())?;
         let records = changed.stdout.strip_suffix(b"\0").ok_or_else(stage_error)?;
         let mut fields = records.split(|byte| *byte == 0);
+        let mut historical_ignores = Vec::new();
         while let Some(metadata) = fields.next() {
             let pathname = fields.next().ok_or_else(stage_error)?;
             let metadata = std::str::from_utf8(metadata).map_err(|_| stage_error())?;
@@ -64,16 +71,29 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
             if !matches!(*mode, "100644" | "100755" | "120000") {
                 return Err(stage_error());
             }
-            write_blob(workspace, &root, pathname, object_id(id)?)?;
+            let id = object_id(id)?;
+            if pathname.eq_ignore_ascii_case(b".gitleaksignore") {
+                historical_ignores.push((pathname, id));
+            } else {
+                write_blob(workspace, &root, pathname, id)?;
+            }
         }
-        workspace.gitleaks(&root, &rules)?;
+        workspace.gitleaks(&root, OsStr::new("."), &rules)?;
+        // Gitleaks also loads <source>/.gitleaksignore implicitly. Keep the
+        // historical file outside the directory scan, then scan it as data.
+        for (name, id) in historical_ignores {
+            write_blob(workspace, &root, name, id)?;
+            let path = OsStr::from_bytes(name);
+            workspace.gitleaks(&root, path, &rules)?;
+            fs::remove_file(root.join(path)).map_err(|_| stage_error())?;
+        }
         screened = true;
         fs::remove_dir_all(&root).map_err(|_| stage_error())?;
     }
     if !screened {
         let empty = staging.path().join("empty");
         fs::create_dir(&empty).map_err(|_| stage_error())?;
-        workspace.gitleaks(&empty, &rules)?;
+        workspace.gitleaks(&empty, OsStr::new("."), &rules)?;
     }
     Ok(())
 }
@@ -83,7 +103,7 @@ fn copy_rules(workspace: &Workspace<'_, '_>, head: &str, rules: &Path) -> Result
         &[
             "ls-tree",
             "-z",
-            head,
+            &git_commit(head),
             "--",
             ".gitleaks.toml",
             ".gitleaksignore",
@@ -131,7 +151,7 @@ fn write_blob(
     }
     let path = root.join(OsStr::from_bytes(pathname));
     let blob = workspace.git(
-        &["cat-file", "blob", id],
+        &["cat-file", "blob", &format!("{id}^{{blob}}")],
         "load an outgoing blob for screening",
     )?;
     fs::create_dir_all(path.parent().ok_or_else(stage_error)?).map_err(|_| stage_error())?;

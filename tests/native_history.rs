@@ -1126,6 +1126,12 @@ fn new_restore_local_inspection_never_follows_an_alternate_promisor() {
         ])
         .arg(&store));
     ok(fixture.git(Some(&store)).args(["branch", "-m", "main"]));
+    for metadata in [
+        "HEAD:.mise-history/manifest.json",
+        "HEAD:.mise-history/format.toml",
+    ] {
+        ok(fixture.git(Some(&store)).args(["show", metadata]));
+    }
     ok(fixture.git(Some(&store)).args([
         "config",
         "remote.promisor.url",
@@ -1134,7 +1140,11 @@ fn new_restore_local_inspection_never_follows_an_alternate_promisor() {
 
     let result = fixture.dots(&["restore"], &remote).output().unwrap();
     assert_eq!(result.status.code(), Some(1), "{}", messages(&result));
-    assert!(messages(&result).contains("could not read the native history checkpoint manifest"));
+    let diagnostic = messages(&result);
+    assert!(
+        diagnostic.contains("could not inspect the encrypted checkpoint envelope"),
+        "{diagnostic}"
+    );
     assert!(fixture.trace().is_empty());
     assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
 
@@ -1142,7 +1152,7 @@ fn new_restore_local_inspection_never_follows_an_alternate_promisor() {
     // invokes our fixture stub, which records the call and never dials out.
     let control = fixture
         .git(Some(&store))
-        .args(["show", "HEAD:.mise-history/manifest.json"])
+        .args(["show", "HEAD:home@host-fixture/app/selected"])
         .env("GIT_ALLOW_PROTOCOL", "ssh")
         .env("GIT_SSH_COMMAND", fixture.world.home().join("bin/ssh"))
         .env("GIT_SSH_VARIANT", "ssh")

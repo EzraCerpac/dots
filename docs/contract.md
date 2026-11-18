@@ -5,6 +5,7 @@ Amended 2026-11-18: shell completion, removal targets, the output of individual 
 Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
 Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish origin and `dev` ancestry checks.
 Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
+Amended 2026-11-18: sync diagnostics, backup publication verification and history format checks, diverged publish approval, and update report replay.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -405,7 +406,7 @@ By default in an interactive terminal, the full `dots up`, also run as `dots upd
 - one line with each step's result;
 - a final outcome line, such as `dots up · Complete` or `dots up · Failed (exit 1)`;
 - "Needs attention", with each issue, its next action and, when its output was captured, its log location;
-- `Details and logs · dots up --last`.
+- `Details and logs · dots up --last` when the final report saves successfully.
 
 It uses no alternate screen, navigation keys, spinner, minimum terminal size or cursor motion across child output.
 A step whose output is recorded privately may update its own progress line once, and finishes that line before any child can print or prompt.
@@ -420,7 +421,7 @@ For these commands, `dots` adds no banner, footer or second copy of a diagnostic
 When such a command is marked "report", its report keeps its stages' outcomes and its exit status, but not the child's raw output or a log path that does not exist.
 
 A report for a failure or an issue that needs attention gives the command to rerun; a report of a success need not.
-`dots sync` may log its backends' output privately, and shows file contents only as [Receipt](#receipt) allows.
+`dots sync` shows file contents only as [Receipt](#receipt) allows.
 When any report cannot be written or finished, `dots` says so on stderr, naming the command, and still exits with the command's own result.
 
 During interactive scrollback, hooks, recipes and steps that `dots` knows are interactive, such as its own `sudo` authorization, run in the foreground and may prompt.
@@ -469,6 +470,9 @@ It runs `ROOT/tests/run ARGS...` in the configuration's mise environment.
 ### `dots up`
 
 `--mas` includes Mac App Store updates; `--last` prints the last saved `dots up` report and exits with the status it records; both together exit 2.
+Ordinary updates appear as `updated  item  old → new` in live output, `--plain` and replay.
+`--last` replays the final report byte for byte, including the successful-save footer `Details and logs · dots up --last`.
+Live child and stage output is excluded from replay.
 The stages run in this order:
 
 1. **Pre-update checkpoint.** Saves tracked settings, after checking that every tracked entry is encrypted.
@@ -526,6 +530,8 @@ Package, tool and standalone mise changes come from comparing state before and a
 #### One run
 
 1. Saves tracked history, refusing any tracked entry that is not `encrypt = true`.
+   A known configuration refusal before the checkpoint reports a bounded, vetted reason and tells the user how to fix the active encryption setting or refused declaration.
+   A native save failure reports a bounded, vetted reason and directs the user to retry the local checkpoint with `dots sync`.
 2. Captures edits to copied dotfiles: when the deployed copy changed and its source still matches the last common version, the deployed bytes become the source.
    When both the copy and the source changed, both stay as they are and sync reports it.
 3. Stages every tracked or unignored public edit as a candidate commit, leaving machine-local files out, without moving `dev` or the index.
@@ -570,7 +576,11 @@ Each issue carries a diagnostic and a recovery action.
 - Otherwise the receipt leads with any issue and its next action, then lists up to five paths per group: shared, saved locally, updated in this checkout, finished after an interruption.
 - When stdin and stdout are terminals, standalone sync may show a complete small text diff for up to two paths and twelve displayed lines.
 - Piped output, `--plain` output and saved reports contain metadata only.
+- **New in 1.0:** live and saved sync receipts exclude raw child stderr and may include vetted scanner metadata such as rule, path and line.
 - A missing gitleaks gives a receipt such as `dots sync: kept 2 files on disk · pulled dev +1, main +0 · not pushed`, led by the issue `NOT SHARED: gitleaks not found; local edits kept on disk, nothing pushed` and the action to install it.
+
+`dots sync` omits Git trace and mise log-file overrides from child environments to keep its output and saved reports clean.
+Native mise owns the `history/sync.json` health record, whose `last_error` may contain verbatim transport errors, and `dots` leaves it untouched.
 
 `dots sync --last` replays the latest receipt for this checkout from the recorded Git revisions, without the network and without mise.
 It spends up to three seconds screening patches and keeps up to 1 MiB for the pager.
@@ -813,6 +823,14 @@ It scans the outgoing commits with gitleaks, asks for confirmation, pushes a boo
 **New in 1.0:** publish uses gitleaks' native archive traversal one level deep.
 An explicitly reported unsupported-format or depth-limit skip stops publication before confirmation or push.
 A successful scan with no reported skip proceeds to normal confirmation.
+
+**New in 1.0:** only diverged `publish --all` needs JJ 0.41's detached operation (`--no-integrate-operation`) to screen the exact proposed merge before preview or approval.
+If the capability is unavailable, it exits 1 naming JJ 0.41 before mutation, preview or approval.
+A screening refusal or declined first approval leaves `@` and bookmarks untouched.
+The first approval materializes the pinned local merge after rechecking its inputs.
+If it conflicts, the merge stays in `@` and the command exits 3 without pushing.
+Declining final approval keeps the approved local merge without creating or moving a publication bookmark, pushing or opening a pull request.
+
 As in 0.4.0, new pull requests target `main`.
 When exactly one pull request matches the head branch from the same repository and that pull request is open, `dots publish` edits its title and body and keeps its existing base, including a base other than `main`.
 The scan still uses `main@origin` as its base.
@@ -1162,7 +1180,8 @@ It stops with exit status 2 at the first failed check:
 Then it saves a checkpoint locally.
 **New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in every local checkpoint reachable from the history branch that the destination host branch lacks.
 A current unencrypted declaration still fails check 4 with exit 2 before the local save or any remote contact.
-With mise's default `history.allow_plaintext_history = false`, a plaintext or invalid encrypted payload stops backup with exit 1 before native sync, and no history is sent.
+With mise's default `history.allow_plaintext_history = false`, a plaintext or unreadable payload or a malformed encrypted wrapper or envelope stops backup with exit 1 before native sync, and no history is sent.
+The historical audit checks format alone and requires no retired private key.
 The diagnostic on stderr names the escaped path and checkpoint and gives the recovery action:
 
 > Keep the current store and inspect the checkpoint in a private copy.
@@ -1171,7 +1190,12 @@ The diagnostic on stderr names the escaped path and checkpoint and gives the rec
 Backup reads the effective `[settings.history]` setting with `mise settings get history.allow_plaintext_history`, including mise's `MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY` override.
 Only a successful `true` skips this audit; native sync still applies its own checks.
 If the setting cannot be read as a boolean, backup stops before sync.
-Only native `mise bootstrap dotfiles sync` publishes to the state repository, and `dots backup` reports successful publication.
+Only native `mise bootstrap dotfiles sync` publishes to the state repository.
+**Changed from 0.4.0:** backup printed `Settings backup published.` on native exit 0 even when conflicts still awaited reconciliation.
+In 1.0, after a successful native sync, backup reads back the validated remote host branch once and reports publication only if the saved checkpoint equals its tip or is an ancestor of it.
+If reconciliation is pending and the checkpoint is absent, backup exits 1, says the checkpoint was kept locally and directs the user to `mise dot status`.
+If the readback cannot verify either outcome, backup exits 1 and reports only that publication could not be confirmed.
+Backup uses one native sync and performs no publication retry or force push.
 
 ### `dots restore [--initialize-history]`
 

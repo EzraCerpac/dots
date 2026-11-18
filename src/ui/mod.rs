@@ -17,8 +17,25 @@ pub fn reports(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     reports::list(&ctx.env, command, &mut io::stdout().lock())
 }
 
-pub fn last(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
-    Err(Fail::unported("P-12", "dots up --last"))
+pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
+    use crate::report::{self, Command};
+    use std::io;
+
+    let read_error = |error| Fail::new(1, format!("could not read saved update report: {error}"));
+    let entries = report::list(&ctx.env, Some(Command::Up)).map_err(read_error)?;
+    for entry in entries {
+        let report = match report::load(&ctx.env, &entry.id) {
+            Ok(report) => report,
+            // A completed report can be pruned between the two reads.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(read_error(error)),
+        };
+        transcript::write_report(&mut io::stdout().lock(), &report, true).map_err(|error| {
+            Fail::new(1, format!("could not write saved update report: {error}"))
+        })?;
+        return Ok(report.status);
+    }
+    Err(Fail::new(1, "no completed update report is available yet"))
 }
 
 pub mod transcript;

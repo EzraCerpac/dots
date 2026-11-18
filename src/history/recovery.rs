@@ -7,10 +7,9 @@ use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use crate::Fail;
+use crate::config::Vars;
 
 use super::checkpoint::{MARKER, STAGING, legacy_marker};
-use crate::config::{RepoSetting, Vars};
-
 use super::keys::{self, LocalSettings};
 use super::native::{Native, exists, private_dir};
 use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origin};
@@ -108,7 +107,7 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
                     "local history is connected elsewhere; inspect it before using dots restore --initialize-history",
                 ));
             }
-            prepare(native, &store, &raw, &branch, expected, &vars, &paths, old)?;
+            prepare(native, &store, &raw, &branch, &vars, &paths, old)?;
             true
         }
     };
@@ -193,7 +192,6 @@ fn prepare(
     store: &Path,
     raw: &str,
     branch: &str,
-    expected: &RepoSetting,
     vars: &Vars,
     paths: &[PathBuf],
     old: Option<fs::Metadata>,
@@ -211,7 +209,7 @@ fn prepare(
     let mut cmd = native.git(Some(&staged))?;
     cmd.args(["config", "--local", "remote.origin.url", raw]);
     native.output(cmd, "could not configure the staged history origin")?;
-    native.destinations(Some(&staged), raw, expected, vars)?;
+    native.destinations(Some(&staged), raw, state_repo(vars)?, vars)?;
     let mut cmd = native.git(Some(&staged))?;
     let refspec = format!("refs/heads/{branch}:refs/heads/main");
     cmd.args([

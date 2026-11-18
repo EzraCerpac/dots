@@ -198,7 +198,7 @@ emit '{"v":1,"kind":"stage_end","id":"bootstrap","status":"ok"}'
 }
 
 func TestHeadlessScrollbackCancellationStopsProcessGroup(t *testing.T) {
-	useTextRunner(t, runnerEvents+`
+	checkHeadlessCancellation(t, "remove", runnerEvents+`
 trap 'emit "{\"v\":1,\"kind\":\"run_end\",\"status\":\"ok\",\"exit_code\":0}"; exit 0' INT
 sh -c '
     trap "" INT TERM
@@ -207,11 +207,28 @@ sh -c '
 ' &
 wait "$!"
 `)
+}
+
+func TestHeadlessUpdateCancelsWhileDescendantDrainsOutput(t *testing.T) {
+	checkHeadlessCancellation(t, "up", `
+sh -c '
+    trap "" INT TERM
+    while kill -0 "$1" 2>/dev/null; do sleep 0.01; done
+    printf "%s\n" "$$"
+    exec sleep 3
+' sh "$$" &
+exit 0
+`)
+}
+
+func checkHeadlessCancellation(t *testing.T, command, script string) {
+	t.Helper()
+	useTextRunner(t, script)
 	state := t.TempDir()
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestScrollbackFixtureProcess$")
-	cmd.Env = append(os.Environ(), "DOTS_SCROLLBACK_FIXTURE="+state, "DOTS_SCROLLBACK_COMMAND=remove")
+	cmd.Env = append(os.Environ(), "DOTS_SCROLLBACK_FIXTURE="+state, "DOTS_SCROLLBACK_COMMAND="+command)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -280,7 +297,7 @@ func TestScrollbackFixtureProcess(t *testing.T) {
 		if command == "" {
 			command = "bootstrap"
 		}
-		os.Exit(Run(Options{Command: command, StateDir: state, Sensitive: command == "bootstrap"}))
+		os.Exit(Run(Options{Command: command, StateDir: state, Sensitive: command == "bootstrap", Verbose: command == "up"}))
 	}
 }
 

@@ -260,9 +260,15 @@ func Run(opts Options) int {
 	var deferredUIEvents []ui.Event
 	var waitCancellation func()
 	requestCancel := func() {
-		if waitCancellation == nil {
-			waitCancellation = cancelBackend(backend)
+		if waitCancellation != nil {
+			return
 		}
+		// An owned group can still hold the output or event pipe after its leader exits.
+		if childFinished && (!backend.processGroup || (eventFinished && outputFinished) ||
+			syscall.Kill(-backend.command.Process.Pid, 0) != nil) {
+			return
+		}
+		waitCancellation = cancelBackend(backend)
 	}
 	var uiAlive = dashboard
 
@@ -599,9 +605,7 @@ func Run(opts Options) int {
 		case control := <-controls:
 			switch control.Kind {
 			case "cancel":
-				if !childFinished {
-					requestCancel()
-				}
+				requestCancel()
 			case "handoff_ready":
 				if dashboard && pendingHandoff == control.ID && relayKind == "" {
 					startAutomaticRelay()
@@ -733,9 +737,7 @@ func Run(opts Options) int {
 				}
 			}
 		case <-interrupts:
-			if !childFinished {
-				requestCancel()
-			}
+			requestCancel()
 		case <-manualEnd:
 			if relayKind == "manual" && dashboard {
 				if err := stopRelay(); err != nil {

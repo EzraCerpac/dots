@@ -39,11 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Install musl C tools and shells
+      - name: Install Linux test dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends musl-tools bash zsh fish
+          sudo apt-get install -y -qq --no-install-recommends musl-tools bash zsh fish age
           printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
             "$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
 
@@ -72,6 +72,13 @@ jobs:
           test "$("$HOME/.local/bin/mise" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
           printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Install age on macOS
+        if: runner.os == 'macOS'
+        run: |
+          mise install age@1.3.2
+          age_bin="$(mise which age --tool age@1.3.2)"
+          printf '%s\n' "${age_bin%/*}" >> "$GITHUB_PATH"
+
       - name: Check formatting
         run: rustup run "$RUST_VERSION" cargo fmt --all -- --check
 
@@ -79,4 +86,126 @@ jobs:
         run: mise run clippy
 
       - name: Run all tests natively
-        run: mise run test
+        run: |
+          age --version
+          age-keygen --version
+          mise run test
+
+  rust-distros:
+    name: Rust scenarios (${{ matrix.distro }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Fedora
+            image: fedora:latest
+          - distro: Arch
+            image: archlinux:base
+          - distro: Alpine
+            image: alpine:3.23
+    env:
+      DISTRO: ${{ matrix.distro }}
+      IMAGE: ${{ matrix.image }}
+      MISE_VERSION: v2026.11.9
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run Rust scenarios in the distribution
+        run: |
+          # Keep Actions' checkout runtime on Ubuntu, including for musl Alpine.
+          docker run --rm -i --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
+            --workdir /workspace -e DISTRO -e RUST_VERSION -e MISE_VERSION \
+            -e MISE_TRUSTED_CONFIG_PATHS=/workspace "$IMAGE" sh -eu <<'SH'
+          rust_host=x86_64-unknown-linux-gnu
+          case "$DISTRO" in
+            Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip age ;;
+            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age ;;
+            Alpine)
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age
+              rust_host=x86_64-unknown-linux-musl
+              ;;
+            *) exit 2 ;;
+          esac
+
+          curl -fsSL "https://static.rust-lang.org/rustup/dist/$rust_host/rustup-init" -o /tmp/rustup-init
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --default-host "$rust_host" \
+            --profile minimal --default-toolchain "$RUST_VERSION"
+          curl -fsSL "https://github.com/jdx/mise/releases/download/$MISE_VERSION/mise-$MISE_VERSION-linux-x64-musl.tar.gz" \
+            -o /tmp/mise.tar.gz
+          tar -xzf /tmp/mise.tar.gz -C /tmp mise/bin/mise
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 /tmp/mise/bin/mise "$HOME/.local/bin/mise"
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          for tool in mise git bash zsh fish; do
+            command -v "$tool"
+          done
+          mise --version
+          age --version
+          age-keygen --version
+          mise run test
+          SH
+
+  rust-first-run:
+    name: Rust first run (mise and Git)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MISE_VERSION: v2026.11.9
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Build the Linux release binary
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target x86_64-unknown-linux-musl
+          seed="$RUNNER_TEMP/dots-first-run"
+          mkdir -p "$seed"
+          curl -fsSL "https://github.com/jdx/mise/releases/download/$MISE_VERSION/mise-$MISE_VERSION-linux-x64-musl.tar.gz" \
+            -o "$RUNNER_TEMP/mise.tar.gz"
+          tar -xzf "$RUNNER_TEMP/mise.tar.gz" -C "$RUNNER_TEMP" mise/bin/mise
+          install -m 0755 "$RUNNER_TEMP/mise/bin/mise" "$seed/mise"
+          "$seed/mise" --version
+          CC=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            "$seed/mise" run build -- --release --target x86_64-unknown-linux-musl
+          install -m 0755 target/x86_64-unknown-linux-musl/release/dots "$seed/dots"
+
+      # This check is expected to fail while init or up is still a stub.
+      - name: Run dots init and dots up in a fresh container
+        run: |
+          docker run --rm -i --mount "type=bind,src=$RUNNER_TEMP/dots-first-run,dst=/seed,readonly" \
+            alpine:3.23 sh -eu <<'SH'
+          apk add --no-cache git ca-certificates
+          adduser -D smoke
+          su -l smoke <<'SMOKE'
+          set -eu
+          fixture=$(mktemp -d /tmp/dots-first-run.XXXXXXXX)
+          export HOME="$fixture/home" TMPDIR="$fixture/tmp"
+          export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
+          export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
+          export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
+          export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
+          export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
+          export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
+          export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
+          export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
+          export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
+          export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
+          export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
+          mkdir -p "$HOME/.local/bin" "$TMPDIR"
+          cp /seed/mise /seed/dots "$HOME/.local/bin/"
+          export PATH="$HOME/.local/bin:/usr/bin:/bin"
+          cd "$HOME"
+          dots init </dev/null
+          dots up </dev/null
+          SMOKE
+          SH

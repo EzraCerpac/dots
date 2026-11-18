@@ -16,6 +16,7 @@ pub mod receipt;
 pub mod report;
 pub mod run;
 pub mod skill;
+pub mod supervisor;
 pub mod sync;
 pub mod targets;
 pub mod ui;
@@ -128,7 +129,6 @@ impl Env {
 pub struct Flags {
     pub plain: bool,
     pub verbose: bool,
-    pub no_wait: bool,
 }
 
 pub struct Ctx {

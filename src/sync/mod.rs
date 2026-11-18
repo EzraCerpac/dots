@@ -1,3 +1,5 @@
+pub mod lock;
+
 use crate::{Args, Ctx, Fail};
 
 pub fn sync(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {

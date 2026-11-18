@@ -18,7 +18,7 @@ pub fn version(env: &Env) -> Result<String, Fail> {
     ))
 }
 
-fn installer(exe: &Path, env: &Env) -> &'static str {
+pub(crate) fn installer(exe: &Path, env: &Env) -> &'static str {
     let components: Vec<_> = exe.iter().collect();
     if components.windows(5).any(|part| {
         part[0] == "Cellar" && part[1] == "dots" && part[3] == "bin" && part[4] == "dots"

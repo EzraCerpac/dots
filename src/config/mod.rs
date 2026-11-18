@@ -11,7 +11,7 @@ pub mod selection;
 
 pub use doc::Doc;
 pub use exceptions::{Exception, Exceptions};
-pub use repo::RepoSetting;
+pub use repo::{CheckoutShape, RepoSetting, checkout_shape};
 pub use vars::Vars;
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,12 @@ impl Root {
                     .unwrap_or_else(|| env.home().unwrap_or(Path::new("/")).join(".config"))
                     .join("mise")
             });
-        let absolute = env.cwd().join(path);
+        Self::from_dir(env, &path)
+    }
+
+    /// Resolve a caller-supplied path, preserving any absent tail for init.
+    pub(crate) fn from_dir(env: &Env, dir: &Path) -> Result<Self, Fail> {
+        let absolute = env.cwd().join(dir);
         let path = physical(&absolute).map_err(|error| file_error(&absolute, error))?;
         Ok(Self {
             path,

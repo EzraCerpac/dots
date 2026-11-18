@@ -2,7 +2,7 @@
 //! inspection. Current enrollment cannot account for a path removed from it.
 
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::str;
 
 use serde::Deserialize;
@@ -27,36 +27,41 @@ pub(super) fn allows_plaintext(output: Output) -> Result<bool, Fail> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GitAccess {
+    Local,
+    Remote,
+}
+
+pub(super) fn git_environment(access: GitAccess) -> [(&'static str, &'static str); 6] {
+    [
+        ("LC_ALL", "C"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
+        ("GIT_GRAFT_FILE", "/dev/null"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        match access {
+            GitAccess::Remote => ("GIT_TERMINAL_PROMPT", "0"),
+            // Even Git without GIT_NO_LAZY_FETCH must fail on missing
+            // promisor objects without contacting the promisor.
+            GitAccess::Local => ("GIT_ALLOW_PROTOCOL", ""),
+        },
+    ]
+}
+
 /// Read-only preflight for native sync. The launcher is bound to the native
-/// bare store and the origin and branch have already passed backup's checks.
+/// bare store and applies git_environment. The origin and branch have already
+/// passed backup's checks, and local is the resulting saved checkpoint.
 pub(super) fn preflight(
-    git: impl Fn() -> Result<Command, Fail>,
-    probe: impl Fn(Command) -> Result<Output, Fail>,
+    probe: impl Fn(&[&str], GitAccess) -> Result<Output, Fail>,
     branch: &str,
     origin: &str,
     local: &str,
 ) -> Result<(), Fail> {
     let blocked = || refusal("could not verify saved settings history", RECONCILE);
-    let run_git = |args: &[&str], network: bool| {
-        let mut command = git()?;
-        command
-            .env("LC_ALL", "C")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_GRAFT_FILE", "/dev/null")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(args);
-        if network {
-            command.env("GIT_TERMINAL_PROMPT", "0");
-        } else {
-            // Git versions that lack GIT_NO_LAZY_FETCH must also stop at a
-            // missing promisor object without initiating an implicit fetch.
-            command.env("GIT_ALLOW_PROTOCOL", "");
-        }
-        probe(command).map_err(|_| blocked())
-    };
+    let run_git = |args: &[&str], access| probe(args, access).map_err(|_| blocked());
     let read = |args: &[&str]| {
-        let output = run_git(args, false)?;
+        let output = run_git(args, GitAccess::Local)?;
         output
             .status
             .success()
@@ -81,7 +86,37 @@ pub(super) fn preflight(
             .ok_or_else(blocked)
     };
     let expected = RepoSetting::parse(origin).map_err(|_| blocked())?;
+    let split_routes = || {
+        refusal(
+            "cannot verify history publication through different fetch and push routes",
+            "Configure one verified route for fetching and pushing this private history, then retry backup",
+        )
+    };
     let routes = || -> Result<Vec<u8>, Fail> {
+        let commands = run_git(
+            &[
+                "config",
+                "--null",
+                "--name-only",
+                "--get-regexp",
+                r"^remote\..*\.(uploadpack|receivepack)$",
+            ],
+            GitAccess::Local,
+        )?;
+        match commands.status.code() {
+            Some(1) if commands.stdout.is_empty() && commands.stderr.is_empty() => {}
+            Some(0) => {
+                let prefix = format!("remote.{origin}.");
+                if commands
+                    .stdout
+                    .split(|&b| b == 0)
+                    .any(|key| key.starts_with(prefix.as_bytes()))
+                {
+                    return Err(split_routes());
+                }
+            }
+            _ => return Err(blocked()),
+        }
         let routes = read(&["remote", "show", "-n", "--", origin])?;
         let text = str::from_utf8(&routes).map_err(|_| blocked())?;
         let mut fetch = text
@@ -99,10 +134,7 @@ pub(super) fn preflight(
             return Err(blocked());
         }
         if push.peek().is_none() || push.any(|route| route != url) {
-            return Err(refusal(
-                "cannot verify history publication through different fetch and push routes",
-                "Configure one verified route for fetching and pushing this private history, then retry backup",
-            ));
+            return Err(split_routes());
         }
         Ok(routes)
     };
@@ -111,10 +143,10 @@ pub(super) fn preflight(
     let remote_tip = || -> Result<Option<String>, Fail> {
         let output = run_git(
             &["ls-remote", "--refs", "--exit-code", "--", origin, &dest],
-            true,
+            GitAccess::Remote,
         )?;
         match output.status.code() {
-            Some(2) if output.stdout.is_empty() => Ok(None),
+            Some(2) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
             Some(0) => {
                 let (id, name) = split_byte(line(&output.stdout), b'\t').ok_or_else(blocked)?;
                 if name != dest.as_bytes() {
@@ -136,7 +168,7 @@ pub(super) fn preflight(
         // If the remote commit is unfamiliar, avoid fetching into the store.
         // Auditing all local ancestors is a safe superset in that case.
         let known_remote = if let Some(remote) = remote.as_deref() {
-            let object = run_git(&["cat-file", "-t", remote], false)?;
+            let object = run_git(&["cat-file", "-t", remote], GitAccess::Local)?;
             if object.status.success() {
                 if object.stdout != b"commit\n" {
                     return Err(blocked());

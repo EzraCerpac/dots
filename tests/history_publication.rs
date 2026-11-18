@@ -6,10 +6,11 @@ mod publication;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use dots_cli::{Fail, config};
-use support::World;
+use publication::{GitAccess, git_environment};
+use support::{FixtureCommand, World};
 
 const BRANCH: &str = "host-fixture";
 const REMOTE_REF: &str = "refs/heads/host-fixture";
@@ -28,10 +29,11 @@ struct History {
 impl History {
     fn new() -> Self {
         let world = World::new();
-        let base = world.root().parent().unwrap().to_owned();
-        let store = base.join("mise-state/history/repo.git");
-        let remote = base.join("state-origin.git");
+        let base = world.base();
+        let store = base.join("mise/state/history/repo.git");
+        let remote = world.bare_remote("state-origin.git");
         let origin = format!("file://{}", remote.display());
+        fs::create_dir(base.join("git-template")).unwrap();
         let mut history = Self {
             world,
             store,
@@ -39,25 +41,6 @@ impl History {
             origin,
             recipient: String::new(),
         };
-        for dir in [
-            "mise-data",
-            "mise-state",
-            "mise-cache",
-            "mise-system",
-            "mise-installs",
-            "mise-plugins",
-            "mise-shims",
-            "codex",
-            "claude",
-            "cargo",
-            "rustup",
-            "tmp",
-            "git-template",
-        ] {
-            fs::create_dir(base.join(dir)).unwrap();
-        }
-        let mut git = history.git(&history.remote);
-        ok(git.args(["init", "--bare", "--initial-branch=main"]));
         let key = history.world.home().join("throwaway-age-key");
         ok(history.command("age-keygen").arg("-o").arg(&key));
         history.recipient = text(ok(history.command("age-keygen").arg("-y").arg(&key)));
@@ -99,28 +82,13 @@ impl History {
         fs::write(self.world.root().join("config.toml"), config).unwrap();
     }
 
-    fn isolate(&self, cmd: &mut Command) {
-        let base = self.world.root().parent().unwrap();
-        for (key, dir) in [
-            ("MISE_DATA_DIR", "mise-data"),
-            ("MISE_STATE_DIR", "mise-state"),
-            ("MISE_CACHE_DIR", "mise-cache"),
-            ("MISE_SYSTEM_CONFIG_DIR", "mise-system"),
-            ("MISE_INSTALLS_DIR", "mise-installs"),
-            ("MISE_PLUGINS_DIR", "mise-plugins"),
-            ("MISE_SHIMS_DIR", "mise-shims"),
-            ("CODEX_HOME", "codex"),
-            ("CLAUDE_CONFIG_DIR", "claude"),
-            ("CARGO_HOME", "cargo"),
-            ("RUSTUP_HOME", "rustup"),
-            ("TMPDIR", "tmp"),
-            ("GIT_TEMPLATE_DIR", "git-template"),
-        ] {
-            cmd.env(key, base.join(dir));
-        }
-        cmd.env("MISE_CONFIG_DIR", self.world.root())
+    fn isolate(&self, cmd: &mut FixtureCommand<'_>) {
+        let base = self.world.base();
+        cmd.env("CARGO_HOME", base.join("cargo"))
+            .env("RUSTUP_HOME", base.join("rustup"))
+            .env("GIT_TEMPLATE_DIR", base.join("git-template"))
+            .env("MISE_CONFIG_DIR", self.world.root())
             .env("MISE_TRUSTED_CONFIG_PATHS", self.world.root())
-            .env("MISE_CEILING_PATHS", base)
             .env("MISE_AUTO_INSTALL", "0")
             .env("MISE_AUTO_UPDATE", "0")
             .env("MISE_OFFLINE", "1")
@@ -129,27 +97,19 @@ impl History {
             .stdin(Stdio::null());
     }
 
-    fn command(&self, program: &str) -> Command {
-        let mut cmd = Command::new(program);
-        cmd.env_clear()
-            .envs(
-                self.world
-                    .git()
-                    .get_envs()
-                    .filter_map(|(k, v)| v.map(|v| (k, v))),
-            )
-            .current_dir(self.world.root());
+    fn command(&self, program: &str) -> FixtureCommand<'_> {
+        let mut cmd = self.world.command(program);
         self.isolate(&mut cmd);
         cmd
     }
 
-    fn dots(&self) -> Command {
+    fn dots(&self) -> FixtureCommand<'_> {
         let mut cmd = self.world.dots();
         self.isolate(&mut cmd);
         cmd
     }
 
-    fn observed_backup(&self) -> (Command, PathBuf) {
+    fn observed_backup(&self) -> (FixtureCommand<'_>, PathBuf) {
         let base = self.world.root().parent().unwrap();
         let bin = base.join("observe-git");
         fs::create_dir(&bin).unwrap();
@@ -182,14 +142,14 @@ exec "$FIXTURE_REAL_GIT" "$@"
         (cmd, log)
     }
 
-    fn git(&self, repo: &Path) -> Command {
+    fn git(&self, repo: &Path) -> FixtureCommand<'_> {
         let mut cmd = self.world.git();
         self.isolate(&mut cmd);
         cmd.arg("--git-dir").arg(repo);
         cmd
     }
 
-    fn mise(&self, operation: &str) -> Command {
+    fn mise(&self, operation: &str) -> FixtureCommand<'_> {
         let mut cmd = self.command("mise");
         cmd.args([
             "-E",
@@ -219,15 +179,19 @@ exec "$FIXTURE_REAL_GIT" "$@"
 
     fn preflight(&self) -> Result<(), Fail> {
         publication::preflight(
-            || Ok(self.git(&self.store)),
-            |mut cmd| {
-                cmd.output()
-                    .map_err(|_| Fail::new(1, "fixture Git did not run"))
-            },
+            |args, access| self.probe(args, access),
             BRANCH,
             &self.origin,
             &self.tip(&self.store, "refs/heads/main"),
         )
+    }
+
+    fn probe(&self, args: &[&str], access: GitAccess) -> Result<Output, Fail> {
+        self.git(&self.store)
+            .envs(git_environment(access))
+            .args(args)
+            .output()
+            .map_err(|_| Fail::new(1, "fixture Git did not run"))
     }
 
     fn empty_remote(&self, absent: &str) {
@@ -267,9 +231,9 @@ exec "$FIXTURE_REAL_GIT" "$@"
     }
 }
 
-fn ok(cmd: &mut Command) -> Output {
+fn ok(cmd: &mut FixtureCommand<'_>) -> Output {
     let result = cmd.output().unwrap();
-    assert!(result.status.success(), "{cmd:?}\n{result:?}");
+    assert!(result.status.success(), "{:?}\n{result:?}", &**cmd);
     result
 }
 
@@ -449,21 +413,13 @@ fn new_changed_destination_tip_refuses() {
         .args(["push", &other_origin, &format!("{tip}:{REMOTE_REF}")]));
     let observed = std::cell::Cell::new(false);
     let err = publication::preflight(
-        || Ok(history.git(&history.store)),
-        |mut cmd| {
-            if cmd.get_args().any(|arg| arg == "ls-remote") && observed.replace(true) {
-                cmd = history.git(&history.store);
-                cmd.args([
-                    "ls-remote",
-                    "--refs",
-                    "--exit-code",
-                    "--",
-                    &other_origin,
-                    REMOTE_REF,
-                ]);
+        |args, access| {
+            if access == GitAccess::Remote && observed.replace(true) {
+                let mut changed = args.to_vec();
+                changed[4] = &other_origin;
+                return history.probe(&changed, access);
             }
-            cmd.output()
-                .map_err(|_| Fail::new(1, "fixture Git did not run"))
+            history.probe(args, access)
         },
         BRANCH,
         &history.origin,
@@ -674,16 +630,16 @@ fn new_split_routes_refuse_before_any_remote_contact() {
     let origin = "https://github.com/example/fixture.git";
     let other = "ssh://git@github.com/example/fixture.git";
     let error = publication::preflight(
-        || {
-            let mut git = history.git(&history.store);
-            git.env("GIT_CONFIG_COUNT", "1")
+        |args, access| {
+            assert!(access == GitAccess::Local);
+            history
+                .git(&history.store)
+                .envs(git_environment(access))
+                .env("GIT_CONFIG_COUNT", "1")
                 .env("GIT_CONFIG_KEY_0", format!("url.{other}.pushInsteadOf"))
-                .env("GIT_CONFIG_VALUE_0", origin);
-            Ok(git)
-        },
-        |mut cmd| {
-            assert!(!cmd.get_args().any(|arg| arg == "ls-remote"));
-            cmd.output()
+                .env("GIT_CONFIG_VALUE_0", origin)
+                .args(args)
+                .output()
                 .map_err(|_| Fail::new(1, "fixture Git did not run"))
         },
         BRANCH,
@@ -701,18 +657,17 @@ fn new_only_ref_queries_allow_git_transport_and_do_not_prompt() {
     let tip = history.save();
     let ref_queries = std::cell::Cell::new(0);
     publication::preflight(
-        || {
-            let mut git = history.git(&history.store);
-            git.env("GIT_TERMINAL_PROMPT", "1");
-            Ok(git)
-        },
-        |mut cmd| {
+        |args, access| {
+            let mut cmd = history.git(&history.store);
+            cmd.env("GIT_TERMINAL_PROMPT", "1")
+                .envs(git_environment(access))
+                .args(args);
             let env = |name| {
                 cmd.get_envs()
                     .find_map(|(key, value)| (key == name).then_some(value))
                     .flatten()
             };
-            if cmd.get_args().any(|arg| arg == "ls-remote") {
+            if args.first() == Some(&"ls-remote") {
                 assert_eq!(env("GIT_TERMINAL_PROMPT").unwrap(), "0");
                 assert_eq!(env("GIT_ALLOW_PROTOCOL").unwrap(), "file");
                 ref_queries.set(ref_queries.get() + 1);
@@ -849,4 +804,38 @@ fn new_unreadable_promisor_payload_refuses_without_fetching_it() {
             .status
             .success()
     );
+}
+
+#[test]
+fn new_per_origin_git_service_override_is_ambiguous() {
+    let history = History::new();
+    history.configure(Some(true), true);
+    let tip = history.save();
+    let refusal = publication::preflight(
+        |args, access| {
+            assert!(access == GitAccess::Local);
+            history
+                .git(&history.store)
+                .envs(git_environment(access))
+                .env("GIT_CONFIG_COUNT", "1")
+                .env(
+                    "GIT_CONFIG_KEY_0",
+                    format!("remote.{}.receivepack", history.origin),
+                )
+                .env("GIT_CONFIG_VALUE_0", "synthetic-receive-pack")
+                .args(args)
+                .output()
+                .map_err(|_| Fail::new(1, "fixture Git did not run"))
+        },
+        BRANCH,
+        &history.origin,
+        &tip,
+    )
+    .unwrap_err();
+    assert!(
+        refusal
+            .diagnostic
+            .contains("different fetch and push routes")
+    );
+    history.empty_remote(&tip);
 }

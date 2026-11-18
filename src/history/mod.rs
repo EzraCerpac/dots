@@ -96,8 +96,11 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         "could not read mise's effective history.allow_plaintext_history setting",
     )?)? {
         publication::preflight(
-            || native.git(Some(&store)),
-            |cmd| native.probe(cmd, "could not verify the history publication range"),
+            |args, access| {
+                let mut git = native.git(Some(&store))?;
+                git.envs(publication::git_environment(access)).args(args);
+                native.probe(git, "could not verify the history publication range")
+            },
             &branch,
             &origin,
             &saved,

@@ -258,7 +258,12 @@ func Run(opts Options) int {
 	var restoreKind, restoreID string
 	var restorePending bool
 	var deferredUIEvents []ui.Event
-	var cancelRequested bool
+	var waitCancellation func()
+	requestCancel := func() {
+		if waitCancellation == nil {
+			waitCancellation = cancelBackend(backend)
+		}
+	}
 	var uiAlive = dashboard
 
 	var eventInput <-chan ui.Event
@@ -409,8 +414,7 @@ func Run(opts Options) int {
 		}
 		if err != nil {
 			backendError = err
-			cancelRequested = true
-			cancelBackend(backend)
+			requestCancel()
 		}
 	}
 	finishStage := func(e ui.Event) {
@@ -595,9 +599,8 @@ func Run(opts Options) int {
 		case control := <-controls:
 			switch control.Kind {
 			case "cancel":
-				if !cancelRequested && !childFinished {
-					cancelRequested = true
-					cancelBackend(backend)
+				if !childFinished {
+					requestCancel()
 				}
 			case "handoff_ready":
 				if dashboard && pendingHandoff == control.ID && relayKind == "" {
@@ -684,7 +687,7 @@ func Run(opts Options) int {
 			if err != nil {
 				exitCode = childExitCode(err)
 			}
-			if cancelRequested {
+			if waitCancellation != nil {
 				exitCode = 130
 			}
 			if relayKind != "" {
@@ -730,9 +733,8 @@ func Run(opts Options) int {
 				}
 			}
 		case <-interrupts:
-			if !cancelRequested && !childFinished {
-				cancelRequested = true
-				cancelBackend(backend)
+			if !childFinished {
+				requestCancel()
 			}
 		case <-manualEnd:
 			if relayKind == "manual" && dashboard {
@@ -752,8 +754,10 @@ func Run(opts Options) int {
 		_ = stageLog.Sync()
 		_ = stageLog.Close()
 	}
-	if cancelRequested {
+	if waitCancellation != nil {
+		waitCancellation()
 		exitCode = 130
+		runEnd.Status = "cancelled"
 	} else if waitErr != nil && exitCode == 0 {
 		exitCode = childExitCode(waitErr)
 	}
@@ -766,7 +770,7 @@ func Run(opts Options) int {
 			Action: "Check the remote host before retrying; local cancellation does not confirm remote termination."})
 		fmt.Fprintln(os.Stderr, "dots remote: "+message)
 	}
-	if exitCode != 0 && !cancelRequested && !workReported {
+	if exitCode != 0 && waitCancellation == nil && !workReported {
 		if !runStarted && opts.Command != "up" {
 			emit(ui.Event{V: 1, Kind: "run_start"})
 		}
@@ -1316,32 +1320,39 @@ func relayTerminalInput(tty, master *os.File, state *relayState, start <-chan st
 	}
 }
 
-func cancelBackend(b *backend) {
-	if b == nil || b.command == nil || b.command.Process == nil {
-		return
-	}
-	cmd := b.command
-	pid := cmd.Process.Pid
+// cancelBackend starts escalation and returns a function to wait for it after the leader exits.
+func cancelBackend(b *backend) func() {
+	process := b.command.Process
 	kill := func(signal syscall.Signal) error {
 		if b.processGroup {
-			return syscall.Kill(-pid, signal)
+			return syscall.Kill(-process.Pid, signal)
 		}
-		return cmd.Process.Signal(signal)
+		return process.Signal(signal)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	graceElapsed := func(delay time.Duration) bool {
+		select {
+		case <-stop:
+			return false
+		case <-time.After(delay):
+			return true
+		}
 	}
 	_ = kill(syscall.SIGINT)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		if b.processGroup {
-			if syscall.Kill(-pid, 0) != nil {
-				return
-			}
-		} else if cmd.Process.Signal(syscall.Signal(0)) != nil {
-			return
+		defer close(done)
+		if graceElapsed(150*time.Millisecond) && kill(syscall.SIGTERM) == nil && graceElapsed(500*time.Millisecond) {
+			_ = kill(syscall.SIGKILL)
 		}
-		_ = kill(syscall.SIGTERM)
-		time.Sleep(500 * time.Millisecond)
-		_ = kill(syscall.SIGKILL)
 	}()
+	return func() {
+		// Streams can drain before descendants leave an owned group.
+		if !b.processGroup || errors.Is(kill(0), syscall.ESRCH) {
+			close(stop)
+		}
+		<-done
+	}
 }
 
 func childExitCode(err error) int {

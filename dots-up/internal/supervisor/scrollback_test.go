@@ -1,13 +1,16 @@
 package supervisor
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -192,6 +195,82 @@ emit '{"v":1,"kind":"stage_end","id":"bootstrap","status":"ok"}'
 			}
 		})
 	}
+}
+
+func TestHeadlessScrollbackCancellationStopsProcessGroup(t *testing.T) {
+	useTextRunner(t, runnerEvents+`
+trap 'emit "{\"v\":1,\"kind\":\"run_end\",\"status\":\"ok\",\"exit_code\":0}"; exit 0' INT
+sh -c '
+    trap "" INT TERM
+    printf "%s\n" "$$"
+    exec sleep 10
+' &
+wait "$!"
+`)
+	state := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestScrollbackFixtureProcess$")
+	cmd.Env = append(os.Environ(), "DOTS_SCROLLBACK_FIXTURE="+state, "DOTS_SCROLLBACK_COMMAND=remove")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	cmd.Stdout = w
+	err = cmd.Start()
+	w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		if cmd.ProcessState == nil {
+			_ = cmd.Wait()
+		}
+	}()
+	if err := r.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	stdout := bufio.NewReader(r)
+	line, err := stdout.ReadString('\n')
+	if err != nil {
+		t.Fatalf("waiting for the stubborn child: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil || pid <= 1 {
+		t.Fatalf("invalid child PID %q", line)
+	}
+	childExited := false
+	defer func() {
+		if !childExited {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}()
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if code := childExitCode(cmd.Wait()); code != 130 {
+		t.Errorf("got exit %d after cancellation, want 130", code)
+	}
+	report, _, err := latestReport(state)
+	if err != nil {
+		t.Error(err)
+	} else if len(report.Events) == 0 {
+		t.Error("saved report has no events")
+	} else if end := report.Events[len(report.Events)-1]; report.ExitCode != 130 || end.Kind != "run_end" || end.ExitCode != 130 || end.Status != "cancelled" {
+		t.Errorf("report exited %d with final event %+v, want cancelled with exit 130", report.ExitCode, end)
+	}
+	// The stubborn child holds stdout and the event descriptor. The test
+	// process's exit closes neither descriptor while that child is alive.
+	if err := r.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdout.ReadByte(); err != io.EOF {
+		t.Fatalf("stubborn child kept stdout open after cancellation: %v", err)
+	}
+	childExited = true
 }
 
 func TestScrollbackFixtureProcess(t *testing.T) {

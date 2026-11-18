@@ -31,7 +31,7 @@ Edges: predecessor → dependent. Layers show dependency readiness, not resource
 - A-01 — Repository metadata; needs: K-01; external: none
 - S-01 — Write the contract for 1.0; needs: K-02; external: none
 - T-01 — Spike: PTY, terminal handoff and signals in Rust; needs: K-02; external: none
-- S-02 — Architecture note; needs: S-01, T-01; external: none
+- S-02 — Architecture note (done in #18, 900ae3c); needs: S-01, T-01; external: none
 - R-01 — Cargo package, command tree, shared modules and Rust CI; needs: S-02; external: none
 - Q-01 — Acceptance harness; needs: R-01; external: none
 - P-11 — Supervisor and report store; needs: T-01, R-01; external: none
@@ -68,7 +68,7 @@ flowchart TD
   n2["A-01 Repository metadata"]
   n3["S-01 Write the contract for 1.0"]
   n4["T-01 Spike: PTY, terminal handoff and signals in Rust"]
-  n5["S-02 Architecture note"]
+  n5["S-02 Architecture note (done in #18, 900ae3c)"]
   n6["R-01 Cargo package, command tree, shared modules and Rust CI"]
   n7["Q-01 Acceptance harness"]
   n8["P-11 Supervisor and report store"]

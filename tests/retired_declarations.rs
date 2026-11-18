@@ -202,12 +202,16 @@ impl Retirement {
     }
 
     fn assert_local(&self, expected: &str) {
-        let local = self.root.join("config.local.toml");
-        assert_eq!(fs::read_to_string(&local).unwrap(), expected);
+        let local = fixture_file(
+            self.root.parent().unwrap(),
+            &self.root.join("config.local.toml"),
+        )
+        .expect("live configuration must remain a regular fixture file");
         assert_eq!(
-            fs::metadata(local).unwrap().permissions().mode() & 0o777,
+            local.file.metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(std::io::read_to_string(local.file).unwrap(), expected);
     }
 
     fn assert_deployed(&self) {

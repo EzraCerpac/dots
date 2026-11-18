@@ -176,6 +176,20 @@ exec {adapter} -C "$HOME" --version"#,
             assert!(!marker.exists());
         }
     }
+    let reader = world.fixture_reader();
+    let local_body = fixture.join("body.md");
+    put(&local_body, "fixture body\n");
+    let read_body = finish(world.tool(&reader).arg(&local_body));
+    assert!(read_body.status.success(), "{read_body:?}");
+    assert_eq!(stdout(&read_body), "fixture body\n");
+    for outside_body in [
+        other.root().join("config.toml"),
+        symlink.join("config.toml"),
+    ] {
+        let output = finish(world.tool(&reader).arg(outside_body));
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
 }
 
 struct Repo {
@@ -1204,11 +1218,20 @@ fn failed_history_save(f: &Repo, output: Option<&Path>, diagnostic: &str) -> [St
         let lower = text.to_ascii_lowercase();
         assert!(
             lower.lines().any(|line| {
-                (line.contains("history") || line.contains("encrypted settings checkpoint"))
-                    && line.contains("save")
-                    && (line.contains("failed") || line.contains("could not"))
+                line.contains("sav")
+                    && ["failed", "could not", "cannot", "unable to"]
+                        .iter()
+                        .any(|reason| line.contains(reason))
             }),
             "missing a clear save failure reason: {text}"
+        );
+        assert!(
+            lower.contains("exit status")
+                || lower.contains("exit code")
+                || lower.contains("cannot read")
+                || lower.contains("fixture diagnostic")
+                || lower.contains("mise error"),
+            "missing a safe reason for the save failure: {text}"
         );
         absent(&lower, "dots backup");
         assert!(
@@ -1796,11 +1819,6 @@ fn wrong_checkout(shape: &str, diagnostic: &str) {
         }
         "jj" => fs::create_dir(f.a.join(".jj")).unwrap(),
         "legacy" => f.write(&f.a, ".git/dots-dev.json", "{}"),
-        "wrong origin" => {
-            let mismatched = f.world.bare_remote("mismatched-origin.git");
-            let url = format!("file://{}", mismatched.display());
-            f.git(&f.a, &["remote", "set-url", "origin", &url]);
-        }
         _ => unreachable!(),
     }
     let receipt = f.sync(&f.a);
@@ -1822,7 +1840,24 @@ sync_case!(unchanged_pre_port_sync_state_stops_cleanly, || {
     wrong_checkout("legacy", "legacy");
 });
 sync_case!(unchanged_wrong_origin_stops_cleanly, || {
-    wrong_checkout("wrong origin", "origin");
+    let f = Repo::new();
+    let local = f.tip(&f.a);
+    let mismatched = f.world.bare_remote("mismatched-origin.git");
+    let refs = |root: &Path| f.git(root, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let expected_refs = refs(&f.origin);
+    let mismatched_refs = refs(&mismatched);
+    let url = format!("file://{}", mismatched.display());
+    f.git(&f.a, &["remote", "set-url", "origin", &url]);
+    assert_eq!(f.git(&f.a, &["remote", "get-url", "origin"]), url);
+    assert_eq!(f.git(&f.a, &["remote", "get-url", "--push", "origin"]), url);
+    let attempted = deny_transport(&f);
+    let receipt = f.sync(&f.a);
+    assert_eq!(receipt.lines().count(), 1, "{receipt}");
+    has(&receipt, "origin");
+    assert!(!attempted.exists(), "sync tried Git transport: {receipt}");
+    assert_eq!(refs(&f.origin), expected_refs);
+    assert_eq!(refs(&mismatched), mismatched_refs);
+    assert_eq!(f.tip(&f.a), local);
 });
 
 sync_case!(
@@ -2103,8 +2138,13 @@ sync_case!(
         f.write(&f.a, "config.host-laptop.toml", "[env]\nKEEP = \"1\"\n");
         let receipt = f.sync(&f.a);
         has(&receipt, "retired");
-        assert_eq!(read(&f.a.join(LOCAL)), KEEP_LOCAL);
-        assert_eq!(mode(&f.a.join(LOCAL)), 0o600);
+        let local_config = fixture_file(&f.scratch, &f.a.join(LOCAL))
+            .expect("rewritten local declaration must be a regular fixture file");
+        assert_eq!(local_config.file.metadata().unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::io::read_to_string(local_config.file).unwrap(),
+            KEEP_LOCAL
+        );
         assert_eq!(
             read(&f.a.join("config.host-laptop.toml")),
             "[env]\nKEEP = \"1\"\n"
@@ -2534,7 +2574,9 @@ copies_case!(
                 .unwrap(),
         );
         let mut previous = fixture_editor(&f.scratch, &target).unwrap().file;
-        let opened = identity(previous.metadata().unwrap());
+        let opened_metadata = previous.metadata().unwrap();
+        let original_mode = opened_metadata.mode() & 0o7777;
+        let opened = identity(opened_metadata);
         assert_eq!(
             opened, original,
             "descriptor opened a different fixture file"
@@ -2571,6 +2613,11 @@ copies_case!(
             .find(|(_, file, _, _)| *file == opened)
             .unwrap_or_else(|| panic!("no printed recovery path names the open inode: {evidence}"));
         assert_eq!(recovered.parent.metadata().unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            recovered.file.metadata().unwrap().mode() & 0o7777,
+            original_mode,
+            "{evidence}"
+        );
         assert_eq!(
             std::io::read_to_string(&mut recovered.file).unwrap(),
             "initial\n",
@@ -2720,8 +2767,55 @@ sed 's/permissions = "0644"/permissions = "0600"/' config.toml > new.toml && mv 
         let target = a.home.join(".copied");
         let before = fs::metadata(&target).unwrap();
         assert_eq!(mode(&target), 0o600);
+        let expected = f.scratch.join("kept-scan-expected");
+        let observed = f.scratch.join("kept-scan-candidate");
+        let scanned = f.scratch.join("kept-scanned-clean");
+        put(&expected, "generated by pre-hook\n");
+        let reader = f.world.fixture_reader();
+        script(
+            &f.tools.join("gitleaks"),
+            &format!(
+                r#"set -f
+for source do :; done
+case "$source" in {world}/*) ;; *) exit 88 ;; esac
+case "$1" in
+  git)
+    revision=
+    for arg do
+      case "$arg" in --log-opts=*)
+        for token in ${{arg#*=}}; do
+          case "$token" in -*|^*) continue ;; esac
+          revision=${{token##*..}}
+          revision=${{revision%%'^{{commit}}'}}
+          break
+        done ;;
+      esac
+    done
+    case "$revision" in *[!0-9a-f]*|'') exit 88 ;; esac
+    git -C "$source" cat-file blob "$revision:kept.txt" > {observed} || exit 88 ;;
+  dir)
+    {reader} "$source/kept.txt" > {observed} || exit 88 ;;
+  *) exit 88 ;;
+esac
+if cmp -s {expected} {observed}; then cp {observed} {scanned}; fi
+{GITLEAKS_FIXTURE}"#,
+                world = sh(&f.scratch),
+                reader = sh(&reader),
+                expected = sh(&expected),
+                observed = sh(&observed),
+                scanned = sh(&scanned),
+            ),
+        );
+        f.hook(
+            &f.a,
+            "pre-push",
+            &format!("cmp -s {} {} || exit 88", sh(&expected), sh(&scanned)),
+        );
         a.sync();
+        assert_eq!(read(&scanned), "generated by pre-hook\n");
         assert_eq!(f.blob("dev", "kept.txt"), "generated by pre-hook");
+        fs::remove_file(f.git_dir(&f.a).join("hooks/pre-push")).unwrap();
+        script(&f.tools.join("gitleaks"), GITLEAKS_FIXTURE);
         let after = fs::metadata(&target).unwrap();
         assert_eq!(before.ino(), after.ino());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
@@ -3134,13 +3228,22 @@ copies_case!(
 
         let receipt = a.sync();
         has(&receipt, ".copied");
-        has(&receipt, "conflict");
         let message = receipt.to_ascii_lowercase();
+        let lines: Vec<_> = message.lines().collect();
         assert!(
-            message.contains("compare")
-                || message.contains("review")
-                || message.contains("recover"),
-            "missing next action in {receipt}"
+            lines.iter().enumerate().any(|(index, line)| {
+                line.contains("conflict")
+                    && line.contains("copy.txt")
+                    && lines[index..].iter().take(3).any(|action| {
+                        (action.contains("git show")
+                            || ((action.contains("recover")
+                                || action.contains("compare")
+                                || action.contains("reconcile"))
+                                && (action.contains("version") || action.contains("parent"))))
+                            && (action.contains("sync") || action.contains(":copy.txt"))
+                    })
+            }),
+            "missing conflict-specific recovery for copy.txt: {receipt}"
         );
 
         let merged = f.remote();

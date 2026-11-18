@@ -27,6 +27,7 @@ struct Publication {
     workspace: PathBuf,
     tools: PathBuf,
     log: PathBuf,
+    fixture_reader: PathBuf,
     real_git: PathBuf,
     real_jj: PathBuf,
     real_gitleaks: Option<PathBuf>,
@@ -45,7 +46,7 @@ impl Publication {
         fs::create_dir(log.join("mise-system")).unwrap();
         fs::create_dir(log.join("scan-bin")).unwrap();
         for name in [
-            "bash", "cat", "dirname", "mise", "node", "python3", "readlink",
+            "bash", "cat", "cmp", "dirname", "mise", "node", "python3", "readlink",
         ] {
             if let Some(tool) = executable_on_path(&world.dots(), name) {
                 let tool = if name == "mise" {
@@ -63,6 +64,7 @@ impl Publication {
         let real_jj =
             executable_on_path(&world.dots(), "jj").expect("publish scenarios require jj");
         let real_gitleaks = executable_on_path(&world.dots(), "gitleaks");
+        let fixture_reader = world.fixture_reader();
         let config = match on_behalf_of {
             Some(person) => format!(
                 "[vars]\ndots_profiles = \"laptop\"\ndots_source_repo = \"{REPOSITORY}\"\ndots_publish_on_behalf_of = \"{person}\"\n"
@@ -104,6 +106,7 @@ impl Publication {
             workspace,
             tools,
             log,
+            fixture_reader,
             real_git,
             real_jj,
             real_gitleaks,
@@ -279,7 +282,7 @@ case "${1-} ${2-}" in
                     if [ "$2" = - ]; then
                         cat > "$PUBLISH_LOG/body"
                     else
-                        cat "$2" > "$PUBLISH_LOG/body"
+                        "$PUBLISH_READ_FILE" "$2" > "$PUBLISH_LOG/body"
                     fi
                     shift 2 ;;
                 --body|-b)
@@ -319,10 +322,17 @@ case "$1" in
         [ "$source" = "$cwd" ]
         range=
         for arg do
-            case "$arg" in --log-opts=*) range=${arg##* } ;; esac
+            case "$arg" in
+                --log-opts=*)
+                    case "$arg" in *--diff-merges=first-parent*) ;; *) exit 88 ;; esac
+                    range=${arg##* } ;;
+            esac
         done
         case "$range" in *[!a-f0-9.]*|'') exit 88 ;; esac
-        "$PUBLISH_GIT" -C "$source" log --format= --name-only "$range" -- >> "$PUBLISH_LOG/scan-input"
+        if [ -n "${PUBLISH_SCAN_BASE:-}" ]; then
+            [ "$range" = "$PUBLISH_SCAN_BASE..$PUBLISH_SCAN_HEAD" ]
+        fi
+        "$PUBLISH_GIT" -C "$source" log --format= --name-only --diff-merges=first-parent "$range" -- >> "$PUBLISH_LOG/scan-input"
         ;;
     dir)
         case "$cwd" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
@@ -331,7 +341,14 @@ case "$1" in
             case "$source" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
             for path in "$source"/public-*.txt "$source"/synthetic-token.txt "$source"/payload.zip "$source"/opaque.bin "$source"/binary.dat "$source"/*.pdf "$source"/collision.txt; do
                 if [ -f "$path" ] && [ ! -L "$path" ]; then
-                    printf '%s\n' "${path##*/}" >> "$PUBLISH_LOG/scan-input"
+                    name=${path##*/}
+                    printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-input"
+                    if [ -n "${PUBLISH_SCAN_HEAD:-}" ]; then
+                        "$PUBLISH_GIT" -C "$PUBLISH_WORKSPACE" cat-file blob "$PUBLISH_SCAN_HEAD:$name" > "$PUBLISH_LOG/approved-bytes"
+                        if cmp -s "$path" "$PUBLISH_LOG/approved-bytes"; then
+                            printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-approved-bytes"
+                        fi
+                    fi
                 fi
             done
         elif [ -f "$source" ]; then
@@ -423,6 +440,7 @@ exit "$status"
             .env("PUBLISH_GIT", &self.real_git)
             .env("PUBLISH_JJ", &self.real_jj)
             .env("PUBLISH_PR_URL", PR_URL)
+            .env("PUBLISH_READ_FILE", &self.fixture_reader)
             .env_remove("DOTS_PUBLISH_MODEL");
         if let Some(gitleaks) = &self.real_gitleaks {
             command.env("PUBLISH_GITLEAKS", gitleaks);
@@ -519,18 +537,45 @@ exit "$status"
 
     fn approve(
         &self,
-        command: FixtureCommand<'_>,
+        mut command: FixtureCommand<'_>,
         revision: &str,
         expected_paths: &[&str],
     ) -> String {
         let approved = self.jj(&["log", "--no-graph", "-r", revision, "-T", "commit_id"]);
         let approved = approved.trim();
+        let main = success(
+            self.world
+                .git()
+                .arg("--git-dir")
+                .arg(&self.bare)
+                .args(["rev-parse", "refs/heads/main"]),
+        );
+        command
+            .env("PUBLISH_SCAN_BASE", main.trim())
+            .env("PUBLISH_SCAN_HEAD", approved);
+        self.real_scan(&mut command);
         let mut terminal = Pty::spawn(command);
         terminal.expect("[y/N]");
         assert!(
             self.log.join("scan-complete").is_file(),
             "confirmation preceded scanner completion"
         );
+        assert_eq!(self.read_log("scan-status"), "0\n");
+        let locations = self.read_log("scan-location");
+        assert!(
+            !locations.is_empty(),
+            "scanner must observe a cwd and source"
+        );
+        if locations.lines().any(|line| line.starts_with("dir\t")) {
+            let bytes = self.read_log("scan-approved-bytes");
+            let mut matching: Vec<_> = bytes.lines().collect();
+            matching.sort_unstable();
+            matching.dedup();
+            assert_eq!(
+                matching, expected_paths,
+                "scanner missed approved file bytes"
+            );
+        }
         let inputs = self.read_log("scan-input");
         let mut scanned: Vec<_> = inputs.lines().filter(|line| !line.is_empty()).collect();
         scanned.sort_unstable();
@@ -543,15 +588,18 @@ exit "$status"
         assert!(status.success(), "{status}\n{transcript}");
         assert!(transcript.contains(PR_URL), "{transcript}");
         let calls = self.read_log("gh");
-        let head = calls
+        let create = calls
             .lines()
             .find(|line| line.starts_with("pr create "))
-            .and_then(|line| {
-                line.split_ascii_whitespace()
-                    .skip_while(|word| *word != "--head")
-                    .nth(1)
-            })
-            .expect("PR creation must name its published head");
+            .expect("expected a PR creation request");
+        let argument = |flag: &str| {
+            create
+                .split_ascii_whitespace()
+                .skip_while(|word| *word != flag)
+                .nth(1)
+        };
+        assert_eq!(argument("--base"), Some("main"));
+        let head = argument("--head").expect("PR creation must name its published head");
         assert!(
             head.starts_with("wip/"),
             "not a private publication bookmark: {head}"
@@ -573,20 +621,17 @@ exit "$status"
             })
             .collect();
         assert_eq!(pushed, [(reference.as_str(), approved)], "{refs}");
+        assert!(
+            refs.lines()
+                .any(|line| line == format!("refs/heads/main {}", main.trim()))
+        );
         approved.to_owned()
     }
 
     fn reject_secret(&self, bookmark: &str, terminal: bool) -> String {
         let mut command = self.dots(&["publish", "--bookmark", bookmark]);
         self.real_scan(&mut command);
-        let transcript = if terminal {
-            let (status, transcript) = Pty::spawn(command).finish();
-            assert_eq!(status.code(), Some(1));
-            transcript
-        } else {
-            let (stdout, stderr) = failure(command.output().unwrap());
-            format!("{stdout}{stderr}")
-        };
+        let transcript = refusal(command, terminal);
         let report = fs::read_to_string(self.log.join("findings.json")).unwrap_or_else(|error| {
             panic!(
                 "scanner report unavailable: {error}\n{}",
@@ -611,9 +656,10 @@ exit "$status"
             "expected one redacted github-pat finding in the fixture file",
         );
         assert!(
-            transcript.contains("gitleaks"),
-            "publish did not report a scanner failure"
+            transcript.contains("gitleaks found potential secrets"),
+            "publish did not report scanner findings"
         );
+        assert_ne!(self.read_log("scan-status"), "0\n");
         self.assert_no_publication();
         transcript
     }
@@ -631,6 +677,37 @@ fn failure(output: Output) -> (String, String) {
         String::from_utf8(output.stdout).unwrap(),
         String::from_utf8(output.stderr).unwrap(),
     )
+}
+
+fn refusal(mut command: FixtureCommand<'_>, terminal: bool) -> String {
+    if terminal {
+        let mut pty = Pty::spawn(command);
+        pty.send("n\n");
+        let (status, transcript) = pty.finish();
+        assert_eq!(status.code(), Some(1), "{transcript}");
+        transcript
+    } else {
+        let (stdout, stderr) = failure(command.output().unwrap());
+        format!("{stdout}{stderr}")
+    }
+}
+
+fn assert_no_preview(transcript: &str) {
+    for marker in [
+        "Proposed changes",
+        "Proposed diff",
+        "Proposed pull request title",
+        "Proposed pull request description",
+        "Final pull request diff",
+        "diff --git",
+        "@@ ",
+        "[y/N]",
+    ] {
+        assert!(
+            !transcript.contains(marker),
+            "found {marker:?}: {transcript}"
+        );
+    }
 }
 
 fn synthetic_token() -> String {
@@ -660,6 +737,12 @@ fn zipped(name: &str, contents: &[u8]) -> Vec<u8> {
 #[test]
 #[ignore = "P-10 archive screening"]
 fn new_publish_finds_a_redacted_secret_one_archive_level_deep() {
+    for terminal in [false, true] {
+        assert_archive_finding_before_preview(terminal);
+    }
+}
+
+fn assert_archive_finding_before_preview(terminal: bool) {
     let fixture = Publication::new(None, false);
     let token = synthetic_token();
     let archive = fixture.workspace.join("payload.zip");
@@ -678,12 +761,9 @@ fn new_publish_finds_a_redacted_secret_one_archive_level_deep() {
     let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
     let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
     fixture.real_scan(&mut command);
-    let mut terminal = Pty::spawn(command);
-    terminal.send("n\n");
-    let (status, transcript) = terminal.finish();
-    assert_eq!(status.code(), Some(1));
+    let transcript = refusal(command, terminal);
     assert!(transcript.contains("gitleaks found potential secrets"));
-    assert!(!transcript.contains("[y/N]"));
+    assert_no_preview(&transcript);
     assert!(!transcript.contains(&token));
     assert_eq!(fixture.read_log("scan-input"), "payload.zip\n");
     let report = fixture.read_log("findings.json");
@@ -743,6 +823,12 @@ fn new_publish_allows_native_success_without_a_skip_signal() {
 #[test]
 #[ignore = "P-10 archive screening"]
 fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmation() {
+    for terminal in [false, true] {
+        assert_archive_skip_before_preview(terminal);
+    }
+}
+
+fn assert_archive_skip_before_preview(terminal: bool) {
     const PDF: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
     let nested = zipped("inner.zip", &zipped("notes.txt", b"fixture notes\n"));
     for (path, bytes, signal, field, diagnostic) in [
@@ -770,15 +856,8 @@ fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmatio
         let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
         let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
         fixture.real_scan(&mut command);
-        let mut terminal = Pty::spawn(command);
-        terminal.send("n\n");
-        let (status, transcript) = terminal.finish();
-        assert_eq!(status.code(), Some(1), "{transcript}");
-        assert!(!transcript.contains("[y/N]"), "{transcript}");
-        assert!(
-            !transcript.contains("Proposed pull request"),
-            "{transcript}"
-        );
+        let transcript = refusal(command, terminal);
+        assert_no_preview(&transcript);
         assert!(transcript.contains(diagnostic), "{transcript}");
         assert!(!transcript.contains(fixture.log.to_str().unwrap()));
         assert_eq!(fixture.read_log("scan-input"), format!("{path}\n"));
@@ -928,9 +1007,7 @@ fn new_publish_never_previews_the_rejected_secret() {
         ] {
             let transcript = fixture.reject_secret(bookmark, terminal);
             assert!(!transcript.contains(&token));
-            assert!(!transcript.contains("Proposed changes"));
-            assert!(!transcript.contains("Final pull request diff"));
-            assert!(!transcript.contains("[y/N]"));
+            assert_no_preview(&transcript);
         }
     }
 }

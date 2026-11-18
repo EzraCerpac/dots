@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileType, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -18,6 +18,7 @@ use super::guard::{CStrName, Dir, Image, private_dir, replace_exact, write_priva
 use super::snapshot::changed;
 
 const PENDING: &str = "dots-sync-pending";
+const SNAPSHOT_LOCK: &str = "dots-sync-snapshot.lock";
 
 pub(super) fn has_pending(directory: &Path) -> bool {
     !matches!(
@@ -43,7 +44,7 @@ pub(super) struct Installed {
     pub index_after: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct Interrupted {
     pub path: Option<PathBuf>,
     pub backups: Vec<PathBuf>,
@@ -66,30 +67,122 @@ pub(super) fn index_snapshot(dir: &Path) -> io::Result<Vec<u8>> {
     fs::read(index)
 }
 
-/// A ref-only update leaves the checkout's index at the preceding tree.
+/// Hold the real worktree index still while a separate index captures edits.
+/// The private inode also identifies our Git lock if the process dies.
+pub(super) struct SnapshotIndex {
+    owner: File,
+    lock: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl SnapshotIndex {
+    pub(super) fn acquire(git: &Git<'_>, directory: &Path) -> io::Result<Self> {
+        let anchor = directory.join(SNAPSHOT_LOCK);
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&anchor)?;
+        let md = owner.metadata()?;
+        if !md.is_file()
+            || md.uid() != nix::unistd::geteuid().as_raw()
+            || md.mode() & 0o077 != 0
+            || md.len() != 0
+            || md.nlink() > 2
+        {
+            return Err(invalid("invalid snapshot lock owner"));
+        }
+        loop {
+            match owner.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => {
+                    return Err(invalid("Git index is locked by another snapshot"));
+                }
+                Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+        }
+        // Persist the identifying name before a competing process can see
+        // index.lock. Never reclaim an index lock created by Git.
+        File::open(directory)?.sync_all()?;
+        let lock = directory.join("index.lock");
+        link_index_lock(&anchor, &lock)?;
+        let mut guard = Self {
+            owner,
+            lock,
+            bytes: Vec::new(),
+        };
+        git.ensure_dense_index()?;
+        guard.bytes = index_snapshot(directory)?;
+        Ok(guard)
+    }
+
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for SnapshotIndex {
+    fn drop(&mut self) {
+        if let (Ok(owner), Ok(lock)) = (self.owner.metadata(), fs::symlink_metadata(&self.lock))
+            && lock.is_file()
+            && (owner.dev(), owner.ino()) == (lock.dev(), lock.ino())
+        {
+            let _ = fs::remove_file(&self.lock);
+        }
+        // A child between fork and exec can briefly inherit the descriptor.
+        let _ = self.owner.unlock();
+    }
+}
+
+/// Identify a ref-only move without treating reflog messages as Git actions.
+/// The caller checks the previous tree against the live paths before moving
+/// any of them. When the index could contain real staged changes, stop.
 pub(super) fn previous_index_base(
     git: &Git<'_>,
     index: &[u8],
     temporary: &Path,
     head: &str,
 ) -> io::Result<Option<String>> {
-    if !git
-        .text(["reflog", "show", "-1", "--format=%gs", "refs/heads/dev"])?
-        .is_empty()
-    {
-        return Ok(None);
-    }
-    let Ok(previous) = git.id(["rev-parse", "--verify", "refs/heads/dev@{1}^{commit}"]) else {
+    let worktree_head = git
+        .id(["rev-parse", "--verify", "HEAD@{0}^{commit}"])
+        .ok()
+        .filter(|logged| logged != head);
+    let previous = if let Some(logged) = &worktree_head {
+        logged.clone()
+    } else if let Ok(logged) = git.id(["rev-parse", "--verify", "refs/heads/dev@{1}^{commit}"]) {
+        logged
+    } else {
         return Ok(None);
     };
     if previous == head {
         return Ok(None);
     }
     fs::write(temporary, index)?;
-    let tree = git.indexed(temporary).id(["write-tree"])?;
-    let previous_tree = git.id(["rev-parse", &format!("{previous}^{{tree}}")])?;
-    let head_tree = git.id(["rev-parse", &format!("{head}^{{tree}}")])?;
-    Ok((previous_tree == tree && head_tree != tree).then_some(previous))
+    let staged = git.indexed(temporary).id(["write-tree"])?;
+    let old = git.tree(&previous)?;
+    let current = git.tree(head)?;
+    let index = git.tree(&staged)?;
+    if index == current || old == current {
+        return Ok(None);
+    }
+    if worktree_head.is_some() && index == old {
+        return Ok(Some(previous));
+    }
+    if changed(&old, &current)
+        .iter()
+        .any(|path| index.get(path) == old.get(path))
+    {
+        // A staged revert or deletion can look exactly like a stale index.
+        // An unrelated staged edit can also leave just part of it stale.
+        return Err(invalid(
+            "the dev move and staged edits cannot be distinguished",
+        ));
+    }
+    Ok(None)
 }
 
 /// A single checkout cannot retain two independent staged and unstaged
@@ -314,10 +407,14 @@ fn prepare_leaf(
 fn index_lock(dir: &Path, pending: &Path) -> io::Result<()> {
     let prepared = pending.join("index.after");
     let lock = dir.join("index.lock");
-    match fs::hard_link(&prepared, &lock) {
+    link_index_lock(&prepared, &lock)
+}
+
+fn link_index_lock(prepared: &Path, lock: &Path) -> io::Result<()> {
+    match fs::hard_link(prepared, lock) {
         Ok(()) => (),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if !fingerprints_match(&lock, &prepared)? {
+            if !fingerprints_match(lock, prepared)? {
                 return Err(invalid("Git index is locked by another writer"));
             }
         }
@@ -463,7 +560,7 @@ fn apply(
     git: &Git<'_>,
     directory: &Path,
     pending: &Path,
-    on_path: &mut Option<PathBuf>,
+    progress: &mut Interrupted,
     cancelled: impl Fn() -> bool,
     write_index: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<Installed> {
@@ -478,8 +575,7 @@ fn apply(
     if head != plan.before && head != plan.after {
         if !pending.join("started").exists() && !pending.join("finished").exists() {
             release_index(directory, pending)?;
-            fs::remove_dir_all(pending)?;
-            File::open(directory)?.sync_all()?;
+            retire_pending(directory, pending, progress)?;
         }
         return Err(invalid("branch changed while checkout was pending"));
     }
@@ -508,7 +604,7 @@ fn apply(
     {
         release_index(directory, pending)?;
         if !pending.join("started").exists() {
-            fs::remove_dir_all(pending)?;
+            retire_pending(directory, pending, progress)?;
         }
         return Err(invalid("Git index changed while sync was running"));
     }
@@ -540,7 +636,7 @@ fn apply(
             if cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            *on_path = Some(item.clone());
+            progress.path = Some(item.clone());
             let expected = if directory_in(&old, &item) {
                 Image::Directory
             } else {
@@ -577,7 +673,7 @@ fn apply(
     } else {
         paths = changed(&old, &new);
     }
-    *on_path = None;
+    progress.path = None;
 
     // Keep Git excluded while installing the index and moving the ref.
     // The separate staged inode also identifies our lock on restart.
@@ -588,7 +684,7 @@ fn apply(
         if let Err(error) = write_index(&staged, directory) {
             if !plan.checkout {
                 release_index(directory, pending)?;
-                fs::remove_dir_all(pending)?;
+                retire_pending(directory, pending, progress)?;
             }
             return Err(error);
         }
@@ -651,14 +747,74 @@ fn prune_empty_ancestors(
     Ok(())
 }
 
-fn backup_paths(directory: &Path) -> Vec<PathBuf> {
-    fs::read_dir(directory)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("old-"))
-        .map(|entry| entry.path())
-        .collect()
+// Only these disposable leaves may be removed after retirement. A directory
+// or an unexpected entry may contain recovery data and must travel intact.
+fn disposable(name: &OsStr, kind: FileType) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let numbered = |prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|number| number.parse::<usize>().is_ok())
+    };
+    (kind.is_file()
+        && (matches!(
+            name,
+            "plan.json" | "index.before" | "index.after" | "index.install" | "started" | "finished"
+        ) || numbered("done-")))
+        || ((kind.is_file() || kind.is_symlink()) && (numbered("expected-") || numbered("new-")))
+}
+
+fn recovery_paths(journal: &Path) -> Vec<PathBuf> {
+    let list = || -> io::Result<Vec<PathBuf>> {
+        let mut saved = Vec::new();
+        for entry in fs::read_dir(journal)? {
+            let entry = entry?;
+            if !disposable(&entry.file_name(), entry.file_type()?) {
+                saved.push(entry.path());
+            }
+        }
+        Ok(saved)
+    };
+    list().unwrap_or_else(|_| vec![journal.to_owned()])
+}
+
+fn clean_retired(journal: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(journal)? {
+        let entry = entry?;
+        if disposable(&entry.file_name(), entry.file_type()?) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    // Exclusive leaf cleanup and rmdir preserve any entries added while
+    // cleanup runs. A later sync never interprets a retired journal as active.
+    fs::remove_dir(journal)
+}
+
+fn park_pending(
+    directory: &Path,
+    pending: &Path,
+    progress: &mut Interrupted,
+) -> io::Result<PathBuf> {
+    let parent = File::open(directory)?;
+    let recovery = private_dir(directory, "dots-sync-recovery-")?;
+    // Drop automatic recursive cleanup before renaming any live journal.
+    let recovery = recovery.keep();
+    if let Err(error) = fs::rename(pending, &recovery) {
+        let _ = fs::remove_dir(&recovery);
+        return Err(error);
+    }
+    progress.backups = recovery_paths(&recovery);
+    parent.sync_all()?;
+    Ok(recovery)
+}
+
+fn retire_pending(directory: &Path, pending: &Path, progress: &mut Interrupted) -> io::Result<()> {
+    let recovery = park_pending(directory, pending, progress)?;
+    if progress.backups.is_empty() && clean_retired(&recovery).is_err() {
+        progress.backups = vec![recovery];
+    }
+    Ok(())
 }
 
 pub(super) fn finish(
@@ -677,45 +833,275 @@ pub(super) fn finish(
             });
         }
     };
-    let mut at = None;
-
-    let installed =
-        apply(git, directory, &pending, &mut at, cancelled, replace_index).map_err(|_| {
-            Interrupted {
-                path: at,
-                backups: backup_paths(&pending),
+    let mut progress = Interrupted::default();
+    let installed = apply(
+        git,
+        directory,
+        &pending,
+        &mut progress,
+        cancelled,
+        replace_index,
+    )
+    .and_then(|installed| {
+        retire_pending(directory, &pending, &mut progress)?;
+        Ok(installed)
+    });
+    match installed {
+        Ok(installed) => Ok(Some((installed, progress.backups))),
+        Err(_) => {
+            if has_pending(directory) {
+                progress.backups = recovery_paths(&pending);
             }
-        })?;
-    let mut backups = backup_paths(&pending);
-    if backups.is_empty() {
-        fs::remove_dir_all(&pending).map_err(|_| Interrupted {
-            path: None,
-            backups: Vec::new(),
-        })?;
-    } else {
-        let recovery = private_dir(directory, "dots-sync-recovery-").map_err(|_| Interrupted {
-            path: None,
-            backups: backups.clone(),
-        })?;
-        fs::rename(&pending, recovery.path()).map_err(|_| Interrupted {
-            path: None,
-            backups: backups.clone(),
-        })?;
-        let recovery = recovery.keep();
-        backups = backup_paths(&recovery);
+            Err(progress)
+        }
     }
-    File::open(directory)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|_| Interrupted {
-            path: None,
-            backups: backups.clone(),
-        })?;
-    Ok(Some((installed, backups)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_ref_move_from_another_worktree_reconciles_the_old_index() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        let other = fixture.path().canonicalize().unwrap().join("other");
+        git.get([
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            other.to_str().unwrap(),
+        ])
+        .unwrap();
+        let detached = git.at(&other);
+        fs::write(other.join("added"), b"from moved dev").unwrap();
+        detached.get(["add", "added"]).unwrap();
+        let after = fixture_commit(&detached, "add file");
+        detached
+            .get([
+                "update-ref",
+                "-m",
+                "adopt dev",
+                "refs/heads/dev",
+                &after,
+                &before,
+            ])
+            .unwrap();
+        assert!(!git.root().join("added").exists());
+
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        let probe = fixture.path().join("probe.index");
+        assert_eq!(
+            previous_index_base(&git, &index, &probe, &after).unwrap(),
+            Some(before.clone())
+        );
+        assert!(
+            preflight(
+                &git,
+                &before,
+                &git.tree(&before).unwrap(),
+                &git.tree(&after).unwrap(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        begin(&git, &dir, &index, &before, &after, true).unwrap();
+        let (_, backups) = finish(&git, &dir, || false).unwrap().unwrap();
+        assert!(backups.is_empty());
+        assert_eq!(
+            fs::read(git.root().join("added")).unwrap(),
+            b"from moved dev"
+        );
+        assert_eq!(git.text(["status", "--porcelain"]).unwrap(), "");
+    }
+
+    #[test]
+    fn named_ref_move_with_staged_work_declines_a_partly_stale_index() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        fs::write(git.root().join("added"), b"from moved dev").unwrap();
+        git.get(["add", "added"]).unwrap();
+        let after = fixture_commit(&git, "add file");
+        git.get(["reset", "--hard", &before]).unwrap();
+        git.get([
+            "update-ref",
+            "-m",
+            "adopt dev",
+            "refs/heads/dev",
+            &after,
+            &before,
+        ])
+        .unwrap();
+        fs::write(git.root().join("staged"), b"independent staged edit").unwrap();
+        git.get(["add", "staged"]).unwrap();
+        fs::write(git.root().join("staged"), b"independent unstaged edit").unwrap();
+
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        let probe = fixture.path().join("probe.index");
+        assert!(previous_index_base(&git, &index, &probe, &after).is_err());
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
+        assert!(!git.root().join("added").exists());
+        assert_eq!(
+            git.get(["show", ":staged"]).unwrap(),
+            b"independent staged edit"
+        );
+        assert_eq!(
+            fs::read(git.root().join("staged")).unwrap(),
+            b"independent unstaged edit"
+        );
+    }
+
+    #[test]
+    fn intentional_staged_and_unstaged_deletions_remain_edits() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        for path in ["staged", "unstaged"] {
+            fs::write(git.root().join(path), b"tracked").unwrap();
+        }
+        git.get(["add", "staged", "unstaged"]).unwrap();
+        fixture_commit(&git, "baseline");
+        fs::write(git.root().join("added"), b"from current dev").unwrap();
+        git.get(["add", "added"]).unwrap();
+        let head = fixture_commit(&git, "add file");
+        git.get(["rm", "staged"]).unwrap();
+        fs::remove_file(git.root().join("unstaged")).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        let probe = fixture.path().join("probe.index");
+        assert_eq!(
+            previous_index_base(&git, &index, &probe, &head).unwrap(),
+            None
+        );
+        assert!(
+            git.text(["status", "--porcelain"])
+                .unwrap()
+                .contains("D  staged")
+        );
+        assert!(
+            git.text(["status", "--porcelain"])
+                .unwrap()
+                .contains(" D unstaged")
+        );
+
+        // A staged deletion of a newly added file has the same index entry
+        // as a ref-only update that added it. Leave its intent to Git.
+        git.get(["rm", "added"]).unwrap();
+        let index = index_snapshot(&dir).unwrap();
+        assert!(previous_index_base(&git, &index, &probe, &head).is_err());
+        assert!(!git.root().join("added").exists());
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
+    }
+
+    #[test]
+    fn linked_snapshot_excludes_resets_and_sparse_index_changes() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (fixture, ctx) = git_fixture();
+        let primary = Git::new(&ctx, ctx.root.path());
+        let baseline = fixture_commit(&primary, "baseline");
+        fs::write(primary.root().join("tracked"), b"live checkout").unwrap();
+        primary.get(["add", "tracked"]).unwrap();
+        let tip = fixture_commit(&primary, "add file");
+        primary.get(["switch", "-qc", "fixture-primary"]).unwrap();
+        let primary_dir = primary.root().join(".git");
+        let primary_index = index_snapshot(&primary_dir).unwrap();
+        let linked = fixture.path().canonicalize().unwrap().join("linked");
+        primary
+            .get([
+                "worktree",
+                "add",
+                "--quiet",
+                linked.to_str().unwrap(),
+                "dev",
+            ])
+            .unwrap();
+        let git = primary.at(&linked);
+        let (dir, _) = super::super::git::repository_dirs(&git).unwrap();
+        let expected = index_snapshot(&dir).unwrap();
+        let snapshot = SnapshotIndex::acquire(&git, &dir).unwrap();
+        assert!(SnapshotIndex::acquire(&git, &dir).is_err());
+        assert!(git.get(["reset", "--hard", &baseline]).is_err());
+        assert!(
+            git.get(["update-index", "--skip-worktree", "tracked"])
+                .is_err()
+        );
+        assert!(
+            git.get(["sparse-checkout", "set", "--no-cone", "/config.toml"])
+                .is_err()
+        );
+        assert_eq!(git.id(["rev-parse", "refs/heads/dev"]).unwrap(), tip);
+        assert_eq!(fs::read(linked.join("tracked")).unwrap(), b"live checkout");
+        assert_eq!(index_snapshot(&dir).unwrap(), snapshot.bytes());
+        assert_eq!(snapshot.bytes(), expected);
+        assert_eq!(index_snapshot(&primary_dir).unwrap(), primary_index);
+        assert!(!primary_dir.join("index.lock").exists());
+        drop(snapshot);
+        assert!(!dir.join("index.lock").exists());
+
+        git.get(["sparse-checkout", "disable"]).unwrap();
+        git.get(["update-index", "--skip-worktree", "tracked"])
+            .unwrap();
+        fs::remove_file(linked.join("tracked")).unwrap();
+        assert!(SnapshotIndex::acquire(&git, &dir).is_err());
+        assert!(!dir.join("index.lock").exists());
+    }
+
+    #[test]
+    fn snapshot_reclaims_only_its_own_stale_git_lock() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        fixture_commit(&git, "baseline");
+        let dir = git.root().join(".git");
+        let lock = dir.join("index.lock");
+        fs::write(&lock, b"another Git writer").unwrap();
+        assert!(SnapshotIndex::acquire(&git, &dir).is_err());
+        assert_eq!(fs::read(&lock).unwrap(), b"another Git writer");
+        fs::remove_file(&lock).unwrap();
+        fs::hard_link(dir.join(SNAPSHOT_LOCK), &lock).unwrap();
+        let snapshot = SnapshotIndex::acquire(&git, &dir).unwrap();
+        assert_eq!(snapshot.bytes(), index_snapshot(&dir).unwrap());
+        drop(snapshot);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn interrupted_cleanup_has_no_active_journal_and_allows_another_install() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        let after = fixture_commit(&git, "candidate");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, false).unwrap();
+        let pending = dir.join(PENDING);
+        let mut progress = Interrupted::default();
+        let installed =
+            apply(&git, &dir, &pending, &mut progress, || false, replace_index).unwrap();
+        let retired = park_pending(&dir, &pending, &mut progress).unwrap();
+        assert!(progress.backups.is_empty());
+        fs::remove_file(retired.join("plan.json")).unwrap();
+        assert!(finish(&git, &dir, || false).unwrap().is_none());
+        assert!(!dir.join("index.lock").exists());
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+        begin(&git, &dir, &installed.index_after, &after, &after, false).unwrap();
+        assert!(finish(&git, &dir, || false).unwrap().is_some());
+        // A different writer's entry created after the rename survives
+        // cleanup and cannot obstruct the next transaction.
+        let note = retired.join("other-writer");
+        fs::write(&note, b"keep").unwrap();
+        assert!(clean_retired(&retired).is_err());
+        assert_eq!(fs::read(note).unwrap(), b"keep");
+    }
 
     #[test]
     fn prepared_head_transaction_excludes_competing_git_writers() {
@@ -790,7 +1176,7 @@ mod tests {
                 &git,
                 &dir,
                 &dir.join(PENDING),
-                &mut None,
+                &mut Interrupted::default(),
                 || false,
                 replace_index
             )
@@ -896,7 +1282,7 @@ mod tests {
             &git,
             &dir,
             &dir.join(PENDING),
-            &mut None,
+            &mut Interrupted::default(),
             || false,
             |prepared, dir| {
                 assert!(fingerprints_match(prepared, &dir.join("index.lock")).unwrap());
@@ -962,7 +1348,7 @@ mod tests {
             &git,
             &dir,
             &dir.join(PENDING),
-            &mut None,
+            &mut Interrupted::default(),
             || false,
             |_, _| Err(io::Error::from_raw_os_error(nix::libc::ENOSPC)),
         );

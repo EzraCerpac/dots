@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::Ctx;
+use crate::config::passive;
 use crate::process::{Cwd, Mise};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId};
-use crate::targets::{Kind, Scope, Targets};
+use crate::targets::github_repo;
 
 use super::{Step, Versions, child, json, mise_command, probe, record_changes, step};
 
@@ -188,8 +189,11 @@ pub(super) enum ManagerSource {
 fn manager_tool(name: &str) -> bool {
     name == "dots"
         || name
-            .split_once(':')
-            .is_some_and(|(_, repository)| repository.eq_ignore_ascii_case("EzraCerpac/dots"))
+            .strip_prefix("https://github.com/")
+            .or_else(|| name.split_once(':').map(|(_, repository)| repository))
+            .and_then(github_repo)
+            .as_deref()
+            == Some("ezracerpac/dots")
 }
 
 pub(super) fn probe_path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
@@ -201,18 +205,38 @@ pub(super) fn probe_path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Optio
     path.is_absolute().then_some(path)
 }
 
-pub(super) fn manager_source(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> Option<ManagerSource> {
+fn declared_manager_tool(root: &Path, files: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct ConfigFile {
+        path: PathBuf,
+    }
+
+    let Ok(files) = serde_json::from_slice::<Vec<ConfigFile>>(files) else {
+        return false;
+    };
+    files
+        .into_iter()
+        .filter(|file| file.path.is_absolute())
+        .filter_map(|file| file.path.canonicalize().ok())
+        .filter(|path| path.starts_with(root))
+        .filter_map(|path| passive::toml(&path).ok())
+        .any(|doc| {
+            doc.get("tools")
+                .and_then(toml_edit::Item::as_table_like)
+                .is_some_and(|table| table.iter().any(|(name, _)| manager_tool(name)))
+        })
+}
+
+pub(super) fn manager_source(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    files: &[u8],
+) -> Option<ManagerSource> {
     if run.cancelled() {
         return None;
     }
-    let declared_tool = Targets::read(&ctx.root, Scope::Active, ctx.env.cwd())
-        .ok()
-        .is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|tool| tool.kind == Kind::Tool && manager_tool(&tool.id))
-        });
-    if declared_tool {
+    if declared_manager_tool(ctx.root.path(), files) {
         return Some(ManagerSource::Tool);
     }
     super::packages::declared_dots_formula(run, mise).map(ManagerSource::Formula)

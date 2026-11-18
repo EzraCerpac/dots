@@ -644,3 +644,229 @@ fn unchanged_app_store_with_missing_tool_and_x64_mise_defers() {
     assert!(!calls.contains("packages apply --manager mas"));
     assert!(calls.contains("install tools"));
 }
+
+#[test]
+#[ignore = "P-06"]
+fn new_manager_discovery_reuses_the_supervised_configuration_listing() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\n[tools]\n'github:EzraCerpac/dots' = 'latest'\n",
+    );
+    fixture.run(0);
+    let calls = fixture.calls();
+    let (before_install, _) = calls.split_once("install tools").unwrap();
+    assert_eq!(before_install.matches("configuration listing").count(), 1);
+    assert!(before_install.contains("manager lookup"));
+}
+
+#[test]
+#[ignore = "P-06"]
+fn new_cancel_reaps_the_configuration_probe_and_its_child() {
+    let fixture = Fixture::new();
+    fixture.write("block-config-lookup", "");
+    let report = cancel_blocked_update(&fixture, &["--plain", "up"], "config-ready", false);
+    let last = report["stages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["label"], "Reload configuration");
+    assert_eq!(last["outcome"], "cancelled");
+    assert!(!fixture.calls().contains("install tools"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "P-06"]
+fn new_held_app_store_work_skips_authorization_and_tool_preparation() {
+    for tool_missing in [false, true] {
+        let fixture = store_fixture();
+        fixture.recipe("held-app", "#!/bin/sh\nexit 0\n");
+        fixture.write("dots/exceptions.tsv", "base\theld-app\thold=mas:42\n");
+        if tool_missing {
+            fs::remove_file(fixture.bin.join("mas")).unwrap();
+            fixture.write("prepare-brew-mas", "");
+        }
+        fixture.run_args(&["--plain", "up", "--mas"], 0);
+        let calls = fixture.calls();
+        assert!(!calls.contains("cached authorization"), "{calls}");
+        assert!(!calls.contains("packages apply --manager"), "{calls}");
+        assert!(!fixture.world.root().join("authorization-prompt").exists());
+        assert!(calls.contains("install tools"), "{calls}");
+    }
+}
+
+fn declared_fixture_package(name: &str) -> Value {
+    serde_json::json!({
+        "package": name,
+        "requested_version": "latest",
+        "desired_state": "present",
+        "state": "missing",
+        "installed_version": ""
+    })
+}
+
+#[test]
+#[ignore = "P-06"]
+fn new_filtered_bare_cask_fails_before_discarding_its_options() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'brew-cask:held' = 'latest'\n         browser = { appdir = '~/fixture-apps', adopt = true }\n",
+    );
+    fixture.recipe("held-cask", "#!/bin/sh\nexit 0\n");
+    fixture.write(
+        "dots/exceptions.tsv",
+        "base\theld-cask\thold=brew-cask:held\n",
+    );
+    fixture.write(
+        "packages.json",
+        &serde_json::json!({
+            "brew-cask": {"available": true, "packages": [declared_fixture_package("held")]},
+            "unprefixed": {"available": false, "packages": [declared_fixture_package("browser")]}
+        })
+        .to_string(),
+    );
+    fixture.write(
+        "resolved-packages.json",
+        &serde_json::json!({
+            "brew-cask": {
+                "available": true,
+                "packages": [declared_fixture_package("held"), declared_fixture_package("browser")]
+            }
+        })
+        .to_string(),
+    );
+    let report = fixture.run(1);
+    assert!(
+        !fixture
+            .calls()
+            .contains("packages apply --manager brew-cask")
+    );
+    assert!(
+        !fixture
+            .calls()
+            .contains("packages upgrade --manager brew-cask")
+    );
+    assert!(fixture.calls().contains("install tools"));
+    let stages = report["stages"].as_array().unwrap();
+    let issue = stages
+        .iter()
+        .find(|stage| stage["label"] == "brew-cask packages")
+        .unwrap()["issues"][0]["diagnostic"]
+        .as_str()
+        .unwrap();
+    assert!(issue.contains("brew-cask:browser") && issue.contains("appdir or adopt"));
+}
+
+#[test]
+#[ignore = "P-06"]
+fn new_failed_grouped_status_skips_unconfirmed_bare_only_managers() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'pacman:good' = 'latest'\n         bare = 'latest'\n",
+    );
+    fixture.write(
+        "package-settings.json",
+        r#"{"system_packages":{"prefer":["pacman","apt"]}}"#,
+    );
+    fixture.write(
+        "packages.json",
+        &serde_json::json!({
+            "pacman": {"available": true, "packages": [declared_fixture_package("good")]},
+            "unprefixed": {"available": false, "packages": [declared_fixture_package("bare")]}
+        })
+        .to_string(),
+    );
+    fixture.write(
+        "apt-packages.json",
+        &serde_json::json!({
+            "apt": {"available": true, "packages": [declared_fixture_package("bare")]}
+        })
+        .to_string(),
+    );
+    fixture.write("fail-bare-assignment", "");
+    let report = fixture.run(0);
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("packages apply --manager pacman --yes"),
+        "{calls}"
+    );
+    assert!(!calls.contains("packages apply --manager apt"), "{calls}");
+    let probes = fs::read_to_string(fixture.world.root().join("package-status-scopes")).unwrap();
+    assert!(
+        probes.lines().any(|scope| scope == "apt,pacman"),
+        "{probes}"
+    );
+    assert!(!probes.lines().any(|scope| scope == "apt"), "{probes}");
+    assert!(report["stages"].as_array().unwrap().iter().any(|stage| {
+        stage["label"] == "Resolve unqualified packages" && stage["outcome"] == "deferred"
+    }));
+}
+
+fn cancel_blocked_update(fixture: &Fixture, args: &[&str], marker: &str, detached: bool) -> Value {
+    use nix::libc;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut dots = fixture
+        .command()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let marker = fixture.world.root().join(marker);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let pids = loop {
+        if let Ok(ready) = fs::read_to_string(&marker)
+            && ready.ends_with('\n')
+            && let Ok(pids) = ready
+                .split_whitespace()
+                .map(str::parse::<libc::pid_t>)
+                .collect::<Result<Vec<_>, _>>()
+            && !pids.is_empty()
+            && pids.iter().all(|pid| *pid > 1)
+        {
+            break pids;
+        }
+        if dots.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            unsafe { libc::kill(dots.id() as libc::pid_t, libc::SIGINT) };
+            let output = dots.wait_with_output().unwrap();
+            panic!(
+                "fixture did not reach {marker:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // The only PIDs signaled or probed belong to this fixture's children.
+    let session = unsafe { libc::getsid(pids[0]) };
+    assert_eq!(
+        unsafe { libc::kill(dots.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = dots.wait_with_output().unwrap();
+    assert_exit(&output, 130);
+    if detached {
+        assert_eq!(session, pids[0], "worker must be its own session leader");
+    }
+    for pid in pids {
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "fixture helper {pid} survived"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    let report = fixture.read_report();
+    assert_eq!(report["cancelled"], true);
+    assert_eq!(fixture.calls().matches("checkpoint inventory").count(), 1);
+    assert!(!fixture.calls().contains("self-update"));
+    report
+}

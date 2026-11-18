@@ -58,11 +58,11 @@ impl Config {
         })
     }
 
-    fn reload<'a>(ctx: &'a Ctx, run: &Run<'_>) -> Result<(Self, Mise<'a>), Issue> {
+    fn reload<'a>(ctx: &'a Ctx, run: &Run<'_>) -> Result<(Self, Mise<'a>, Vec<u8>), Issue> {
         let config = Self::read(ctx).map_err(issue)?;
         let mise = Mise::new(ctx).map_err(issue)?;
-        probe(run, mise_command(run, &mise, ["config", "ls", "--json"]))?;
-        Ok((config, mise))
+        let files = probe(run, mise_command(run, &mise, ["config", "ls", "--json"]))?;
+        Ok((config, mise, files))
     }
 }
 
@@ -95,9 +95,11 @@ fn update(run: &Run<'_>, mas: bool) {
         loaded = Some(Config::reload(ctx, run)?);
         Ok(Outcome::Completed)
     });
-    let Some((config, mise)) = loaded else { return };
+    let Some((config, mise, files)) = loaded else {
+        return;
+    };
 
-    let manager = tools::manager_source(ctx, run, &mise);
+    let manager = tools::manager_source(ctx, run, &mise, &files);
     let manager_before = manager
         .as_ref()
         .and_then(|source| tools::manager_version(ctx, run, &mise, source));

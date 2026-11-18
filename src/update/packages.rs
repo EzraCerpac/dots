@@ -89,14 +89,25 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         if self.scope.managers().next().is_none() || self.run.cancelled() {
             return None;
         }
-        let mas = self.prepare_store_tool();
+        let store_tool = self.prepare_store_tool();
+        let mas = store_tool.as_ref().map(|(tool, _)| tool);
         // Only bare keys need a grouped probe to discover mise's assignment.
         // Native actions still use the full preference scope if that probe fails.
-        let resolved = self
+        let resolved = match self
             .scope
             .has_bare()
-            .then(|| grouped_status(self.run, self.mise, &self.scope, mas.as_ref()).ok())
-            .flatten();
+            .then(|| grouped_status(self.run, self.mise, &self.scope, mas))
+            .transpose()
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                step(self.run, "Resolve unqualified packages", |id| {
+                    self.run.issue(id, error);
+                    Ok(Outcome::Deferred)
+                });
+                None
+            }
+        };
 
         for name in self.scope.managers().filter(|name| *name != "mas") {
             if self.run.cancelled() {
@@ -104,7 +115,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             }
             match self.inspect_manager(name, resolved.as_ref(), None) {
                 Ok(Some(manager)) if manager.available && !manager.packages.is_empty() => {
-                    self.update_manager(name, &manager, mas.as_ref(), resolved.as_ref());
+                    self.update_manager(name, &manager, mas, resolved.as_ref());
                 }
                 Err(error) => {
                     step(self.run, format!("Inspect {name} packages"), |_| Err(error));
@@ -112,7 +123,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 _ => (),
             }
         }
-        let mas = mas.as_ref().filter(|_| !self.run.cancelled())?;
+        let (mas, already_authorized) = store_tool.as_ref().filter(|_| !self.run.cancelled())?;
         let mut store = None;
         step(self.run, "Prepare Mac App Store updates", |id| {
             let Some(manager) = self
@@ -159,7 +170,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             });
             Ok(Outcome::Completed)
         });
-        store
+        store.filter(|_| *already_authorized || self.authorize_store())
     }
 
     fn inspect_manager(
@@ -168,6 +179,12 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         resolved: Option<&Status>,
         mas: Option<&Tool>,
     ) -> Result<Option<Manager>, Issue> {
+        let unresolved = self.scope.has_bare() && resolved.is_none();
+        // A narrow inspection can force bare declarations onto this manager.
+        // Native apply retains the original preference and needs real work here.
+        if unresolved && self.scope.declared_names(name).next().is_none() {
+            return Ok(None);
+        }
         let mut status = if let Some(mas) = mas {
             let command = scoped_status_command(self.run, self.mise, &self.scope, name)
                 .and_then(|command| mas.expose(command));
@@ -186,7 +203,13 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                     .retain(|pkg| known.packages.iter().any(|row| row.package == pkg.package));
             }
         }
-        Ok(status)
+        Ok(status.filter(|manager| {
+            !unresolved
+                || manager
+                    .packages
+                    .iter()
+                    .any(|pkg| self.scope.declares(name, &pkg.package))
+        }))
     }
 
     fn tracked_names(
@@ -233,14 +256,46 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 "Qualify the package declarations with manager names or fix the manager status error, then rerun dots up.",
             ));
         }
+        if manager == "brew-cask"
+            && let Some(spec) = specs.as_ref().and_then(|specs| {
+                specs.0.iter().find(|spec| {
+                    spec.strip_prefix("brew-cask:")
+                        .is_some_and(|name| !self.scope.declares(manager, name))
+                })
+            })
+        {
+            return Err(Issue::new(
+                format!(
+                    "Cannot filter the brew-cask pass: a positional {spec} cannot preserve appdir or adopt from its unqualified declaration."
+                ),
+                "Qualify the cask declaration as brew-cask:NAME, then rerun dots up.",
+            ));
+        }
         Ok(specs)
     }
 
-    fn prepare_store_tool(&self) -> Option<Tool> {
+    fn prepare_store_tool(&self) -> Option<(Tool, bool)> {
         if !cfg!(target_os = "macos") || !self.scope.includes("mas") || !self.mas {
             return None;
         }
+        let eligible_declarations = self.scope.declared_names("mas").any(|name| {
+            self.config
+                .exceptions
+                .held_by_for(&format!("mas:{name}"), &self.config.profile)
+                .is_none()
+        });
+        if !eligible_declarations && !self.scope.has_bare() {
+            return None;
+        }
         let mut tool = app_store::locate(self.ctx, self.run, self.mise);
+        if let Some(tool) = tool {
+            return Some((tool, false));
+        }
+        // A missing manager cannot receive bare declarations through mise's
+        // built-in availability check. Only qualified work can provision it.
+        if !eligible_declarations {
+            return None;
+        }
         if tool.is_none() {
             let can_prepare = self.brew_can_prepare_store_tool();
             match can_prepare {
@@ -271,7 +326,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 })
             });
         }
-        tool
+        tool.map(|tool| (tool, true))
     }
 
     fn brew_can_prepare_store_tool(&self) -> Result<bool, Issue> {

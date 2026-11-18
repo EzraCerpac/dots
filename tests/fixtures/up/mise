@@ -3,9 +3,10 @@ set -eu
 [ -z "${__MISE_DIFF+x}" ] || exit 75
 for directory in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" \
     "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_STATE_DIR" "$MISE_CACHE_DIR" \
-    "$MISE_TMP_DIR" "$MISE_SYSTEM_CONFIG_DIR" "$MISE_GLOBAL_CONFIG_FILE"; do
+    "$MISE_TMP_DIR" "$MISE_SYSTEM_CONFIG_DIR"; do
     case "$directory" in "$HOME"/*) ;; *) exit 75 ;; esac
 done
+case "${MISE_GLOBAL_CONFIG_FILE-}" in ""|"$HOME"/*) ;; *) exit 75 ;; esac
 [ "$MISE_CONFIG_DIR" = "$DOTS_ROOT" ] || exit 75
 cd "$DOTS_ROOT"
 while [ "$#" -gt 0 ]; do
@@ -19,7 +20,17 @@ case "${1-}" in
         ;;
     config)
         case "$2" in
-            ls) printf '[]\n' ;;
+            ls)
+                printf 'configuration listing\n' >> calls
+                if [ -f block-config-lookup ]; then
+                    /bin/sleep 30 &
+                    helper=$!
+                    trap 'kill -TERM "$helper" 2>/dev/null || :; wait "$helper" || :; exit 130' INT TERM
+                    printf '%s %s\n' "$$" "$helper" > config-ready
+                    wait "$helper"
+                fi
+                printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                ;;
             get)
                 for last; do :; done
                 case "$last" in
@@ -31,7 +42,11 @@ case "${1-}" in
         esac
         ;;
     which)
-        case "$2" in jq) command -v jq ;; *) exit 1 ;; esac
+        case "$2" in
+            jq) command -v jq ;;
+            dots) printf 'manager lookup\n' >> calls; exit 1 ;;
+            *) exit 1 ;;
+        esac
         ;;
     ls)
         if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
@@ -52,7 +67,11 @@ case "${1-}" in
         ;;
     upgrade) printf '%s\n' "$*" >> calls ;;
     settings)
-        printf '{"system_packages":{"managers":null}}\n'
+        if [ -f package-settings.json ]; then
+            cat package-settings.json
+        else
+            printf '{"system_packages":{"managers":null}}\n'
+        fi
         ;;
     bootstrap)
         case "$2:$3" in
@@ -72,6 +91,7 @@ case "${1-}" in
                 ;;
             packages:status)
                 scope=${MISE_SYSTEM_PACKAGES_MANAGERS-}
+                printf '%s\n' "$scope" >> package-status-scopes
                 if [ "$scope" = apt ] && [ -f fail-apt-status ]; then
                     printf 'fixture apt state probe failed\n' >&2
                     exit 76
@@ -84,6 +104,8 @@ case "${1-}" in
                 esac
                 if [ "$scope" = apt ] && [ -f apt-packages.json ]; then
                     cat apt-packages.json
+                elif [ -n "$scope" ] && [ -f resolved-packages.json ]; then
+                    cat resolved-packages.json
                 elif [ -f packages.json ]; then
                     cat packages.json
                 else

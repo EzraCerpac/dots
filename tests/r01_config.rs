@@ -734,13 +734,14 @@ fn rust_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() 
         ),
     );
     let executable = dots_bin();
+    let pinned_snapshot = f.base.join("pinned-executable");
     f.script(
         "config/tests/run",
         r#"
 set -eu
 printf '[%s]\n' "$@"
 pinned=$(command -v dots)
-cmp -s "$pinned" "$FIXTURE_DOTS_EXECUTABLE"
+cat "$pinned" > "$FIXTURE_PINNED_SNAPSHOT"
 printf '%s\n' "$PWD" "$FROM_MISE" "${REMOVED-unset}" "$pinned"
 cat
 cat <&9
@@ -764,8 +765,8 @@ exec "$@"
         .command(launcher)
         .current_dir(&f.config)
         .env("REMOVED", "from caller")
-        .env("FIXTURE_DOTS_EXECUTABLE", &executable)
-        .args([fd, executable])
+        .env("FIXTURE_PINNED_SNAPSHOT", &pinned_snapshot)
+        .args([&fd, &executable])
         .args(["test", "--help", "one two", ""])
         .arg(OsString::from_vec(vec![0xff]))
         .stdin(Stdio::from(fs::File::open(input).unwrap()))
@@ -778,6 +779,10 @@ exec "$@"
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stderr, b"hook stderr\n");
+    assert!(
+        fs::read(pinned_snapshot).unwrap() == fs::read(executable).unwrap(),
+        "the pinned executable differs from the running dots binary"
+    );
     let prefix = b"[--help]\n[one two]\n[]\n[\xff]\n";
     assert_eq!(&output.stdout[..prefix.len()], prefix);
     let tail = std::str::from_utf8(&output.stdout[prefix.len()..]).unwrap();

@@ -81,12 +81,12 @@ The exit status is the outcome:
 | 4 | skipped |
 | other | failed |
 
-A hook can prompt.
-With `--plain`, or without a terminal for the `dots up` dashboard, the hook reads the caller's stdin.
-While the dashboard is shown, it tells you how to open the running stage's terminal and how to return.
-`dots` does not detect prompts inside a hook, so prefer hooks that do not need one.
-
-> TODO(P-12): The dashboard is being redesigned; add how to answer a prompt from it only after the design is approved and checked against the integrated binary.
+A hook or recipe can prompt using the caller's stdin, stdout, stderr and controlling terminal from the start of its step.
+If stdin is redirected, the child receives that input.
+Answer prompts directly. Only the child reads the reply.
+`dots up` prints the step and its result in scrollback.
+If a step that had the terminal fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
+The step’s output stays in scrollback. Ordinary captured steps have private logs.
 
 ### Update hooks
 
@@ -152,7 +152,7 @@ Built-in commands win, so a command named `root`, `profile`, `mise` or `brew`, f
 - It runs before mise loads the configuration: no sync, tool installs or package updates happen first.
 - Global flags such as `--plain` before a configuration command exit 2.
 
-`dots help` and the `dots` menu list the configuration's commands.
+Both `dots` and `dots help` list the configuration's commands alongside the built-ins.
 
 ## Installer exceptions
 

@@ -137,12 +137,12 @@ Make them executable (`chmod +x`), keep them safe to rerun, and check their synt
 ## When something fails
 
 - Start from what `dots up` or `dots sync` printed: each issue names its next action.
-- `dots up --last` reopens the last update report; full stage logs live under `${XDG_STATE_HOME:-~/.local/state}/dots/`.
+- `dots up --last` prints the saved update report and returns its recorded exit status.
+  Captured stages have private logs under `${XDG_STATE_HOME:-~/.local/state}/dots/`. A failed step that had the terminal gives its exit status and next action, with its output in scrollback.
 - `dots sync --last` replays the last sync receipt.
   The sync guide, `docs/sync.md` in the dots repository, explains each kind of sync issue.
-- A hand-off from the `dots up` dashboard, through `DOTS_AGENT_COMMAND`, passes the issue's output, log path, configuration root, host, profile and `dots` version.
-
-> TODO(P-12): The `dots up` dashboard, menu and report browser are being redesigned; describe their appearance, interaction and keys here only after the design is approved and checked against the integrated binary.
+- In a terminal, `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
+- Run `dots` for help, including the configuration's commands.
 
 ## This skill
 

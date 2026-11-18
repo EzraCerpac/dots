@@ -12,8 +12,9 @@ For anyone reviewing a pull request here, human or automated.
   When a step of `dots add` or `dots remove` fails, it puts back only what it changed.
 - A command checks only the programs its requested action uses; a missing one fails that action with one line naming it, without failing an inspection command or a stage with nothing to do.
 - Ctrl-C cancels every active stage's process group, starts no further stage, and waits for cleanup before saving the report or exiting, with the statuses the contract gives.
-- Only the full `dots up` has a dashboard.
-  Every other supervised command runs its child in the caller's foreground with direct stdin, stdout and stderr, byte for byte, so native prompts such as `sudo` or `ssh` work, and adds no banner or footer around that output.
+- `dots up` prints each step and its result in terminal scrollback. Hooks, recipes and known interactive steps own the terminal from the start, and `dots` never reads their replies.
+  Ordinary steps keep private logs. A failed step that had the terminal gives its status and next action and points to scrollback without saving a tail or log.
+  A supervised individual command runs its child in the caller's foreground with direct stdin, stdout and stderr, byte for byte, so native prompts such as `sudo` or `ssh` work, and adds no banner or footer around that output.
 - A child that `dots` starts directly has the running `dots` first on `PATH`, after the configuration environment.
   An explicit `dots mise exec` or `dots mise run` follows mise's own `PATH` rules, and mise's native bootstrap callbacks use the configuration's pinned `dots`; neither is that guarantee.
 - A tracked history file is never saved unless it is declared `encrypt = true`, and bundle values never reach a file, argument, environment variable or output from `dots`.
@@ -25,8 +26,10 @@ For anyone reviewing a pull request here, human or automated.
 
 A change that breaks one of these is worth a comment at any size.
 
-> TODO(P-12): The dashboard, menu and report browser are being redesigned.
-> Until that design is approved and checked against the integrated binary, their appearance, interaction and keys are not review requirements; the 0.4.0 layout and bindings are not either.
+Check that background Mac App Store work logs privately, announces its result at a stage boundary and finishes before the standalone mise stage.
+Authorization belongs in the foreground before the worker starts. Expired authorization defers the work with a next action.
+`dots reports` prints recent completed reports newest first and needs a terminal.
+`dots up --last` prints the saved report and returns its recorded status.
 
 ## Facts to check claims against
 

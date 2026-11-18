@@ -1,3 +1,5 @@
+mod inventory;
+
 use crate::{Args, Ctx, Fail};
 
 pub fn backup(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
@@ -55,6 +57,10 @@ pub fn enroll(run: &Run<'_>, stage: StageId, _settings: Enroll<'_>) -> Outcome {
     Outcome::Failed
 }
 
-pub fn checkpoint(_run: &Run<'_>, _stage: StageId, _ctx: &Ctx) -> Result<Checkpoint, Issue> {
-    Err(unported("saving a settings checkpoint"))
+pub fn checkpoint(run: &Run<'_>, stage: StageId, ctx: &Ctx) -> Result<Checkpoint, Issue> {
+    if inventory::empty(run, stage, ctx) {
+        Ok(Checkpoint::NothingTracked)
+    } else {
+        Err(unported("saving a settings checkpoint"))
+    }
 }

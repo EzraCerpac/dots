@@ -64,7 +64,7 @@ fn file_error(path: &Path, problem: impl fmt::Display) -> Fail {
     Fail::usage(format!("{}: {problem}", path.display()))
 }
 
-fn valid_id(name: &str) -> bool {
+pub(crate) fn valid_id(name: &str) -> bool {
     let alphanumeric = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
     name.as_bytes().first().copied().is_some_and(alphanumeric)
         && name.bytes().all(|c| alphanumeric(c) || c == b'-')

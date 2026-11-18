@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use serde::de::DeserializeOwned;
@@ -22,36 +22,91 @@ pub fn plan(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     let result = stage(&run, "Bootstrap plan", "dots plan", |stage| {
         let mise = Mise::new(ctx)?;
         let scope = packages::Scope::read(&run, &mise)?;
-        let command = scope.scoped(mise.command(["bootstrap", "plan"])?, false);
+        let command = scope.scoped(mise.command_active(["bootstrap", "plan"])?, false);
         run_command(&run, stage, command, "mise bootstrap plan")
     });
     Ok(run.end(result))
 }
 
 pub fn apply(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
-    let run = Run::begin(ctx, Sink::Report(Report::Apply));
-    let result = stage(&run, "Apply dotfiles", "dots apply", |stage| {
+    let mut arguments = Vec::new();
+    for flag in ["force", "dry-run", "yes", "prune", "prompt-secrets"] {
+        if args.get_flag(flag) {
+            arguments.push(format!("--{flag}").into());
+        }
+    }
+    let target_offset = arguments.len();
+    if let Some(targets) = args.get_many::<OsString>("TARGET") {
+        arguments.push("--".into());
+        arguments.extend(targets.cloned());
+    }
+    let rerun = apply_rerun(&arguments, target_offset);
+    let run = Run::begin(ctx, Sink::Report(Report::Apply)).with_rerun(
+        if rerun.starts_with("dots apply") {
+            rerun.clone()
+        } else {
+            "Rerun your original dots apply command with the same arguments.".into()
+        },
+    );
+    let result = stage(&run, "Apply dotfiles", &rerun, |stage| {
         let mise = Mise::new(ctx)?;
-        let mut native = ["bootstrap", "dotfiles", "apply"]
+        let native = ["bootstrap", "dotfiles", "apply"]
             .map(OsString::from)
-            .to_vec();
-        for flag in ["force", "dry-run", "yes", "prune", "prompt-secrets"] {
-            if args.get_flag(flag) {
-                native.push(format!("--{flag}").into());
-            }
-        }
-        if let Some(targets) = args.get_many::<OsString>("TARGET") {
-            native.push("--".into());
-            native.extend(targets.cloned());
-        }
+            .into_iter()
+            .chain(arguments);
         run_command(
             &run,
             stage,
-            mise.command(native)?,
+            mise.command_active(native)?,
             "mise bootstrap dotfiles apply",
         )
     });
     Ok(run.end(result))
+}
+
+fn apply_rerun(arguments: &[OsString], target_offset: usize) -> String {
+    let targets = arguments.get(target_offset + 1..).unwrap_or_default();
+    let marker_needed = targets
+        .iter()
+        .any(|arg| arg.as_encoded_bytes().starts_with(b"-"));
+    let operands = arguments
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != target_offset || marker_needed)
+        .map(|(_, arg)| shell_operand(arg))
+        .collect::<Option<Vec<_>>>();
+    match operands.as_deref() {
+        Some([]) => "dots apply".into(),
+        Some(operands) => format!("dots apply {}", operands.join(" ")),
+        None => "your original dots apply command".into(),
+    }
+}
+
+fn shell_operand(arg: &OsStr) -> Option<String> {
+    let arg = arg
+        .to_str()
+        .filter(|text| !text.chars().any(char::is_control))?;
+    if !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))
+    {
+        Some(arg.to_owned())
+    } else {
+        Some(format!("'{}'", arg.replace('\'', "'\\''")))
+    }
+}
+
+pub(crate) fn startup_error(run: Run<'_>, error: Fail, next: &str) -> u8 {
+    if run.cancelled() {
+        return run.end(130);
+    }
+    let diagnostic = format!("dots: {error}");
+    eprintln!("{diagnostic}");
+    let startup = run.start("Startup");
+    run.issue(startup, Issue::new(diagnostic, next));
+    run.finish(startup, Outcome::Failed);
+    run.end(error.status)
 }
 
 fn run_command(run: &Run<'_>, stage: StageId, cmd: Command, label: &str) -> Result<u8, Fail> {
@@ -84,7 +139,7 @@ fn stage(
             id,
             Issue::new(
                 diagnostic,
-                format!("Review the output and rerun {invocation} with the same arguments."),
+                format!("Review the output and rerun {invocation}."),
             ),
         );
     }

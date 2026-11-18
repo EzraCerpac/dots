@@ -46,14 +46,23 @@ impl<'a> Mise<'a> {
         Ok(command)
     }
 
+    pub(crate) fn command_active<I, S>(&self, args: I) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = self.command(args)?;
+        command.env("MISE_ENV", self.selected.active_environments());
+        Ok(command)
+    }
+
     pub fn json<I, S>(&self, args: I) -> Result<Value, Fail>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         let output = self
-            .command(args)?
-            .env("MISE_ENV", self.selected.active_environments())
+            .command_active(args)?
             .output()
             .map_err(|error| Fail::new(1, format!("could not run mise: {error}")))?;
         if !output.status.success() {

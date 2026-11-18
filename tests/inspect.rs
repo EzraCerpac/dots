@@ -302,3 +302,99 @@ fn new_retire_dotfiles_removes_only_dead_links_into_the_config() {
         assert!(fs::symlink_metadata(world.home().join(name)).is_ok());
     }
 }
+
+#[test]
+fn new_missing_configuration_saves_one_startup_issue_without_a_child() {
+    for command in ["plan", "apply", "test"] {
+        let world = World::new();
+        fs::remove_file(world.root().join("config.toml")).unwrap();
+        let mise = world.home().join("unwanted-mise");
+        script(&mise, r#": > "$HOME/mise-ran"; exit 99"#);
+        let result = output(world.dots().env("DOTS_MISE_BIN", mise).arg(command), 2);
+        assert!(result.stdout.is_empty(), "{result:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(stderr.lines().count(), 1);
+        assert!(stderr.contains("config.toml"));
+        assert!(!world.home().join("mise-ran").exists());
+        let report = read_report(&world);
+        assert_eq!(report["command"], command);
+        assert_eq!(report["status"], 2);
+        let stages = report["stages"].as_array().unwrap();
+        assert_eq!(stages.len(), 1);
+        let issues = stages[0]["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["diagnostic"], stderr.trim_end());
+    }
+}
+
+#[test]
+fn new_inspection_uses_all_persisted_selectors_and_lists_uninstalled_tools() {
+    let world = World::new();
+    minimal(&world, "");
+    fs::write(
+        world.root().join("miserc.toml"),
+        "env = ['laptop', 'host-fixture', 'extra']\n",
+    )
+    .unwrap();
+    let mise = world.home().join("fixture-mise");
+    script(
+        &mise,
+        r#"
+case "$*" in
+  --version) printf '2026.11.9\n'; exit 0 ;;
+  'which ruby') exit 1 ;;
+  'cli-selector') printf '%s\n' "$MISE_ENV"; exit 0 ;;
+esac
+[ "$MISE_ENV" = laptop,host-fixture,extra ] || exit 91
+case "$*" in
+  'bootstrap packages status --json') printf '{}\n' ;;
+  'ls --current --json') printf '%s\n' '{"fixture-tool":[{"active":false,"installed":false,"requested_version":"2.0"}]}' ;;
+  'bootstrap dotfiles status --json') printf '{}\n' ;;
+  'bootstrap plan') printf 'planned\n' ;;
+  'bootstrap dotfiles apply') printf 'applied\n' ;;
+  *) exit 92 ;;
+esac
+"#,
+    );
+    let dots = || {
+        let mut command = world.dots();
+        command.env("DOTS_MISE_BIN", &mise);
+        command
+    };
+    let status = output(dots().arg("status"), 0);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("fixture-tool@2.0") && stdout.contains("Install the selected tools"),
+        "{stdout}"
+    );
+    assert_eq!(output(dots().arg("plan"), 0).stdout, b"planned\n");
+    assert_eq!(output(dots().arg("apply"), 0).stdout, b"applied\n");
+    assert_eq!(
+        output(dots().args(["mise", "cli-selector"]), 0).stdout,
+        b"laptop,host-fixture\n"
+    );
+}
+
+#[test]
+fn new_status_reads_origin_from_a_local_git_include() {
+    let world = World::new();
+    minimal(&world, "");
+    output(world.git().args(["init", "--initial-branch=dev"]), 0);
+    fs::write(
+        world.root().join(".git/source.inc"),
+        "[remote \"origin\"]\nurl = https://example.invalid/owner/repo.git\n",
+    )
+    .unwrap();
+    output(
+        world
+            .git()
+            .args(["config", "--local", "include.path", "source.inc"]),
+        0,
+    );
+    let status = output(with_mise(&world).arg("status"), 0);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("shared through https://example.invalid/owner/repo.git"),
+        "{stdout}"
+    );
+}

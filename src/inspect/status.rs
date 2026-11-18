@@ -10,7 +10,7 @@ use crate::report::Command;
 use crate::run::{Issue, Outcome, Run, Sink};
 use crate::{Args, Ctx, Env, Fail, skill};
 
-use super::{packages, read_json, stage};
+use super::{packages, read_json, stage, startup_error};
 
 struct Program {
     name: &'static str,
@@ -129,32 +129,39 @@ pub fn status(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
         }
     }
 
-    let mise = match Mise::new(ctx) {
-        Ok(mise) => mise,
-        Err(error) => {
-            return Ok(startup_error(
-                run,
-                error,
-                "Check mise and the selected profile. To correct the selection, run dots profile --profile PROFILE --machine-id ID, then rerun dots status.",
-            ));
-        }
-    };
     if !mise_version_readable {
+        let error = mise_binary(&ctx.env)
+            .err()
+            .unwrap_or_else(|| Fail::usage("could not run mise --version"));
         return Ok(startup_error(
             run,
-            Fail::usage("could not run mise --version"),
+            error,
             "Install a working mise or set DOTS_MISE_BIN, then rerun dots status.",
         ));
     }
-    let (vars, selected) = match Vars::read(&ctx.root)
-        .and_then(|vars| selection::read(&ctx.root, &ctx.env).map(|selected| (vars, selected)))
-    {
+    let (vars, selected) = match Vars::read(&ctx.root).and_then(|vars| {
+        selection::read(&ctx.root, &ctx.env)
+            .map_err(|error| {
+                Fail::new(error.status, format!("{error}; check [vars] dots_profiles"))
+            })
+            .map(|selected| (vars, selected))
+    }) {
         Ok(selection) => selection,
         Err(error) => {
             return Ok(startup_error(
                 run,
                 error,
                 "Check dots_profiles and run dots profile --profile PROFILE --machine-id ID, then rerun dots status.",
+            ));
+        }
+    };
+    let mise = match Mise::new(ctx) {
+        Ok(mise) => mise,
+        Err(error) => {
+            return Ok(startup_error(
+                run,
+                error,
+                "Check mise and the selected profile, then rerun dots status.",
             ));
         }
     };
@@ -197,17 +204,6 @@ pub fn status(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
         )
     };
     Ok(run.end(result))
-}
-
-fn startup_error(run: Run<'_>, error: Fail, next: &str) -> u8 {
-    if run.cancelled() {
-        return run.end(130);
-    }
-    eprintln!("dots: {error}");
-    let startup = run.start("Startup");
-    run.issue(startup, Issue::new(error.to_string(), next));
-    run.finish(startup, Outcome::Failed);
-    run.end(error.status)
 }
 
 fn show_programs(ctx: &Ctx, run: &Run<'_>) -> bool {
@@ -295,7 +291,15 @@ fn show_source(ctx: &Ctx, run: &Run<'_>, expected: Option<&RepoSetting>) {
     };
     let has_repository = ctx.root.path().join(".git").exists();
     let origin = has_repository
-        .then(|| git_query(&["config", "--local", "--get", "remote.origin.url"]))
+        .then(|| {
+            git_query(&[
+                "config",
+                "--local",
+                "--includes",
+                "--get",
+                "remote.origin.url",
+            ])
+        })
         .flatten();
     let diagnostic = match (git.is_some(), expected, origin.as_deref()) {
         (false, _, _) => Some(("Git is missing", "Install Git, then rerun dots status.")),
@@ -411,11 +415,14 @@ fn active() -> bool {
 
 fn show_tools(run: &Run<'_>, mise: &Mise<'_>) -> Result<(), Fail> {
     println!("Tools");
-    let command = mise.command(["ls", "--current", "--json"])?;
+    let command = mise.command_active(["ls", "--current", "--json"])?;
     let tools: BTreeMap<String, Vec<Tool>> = read_json(run, command, "inspect declared tools")?;
     let mut active = BTreeMap::new();
     for (name, records) in tools {
-        for tool in records.into_iter().filter(|tool| tool.active) {
+        for tool in records
+            .into_iter()
+            .filter(|tool| tool.active || tool.installed == Some(false))
+        {
             let version = tool
                 .requested_version
                 .as_deref()
@@ -479,7 +486,7 @@ struct HistorySync {
 
 fn show_files(run: &Run<'_>, mise: &Mise<'_>) -> Result<(), Fail> {
     println!("Dotfiles");
-    let command = mise.command(["bootstrap", "dotfiles", "status", "--json"])?;
+    let command = mise.command_active(["bootstrap", "dotfiles", "status", "--json"])?;
     let data: Files = read_json(run, command, "inspect dotfiles and history")?;
     let mut files = BTreeMap::new();
     for file in data

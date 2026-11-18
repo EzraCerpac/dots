@@ -506,6 +506,35 @@ fn delayed_owned_probe_output_is_fully_collected() {
 }
 
 #[test]
+fn empty_group_does_not_discard_already_buffered_probe_output() {
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
+    let mut child = supervisor
+        .spawn(
+            shell("printf out; printf err >&2", &[]),
+            Placement::Probe,
+            false,
+        )
+        .unwrap();
+    assert!(wait_until(|| matches!(
+        observe(child.entry.pid, false),
+        Ok(Observed::Exited)
+    )));
+    // Let the leader/group be gone before this pump sees their final bytes.
+    let idle_since = Instant::now() - Duration::from_secs(2);
+    child.last_output = idle_since;
+    child.leader_exit = Some(idle_since);
+    let output = Pipes::take(&mut child.child)
+        .unwrap()
+        .collect(&mut child)
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"out");
+    assert_eq!(output.stderr, b"err");
+}
+
+#[test]
 fn captured_foreground_interrupt_escalates_against_ignoring_leader() {
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
@@ -712,13 +741,54 @@ fn failed_pump_keeps_tail_without_advertising_log() {
 }
 
 #[test]
+fn incomplete_alongside_log_replays_recorded_bytes_without_a_full_log_link() {
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), true);
+    let supervisor = Supervisor::new(&ctx, Mode::up(&ctx));
+    let id = StageId(0);
+    let mut logs = supervisor.logs.lock().unwrap();
+    let mut diagnostic = logs.stage(&supervisor.log_base, id);
+    diagnostic.record(b"recorded bytes");
+    diagnostic.incomplete();
+    diagnostic.record(b"\nremaining tail\n");
+    logs.store(id, diagnostic);
+    drop(logs);
+
+    let mut replay = Vec::new();
+    supervisor.replay_alongside(id, &mut replay).unwrap();
+    assert_eq!(replay, b"recorded bytes\n");
+    let mut issue = Issue::new("Capture stopped", "Retry it");
+    supervisor.enrich_issue(id, &mut issue);
+    assert!(issue.log.is_none());
+    assert_eq!(
+        issue.tail.as_deref(),
+        Some("recorded bytes\nremaining tail")
+    );
+}
+
+#[test]
 fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
+    run_tty_probe_fixture(
+        "supervisor::tests::tty_probe_uses_pinned_observer_and_respects_foreground_ownership",
+        false,
+    );
+}
+
+#[test]
+fn tty_probe_resumes_helper_when_launcher_catches_ttin() {
+    run_tty_probe_fixture(
+        "supervisor::tests::tty_probe_resumes_helper_when_launcher_catches_ttin",
+        true,
+    );
+}
+
+fn run_tty_probe_fixture(test: &str, helper: bool) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
     const FLAG: &str = "DOTS_SUPERVISOR_TTY_PROBE";
     if let Some(path) = std::env::var_os(FLAG) {
-        check_tty_probe(Path::new(&path));
+        check_tty_probe(Path::new(&path), helper);
         return;
     }
 
@@ -746,25 +816,22 @@ fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
     }
     pipe::nonblocking(master).unwrap();
 
-    let mut child =
-        unsafe {
-            fixture_command(
-            fixture.path(), FLAG,
-            "supervisor::tests::tty_probe_uses_pinned_observer_and_respects_foreground_ownership",
-        )
-        .stdin(inner.try_clone().unwrap())
-        .stdout(inner.try_clone().unwrap())
-        .stderr(inner)
-        .pre_exec(|| {
-            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
-                || libc::tcsetpgrp(0, libc::getpgrp()) == -1
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        })
-        .spawn().unwrap()
-        };
+    let mut child = unsafe {
+        fixture_command(fixture.path(), FLAG, test)
+            .stdin(inner.try_clone().unwrap())
+            .stdout(inner.try_clone().unwrap())
+            .stderr(inner)
+            .pre_exec(|| {
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
+                    || libc::tcsetpgrp(0, libc::getpgrp()) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .unwrap()
+    };
 
     let mut transcript = Vec::new();
     let drain = |outer: &mut File, transcript: &mut Vec<u8>| {
@@ -809,7 +876,7 @@ fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
     );
 }
 
-fn check_tty_probe(path: &Path) {
+fn check_tty_probe(path: &Path, helper: bool) {
     use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::PermissionsExt;
 
@@ -851,52 +918,73 @@ if [ "$marker" = F ]; then printf F; fi
     input.write_all(b"private stdin\n").unwrap();
     input.seek(SeekFrom::Start(0)).unwrap();
     let phase = path.join("probe-phase");
-    let output = supervisor
-        .probe(
-            shell(
-                r#"printf 'probe prompt\n' >/dev/tty
+    let reader = r#"printf 'probe prompt\n' >/dev/tty
             printf 'reading tty\n' > "$1"
             IFS= read -r answer </dev/tty || exit 31
             printf 'reading private input\n' > "$1"
             IFS= read -r private || exit 32
             printf '%s:%s' "$answer" "$private"
-            printf 'returning\n' > "$1""#,
-                &[&phase],
-            ),
-            Stdio::from(input),
-            false,
+            printf 'returning\n' > "$1""#;
+    let trap_marker = path.join("launcher-caught-ttin");
+    let command = if helper {
+        shell(
+            r#"trap ': > "$3"' TTIN
+            exec 3<&0
+            /bin/sh -c "$1" reader "$2" <&3 &
+            reader=$!
+            wait "$reader"
+            code=$?
+            if [ "$code" -gt 128 ]; then wait "$reader"; else exit "$code"; fi"#,
+            &[Path::new(reader), &phase, &trap_marker],
         )
+    } else {
+        shell(reader, &[&phase])
+    };
+    let output = supervisor
+        .probe(command, Stdio::from(input), false)
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"tty answer:private stdin");
     assert!(observed.is_file());
+    if helper {
+        assert!(
+            trap_marker.is_file(),
+            "launcher did not catch terminal stop signal"
+        );
+        return;
+    }
 
     fs::write(&phase, "checking competing foreground").unwrap();
     let ready = path.join("foreground");
-    let release = path.join("release");
     std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            let command = shell(
-                r#": > "$1"
-                i=0
-                while [ ! -e "$2" ] && [ "$i" -lt 100 ]; do
-                    sleep .04
-                    i=$((i+1))
-                done
-                test -e "$2""#,
-                &[&ready, &release],
-            );
-            supervisor
+        let (reader, mut release) = io::pipe().unwrap();
+        let ready = &ready;
+        let supervisor = &supervisor;
+        let worker = scope.spawn(move || {
+            let mut command = shell("IFS= read -r line && test \"$line\" = release", &[]);
+            command.stdin(reader);
+            let mut stage = supervisor
                 .spawn(command, Placement::Foreground, true)
-                .unwrap()
-                .wait()
-                .unwrap()
+                .unwrap();
+            assert!(
+                stage
+                    .terminal
+                    .as_ref()
+                    .is_some_and(TerminalJob::owns_foreground)
+            );
+            fs::write(ready, "").unwrap();
+            stage.wait().unwrap()
         });
-        let active = wait_until(|| ready.exists());
-        let outcome = supervisor.probe(shell("read line </dev/tty", &[]), Stdio::null(), false);
-        fs::write(&release, "").unwrap();
+        assert!(wait_until(|| ready.exists()));
+        let competing = shell(
+            "printf 'competing reader on tty\\n' > \"$1\"; IFS= read -r line </dev/tty",
+            &[&phase],
+        );
+        let outcome = supervisor.probe(competing, Stdio::null(), false);
+        fs::write(&phase, format!("competing probe returned {outcome:?}")).unwrap();
+        release.write_all(b"release\n").unwrap();
         let status = worker.join().unwrap();
-        assert!(active && status.success());
+        assert!(status.success(), "{status}");
         let error = outcome.unwrap_err();
         assert!(
             error.to_string().contains("another foreground command"),

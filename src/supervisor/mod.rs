@@ -497,6 +497,7 @@ impl<'a> Supervisor<'a> {
                 .then(Instant::now),
             leader_exit: None,
             last_output: Instant::now(),
+            group_empty_since: None,
             group_cleanup: None,
             membership: None,
             forced_drain: false,
@@ -714,6 +715,7 @@ struct Running<'a> {
     probe_stop_check: Option<Instant>,
     leader_exit: Option<Instant>,
     last_output: Instant,
+    group_empty_since: Option<Instant>,
     group_cleanup: Option<Instant>,
     membership: Option<(Instant, Result<bool, String>)>,
     forced_drain: bool,
@@ -754,7 +756,7 @@ impl Running<'_> {
             // A launcher can block the job-control signal while its reader stops.
             self.reserve_probe_foreground(&mut state)?;
             drop(state);
-            self.handle_stop(libc::SIGTTIN)?;
+            self.promote_group()?;
             return Ok(None);
         }
         if let Some(budget) = &mut self.budget {
@@ -843,12 +845,18 @@ impl Running<'_> {
             if self.budget.is_some() {
                 return Ok(None);
             }
-            let delay = if matches!(self.group_members(), Ok(true)) {
-                OWNED_DRAIN_IDLE
-            } else {
-                DRAIN_AFTER_KILL
+            let drain_expired = match self.group_members() {
+                Ok(false) => {
+                    // A writer may have just exited with bytes waiting in the pipe.
+                    let empty = self.group_empty_since.get_or_insert_with(Instant::now);
+                    empty.elapsed().min(idle) >= DRAIN_AFTER_KILL
+                }
+                _ => {
+                    self.group_empty_since = None;
+                    idle >= OWNED_DRAIN_IDLE
+                }
             };
-            if display_pending || idle < delay {
+            if display_pending || !drain_expired {
                 self.draining = true;
                 return Ok(None);
             }
@@ -1058,15 +1066,19 @@ impl Running<'_> {
     }
 
     fn handle_stop(&mut self, signal: libc::c_int) -> io::Result<()> {
-        let group = -self.entry.target;
         if let Some(job) = &mut self.terminal {
             // A fast native child can read or write its terminal before the
             // parent's post-spawn handoff. Resume that background stop.
             if matches!(signal, libc::SIGTTIN | libc::SIGTTOU) && job.owns_foreground() {
-                return terminal::continue_group(group);
+                return terminal::continue_group(-self.entry.target);
             }
             return job.suspend();
         }
+        self.promote_group()
+    }
+
+    fn promote_group(&mut self) -> io::Result<()> {
+        let group = -self.entry.target;
         if terminal::controlling_terminal().is_none() {
             return if self.probe {
                 Err(io::Error::other(

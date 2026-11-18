@@ -1,16 +1,9 @@
 use super::*;
+use crate::Env;
 use std::fs;
 use std::path::Path;
 
 mod detached_probe;
-
-fn supervisor_at(path: &Path) -> Supervisor {
-    let env = Env {
-        vars: [("XDG_STATE_HOME".into(), path.as_os_str().into())].into(),
-        cwd: path.to_owned(),
-    };
-    Supervisor::new(&env, Mode::Direct)
-}
 
 fn shell(source: &str, paths: &[&Path]) -> Command {
     let mut command = Command::new("/bin/sh");
@@ -39,7 +32,8 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
 #[test]
 fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups() {
     let fixture = tempfile::tempdir().unwrap();
-    let supervisor = supervisor_at(fixture.path());
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let heartbeat = fixture.path().join("draining");
     let alongside_ready = fixture.path().join("alongside-ready");
 
@@ -77,9 +71,7 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
                     done"#,
                 &[&alongside_ready],
             );
-            let mut stage = supervisor
-                .spawn(command, Placement::Background, false)
-                .unwrap();
+            let mut stage = supervisor.spawn(command, Placement::Probe, false).unwrap();
             Pipes::take(&mut stage.child)
                 .unwrap()
                 .collect(&mut stage)
@@ -90,8 +82,7 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
             heartbeat.exists()
                 && alongside_ready.exists()
                 && supervisor.state().children.iter().any(|entry| {
-                    entry.foreground
-                        && matches!(observe(entry.pid, false), Ok(Observed::Exited { .. }))
+                    entry.foreground && matches!(observe(entry.pid, false), Ok(Observed::Exited))
                 })
         });
         supervisor.state().cancel(Some(libc::SIGINT), None);
@@ -133,7 +124,8 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
 #[test]
 fn active_foreground_status_wins_over_fallback_and_sync_remains_zero() {
     let fixture = tempfile::tempdir().unwrap();
-    let supervisor = supervisor_at(fixture.path());
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let ready_path = fixture.path().join("foreground-ready");
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
@@ -169,11 +161,11 @@ fn active_foreground_status_wins_over_fallback_and_sync_remains_zero() {
 
 fn fixture_context(path: &Path, verbose: bool) -> crate::Ctx {
     let env = Env {
-        vars: [
-            ("DOTS_ROOT".into(), path.as_os_str().into()),
-            ("XDG_STATE_HOME".into(), path.as_os_str().into()),
-        ]
-        .into(),
+        vars: PRIVATE_DIRS
+            .iter()
+            .map(|name| ((*name).into(), path.as_os_str().into()))
+            .chain([("DOTS_ROOT".into(), path.as_os_str().into())])
+            .collect(),
         cwd: path.to_owned(),
     };
     let root = crate::config::Root::resolve(&env).unwrap();
@@ -216,6 +208,34 @@ fn fixture_process(path: &Path, flag: &str, test: &str, input: &[u8]) -> Output 
     child.wait_with_output().unwrap()
 }
 
+const PRIVATE_DIRS: &[&str] = &[
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "MISE_CONFIG_DIR",
+    "MISE_SYSTEM_CONFIG_DIR",
+    "MISE_CACHE_DIR",
+    "MISE_DATA_DIR",
+    "MISE_STATE_DIR",
+    "MISE_TMP_DIR",
+    "MISE_INSTALLS_DIR",
+    "MISE_INSTALL_STORE_DIR",
+    "MISE_DOWNLOADS_DIR",
+    "MISE_PLUGINS_DIR",
+    "MISE_SHIMS_DIR",
+    "MISE_SYSTEM_DATA_DIR",
+    "MISE_SYSTEM_INSTALLS_DIR",
+    "MISE_SYSTEM_SHIMS_DIR",
+    "MISE_SYSTEM_PLUGINS_DIRS",
+];
+
 fn fixture_command(path: &Path, flag: &str, test: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
@@ -226,19 +246,7 @@ fn fixture_command(path: &Path, flag: &str, test: &str) -> Command {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in [
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "MISE_CONFIG_DIR",
-        "MISE_CACHE_DIR",
-        "MISE_DATA_DIR",
-        "MISE_STATE_DIR",
-    ] {
+    for name in PRIVATE_DIRS {
         command.env(name, path);
     }
     unsafe {
@@ -482,7 +490,8 @@ fn report_retention_uses_its_log_id_instead_of_an_issue_path() {
 #[test]
 fn delayed_owned_probe_output_is_fully_collected() {
     let fixture = tempfile::tempdir().unwrap();
-    let supervisor = supervisor_at(fixture.path());
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let command = shell(
         r#"(sleep 1.2
             printf 'delayed stdout'
@@ -499,7 +508,8 @@ fn delayed_owned_probe_output_is_fully_collected() {
 #[test]
 fn captured_foreground_interrupt_escalates_against_ignoring_leader() {
     let fixture = tempfile::tempdir().unwrap();
-    let supervisor = supervisor_at(fixture.path());
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let ready = fixture.path().join("registered");
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
@@ -600,4 +610,327 @@ fn cancellation_finishes_report_during_blocked_verbose_boundary() {
     assert!(report.cancelled);
     assert_eq!(report.status, 130);
     assert_eq!(report.stages[0].outcome, Some(Outcome::Completed));
+}
+
+#[test]
+fn child_sigint_is_a_status_in_owned_and_fragment_runs() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    for mode in [Mode::Direct, Mode::Fragment] {
+        let supervisor = Supervisor::new(&ctx, mode);
+        let source = "kill -INT \"$$\"";
+        let output = supervisor
+            .probe(shell(source, &[]), Stdio::null(), false)
+            .unwrap();
+        assert_eq!(output.status.signal(), Some(libc::SIGINT));
+        let mut stage = supervisor
+            .spawn(shell(source, &[]), Placement::HeadlessForeground, true)
+            .unwrap();
+        assert_eq!(stage.wait().unwrap().signal(), Some(libc::SIGINT));
+        drop(stage);
+        assert!(!supervisor.cancelled());
+        assert!(supervisor.admit_stage(|| StageId(0)).is_some());
+    }
+}
+
+#[test]
+fn drop_verifies_membership_even_after_synthetic_leader_refusal() {
+    use std::sync::atomic::Ordering;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
+    let mut stage = supervisor
+        .spawn(shell("exec sleep 10", &[]), Placement::Probe, false)
+        .unwrap();
+    let pid = stage.entry.pid;
+    let diagnostic = "dots: synthetic SIGKILL refusal for the leader";
+    supervisor.state().warnings.push(diagnostic.into());
+    // The owned group is real and still receives SIGKILL. Simulate the
+    // separate positive-PID refusal without creating a privileged process.
+    stage.leader_kill = Some(false);
+    drop(stage);
+
+    assert!(supervisor.membership_checks.load(Ordering::Relaxed) > 0);
+    assert!(
+        supervisor
+            .state()
+            .warnings
+            .iter()
+            .any(|warning| warning == diagnostic)
+    );
+    assert!(supervisor.state().children.is_empty());
+    assert!(!groups::has_live(pid, None).unwrap());
+}
+
+#[test]
+fn failed_pump_keeps_tail_without_advertising_log() {
+    use crate::run::{Outcome, Run, Sink};
+    use std::os::fd::AsRawFd;
+
+    const FLAG: &str = "DOTS_SUPERVISOR_PUMP_FAILURE";
+    if let Some(path) = std::env::var_os(FLAG) {
+        let ctx = fixture_context(Path::new(&path), true);
+        let dev_null = File::open("/dev/null").unwrap();
+        // Make an actual verbose write fail after capture has stored bytes.
+        assert_eq!(
+            unsafe { libc::dup2(dev_null.as_raw_fd(), libc::STDERR_FILENO) },
+            libc::STDERR_FILENO
+        );
+        let run = Run::begin(&ctx, Sink::Report(ReportCommand::Up));
+        let id = run.start("Captured step");
+        let error = run
+            .run(
+                id,
+                shell("printf 'useful tail\\n' >&2", &[]),
+                Policy::Ordinary,
+            )
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        run.issue(id, Issue::new("Fixture output failed.", "Retry."));
+        run.finish(id, Outcome::Failed);
+        assert_eq!(run.end(1), 1);
+        return;
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let output = fixture_process(
+        fixture.path(),
+        FLAG,
+        "supervisor::tests::failed_pump_keeps_tail_without_advertising_log",
+        b"",
+    );
+    assert!(output.status.success(), "{output:?}");
+    let ctx = fixture_context(fixture.path(), true);
+    let entry = &crate::report::list(&ctx.env, Some(ReportCommand::Up)).unwrap()[0];
+    let report = crate::report::load(&ctx.env, &entry.id).unwrap();
+    let issue = &report.stages[0].issues[0];
+    assert_eq!(issue.tail.as_deref(), Some("useful tail"));
+    assert!(issue.log.is_none());
+}
+
+#[test]
+fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    const FLAG: &str = "DOTS_SUPERVISOR_TTY_PROBE";
+    if let Some(path) = std::env::var_os(FLAG) {
+        check_tty_probe(Path::new(&path));
+        return;
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let (mut master, mut slave) = (-1, -1);
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let mut outer = unsafe { File::from_raw_fd(master) };
+    let inner = unsafe { File::from_raw_fd(slave) };
+    for fd in [master, slave] {
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
+    pipe::nonblocking(master).unwrap();
+
+    let mut child =
+        unsafe {
+            fixture_command(
+            fixture.path(), FLAG,
+            "supervisor::tests::tty_probe_uses_pinned_observer_and_respects_foreground_ownership",
+        )
+        .stdin(inner.try_clone().unwrap())
+        .stdout(inner.try_clone().unwrap())
+        .stderr(inner)
+        .pre_exec(|| {
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
+                || libc::tcsetpgrp(0, libc::getpgrp()) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .spawn().unwrap()
+        };
+
+    let mut transcript = Vec::new();
+    let drain = |outer: &mut File, transcript: &mut Vec<u8>| {
+        let mut bytes = [0; 4096];
+        while let Ok(n @ 1..) = outer.read(&mut bytes) {
+            transcript.extend_from_slice(&bytes[..n]);
+        }
+    };
+    let prompted = wait_until(|| {
+        drain(&mut outer, &mut transcript);
+        transcript
+            .windows(b"probe prompt".len())
+            .any(|bytes| bytes == b"probe prompt")
+    });
+    if prompted {
+        outer.write_all(b"tty answer\n").unwrap();
+    }
+    let mut result = None;
+    let exited = prompted
+        && wait_until(|| {
+            drain(&mut outer, &mut transcript);
+            result = child.try_wait().unwrap();
+            result.is_some()
+        });
+    drain(&mut outer, &mut transcript);
+    drop(outer);
+    if !exited {
+        let _ = child.kill();
+        let _ = wait_until(|| child.try_wait().unwrap().is_some());
+    }
+    assert!(
+        exited && result.unwrap().success(),
+        "{}",
+        String::from_utf8_lossy(&transcript)
+    );
+}
+
+fn check_tty_probe(path: &Path) {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut ctx = fixture_context(path, false);
+    let observed = path.join("observer-used");
+    ctx.env
+        .vars
+        .insert("FIXTURE_TRACE".into(), observed.clone().into());
+    // Model a prepared Ctx pin with a tiny observer. The test executable has
+    // no observer entry point, so using current_exe here fails the handshake.
+    let bin = tempfile::tempdir_in(path).unwrap();
+    let pinned = bin.path().join("dots");
+    fs::write(
+        &pinned,
+        r#"#!/bin/sh
+PATH=/usr/bin:/bin
+: > "$FIXTURE_TRACE"
+printf R
+if [ "$(dd bs=1 count=1 2>/dev/null)" = F ]; then printf F; fi
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&pinned, fs::Permissions::from_mode(0o700)).unwrap();
+    ctx.root.child_bin.set(Ok(bin)).unwrap();
+
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
+    assert!(
+        supervisor
+            .probe(shell(":", &[]), Stdio::null(), false)
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!observed.exists(), "quiet probe started an observer");
+
+    let mut input = tempfile::tempfile_in(path).unwrap();
+    input.write_all(b"private stdin\n").unwrap();
+    input.seek(SeekFrom::Start(0)).unwrap();
+    let output = supervisor
+        .probe(
+            shell(
+                r#"printf 'probe prompt\n' >/dev/tty
+            IFS= read -r answer </dev/tty || exit 31
+            IFS= read -r private || exit 32
+            printf '%s:%s' "$answer" "$private""#,
+                &[],
+            ),
+            Stdio::from(input),
+            false,
+        )
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"tty answer:private stdin");
+    assert!(observed.is_file());
+
+    let ready = path.join("foreground");
+    let release = path.join("release");
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let command = shell(
+                r#": > "$1"
+                i=0
+                while [ ! -e "$2" ] && [ "$i" -lt 100 ]; do
+                    sleep .04
+                    i=$((i+1))
+                done
+                test -e "$2""#,
+                &[&ready, &release],
+            );
+            supervisor
+                .spawn(command, Placement::Foreground, true)
+                .unwrap()
+                .wait()
+                .unwrap()
+        });
+        let active = wait_until(|| ready.exists());
+        let outcome = supervisor.probe(shell("read line </dev/tty", &[]), Stdio::null(), false);
+        fs::write(&release, "").unwrap();
+        let status = worker.join().unwrap();
+        assert!(active && status.success());
+        let error = outcome.unwrap_err();
+        assert!(
+            error.to_string().contains("another foreground command"),
+            "{error}"
+        );
+    });
+
+    check_terminal_reclaim(&ctx, &supervisor);
+}
+
+fn check_terminal_reclaim(ctx: &crate::Ctx, supervisor: &Supervisor<'_>) {
+    use std::os::fd::AsRawFd;
+
+    let (tty, caller) = foreground_terminal().unwrap();
+    let fd = tty.as_raw_fd();
+    let tty_modes = || {
+        let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(fd, modes.as_mut_ptr()) }, 0);
+        unsafe { modes.assume_init() }
+    };
+    let original = tty_modes();
+    let mut changed = original;
+    changed.c_lflag ^= libc::ECHO;
+    let unrelated = supervisor
+        .spawn(shell("exec sleep 10", &[]), Placement::Probe, false)
+        .unwrap();
+    for next in [caller, unrelated.entry.pid] {
+        let mut job = TerminalJob::start(ctx, None).unwrap().unwrap();
+        job.enter().unwrap();
+        terminal::without_sigttou(|| {
+            assert_eq!(unsafe { libc::tcsetattr(fd, libc::TCSANOW, &changed) }, 0);
+            assert_eq!(unsafe { libc::tcsetpgrp(fd, next) }, 0);
+            Ok(())
+        })
+        .unwrap();
+        let _ = job.fence().unwrap();
+        assert_eq!(unsafe { libc::tcgetpgrp(fd) }, next);
+        if next != caller {
+            assert_eq!(tty_modes().c_lflag, changed.c_lflag);
+            terminal::without_sigttou(|| {
+                assert_eq!(unsafe { libc::tcsetpgrp(fd, caller) }, 0);
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            assert_eq!(tty_modes().c_lflag, original.c_lflag);
+        }
+        drop(job);
+        assert_eq!(tty_modes().c_lflag, original.c_lflag);
+    }
 }

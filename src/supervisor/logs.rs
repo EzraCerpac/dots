@@ -151,14 +151,18 @@ pub(super) struct Diagnostic {
 }
 
 impl Diagnostic {
+    pub(super) fn incomplete(&mut self) {
+        self.file = None;
+        self.path = None;
+    }
+
     pub(super) fn record(&mut self, bytes: &[u8]) {
         if let Some(file) = &mut self.file
             && let Err(error) = file.write_all(bytes)
         {
             self.warning = Some(warning(&error));
             // A truncated file does not qualify as the step's full log.
-            self.file = None;
-            self.path = None;
+            self.incomplete();
         }
         let bytes = &bytes[bytes.len().saturating_sub(TAIL_BYTES)..];
         let excess = (self.tail.len() + bytes.len()).saturating_sub(TAIL_BYTES);

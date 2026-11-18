@@ -16,9 +16,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::Ctx;
 use crate::report::{Command as ReportCommand, Issue, StageId};
 use crate::run::{Policy, exit_code};
-use crate::{Ctx, Env};
 use logs::Logs;
 use pipe::{Console, Pipes};
 use signals::Signals;
@@ -59,7 +59,7 @@ impl Mode {
 #[derive(Clone, Copy)]
 enum Placement {
     Foreground,
-    Background,
+    Probe,
     Detached,
     DetachedProbe(Instant),
     #[cfg(test)]
@@ -77,13 +77,16 @@ impl Placement {
     }
 }
 
-pub(crate) struct Supervisor {
+pub(crate) struct Supervisor<'a> {
+    ctx: &'a Ctx,
     mode: Mode,
     signals: io::Result<Signals>,
     state: Mutex<State>,
     idle: Condvar,
     log_base: io::Result<PathBuf>,
     logs: Mutex<Logs>,
+    #[cfg(test)]
+    membership_checks: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -186,7 +189,7 @@ pub(crate) struct Completion {
     pub(crate) cancelled: bool,
 }
 
-struct PendingLaunch<'a>(&'a Supervisor);
+struct PendingLaunch<'a>(&'a Supervisor<'a>);
 
 impl Drop for PendingLaunch<'_> {
     fn drop(&mut self) {
@@ -195,11 +198,12 @@ impl Drop for PendingLaunch<'_> {
     }
 }
 
-impl Supervisor {
-    pub(crate) fn new(env: &Env, mode: Mode) -> Self {
+impl<'a> Supervisor<'a> {
+    pub(crate) fn new(ctx: &'a Ctx, mode: Mode) -> Self {
         let signals = Signals::install();
         let last_signal = signals.as_ref().map_or(0, |signals| signals.start);
         Self {
+            ctx,
             mode,
             signals,
             state: Mutex::new(State {
@@ -207,8 +211,10 @@ impl Supervisor {
                 ..State::default()
             }),
             idle: Condvar::new(),
-            log_base: env.state_dir(),
+            log_base: ctx.env.state_dir(),
             logs: Mutex::new(Logs::default()),
+            #[cfg(test)]
+            membership_checks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -271,17 +277,25 @@ impl Supervisor {
             logs::Diagnostic::default()
         };
         let verbose = matches!(self.mode, Mode::Up { verbose: true, .. }) && !alongside;
-        let result = Pipes::take(&mut running.child)?.pump(&mut running, verbose, |_, bytes| {
-            if up {
-                diagnostic.record(bytes);
-            }
-            Ok(())
+        let mut drained = false;
+        let result = Pipes::take(&mut running.child).and_then(|mut pipes| {
+            let result = pipes.pump(&mut running, verbose, |_, bytes| {
+                if up {
+                    diagnostic.record(bytes);
+                }
+                Ok(())
+            });
+            drained = pipes.drained();
+            result
         });
+        if result.is_err() || !drained {
+            diagnostic.incomplete();
+        }
         if !up {
             return result;
         }
         let mut logs = self.logs.lock().unwrap();
-        if result.as_ref().is_ok_and(|status| !status.success()) {
+        if !result.as_ref().is_ok_and(|status| status.success()) {
             logs.failed(id, None);
         }
         logs.store(id, diagnostic);
@@ -299,7 +313,7 @@ impl Supervisor {
         let placement = if alongside {
             Placement::Detached
         } else {
-            Placement::Background
+            Placement::Probe
         };
         let mut running = self.spawn(command, placement, false)?;
         Pipes::take(&mut running.child)?.collect(&mut running)
@@ -381,7 +395,7 @@ impl Supervisor {
         let fragment = matches!(self.mode, Mode::Fragment) && !verify_wait;
         let job_control = matches!(placement, Placement::Foreground) && !fragment;
         let terminal = if job_control {
-            TerminalJob::start(None)?
+            TerminalJob::start(self.ctx, None)?
         } else {
             None
         };
@@ -476,6 +490,7 @@ impl Supervisor {
             entry,
             job_control,
             budget: None,
+            probe: matches!(placement, Placement::Probe) && !fragment,
             leader_exit: None,
             last_output: Instant::now(),
             group_cleanup: None,
@@ -685,12 +700,13 @@ impl Entry {
 }
 
 struct Running<'a> {
-    supervisor: &'a Supervisor,
+    supervisor: &'a Supervisor<'a>,
     child: Child,
     terminal: Option<TerminalJob>,
     entry: Entry,
     job_control: bool,
     budget: Option<ProbeBudget>,
+    probe: bool,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_cleanup: Option<Instant>,
@@ -724,8 +740,8 @@ impl Running<'_> {
 
         let supervisor = self.supervisor;
         let mut state = supervisor.state();
-        let observation = self.observe(&mut state, self.job_control)?;
-        let exited = matches!(observation, Observed::Exited { .. });
+        let observation = self.observe(&mut state, self.job_control || self.probe)?;
+        let exited = matches!(observation, Observed::Exited);
         if let Some(budget) = &mut self.budget {
             budget.cancelled = state.cancel.is_some();
             if !budget.received && budget.shutdown.is_none() && !budget.cancelled {
@@ -781,6 +797,24 @@ impl Running<'_> {
                     .as_ref()
                     .is_none_or(|cancel| cancel.terminal_pid == Some(self.entry.pid)) =>
             {
+                if self.probe && !self.entry.foreground {
+                    if !matches!(signal, libc::SIGTTIN | libc::SIGTTOU) {
+                        return Err(io::Error::other("probe stopped"));
+                    }
+                    if state.children.iter().any(|child| child.foreground) {
+                        return Err(io::Error::other(
+                            "probe needs the terminal while another foreground command is active",
+                        ));
+                    }
+                    // Reserve the foreground before releasing admission.
+                    self.entry.foreground = true;
+                    state
+                        .children
+                        .iter_mut()
+                        .find(|child| child.pid == self.entry.pid)
+                        .unwrap()
+                        .foreground = true;
+                }
                 drop(state);
                 if acknowledge_stop(self.entry.pid)? {
                     self.handle_stop(signal)?;
@@ -791,12 +825,7 @@ impl Running<'_> {
                 let _ = acknowledge_stop(self.entry.pid);
                 return Ok(None);
             }
-            Observed::Exited { signal } => {
-                if !self.entry.verify_wait && state.cancel.is_none() && signal == Some(libc::SIGINT)
-                {
-                    state.terminal_interrupt(self.entry, self.draining);
-                }
-            }
+            Observed::Exited => {}
         }
         let exited_at = *self.leader_exit.get_or_insert_with(Instant::now);
         let idle = self.last_output.max(exited_at).elapsed();
@@ -935,6 +964,10 @@ impl Running<'_> {
         {
             return result.clone();
         }
+        #[cfg(test)]
+        self.supervisor
+            .membership_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = if self.entry.verify_wait && self.leader_exit.is_some() {
             groups::has_live_after_leader_exit(self.entry.pid)
         } else {
@@ -1005,14 +1038,20 @@ impl Running<'_> {
             return job.suspend();
         }
         if terminal::controlling_terminal().is_none() {
-            return Ok(());
+            return if self.probe {
+                Err(io::Error::other(
+                    "probe stopped without a controlling terminal",
+                ))
+            } else {
+                Ok(())
+            };
         }
         // The shell may foreground dots before we observe its reader stop.
         // If it has not, stop dots too so an ordinary fg can promote it.
         if foreground_terminal().is_none() {
             terminal::suspend_caller()?;
         }
-        if let Some(mut job) = TerminalJob::start(Some(group))? {
+        if let Some(mut job) = TerminalJob::start(self.supervisor.ctx, Some(group))? {
             job.enter()?;
             self.terminal = Some(job);
         }
@@ -1046,11 +1085,11 @@ impl Drop for Running<'_> {
                 if self.entry.verify_wait && observation.is_err() {
                     break;
                 }
-                if self.entry.verify_wait && matches!(observation, Ok(Observed::Exited { .. })) {
+                if self.entry.verify_wait && matches!(observation, Ok(Observed::Exited)) {
                     self.leader_exit.get_or_insert_with(Instant::now);
                 }
                 let retired = self.retired(&mut state);
-                if retired && matches!(observation, Ok(Observed::Exited { .. })) {
+                if retired && matches!(observation, Ok(Observed::Exited)) {
                     let _ = self.child.wait();
                     break;
                 }
@@ -1076,7 +1115,7 @@ impl Drop for Running<'_> {
 enum Observed {
     Running,
     Stopped { signal: libc::c_int },
-    Exited { signal: Option<libc::c_int> },
+    Exited,
 }
 
 fn require_waitable_children() -> io::Result<()> {
@@ -1127,10 +1166,7 @@ fn observe(pid: libc::pid_t, stops: bool) -> io::Result<Observed> {
         libc::CLD_STOPPED | libc::CLD_TRAPPED => Ok(Observed::Stopped {
             signal: unsafe { info.si_status() },
         }),
-        libc::CLD_KILLED | libc::CLD_DUMPED => Ok(Observed::Exited {
-            signal: Some(unsafe { info.si_status() }),
-        }),
-        _ => Ok(Observed::Exited { signal: None }),
+        _ => Ok(Observed::Exited),
     }
 }
 
@@ -1160,7 +1196,7 @@ fn signal_target(target: libc::pid_t, signal: libc::c_int, warnings: &mut Vec<St
             && if target < 0 {
                 zombie_only_group(-target)
             } else {
-                matches!(observe(target, false), Ok(Observed::Exited { .. }))
+                matches!(observe(target, false), Ok(Observed::Exited))
             })
     {
         return true;

@@ -34,7 +34,7 @@ pub struct Run<'a> {
     sink: Sink,
     stages: Mutex<Stages>,
     rerun: Option<String>,
-    supervisor: Supervisor,
+    supervisor: Supervisor<'a>,
 }
 
 #[derive(Default)]
@@ -44,7 +44,7 @@ struct Stages {
 }
 
 impl Stages {
-    fn flush_alongside(&mut self, out: &mut impl Write, supervisor: &Supervisor) {
+    fn flush_alongside(&mut self, out: &mut impl Write, supervisor: &Supervisor<'_>) {
         for id in self.finished_alongside.drain(..) {
             let _ = supervisor.replay_alongside(id, out);
             let _ = write_stage_end(out, &self.values[id.0]);
@@ -68,7 +68,7 @@ impl<'a> Run<'a> {
             sink,
             stages: Mutex::new(Stages::default()),
             rerun: None,
-            supervisor: Supervisor::new(&ctx.env, mode),
+            supervisor: Supervisor::new(ctx, mode),
         }
     }
 

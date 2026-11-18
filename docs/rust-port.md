@@ -39,7 +39,10 @@ The supervisor then cleans up owned remnants, including leaderless groups, befor
 Self-detached processes are outside that scope. A guard restores the caller’s terminal on exit, cancellation and unwinding panic.
 Native mise runs `dots bootstrap complete` as a separate, direct process in its stage's group and cancellation scope; `DOTS_STAGES`, set only on that stage, names a unique private file its `Sink::Fragment` run alone atomically rewrites with stage metadata before each hook starts and after it finishes.
 After native exit the parent calls `run.fold(path)` even on failure, marking the active hook cancelled on interruption; standalone `complete` prints outcomes without saving a report.
-`--mas` runs `sudo -v` as an `Interactive` stage when needed on a TTY, before `mas` starts alongside as `Ordinary`, else defers; the parent reports its result at the next stage boundary and joins it before standalone mise, and expired access defers without prompting again.
+With valid cached administrator access, `--mas` starts the background worker as `Ordinary` without prompting, with or without a terminal.
+Without cached access, an interactive run obtains authorization first with `sudo -v` as a foreground `Interactive` stage. A noninteractive run defers the App Store stage.
+The parent announces the worker’s result at the next stage boundary and joins it before standalone mise.
+If authorization expires, the worker defers with a next action and never prompts again.
 `hooks::list(&Root, Dir, &Vars, profile)?`, `hooks::run(&Run, &Hook, HookEnv) -> Outcome`, `exceptions::run(&Run, &Exceptions, Update | InstallOnly)?`.
 P-05 selects, validates and persists the profile, machine or restore ID, history origin and `host-ID` branch, and recovery identity, checks bundle recipients and private readiness, then calls `history::restore(&Run, StageId, Restore { machine, origin, identity, initialize })` and `enroll(&Run, StageId, Enroll { profile, machine, origin, identity, recipients })` `-> Outcome`; only restore's `Outcome` feeds `DOTS_RESTORED` and its share of `DOTS_PRIVATE_READY` and hook secrets; P-06 re-derives nothing.
 `history::checkpoint(&Run, StageId, &Ctx) -> Result<Saved | NothingTracked, Issue>`; `sync::load(&Ctx) -> LocalOnly | Problem | Ready` and `sync::run(&Run, StageId, Loaded, Display) -> Receipt` never fail; only shared runs checkpoint.

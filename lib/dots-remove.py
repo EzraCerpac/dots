@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
@@ -178,7 +179,15 @@ def resolve(targets, declarations, records):
         else:
             matches = {name} if ":" in name and (name in declarations or name in records) else index.get(name.casefold(), set())
         if not matches:
-            raise ValueError(f"no declaration or managed app matches {request!r}")
+            message = f"no declaration or managed app matches {request!r}"
+            close = difflib.get_close_matches(name.casefold(), index, n=max(1, len(index)), cutoff=0.8)
+            suggestions = {identity for alias in close for identity in index[alias]}
+            if len(suggestions) == 1:
+                suggestion = suggestions.pop()
+                if ":" not in suggestion and len(index[suggestion.casefold()]) > 1:
+                    suggestion = f"mise:{suggestion}"
+                message += f". Did you mean {suggestion!r}?"
+            raise ValueError(message)
         if len(matches) != 1:
             choices = sorted(identity if ":" in identity else f"mise:{identity}" for identity in matches)
             raise ValueError(f"ambiguous target {request!r}; use one of: {', '.join(choices)}")

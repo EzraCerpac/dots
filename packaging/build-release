@@ -20,7 +20,7 @@ mkdir -p "$out"
 out="$(cd "$out" && pwd -P)"
 platforms=(darwin-arm64 darwin-amd64 linux-arm64 linux-amd64)
 # Runtime files only: the Go sources, tests and CI files stay in the repository.
-runtime=(bin bootstrap docs init lib skills tasks LICENSE README.md)
+runtime=(bin bootstrap completions docs init lib skills tasks LICENSE README.md)
 
 stage="$(mktemp -d "${TMPDIR:-/tmp}/dots-release.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT

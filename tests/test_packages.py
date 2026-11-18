@@ -211,6 +211,27 @@ esac
     def declarations(self, host: str) -> dict:
         return self.config(host).get("bootstrap", {}).get("packages", {})
 
+    def test_remove_suggests_only_a_unique_managed_match(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        source = config / "config.toml"
+        source.write_text(BASE + '\n[bootstrap.packages]\n"brew-cask:codexbar" = "latest"\n')
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                if ambiguous:
+                    with source.open("a") as stream:
+                        stream.write('"brew:codexbar" = "latest"\n')
+                before = source.read_bytes()
+                result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                                      str(self.bin / "mise"), str(config), "codex-bar")
+                message = "dots: no declaration or managed app matches 'codex-bar'"
+                if not ambiguous:
+                    message += ". Did you mean 'brew-cask:codexbar'?"
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr.strip(), message)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(source.read_bytes(), before)
+
     def local_tool(self) -> None:
         plugin = self.root / "plugin"
         scripts = plugin / "bin"

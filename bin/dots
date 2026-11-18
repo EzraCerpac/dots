@@ -23,7 +23,7 @@ else
 fi
 export DOTS_HOME
 # Built-in commands always win over configuration commands of the same name.
-builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall help internal init "
+builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall completions help internal init "
 
 # The configuration: DOTS_ROOT, else mise's config directory. lib/setup-common.sh
 # applies the same rule; it is repeated here so a bare bin/dots, or one whose
@@ -53,6 +53,7 @@ Your machine setup, from any directory.
   dots --version                  Print the manager version and how it was installed
   dots [--plain|--verbose] [--no-wait] COMMAND [ARGS...]
   dots reports [COMMAND]          Browse saved command reports
+  dots completions SHELL          Print completions for fish, zsh or bash
 
   dots up [--mas] [--plain|--verbose] [--no-wait] [--last]
                                    Sync configuration, then update tools and plugins
@@ -120,6 +121,22 @@ if [[ " $frontend_flags " == *' --plain '* && " $frontend_flags " == *' --verbos
 fi
 backend_mode=0
 if [[ "${1:-}" == --backend ]]; then backend_mode=1; shift; fi
+# The shell can ask for completions before the first setup exists. Keep both
+# the loader and the per-Tab query ahead of skill linking and mise startup.
+if [[ "${1:-}" == completions ]]; then
+    case "${2:-}:$#" in
+        fish:2) file=dots.fish ;;
+        zsh:2)  file=_dots ;;
+        bash:2) file=dots.bash ;;
+        *) echo 'dots: usage: dots completions {fish|zsh|bash}' >&2; exit 2 ;;
+    esac
+    exec cat "$DOTS_HOME/completions/$file"
+fi
+if [[ "${1:-}" == internal && "${2:-}" == shell-complete ]]; then
+    shift 2
+    [[ -x "$DOTS_HOME/bin/dots-up" ]] || exit 0
+    exec "$DOTS_HOME/bin/dots-up" complete "$@"
+fi
 # Reading a receipt must also work when the sync stopped on a broken setup.
 if [[ "$#" -eq 2 && "$1" == sync && "$2" == --last ]] ||
    [[ "$#" -eq 3 && "$1" == internal && "$2" == sync-present ]]; then
@@ -454,7 +471,11 @@ case "$command_name" in
             esac
         done
         cd "$root"
-        exec uv run --script "$DOTS_HOME/lib/dots-remove.py" "$mise_bin" "$root" ${remove_args[@]+"${remove_args[@]}"}
+        uv_run=(uv run)
+        if [[ " $frontend_flags " != *' --verbose '* && "${DOTS_UP_VERBOSE:-0}" != 1 ]]; then
+            uv_run+=(--quiet)
+        fi
+        exec "${uv_run[@]}" --script "$DOTS_HOME/lib/dots-remove.py" "$mise_bin" "$root" ${remove_args[@]+"${remove_args[@]}"}
         ;;
     add) ;;
     *) echo "dots: unknown command '$command_name'; use dots help" >&2; exit 2 ;;

@@ -43,6 +43,9 @@ class Dots < Formula
   def install
     libexec.install Dir["*"]
     bin.install_symlink libexec/"bin/dots"
+    fish_completion.install_symlink libexec/"completions/dots.fish"
+    zsh_completion.install_symlink libexec/"completions/_dots"
+    bash_completion.install_symlink libexec/"completions/dots.bash" => "dots"
   end
 
   def caveats

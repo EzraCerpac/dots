@@ -50,6 +50,22 @@ The `dots-up` renderer adds the interactive menu, live progress and saved report
 `DOTS_UP_BIN` overrides that search.
 Update or unset it if it points to an older renderer.
 
+### Shell completions
+
+Homebrew installs completions for Fish, Zsh and Bash in their standard directories.
+With mise or a release archive, add the line for your shell to its interactive configuration:
+
+| Shell | Startup file | Line to add |
+| --- | --- | --- |
+| Fish | `~/.config/fish/config.fish` | `dots completions fish \| source` |
+| Zsh | `~/.zshrc`, after `compinit` | `source <(dots completions zsh)` |
+| Bash | `~/.bashrc` | `source <(dots completions bash)` |
+
+Each new shell loads completions from the active release.
+From a source checkout, build `bin/dots-up` as shown above.
+Try `dots remove ` followed by Tab to see managed tools, packages and apps.
+Use `--base`, `--profile` or `--path` to narrow the list.
+
 ## Updating
 
 `dots up` updates `dots` only when the configuration declares it, as a mise tool or a Homebrew formula (see below); otherwise update it the way you installed it: `mise upgrade github:EzraCerpac/dots`, `brew upgrade dots`, or `git pull` in the checkout.
@@ -131,9 +147,11 @@ dots up
 
 Run `dots help` for the full list with examples.
 In a terminal, `dots` alone opens a menu of the same commands.
+`dots up` shows the live update dashboard.
+Individual commands print in scrollback and return to the prompt when finished.
 `--plain`, `--verbose` and `--no-wait` before a command choose how its output is shown, for example `dots --plain status`.
 
-Every problem is one issue, listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
+Update issues are listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
 Under it stand the last lines of the error, the command to run next and the path of the step's full log (under `~/.local/state/dots/`).
 In the dashboard, `A` on an issue hands it to a coding agent once the run has finished: `dots` suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument, for example `export DOTS_AGENT_COMMAND=claude` or `DOTS_AGENT_COMMAND=codex`.
 Without it, `A` says how to set it.

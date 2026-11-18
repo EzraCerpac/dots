@@ -5,7 +5,7 @@ Amended 2026-11-18: shell completion, removal targets, the output of individual 
 Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
 Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish origin and `dev` ancestry checks.
 Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
-Amended 2026-11-18: sync diagnostics, backup publication verification and history format checks, diverged publish approval, and update report replay.
+Amended 2026-11-18: sync diagnostics and hook-generated inputs, backup publication verification and history format checks, diverged publish approval, and update report replay.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -565,6 +565,10 @@ Package, tool and standalone mise changes come from comparing state before and a
 - When the deployed mode of a leaf cannot be verified, the leaf is updated only if its current mode can stay.
 - Recovery files stay on the same filesystem as the target; when that is impossible, sync reports the path and keeps both versions.
 - Other targets are applied in dependency order with the usual mise hooks, and matching reload commands run once, after the writes.
+- As in 0.4.0, a validated pre-hook runs in its normal checkout context, and public source or configuration edits it generates remain there for the next screened sync.
+  In the same run, already validated entries use the generated source bytes and permissions, honour `create_if_missing`, and can consume the output of a successful declared dependency.
+  A kept or failed dependency blocks its dependent.
+  The same write guards protect competing edits, and an omitted input, changed selector, target, source path or operation, or a newly introduced hook cannot authorize an additional write.
 
 Sync never force-pushes, skips validation, discards uncommitted edits or writes conflict markers into live files.
 Each issue carries a diagnostic and a recovery action.
@@ -1196,7 +1200,8 @@ Only native `mise bootstrap dotfiles sync` publishes to the state repository.
 Version 0.4.0 printed `Settings backup published.` on native exit 0 even when conflicts still awaited reconciliation.
 **New in 1.0:** after a successful native sync, backup reads back the validated remote host branch once and reports publication only if the saved checkpoint equals its tip or is an ancestor of it.
 If reconciliation is pending and the checkpoint is absent, backup exits 1, says the checkpoint was kept locally and directs the user to `mise dot status`.
-If the readback cannot verify either outcome, backup exits 1 and reports only that publication could not be confirmed.
+If the readback cannot verify publication, backup exits 1, says the checkpoint was saved locally and directs the user to check the private history remote.
+It leaves the publication outcome unconfirmed.
 Backup uses one native sync and performs no publication retry or force push.
 
 ### `dots restore [--initialize-history]`

@@ -1,4 +1,5 @@
 //! Native stage and probe lifecycle, plus the plain and verbose up presentation.
+mod groups;
 mod logs;
 mod pipe;
 mod signals;
@@ -8,7 +9,7 @@ mod tests;
 
 use nix::libc;
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -19,7 +20,7 @@ use crate::report::{Command as ReportCommand, Issue, StageId};
 use crate::run::{Policy, exit_code};
 use crate::{Ctx, Env};
 use logs::Logs;
-use pipe::Pipes;
+use pipe::{Console, Pipes};
 use signals::Signals;
 use terminal::{TerminalJob, foreground_terminal};
 
@@ -29,8 +30,10 @@ pub use terminal::terminal_observer;
 const TICK: Duration = Duration::from_millis(10);
 const TERM_AFTER: Duration = Duration::from_millis(150);
 const KILL_AFTER: Duration = Duration::from_millis(650);
-const DRAIN_IDLE: Duration = Duration::from_secs(1);
+const OWNED_DRAIN_IDLE: Duration = Duration::from_secs(30);
 const DRAIN_AFTER_KILL: Duration = Duration::from_millis(250);
+const GROUP_CHECK_TICK: Duration = Duration::from_millis(50);
+const GROUP_RETIRE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Mode {
@@ -87,6 +90,7 @@ struct State {
     last_signal: libc::c_int,
     cancel: Option<Cancellation>,
     closed: bool,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -94,6 +98,7 @@ struct Entry {
     pid: libc::pid_t,
     target: libc::pid_t,
     foreground: bool,
+    native: bool,
 }
 
 struct Cancellation {
@@ -179,7 +184,7 @@ impl Supervisor {
         } else {
             Placement::Foreground
         };
-        let mut running = self.spawn(command, placement)?;
+        let mut running = self.spawn(command, placement, !capture)?;
         if !capture {
             let status = running.wait()?;
             if native_prompt && !status.success() {
@@ -225,7 +230,7 @@ impl Supervisor {
         } else {
             Placement::Background
         };
-        let mut running = self.spawn(command, placement)?;
+        let mut running = self.spawn(command, placement, false)?;
         Pipes::take(&mut running.child)?.collect(&mut running)
     }
 
@@ -240,7 +245,12 @@ impl Supervisor {
         command.stdout(stream()).stderr(stream());
     }
 
-    fn spawn(&self, mut command: Command, placement: Placement) -> io::Result<Running<'_>> {
+    fn spawn(
+        &self,
+        mut command: Command,
+        placement: Placement,
+        native: bool,
+    ) -> io::Result<Running<'_>> {
         if let Err(error) = &self.signals {
             return Err(io::Error::other(format!(
                 "install cancellation handlers: {error}"
@@ -259,13 +269,14 @@ impl Supervisor {
             ));
         }
         let fragment = matches!(self.mode, Mode::Fragment);
-        let mut terminal = if matches!(placement, Placement::Foreground) && !fragment {
-            TerminalJob::start()?
+        let job_control = matches!(placement, Placement::Foreground) && !fragment;
+        let terminal = if job_control {
+            TerminalJob::start(None)?
         } else {
             None
         };
-        if let Some(terminal) = &mut terminal {
-            terminal.prepare(&mut command);
+        if let Some(terminal) = &terminal {
+            command.process_group(terminal.group());
         } else if !fragment {
             if matches!(placement, Placement::Detached) {
                 unsafe {
@@ -301,21 +312,35 @@ impl Supervisor {
             pid,
             target,
             foreground: placement.foreground(),
+            native,
         };
         state.children.push(entry);
         state.refresh_signals();
-        Ok(Running {
+        drop(state);
+        let mut running = Running {
             supervisor: self,
             child,
             terminal,
             entry,
+            job_control,
             leader_exit: None,
             last_output: Instant::now(),
             group_cleanup: None,
+            membership: None,
+            forced_drain: false,
+            retirement_done: false,
             draining: false,
             leader_kill: None,
             reaped: false,
-        })
+        };
+        // Transfer from the parent after exec, so terminal stop signals
+        // cannot suspend the child before Command::spawn finishes.
+        if !self.cancelled()
+            && let Some(terminal) = &mut running.terminal
+        {
+            terminal.enter()?;
+        }
+        Ok(running)
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -327,7 +352,12 @@ impl Supervisor {
         state
     }
 
-    pub(crate) fn complete(&self, command: Option<ReportCommand>, status: u8) -> Completion {
+    pub(crate) fn complete(
+        &self,
+        command: Option<ReportCommand>,
+        status: u8,
+        flush: impl FnOnce(),
+    ) -> Completion {
         let mut state = self.state();
         state.closed = true;
         while !state.children.is_empty() {
@@ -336,7 +366,9 @@ impl Supervisor {
                 .wait(state)
                 .unwrap_or_else(|poison| poison.into_inner());
         }
-        state.refresh_signals();
+        drop(state);
+        flush();
+        let state = self.state();
         match &state.cancel {
             Some(cancel) => Completion {
                 status: if command == Some(ReportCommand::Sync) {
@@ -357,12 +389,39 @@ impl Supervisor {
         self.logs.lock().unwrap().enrich(id, issue);
     }
 
+    pub(crate) fn stdout(&self) -> Console<'_> {
+        Console::new(self, libc::STDOUT_FILENO)
+    }
+
+    pub(crate) fn stderr(&self) -> Console<'_> {
+        Console::new(self, libc::STDERR_FILENO)
+    }
+
+    pub(crate) fn flush_warnings(&self) {
+        let mut warnings = std::mem::take(&mut self.state().warnings);
+        warnings.extend(self.logs.lock().unwrap().take_warnings());
+        let mut stderr = self.stderr();
+        for warning in warnings {
+            let _ = writeln!(stderr, "{warning}");
+        }
+    }
+
     pub(crate) fn replay_alongside(&self, id: StageId, output: &mut impl Write) -> io::Result<()> {
         if matches!(self.mode, Mode::Up { verbose: true, .. }) {
             let replay = self.logs.lock().unwrap().replay(id);
             if let Some((path, needs_newline)) = replay {
                 let mut log = File::open(path)?;
-                if io::copy(&mut log, output)? != 0 && needs_newline {
+                let mut bytes = [0; 8192];
+                let mut shown = false;
+                while !self.cancelled() {
+                    let count = log.read(&mut bytes)?;
+                    if count == 0 {
+                        break;
+                    }
+                    output.write_all(&bytes[..count])?;
+                    shown = true;
+                }
+                if shown && needs_newline {
                     output.write_all(b"\n")?;
                 }
             }
@@ -398,7 +457,7 @@ impl State {
                 cancel.escalation = escalation;
                 for entry in &self.children {
                     if Some(entry.pid) != cancel.terminal_pid {
-                        signal_target(entry.target, signal);
+                        signal_target(entry.target, signal, &mut self.warnings);
                     }
                 }
             }
@@ -412,7 +471,7 @@ impl State {
                 && let Some(entry) = self.children.iter().find(|entry| entry.pid == pid)
             {
                 // An explicit signal to dots supersedes a terminal-only cancel.
-                signal_target(entry.target, signal);
+                signal_target(entry.target, signal, &mut self.warnings);
                 cancel.start = Instant::now();
                 cancel.escalation = Escalation::Interrupt;
             }
@@ -436,21 +495,27 @@ impl State {
         });
         for entry in &self.children {
             if Some(entry.pid) != terminal_pid {
-                signal_target(entry.target, signal.unwrap_or(libc::SIGINT));
+                signal_target(
+                    entry.target,
+                    signal.unwrap_or(libc::SIGINT),
+                    &mut self.warnings,
+                );
             }
         }
     }
 
-    fn terminal_interrupt(&mut self, pid: libc::pid_t, during_drain: bool) {
+    fn terminal_interrupt(&mut self, entry: Entry, during_drain: bool) {
         if self.cancel.is_some() {
             return;
         }
-        self.cancel(None, Some(pid));
-        if during_drain && let Some(cancel) = &mut self.cancel {
-            // The kernel already signalled that group, but the recorded
-            // leader had exited. Escalate against remaining group members.
-            cancel.foreground = None;
-            cancel.terminal_pid = None;
+        self.cancel(None, Some(entry.pid));
+        if let Some(cancel) = &mut self.cancel {
+            if during_drain {
+                cancel.foreground = None;
+            }
+            if !entry.native || during_drain {
+                cancel.terminal_pid = None;
+            }
         }
     }
 }
@@ -460,9 +525,13 @@ struct Running<'a> {
     child: Child,
     terminal: Option<TerminalJob>,
     entry: Entry,
+    job_control: bool,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_cleanup: Option<Instant>,
+    membership: Option<(Instant, Result<bool, String>)>,
+    forced_drain: bool,
+    retirement_done: bool,
     draining: bool,
     leader_kill: Option<bool>,
     reaped: bool,
@@ -484,11 +553,12 @@ impl Running<'_> {
         {
             self.supervisor
                 .state()
-                .terminal_interrupt(self.entry.pid, self.draining);
+                .terminal_interrupt(self.entry, self.draining);
         }
 
-        let mut state = self.supervisor.state();
-        let observation = observe(self.entry.pid, self.terminal.is_some())?;
+        let supervisor = self.supervisor;
+        let mut state = supervisor.state();
+        let observation = observe(self.entry.pid, self.job_control)?;
         if !matches!(observation, Observed::Exited { .. })
             && self.leader_kill.is_none()
             && state.cancel.as_ref().is_some_and(|cancel| {
@@ -497,7 +567,7 @@ impl Running<'_> {
         {
             // A group signal can succeed for its observer or a descendant
             // even when the native leader refuses it.
-            let signalled = signal_target(self.entry.pid, libc::SIGKILL);
+            let signalled = signal_target(self.entry.pid, libc::SIGKILL, &mut state.warnings);
             self.leader_kill = Some(signalled);
             if !signalled {
                 return Err(io::Error::new(
@@ -508,32 +578,35 @@ impl Running<'_> {
         }
         match observation {
             Observed::Running => return Ok(None),
-            Observed::Stopped if state.cancel.is_none() => {
+            Observed::Stopped { signal }
+                if state
+                    .cancel
+                    .as_ref()
+                    .is_none_or(|cancel| cancel.terminal_pid == Some(self.entry.pid)) =>
+            {
                 drop(state);
-                if acknowledge_stop(self.entry.pid)?
-                    && let Some(terminal) = &mut self.terminal
-                {
-                    terminal.suspend()?;
+                if acknowledge_stop(self.entry.pid)? {
+                    self.handle_stop(signal)?;
                 }
                 return Ok(None);
             }
-            Observed::Stopped => {
+            Observed::Stopped { .. } => {
                 let _ = acknowledge_stop(self.entry.pid);
                 return Ok(None);
             }
             Observed::Exited { signal } => {
                 if state.cancel.is_none() && signal == Some(libc::SIGINT) {
-                    state.cancel(None, Some(self.entry.pid));
+                    state.terminal_interrupt(self.entry, self.draining);
                 }
             }
         }
         let exited_at = *self.leader_exit.get_or_insert_with(Instant::now);
         let idle = self.last_output.max(exited_at).elapsed();
-        let cancelled = state
+        let cleanup = state
             .cancel
             .as_ref()
             .filter(|cancel| cancel.terminal_pid != Some(self.entry.pid));
-        if let Some(cancel) = cancelled {
+        if let Some(cancel) = cleanup {
             if self.entry.target < 0 && cancel.escalation != Escalation::Kill {
                 return Ok(None);
             }
@@ -541,23 +614,16 @@ impl Running<'_> {
                 return Ok(None);
             }
         } else if !drained {
-            // Give descendants time to finish the stream after the leader exits.
-            // A detached process can inherit the pipe, so idle drain is bounded.
-            if display_pending || idle < DRAIN_IDLE {
+            let delay = if matches!(self.group_members(), Ok(true)) {
+                OWNED_DRAIN_IDLE
+            } else {
+                DRAIN_AFTER_KILL
+            };
+            if display_pending || idle < delay {
                 self.draining = true;
                 return Ok(None);
             }
-            if self.entry.target < 0 && self.group_cleanup.is_none() && self.terminal.is_none() {
-                signal_target(self.entry.target, libc::SIGKILL);
-                self.group_cleanup = Some(Instant::now());
-                return Ok(None);
-            }
-            if self
-                .group_cleanup
-                .is_some_and(|when| when.elapsed() < DRAIN_AFTER_KILL)
-            {
-                return Ok(None);
-            }
+            self.forced_drain = true;
         }
         if let Some(job) = &mut self.terminal {
             // Check the fence only after restoring foreground. Its reply comes
@@ -566,11 +632,14 @@ impl Running<'_> {
                 return Ok(None);
             }
             if job.notices()? {
-                state.terminal_interrupt(self.entry.pid, self.draining);
+                state.terminal_interrupt(self.entry, self.draining);
             }
         }
-        if self.entry.target < 0 {
-            signal_target(self.entry.target, libc::SIGKILL);
+        if !self.retired(&mut state) {
+            return Ok(None);
+        }
+        if display_pending && state.cancel.is_none() {
+            return Ok(None);
         }
         let status = self.child.wait()?;
         self.reaped = true;
@@ -590,11 +659,89 @@ impl Running<'_> {
             .find(|entry| entry.pid == self.entry.pid)
             .unwrap()
             .target = 0;
-        Ok(Some(status))
+        if self.forced_drain && state.cancel.is_none() {
+            Err(io::Error::other(
+                "the stage output stayed open after its leader exited",
+            ))
+        } else {
+            Ok(Some(status))
+        }
     }
 
     fn output_progress(&mut self) {
         self.last_output = Instant::now();
+    }
+
+    fn group_members(&mut self) -> Result<bool, String> {
+        if self.entry.target >= 0 {
+            return Ok(false);
+        }
+        if let Some((at, result)) = &self.membership
+            && at.elapsed() < GROUP_CHECK_TICK
+        {
+            return result.clone();
+        }
+        let result = groups::has_live(
+            -self.entry.target,
+            self.terminal.as_ref().map(TerminalJob::observer_pid),
+        )
+        .map_err(|error| error.to_string());
+        self.membership = Some((Instant::now(), result.clone()));
+        result
+    }
+
+    /// Waitable leaders anchor the group until its final live-member check.
+    fn retired(&mut self, state: &mut State) -> bool {
+        if self.retirement_done {
+            return true;
+        }
+        let result = self.group_members();
+        if matches!(result, Ok(false)) {
+            self.retirement_done = true;
+            return true;
+        }
+        let Some(start) = self.group_cleanup else {
+            signal_target(self.entry.target, libc::SIGKILL, &mut state.warnings);
+            self.group_cleanup = Some(Instant::now());
+            self.membership = None;
+            return false;
+        };
+        if start.elapsed() < GROUP_RETIRE_GRACE {
+            return false;
+        }
+        let reason = result
+            .err()
+            .unwrap_or_else(|| "the group still has live members".into());
+        state.warnings.push(format!(
+            "dots: could not confirm that the command's processes stopped ({reason})"
+        ));
+        self.retirement_done = true;
+        true
+    }
+
+    fn handle_stop(&mut self, signal: libc::c_int) -> io::Result<()> {
+        let group = -self.entry.target;
+        if let Some(job) = &mut self.terminal {
+            // A fast native child can read or write its terminal before the
+            // parent's post-spawn handoff. Resume that background stop.
+            if matches!(signal, libc::SIGTTIN | libc::SIGTTOU) && job.owns_foreground() {
+                return terminal::continue_group(group);
+            }
+            return job.suspend();
+        }
+        if terminal::controlling_terminal().is_none() {
+            return Ok(());
+        }
+        // The shell may foreground dots before we observe its reader stop.
+        // If it has not, stop dots too so an ordinary fg can promote it.
+        if foreground_terminal().is_none() {
+            terminal::suspend_caller()?;
+        }
+        if let Some(mut job) = TerminalJob::start(Some(group))? {
+            job.enter()?;
+            self.terminal = Some(job);
+        }
+        terminal::continue_group(group)
     }
 
     fn discard_display(&self) -> bool {
@@ -612,14 +759,33 @@ impl Drop for Running<'_> {
     fn drop(&mut self) {
         let mut state = self.supervisor.state();
         if !self.reaped {
-            signal_target(self.entry.target, libc::SIGKILL);
+            signal_target(self.entry.target, libc::SIGKILL, &mut state.warnings);
+            self.group_cleanup = Some(Instant::now());
+            self.membership = None;
             // Signal the leader separately if a mixed-privilege group accepted
             // SIGKILL only for some of its members.
-            if self
-                .leader_kill
-                .unwrap_or_else(|| signal_target(self.entry.pid, libc::SIGKILL))
-            {
-                let _ = self.child.wait();
+            if self.leader_kill.unwrap_or_else(|| {
+                signal_target(self.entry.pid, libc::SIGKILL, &mut state.warnings)
+            }) {
+                let until = Instant::now() + GROUP_RETIRE_GRACE;
+                loop {
+                    let retired = self.retired(&mut state);
+                    let exited =
+                        matches!(observe(self.entry.pid, false), Ok(Observed::Exited { .. }));
+                    if retired && exited {
+                        let _ = self.child.wait();
+                        break;
+                    }
+                    if Instant::now() >= until && retired {
+                        state
+                            .warnings
+                            .push("dots: could not confirm that the command leader stopped".into());
+                        break;
+                    }
+                    drop(state);
+                    std::thread::sleep(TICK);
+                    state = self.supervisor.state();
+                }
             } else {
                 let _ = self.child.try_wait();
             }
@@ -632,7 +798,7 @@ impl Drop for Running<'_> {
 
 enum Observed {
     Running,
-    Stopped,
+    Stopped { signal: libc::c_int },
     Exited { signal: Option<libc::c_int> },
 }
 
@@ -655,7 +821,9 @@ fn observe(pid: libc::pid_t, stops: bool) -> io::Result<Observed> {
         return Ok(Observed::Running);
     }
     match info.si_code {
-        libc::CLD_STOPPED | libc::CLD_TRAPPED => Ok(Observed::Stopped),
+        libc::CLD_STOPPED | libc::CLD_TRAPPED => Ok(Observed::Stopped {
+            signal: unsafe { info.si_status() },
+        }),
         libc::CLD_KILLED | libc::CLD_DUMPED => Ok(Observed::Exited {
             signal: Some(unsafe { info.si_status() }),
         }),
@@ -679,7 +847,7 @@ fn acknowledge_stop(pid: libc::pid_t) -> io::Result<bool> {
     Ok(unsafe { info.si_pid() } != 0)
 }
 
-fn signal_target(target: libc::pid_t, signal: libc::c_int) -> bool {
+fn signal_target(target: libc::pid_t, signal: libc::c_int, warnings: &mut Vec<String>) -> bool {
     if target == 0 || unsafe { libc::kill(target, signal) } == 0 {
         return true;
     }
@@ -694,38 +862,17 @@ fn signal_target(target: libc::pid_t, signal: libc::c_int) -> bool {
     {
         return true;
     }
-    eprintln!("dots: could not signal the command; its processes may still be running ({error})");
+    let warning =
+        format!("dots: could not signal the command; its processes may still be running ({error})");
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
     false
 }
 
 #[cfg(target_os = "macos")]
 fn zombie_only_group(group: libc::pid_t) -> bool {
-    // Darwin can return EPERM when the group contains only zombies. Inspect
-    // membership while our unreaped child still reserves the group ID.
-    let mut pids = [0 as libc::pid_t; 32];
-    let count = unsafe {
-        *libc::__error() = 0;
-        let count = libc::proc_listpgrppids(
-            group,
-            pids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&pids) as libc::c_int,
-        );
-        if *libc::__error() != 0 {
-            return false;
-        }
-        count as usize
-    };
-    if count >= pids.len() {
-        return false;
-    }
-    pids[..count].iter().all(|&pid| {
-        let current = unsafe { libc::getpgid(pid) };
-        if current < 0 {
-            io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        } else {
-            current != group
-        }
-    })
+    matches!(groups::has_live(group, None), Ok(false))
 }
 
 #[cfg(not(target_os = "macos"))]

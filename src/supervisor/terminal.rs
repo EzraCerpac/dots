@@ -73,13 +73,14 @@ pub(super) struct TerminalJob {
     caller: libc::pid_t,
     modes: libc::termios,
     observer: Child,
+    group: libc::pid_t,
     handed_off: bool,
     fence_sent: bool,
     fenced: bool,
 }
 
 impl TerminalJob {
-    pub(super) fn start() -> io::Result<Option<Self>> {
+    pub(super) fn start(join: Option<libc::pid_t>) -> io::Result<Option<Self>> {
         let Some((tty, caller)) = foreground_terminal() else {
             return Ok(None);
         };
@@ -90,17 +91,19 @@ impl TerminalJob {
         let observer = Command::new(std::env::current_exe()?)
             .arg(OBSERVER)
             .env(OBSERVER_ENV, "1")
-            .process_group(0)
+            .process_group(join.unwrap_or(0))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        let group = join.unwrap_or(observer.id() as libc::pid_t);
         let mut job = Self {
             tty,
             caller,
             // tcgetattr initialized the entire termios value.
             modes: unsafe { modes.assume_init() },
             observer,
+            group,
             handed_off: false,
             fence_sent: false,
             fenced: false,
@@ -118,26 +121,24 @@ impl TerminalJob {
     }
 
     pub(super) fn group(&self) -> libc::pid_t {
+        self.group
+    }
+
+    pub(super) fn observer_pid(&self) -> libc::pid_t {
         self.observer.id() as libc::pid_t
     }
 
-    pub(super) fn prepare(&mut self, command: &mut Command) {
+    pub(super) fn enter(&mut self) -> io::Result<()> {
         let fd = self.tty.as_raw_fd();
-        let group = self.group();
-        // Mark the guard before spawn so even an exec failure restores pgrp.
-        self.handed_off = true;
-        command.process_group(group);
-        unsafe {
-            command.pre_exec(move || {
-                // Reset the supervisor's handler before transferring foreground.
-                for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
-                    if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
-                foreground(fd, group)
-            });
+        if unsafe { libc::tcgetpgrp(fd) } == self.caller {
+            foreground(fd, self.group)?;
+            self.handed_off = true;
         }
+        Ok(())
+    }
+
+    pub(super) fn owns_foreground(&self) -> bool {
+        (unsafe { libc::tcgetpgrp(self.tty.as_raw_fd()) }) == self.group
     }
 
     pub(super) fn notices(&mut self) -> io::Result<bool> {
@@ -184,9 +185,7 @@ impl TerminalJob {
         }
         self.reclaim()?;
         // Use an unconditional stop so a shell can resume dots with fg/bg.
-        if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        suspend_caller()?;
         if unsafe { libc::tcgetpgrp(fd) } == self.caller {
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, stopped_modes.as_ptr()) } == -1 {
                 return Err(io::Error::last_os_error());
@@ -197,13 +196,7 @@ impl TerminalJob {
             }
             self.handed_off = true;
         }
-        if unsafe { libc::kill(-self.group(), libc::SIGCONT) } == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        Ok(())
+        continue_group(self.group)
     }
 
     fn reclaim(&mut self) -> io::Result<()> {
@@ -231,33 +224,59 @@ impl Drop for TerminalJob {
 }
 
 pub(super) fn foreground_terminal() -> Option<(File, libc::pid_t)> {
-    let tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
+    let tty = controlling_terminal()?;
     let caller = unsafe { libc::getpgrp() };
     (unsafe { libc::tcgetpgrp(tty.as_raw_fd()) } == caller).then_some((tty, caller))
 }
 
-// Also called from pre_exec. Keep this to async-signal-safe libc calls.
+pub(super) fn controlling_terminal() -> Option<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()
+}
+
+pub(super) fn suspend_caller() -> io::Result<()> {
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(super) fn continue_group(group: libc::pid_t) -> io::Result<()> {
+    if unsafe { libc::kill(-group, libc::SIGCONT) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn foreground(fd: RawFd, group: libc::pid_t) -> io::Result<()> {
+    without_sigttou(|| {
+        if unsafe { libc::tcsetpgrp(fd, group) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn without_sigttou<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
     unsafe {
         let mut blocked = std::mem::zeroed();
         let mut previous = std::mem::zeroed();
         libc::sigemptyset(&mut blocked);
         libc::sigaddset(&mut blocked, libc::SIGTTOU);
-        if libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut previous) == -1 {
-            return Err(io::Error::last_os_error());
+        let error = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error));
         }
-        let result = if libc::tcsetpgrp(fd, group) == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        };
-        let restored = libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
-        if restored == -1 && result.is_ok() {
-            return Err(io::Error::last_os_error());
+        let result = operation();
+        let restored = libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if restored != 0 && result.is_ok() {
+            return Err(io::Error::from_raw_os_error(restored));
         }
         result
     }

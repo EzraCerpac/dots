@@ -55,7 +55,7 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
                 &[&heartbeat],
             );
             let mut stage = supervisor
-                .spawn(command, Placement::HeadlessForeground)
+                .spawn(command, Placement::HeadlessForeground, false)
                 .unwrap();
             Pipes::take(&mut stage.child)
                 .unwrap()
@@ -75,7 +75,9 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
                     done"#,
                 &[&alongside_ready],
             );
-            let mut stage = supervisor.spawn(command, Placement::Background).unwrap();
+            let mut stage = supervisor
+                .spawn(command, Placement::Background, false)
+                .unwrap();
             Pipes::take(&mut stage.child)
                 .unwrap()
                 .collect(&mut stage)
@@ -100,7 +102,7 @@ fn cancellation_during_drain_ignores_exited_foreground_and_retires_other_groups(
                 .kind(),
             io::ErrorKind::Interrupted,
         );
-        let result = supervisor.complete(Some(ReportCommand::Up), 1);
+        let result = supervisor.complete(Some(ReportCommand::Up), 1, || {});
         assert!(supervisor.state().children.is_empty());
         (
             result,
@@ -145,19 +147,19 @@ fn active_foreground_status_wins_over_fallback_and_sync_remains_zero() {
                 &[&ready_path],
             );
             let mut stage = supervisor
-                .spawn(command, Placement::HeadlessForeground)
+                .spawn(command, Placement::HeadlessForeground, false)
                 .unwrap();
             stage.wait().unwrap()
         });
         let ready = wait_until(|| ready_path.exists());
         supervisor.state().cancel(Some(libc::SIGINT), None);
-        let result = supervisor.complete(Some(ReportCommand::Up), 1);
+        let result = supervisor.complete(Some(ReportCommand::Up), 1, || {});
         assert!(ready, "foreground did not register its interrupt trap");
         let native = worker.join().unwrap();
         assert_eq!(native.code(), Some(23), "{native:?}");
         assert!(result.cancelled);
         assert_eq!(result.status, 23);
-        let sync = supervisor.complete(Some(ReportCommand::Sync), 1);
+        let sync = supervisor.complete(Some(ReportCommand::Sync), 1, || {});
         assert!(sync.cancelled);
         assert_eq!(sync.status, 0);
     });
@@ -207,6 +209,12 @@ fn alongside_stage_and_probe_have_no_controlling_tty_or_input() {
 }
 
 fn fixture_process(path: &Path, flag: &str, test: &str, input: &[u8]) -> Output {
+    let mut child = fixture_command(path, flag, test).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn fixture_command(path: &Path, flag: &str, test: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .env_clear()
@@ -239,9 +247,7 @@ fn fixture_process(path: &Path, flag: &str, test: &str, input: &[u8]) -> Output 
             Ok(())
         });
     }
-    let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
-    child.wait_with_output().unwrap()
+    command
 }
 
 fn check_alongside_session(path: &Path) {
@@ -401,6 +407,7 @@ fn probe_with_private_input_does_not_enrich_reports_or_transcripts() {
 fn report_retention_uses_its_log_id_instead_of_an_issue_path() {
     use crate::report::{self, Report, Stage};
     use crate::run::Outcome;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
@@ -441,11 +448,25 @@ fn report_retention_uses_its_log_id_instead_of_an_issue_path() {
         saved_ids.push(log_id);
     }
 
+    let logs_root = state.unwrap().join("logs");
+    let oldest_logs = logs_root.join(&saved_ids[0]);
+    fs::set_permissions(&oldest_logs, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        report::prune(&ctx.env, ReportCommand::Up)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let retained = report::list(&ctx.env, Some(ReportCommand::Up)).unwrap();
+    assert_eq!(retained.len(), 11);
+    assert_eq!(retained.last().unwrap().finished_at_ms, 0);
+    assert!(oldest_logs.join("0.log").is_file());
+    fs::set_permissions(&oldest_logs, fs::Permissions::from_mode(0o700)).unwrap();
+
     report::prune(&ctx.env, ReportCommand::Up).unwrap();
     let retained = report::list(&ctx.env, Some(ReportCommand::Up)).unwrap();
     assert_eq!(retained.len(), 10);
     assert_eq!(retained.last().unwrap().finished_at_ms, 1);
-    let logs_root = state.unwrap().join("logs");
     assert!(!logs_root.join(&saved_ids[0]).exists());
     assert!(logs_root.join(&active_id).join("0.log").is_file());
     assert!(
@@ -454,4 +475,127 @@ fn report_retention_uses_its_log_id_instead_of_an_issue_path() {
             .all(|id| logs_root.join(id).join("0.log").is_file())
     );
     assert_eq!(fs::read_to_string(alternate).unwrap(), "keep me");
+}
+
+#[test]
+fn delayed_owned_probe_output_is_fully_collected() {
+    let fixture = tempfile::tempdir().unwrap();
+    let supervisor = supervisor_at(fixture.path());
+    let command = shell(
+        r#"(sleep 1.2
+            printf 'delayed stdout'
+            printf 'delayed stderr' >&2) &
+            exit 0"#,
+        &[],
+    );
+    let output = supervisor.probe(command, Stdio::null(), false).unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"delayed stdout");
+    assert_eq!(output.stderr, b"delayed stderr");
+}
+
+#[test]
+fn captured_foreground_interrupt_escalates_against_ignoring_leader() {
+    let fixture = tempfile::tempdir().unwrap();
+    let supervisor = supervisor_at(fixture.path());
+    let ready = fixture.path().join("registered");
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let command = shell(
+                r#"trap '' INT TERM
+                    : > "$1"
+                    i=0
+                    while [ "$i" -lt 250 ]; do
+                        sleep .04
+                        i=$((i+1))
+                    done"#,
+                &[&ready],
+            );
+            let mut stage = supervisor
+                .spawn(command, Placement::HeadlessForeground, false)
+                .unwrap();
+            Pipes::take(&mut stage.child)
+                .unwrap()
+                .collect(&mut stage)
+                .unwrap()
+                .status
+        });
+        let registered = wait_until(|| ready.exists());
+        {
+            let mut state = supervisor.state();
+            let entry = *state.children.first().unwrap();
+            state.terminal_interrupt(entry, false);
+        }
+        let result = supervisor.complete(Some(ReportCommand::Up), 1, || {});
+        assert!(registered);
+        let exit = worker.join().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&exit),
+            Some(libc::SIGKILL)
+        );
+        assert!(result.cancelled);
+        assert_eq!(result.status, 130);
+    });
+}
+
+#[test]
+fn cancellation_finishes_report_during_blocked_verbose_boundary() {
+    use crate::run::{Outcome, Run, Sink};
+
+    const FLAG: &str = "DOTS_SUPERVISOR_BLOCKED_BOUNDARY";
+    if let Some(path) = std::env::var_os(FLAG) {
+        let path = Path::new(&path);
+        let ctx = fixture_context(path, true);
+        let run = Run::begin(&ctx, Sink::Report(ReportCommand::Up));
+        let stage = run.start_alongside("Verbose worker");
+        let command = shell("head -c 2097152 /dev/zero", &[]);
+        assert!(run.run(stage, command, Policy::Ordinary).unwrap().success());
+        run.finish(stage, Outcome::Completed);
+        fs::write(path.join("replaying"), "").unwrap();
+        assert_eq!(run.end(0), 130);
+        return;
+    }
+
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path();
+    let ctx = fixture_context(path, true);
+    let mut child = fixture_command(
+        path,
+        FLAG,
+        "supervisor::tests::cancellation_finishes_report_during_blocked_verbose_boundary",
+    )
+    .stdin(Stdio::null())
+    .spawn()
+    .unwrap();
+    let ready = wait_until(|| path.join("replaying").exists());
+    let pending = std::os::fd::AsRawFd::as_raw_fd(child.stdout.as_ref().unwrap());
+    let ready = ready && pipe::ready(pending, libc::POLLIN, Duration::from_secs(1)).unwrap();
+    let absent_before_signal = crate::report::list(&ctx.env, Some(ReportCommand::Up))
+        .unwrap()
+        .is_empty();
+    let interrupted = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) } == 0;
+    let saved = wait_until(|| {
+        !crate::report::list(&ctx.env, Some(ReportCommand::Up))
+            .unwrap()
+            .is_empty()
+    });
+    if !saved {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        ready && absent_before_signal && interrupted && saved,
+        "expected the report while the output pipe was still blocked; status {}",
+        output.status
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry = &crate::report::list(&ctx.env, Some(ReportCommand::Up)).unwrap()[0];
+    let report = crate::report::load(&ctx.env, &entry.id).unwrap();
+    assert!(report.cancelled);
+    assert_eq!(report.status, 130);
+    assert_eq!(report.stages[0].outcome, Some(Outcome::Completed));
 }

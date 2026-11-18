@@ -17,6 +17,7 @@ pub(super) struct Logs {
     unavailable: bool,
     diagnostics: Vec<(StageId, Diagnostic)>,
     terminal_failures: Vec<(StageId, u8)>,
+    warnings: Vec<String>,
 }
 
 impl Logs {
@@ -27,7 +28,7 @@ impl Logs {
                 match OpenOptions::new().append(true).open(path) {
                     Ok(file) => diagnostic.file = Some(file),
                     Err(error) => {
-                        warn(&error);
+                        self.warnings.push(warning(&error));
                         diagnostic.path = None;
                     }
                 }
@@ -71,7 +72,7 @@ impl Logs {
                 ..Diagnostic::default()
             },
             Err(error) => {
-                warn(&error);
+                self.warnings.push(warning(&error));
                 self.unavailable = true;
                 Diagnostic::default()
             }
@@ -80,7 +81,14 @@ impl Logs {
 
     pub(super) fn store(&mut self, id: StageId, mut diagnostic: Diagnostic) {
         diagnostic.file = None;
+        if let Some(warning) = diagnostic.warning.take() {
+            self.warnings.push(warning);
+        }
         self.diagnostics.push((id, diagnostic));
+    }
+
+    pub(super) fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub(super) fn failed(&mut self, id: StageId, terminal_exit: Option<u8>) {
@@ -139,6 +147,7 @@ pub(super) struct Diagnostic {
     path: Option<PathBuf>,
     file: Option<File>,
     tail: Vec<u8>,
+    warning: Option<String>,
 }
 
 impl Diagnostic {
@@ -146,7 +155,7 @@ impl Diagnostic {
         if let Some(file) = &mut self.file
             && let Err(error) = file.write_all(bytes)
         {
-            warn(&error);
+            self.warning = Some(warning(&error));
             // A truncated file does not qualify as the step's full log.
             self.file = None;
             self.path = None;
@@ -171,8 +180,8 @@ impl Diagnostic {
     }
 }
 
-fn warn(error: &io::Error) {
-    eprintln!("dots: could not save the stage log for dots up: {error}");
+fn warning(error: &io::Error) -> String {
+    format!("dots: could not save the stage log for dots up: {error}")
 }
 
 fn logs_root(state: &Path) -> io::Result<PathBuf> {
@@ -193,8 +202,8 @@ pub(crate) fn remove_run_logs(env: &Env, id: &str) -> io::Result<()> {
         ));
     }
     let directory = logs_root(&env.state_dir()?)?.join(id);
-    match report::check_directory(&directory, 0o077) {
-        Ok(()) => fs::remove_dir_all(directory),
+    match report::check_directory(&directory, 0o077).and_then(|()| fs::remove_dir_all(directory)) {
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }

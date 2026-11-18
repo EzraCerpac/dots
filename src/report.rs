@@ -305,13 +305,13 @@ pub(crate) fn prune(env: &Env, command: Command) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
+        if let Some(log_id) = old.log_id {
+            crate::supervisor::remove_run_logs(env, &log_id)?;
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
-        }
-        if let Some(log_id) = old.log_id {
-            crate::supervisor::remove_run_logs(env, &log_id)?;
         }
     }
     Ok(())

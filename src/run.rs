@@ -110,7 +110,8 @@ impl<'a> Run<'a> {
         };
         self.update_fragment(&stages.values);
         if self.up() && !alongside {
-            let mut output = io::stdout().lock();
+            self.supervisor.flush_warnings();
+            let mut output = self.supervisor.stdout();
             stages.flush_alongside(&mut output, &self.supervisor);
             let stage = &stages.values[id.0];
             let _ = if outcome.is_some() {
@@ -198,7 +199,8 @@ impl<'a> Run<'a> {
                 if stage.alongside {
                     stages.finished_alongside.push(id);
                 } else {
-                    let mut output = io::stdout().lock();
+                    self.supervisor.flush_warnings();
+                    let mut output = self.supervisor.stdout();
                     stages.flush_alongside(&mut output, &self.supervisor);
                     let _ = write_stage_end(&mut output, &stages.values[id.0]);
                 }
@@ -242,7 +244,10 @@ impl<'a> Run<'a> {
         if let Sink::Fragment(path) = &self.sink
             && let Err(error) = report::save_fragment(path, stages)
         {
-            eprintln!("dots: could not save stage metadata for dots bootstrap complete: {error}");
+            let _ = writeln!(
+                self.supervisor.stderr(),
+                "dots: could not save stage metadata for dots bootstrap complete: {error}"
+            );
         }
     }
 
@@ -255,7 +260,15 @@ impl<'a> Run<'a> {
             Sink::Report(command) => Some(command),
             _ => None,
         };
-        let result = self.supervisor.complete(command, status);
+        let result = self.supervisor.complete(command, status, || {
+            if command == Some(Command::Up) {
+                self.stages
+                    .lock()
+                    .expect("stage lock poisoned")
+                    .flush_alongside(&mut self.supervisor.stdout(), &self.supervisor);
+            }
+            self.supervisor.flush_warnings();
+        });
         if result.cancelled {
             let mut stages = self.stages.lock().expect("stage lock poisoned");
             for stage in &mut stages.values {
@@ -266,10 +279,7 @@ impl<'a> Run<'a> {
             self.update_fragment(&stages.values);
         }
         if let Sink::Report(command) = self.sink {
-            let mut records = self.stages.into_inner().expect("stage lock poisoned");
-            if command == Command::Up {
-                records.flush_alongside(&mut io::stdout().lock(), &self.supervisor);
-            }
+            let records = self.stages.into_inner().expect("stage lock poisoned");
             let mut stages = records.values;
             let rerun = self.rerun.unwrap_or_else(|| {
                 format!(
@@ -280,7 +290,7 @@ impl<'a> Run<'a> {
             if result.cancelled && command == Command::Remote {
                 let diagnostic = "The remote host's state is unknown after cancellation.";
                 let next = "Inspect the remote host before retrying.";
-                eprintln!("dots remote: {diagnostic} {next}");
+                let _ = writeln!(self.supervisor.stderr(), "dots remote: {diagnostic} {next}");
                 let stage = Stage {
                     id: StageId(stages.len()),
                     label: "Remote host".into(),
@@ -317,7 +327,8 @@ impl<'a> Run<'a> {
                 Ok(()) => {
                     self.supervisor.keep_logs();
                     if let Err(error) = report::prune(&self.ctx.env, command) {
-                        eprintln!(
+                        let _ = writeln!(
+                            self.supervisor.stderr(),
                             "dots: could not finish report retention for dots {}: {error}",
                             command.name()
                         );
@@ -325,7 +336,8 @@ impl<'a> Run<'a> {
                     true
                 }
                 Err(error) => {
-                    eprintln!(
+                    let _ = writeln!(
+                        self.supervisor.stderr(),
                         "dots: could not save the report for dots {}: {error}",
                         command.name()
                     );
@@ -336,7 +348,7 @@ impl<'a> Run<'a> {
                 }
             };
             if command == Command::Up {
-                let _ = write_report(&mut io::stdout().lock(), &report, saved);
+                let _ = write_report(&mut self.supervisor.stdout(), &report, saved);
             }
         }
         result.status

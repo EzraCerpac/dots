@@ -1,7 +1,7 @@
 # dots 1.0 contract
 
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
-Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation and the 1.0 guarantee for the running `dots` on children's `PATH`.
+Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation, the 1.0 guarantee for the running `dots` on children's `PATH`, file adoption and removal, software version syntax, status program versions, history enrollment and restore, retired declarations, and publish validation.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -23,7 +23,7 @@ Linux under WSL is supported; native Windows is not.
 | Program | Needed by |
 | --- | --- |
 | mise 2026.11.8 or newer | Every command that reads the configuration through mise |
-| Git | `init`, `sync`, the sync stage of `up`, `backup`, `restore`, `bootstrap`, `publish`; sync needs Git 2.43 or newer |
+| Git | `init`, `sync`, the sync stage of `up`, `backup`, `restore`, `bootstrap`, `publish`, `add FILE` (**New in 1.0**); sync needs Git 2.43 or newer |
 | gitleaks | Sharing in `sync` and `up`; `publish`; showing patches in `sync --last` |
 | age, age-keygen | `bundle`, a bootstrap that uses a bundle, history enrollment, `backup`, `restore` |
 | ssh | `remote` |
@@ -124,7 +124,7 @@ Commands take the profile and machine ID from `SETUP_PROFILE` and `SETUP_MACHINE
 | `dots add` | Software only | Software, or an existing file |
 | `dots remove ./FILE` | Treated as a software name that matches no declaration | Restores an adopted file |
 | A missing program | Often the child's own error, such as a failed `mise exec` | One line naming the program and the action |
-| `dots status` | No program list (`tasks/status:15-45`) | Lists each program with its version, or missing with the commands that need it |
+| `dots status` | No program list (`tasks/status:15-45`) | Lists versions, reports unreadable optional versions as `version unavailable`, and lists missing programs with the commands that need them |
 | Internal commands in the quickstart | Required | None |
 
 The local quickstart needs only mise and Git installed:
@@ -424,6 +424,7 @@ Without a configuration it prints the program list and exits 2.
 With a configuration but no usable mise it prints the program list, the version and the skill links, then exits 2.
 Otherwise it exits 1 when a section fails, and 0 when every section succeeded or only needs attention.
 A missing optional program and a source diagnostic do not fail it.
+**New in 1.0:** the program list gives a found optional program the informational label `version unavailable` when its version cannot be read.
 **Changed in 0.4.0:** it names the host and profile, prints each item once under its group with its status and summary, and puts any action the item supplies underneath, including for an item that is ok, such as a pending sync.
 Each of these fields is shown as one line without control characters.
 A selected profile that `dots_profiles` does not list gives one diagnostic on stderr and exit status 2, and the report keeps that diagnosis and its next action as a startup issue.
@@ -559,11 +560,16 @@ For a software request, `--path FILE` keeps its usual meaning.
 ### `dots add SOFTWARE...`
 
 It installs first and records only what installed.
-A bare name uses mise's preferred backend and the latest version.
+A bare tool name uses mise's preferred backend and defaults to `latest`.
 A backend prefix such as `npm:` or `cargo:` is recorded as a mise tool.
+A mise tool request accepts `TOOL@VERSION` and supported inline tool options in brackets, such as `TOOL@VERSION[KEY=VALUE]`.
+Existing inline tool options are retained unless explicitly changed.
+In `npm:@scope/name`, the leading `@` is part of the package name.
 `brew:` prefers a formula and selects a cask only when the formula is confirmed absent; `brew-cask:` always selects a cask.
 New Homebrew declarations are restricted to macOS.
 `apt:`, `dnf:`, `pacman:`, `apk:` and `mas:` select those managers.
+For `brew:`, `brew-cask:` and `mas:`, `@` is part of the name.
+For `apt:`, `dnf:`, `pacman:` and `apk:`, `NAME@VERSION` supplies the version for a new declaration.
 A GitHub URL with a prebuilt command-line release uses mise's GitHub backend.
 A macOS app in a ZIP or tar release is recorded with a post-install hook that runs `dots install-release-app OWNER/REPO`.
 DMG and pkg releases, and repositories without a release, are refused; no script from the repository runs.
@@ -576,6 +582,9 @@ With several requests, earlier successes stay recorded and the command stops at 
 
 **New in 1.0.**
 For a file request, `REL` is the target's path relative to `HOME`, the source is `ROOT/dotfiles/REL`, and the declaration is `"~/REL" = { source = "dotfiles/REL", mode = "symlink" }` under `[dotfiles]` in the selected file.
+`dots add FILE` requires Git to check ignore rules, including for a root without a repository.
+A root without a Git repository stays uninitialized.
+If Git is missing, it prints one diagnostic naming Git and the action and exits 1.
 
 `dots add` first checks for an exact earlier adoption: the target is a symlink to that source, the source is a regular file, and the selected file holds that declaration.
 Such a request reports the file as already adopted, changes nothing and succeeds.
@@ -597,7 +606,7 @@ The new source reaches other machines with the next sync, which scans it first.
 
 ### `dots remove TARGET...`
 
-It searches every active configuration file, including the machine-local ones; a selector narrows the search.
+For software targets it searches every active configuration file, including the machine-local ones, and a selector narrows the search.
 A software target is named by its exact declaration (`brew-cask:firefox`), by a short name that identifies exactly one piece of software, or by a GitHub URL.
 `mise:NAME` selects a mise tool when another manager also has `NAME`.
 When another active file still declares the software, only the selected declaration goes and the software stays.
@@ -629,7 +638,10 @@ An exact name shared by several pieces of software lists their qualified names, 
 - Targets already on the command line, targets an installer exception holds under the same rule as removal, and names that are not valid targets are left out.
 - Where the shell shows descriptions, each candidate has one saying what kind of software it is.
 
-**New in 1.0:** a file target is an adopted dotfile when all of these hold, with paths compared after normalization:
+**New in 1.0:** without a selector, `dots remove FILE` searches all configuration files in `ROOT`, regardless of the active profile or machine.
+A selector limits which file can supply the declaration to the base file or a listed profile's file, as described in [Requests to `dots add` and `dots remove`](#requests-to-dots-add-and-dots-remove).
+With or without a selector, uniqueness is checked across all configuration files in `ROOT`.
+A file target is an adopted dotfile when all of these hold, with paths compared after normalization:
 
 - the target is a symlink whose destination is exactly `ROOT/dotfiles/REL`, where `REL` is the target's path relative to `HOME`;
 - the source is a regular file, and no parent directory below `ROOT` is a symlink or a non-directory;
@@ -685,7 +697,7 @@ That verifies resolving the pin and launching it from the hook, not the 1.0 call
 It keeps an existing persisted profile and machine ID.
 Without one, it takes the profile from `SETUP_PROFILE`, else from a single profile named in the caller's `MISE_ENV`, and the machine ID from `SETUP_MACHINE_ID`, else from a persisted `host-` selector, else `auto-` followed by a random identifier.
 With `--restore ID` in effect, the machine ID is `ID`, and a different persisted ID stops it with exit status 2.
-It records `SETUP_HISTORY_ORIGIN` as the history origin when set.
+It records `SETUP_HISTORY_ORIGIN` as the history origin when set and preserves any conflicting recorded history origin.
 It never runs a full bootstrap.
 
 `dots bootstrap complete` runs these stages, printing one result line per stage and a final count:
@@ -693,15 +705,17 @@ It never runs a full bootstrap.
 1. **Private inputs.** Selects, decrypts and validates a bundle as in [Bootstrap bundle](#bootstrap-bundle), and remembers the identity path in `config.local.toml`.
 2. **Source repository.** Moves a fresh clone that is still on `main`, with no edits, to `dev`.
 3. **Restore private settings**, only with `--restore`.
+   Restore requires the selected recovery identity to already exist.
    The history origin is the one recorded in `config.local.toml` when it matches `dots_state_repo`; otherwise it comes from `dots_state_repo`, where `OWNER/NAME` becomes `https://github.com/OWNER/NAME` and a URL is used as written.
    Before restoring, bootstrap records that origin, the branch `host-ID` and the recovery identity in `config.local.toml`.
    A recorded origin that does not match `dots_state_repo`, or a recorded recovery identity other than the one in use, stops the stage with nothing changed; a recorded value is never replaced by a default.
    It then restores as `dots restore --initialize-history`, with the recovery identity and the user's normal Git credentials.
 4. **Installer exceptions**, as `dots exceptions`.
 5. **Bootstrap hooks**, in name order, each its own stage.
-6. **Encrypted local history**, only when `dots_state_repo` or `SETUP_HISTORY_ORIGIN` is set; see [Enrollment](#enrollment).
+6. **Encrypted local history**, when `dots_state_repo` or `SETUP_HISTORY_ORIGIN` is set, as described in [Enrollment](#enrollment).
 
-Without a state repository or history origin, stage 6 is not listed, so a bootstrap with nothing private needs no attention.
+**Changed from 0.3.5:** 0.4.0 always listed the history stage, and 1.0 lists it only when the state repository or history origin is set.
+`SETUP_HISTORY_ORIGIN` alone lists the stage, independently of the source repository's origin.
 It exits 1 when any stage failed, and 0 otherwise.
 **Changed from 0.3.5:** the Atuin, Tailscale and private-file stages are gone, and so is the `GH_TOKEN` injection from a bundle value.
 
@@ -739,7 +753,9 @@ dots publish [--all | --bookmark NAME]
 ```
 
 It runs in a colocated JJ workspace of the configuration repository, never in the live checkout.
-It first checks that the repository is on GitHub; otherwise it exits 1 with one line naming that requirement, before looking for JJ, `gh` or gitleaks.
+**Changed from 0.3.5:** invalid settings in the base file's `[vars]` make `dots publish` exit 2.
+With valid settings, it exits 1 before looking for JJ, `gh` or gitleaks when the source is outside GitHub or the raw `origin` is absent, malformed, credential-bearing or mismatched.
+It prints one line naming the GitHub requirement or repository mismatch and omits the rejected origin.
 By default it publishes exactly one unpublished working change directly above `main@origin`.
 `--bookmark NAME` publishes an existing private `wip/...` bookmark.
 `--all` publishes the current stack, offering to merge `main@origin` into it first.
@@ -868,9 +884,11 @@ A recipe can prompt, as [Output and reports](#output-and-reports) describes.
 It ignores, with a warning, an entry that does not start with `~/` or that contains `..`, and reports each link it removes.
 Call it from a mise `post-dotfiles` hook.
 
-`retired-declarations` rows are `dotfiles.NAME<TAB>SOURCE`, with `SOURCE` a plain relative path without `.`, `..` or empty parts; other rows are ignored.
+`retired-declarations` rows are `dotfiles.NAME<TAB>SOURCE`, with `SOURCE` a plain relative path without backslashes, `.`, `..` or empty parts.
+Invalid rows are ignored individually.
 Before validating a merged configuration, sync validates it with each machine-local file's matching tables taken out.
-A table goes only when it is exactly `[dotfiles.NAME]`, its `source` is exactly `SOURCE`, nothing else defines it, and `SOURCE` does not exist in the merged configuration.
+A table goes only when it is exactly `[dotfiles.NAME]`, its decoded `source` string equals `SOURCE` without path normalization, nothing else defines it, and `SOURCE` does not exist in the merged configuration.
+**New in 1.0:** the source string can use any valid TOML quoting, including triple quotes that 0.4.0 left in place.
 The machine-local file changes only after the merged files are on disk, and only while it is still the file sync validated; the rest of it, its mode and the deployed file stay, and sync keeps a backup and prints where.
 A rendered template is a regular file and is never deleted.
 
@@ -979,8 +997,9 @@ Selection:
 
 - The bundle is `--bundle FILE` when given, else `encrypted/bootstrap.PROFILE.json.age` when it exists.
 - A bundle is requested when that profile file exists, or when a bundle or bundle identity was given now or remembered from an earlier run.
-- The identity is `--identity KEY`, else the remembered bundle identity, else, for a requested bundle, the recovery identity.
+- The bundle identity is `--identity KEY`, else the remembered bundle identity, else, for a requested bundle, the recovery identity.
 - The recovery identity is `--identity KEY`, else `SETUP_AGE_IDENTITY`, else the one recorded in `config.local.toml`, else `~/.config/age/keys.txt`.
+- The remembered bundle identity supplies only bundle decryption.
 - A requested bundle whose file or identity is missing makes the private inputs stage deferred, with `dots bootstrap --bundle FILE --identity FILE` as the next step.
 
 **New in 1.0:** bundle values reach bootstrap hooks through `DOTS_BUNDLE_FD`.
@@ -1037,17 +1056,25 @@ Tracked files end at mode 0600.
 
 `dots enroll-history`, and stage 6 of `dots bootstrap complete`, prepare a machine for encrypted history:
 
-- Each machine has its own age identity at `~/.config/age/keys.txt`; when it is missing, bootstrap generates one, creating it exclusively with mode 0600 in a mode-0700 directory.
+- Once its prerequisites hold, stage 6 of `dots bootstrap complete` alone creates a missing machine identity at `~/.config/age/keys.txt`, using exclusive creation with mode 0600 and mode 0700 for a new parent directory.
+- Standalone enrollment uses an existing identity to prepare machine-local configuration, public recipients and tracked file permissions.
+- A missing identity makes standalone `dots enroll-history` or `dots restore` exit 2.
+- **New in 1.0:** the diagnostic names the missing identity path and tells the user how to supply or generate it.
 - Another machine's private key, and the recovery identity's private key, are never copied.
-- The recipients are this machine's public key, the recovery identity's public key and the bundle's recipients; they are stored only in `config.local.toml`, never in shared files.
+- Bootstrap enrollment adds this machine's public key, the recovery identity's public key and the bundle's recipients only to `config.local.toml`.
+- **Changed from 0.3.5:** 0.4.0 used the bundle identity to derive the recovery recipient when the bundle file existed, while 1.0 uses the recovery identity's public key.
+- A recipient refresh retains valid extra public recipients already recorded in `config.local.toml`.
 - Bootstrap enrolls only once private recovery is ready and the recovery identity file exists; otherwise the stage is deferred.
+- **New in 1.0:** once private recovery is ready and the recovery identity exists, a missing `dots_state_repo` fails the stage and bootstrap exits 1.
+- **New in 1.0:** bootstrap fails enrollment on a conflicting recorded history origin or recovery identity and leaves the recorded value in place.
 - Enrollment needs at least one recipient other than this machine's own public key: a recovery identity with a different key, a bundle recipient or a `--recipient`.
   The default recovery identity is the machine identity's own path, so it alone never qualifies.
   Without such a recipient, enrollment exits 3 and the bootstrap stage is deferred, naming `--identity` or `SETUP_AGE_IDENTITY` as the way to supply a separate recovery identity; the machine's own key is never described as a recovery backup.
 - The identity is a readable regular file outside the configuration root, named by an absolute path or one starting with `~/`.
 - Every tracked file this machine keeps is set to mode 0600; a tracked path that is a symlink or lies outside `HOME` is refused.
 - When no tracked file names this machine's `host-ID` profile yet, enrollment exits 3 and the bootstrap stage is deferred.
-- Bootstrap then records the history origin, sets history sync to `manual`, and activates mise's history watcher service.
+- Bootstrap then records the history origin and sets history sync to `manual`.
+- Only bootstrap enrollment activates mise's history watcher service and checks that it is running.
 - A watcher that is not running after that leaves the stage deferred, with `dots backup` as the way to save.
 - Enrollment saves no checkpoint, creates no repository and uploads nothing; publication happens only through `dots backup`.
 
@@ -1070,7 +1097,11 @@ Then it saves a checkpoint, publishes it to the state repository, and says so.
 
 - It needs a history origin in machine-local configuration that matches `dots_state_repo`, and checks the effective fetch URL as in [Remotes](#remotes) before contacting it.
 - It never adopts private history into the public source checkout.
-- Before anything else it checks the user's mise history watcher process and its launchd or systemd service, and stops when the watcher runs or its state cannot be confirmed; it never stops services itself.
+- Its first restore preflight checks the user's mise history watcher process and its launchd or systemd service, and refuses to proceed when the watcher runs or its state cannot be confirmed.
+- **Changed from 0.3.5:** when the watcher check and a pending-marker or local-store check would both fail, 1.0 reports the watcher failure first.
+  Version 0.4.0 checked the marker and store first.
+- Restore never activates, stops or restarts the watcher.
+- It requires an existing recovery identity and never generates one.
 - It never saves or publishes during restore; it fetches only, and publication stays a separate `dots backup`.
 - A new store is staged and validated as a bare clone before it is installed.
 - The fetched remote state is applied as the initial checkpoint, with mise's conflict checks.

@@ -82,13 +82,8 @@ fn external(ctx: &Ctx, name: &str, args: &[OsString]) -> Result<u8, Fail> {
     }
     let path = directory(&ctx.root).join(name);
     if !is_executable(&path) {
-        let reason = if path.symlink_metadata().is_ok() {
-            format!("; {} is not an executable file", path.display())
-        } else {
-            String::new()
-        };
         return Err(Fail::usage(format!(
-            "unknown command '{name}'{reason}; use dots help"
+            "unknown command '{name}'; use dots help"
         )));
     }
     let persisted;

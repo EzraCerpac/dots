@@ -102,9 +102,9 @@ A machine persists its selection in two ignored files, both mode 0600:
 - `config.local.toml` records the profile as `env.SETUP_PROFILE`, the machine ID as `env.SETUP_MACHINE_ID`, and `settings.history.sync = "manual"`; with a history origin it also records that origin and the branch `host-ID`.
 
 Both files are validated with mise before either changes, and each is replaced atomically.
-A `miserc.toml` that selects two profiles or two `host-` IDs is ambiguous.
+A `miserc.toml` that selects two profiles or two `host-` IDs is ambiguous, and so is a pair of files that name a different profile or machine ID, for example after an interrupted write.
 `dots` never chooses between them: every command that reads the selection stops with exit status 2 and names `dots profile --profile PROFILE --machine-id ID` as the fix.
-That command is the one exception: it replaces every profile and `host-` selector with the given pair and keeps the other selectors, under the same validation and atomic replacement.
+That command is the one exception: it replaces every profile and `host-` selector with the given pair, keeps the other selectors, and rewrites both files' profile and machine ID, under the same validation and atomic replacement.
 Commands take the profile and machine ID from `SETUP_PROFILE` and `SETUP_MACHINE_ID` in the environment when set, else from the persisted selection.
 
 ## First run
@@ -235,6 +235,7 @@ A repository setting is GitHub `OWNER/NAME`, a GitHub URL, or another Git URL.
 - Accepted URL forms are `ssh://`, scp-like `[user@]host:path`, `git://`, `http://`, `https://` and `file://`.
 - `dots` refuses a URL that carries a password or token, a `TRANSPORT::ADDRESS` remote-helper form such as `ext::`, and a value starting with `-`.
 - Credentials come from the user's normal Git setup: SSH keys, or a configured credential helper.
+  `dots` adds no protection to Git's own transport, so a repository that needs authentication belongs on `https://` or SSH, not `http://`.
 
 `dots` passes a URL to Git as one argument and never through a shell.
 Before it fetches, clones, adopts or pushes, `dots` resolves the effective fetch URL and every effective push URL after Git's URL rewrites on this machine, and stops before contacting the remote unless each one matches the expected repository.

@@ -24,7 +24,7 @@ use crate::{Args, Ctx, Fail};
 
 use git::{Git, repository_dirs};
 use lock::RepoLock;
-use remote::{Fetch, Origin, RemoteHeads};
+use remote::{Fetch, Origin, PushError, RemoteHeads};
 use snapshot::{ScanError, Scratch, changed, machine_local_in_history};
 
 const RERUN: &str = "Review the checkout and rerun dots sync.";
@@ -186,13 +186,7 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
             "Sync stopped after interruption",
             "Rerun dots sync to finish any pending checkout.",
         );
-        if receipt.outcome == "not pushed" {
-            receipt.outcome = if receipt.saved.is_empty() {
-                "stopped · not pushed".into()
-            } else {
-                "stopped · local work saved, not pushed".into()
-            };
-        }
+        receipt.outcome = format!("stopped · {}", receipt.outcome);
         receipt.stage_outcome = Outcome::Cancelled;
     } else if !receipt.issues.is_empty() {
         receipt.stage_outcome = Outcome::Deferred;
@@ -577,7 +571,28 @@ fn synchronize(
         scratch
             .promote(&merged, &approved)
             .or_note("Could not retain the validated merged revision", GIT)?;
-        if remote::push(&git, run, &origin, heads.dev(), &merged).is_ok() {
+        let pushed = match remote::push(&git, run, &origin, heads.dev(), &merged) {
+            Ok(()) => true,
+            Err(PushError::Rejected) => false,
+            Err(PushError::NotAttempted) => {
+                return Err(Note(
+                    "NOT SHARED: the conditional dev push could not be started",
+                    "Check the verified revision and origin settings, then rerun dots sync.",
+                ));
+            }
+            Err(PushError::Unconfirmed) => {
+                receipt.outcome = if receipt.saved.is_empty() {
+                    "dev push unconfirmed".into()
+                } else {
+                    "local work saved · dev push unconfirmed".into()
+                };
+                return Err(Note(
+                    "Could not verify whether origin accepted the dev push",
+                    "Check origin's dev revision before retrying dots sync.",
+                ));
+            }
+        };
+        if pushed {
             receipt.outcome = if let Some(sharing) = sharing {
                 receipt.shared.push(sharing);
                 "pushed dev".into()
@@ -636,7 +651,7 @@ fn synchronize(
             break;
         }
         let refreshed = fetch.heads(run, &origin).or_note(
-            "Could not verify dev after the rejected or timed-out push",
+            "Could not verify dev after the rejected push",
             "Check origin and the Git credential helper, then rerun dots sync.",
         )?;
         if refreshed
@@ -648,14 +663,16 @@ fn synchronize(
                 "Review origin's branch history and rerun dots sync.",
             ));
         }
-        if refreshed.same_incoming(&heads) {
+        if !refreshed.same_incoming(&heads) {
+            incoming(receipt, &git, &refreshed, &before);
+        }
+        if refreshed.dev() == heads.dev() {
             break;
         }
         heads = refreshed;
-        incoming(receipt, &git, &heads, &before);
     }
     Err(Note(
-        "NOT SHARED: the conditional dev push failed or timed out",
+        "NOT SHARED: the conditional dev push was rejected",
         "Check origin, credentials and remote branch policies, then rerun dots sync.",
     ))
 }

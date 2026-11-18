@@ -85,6 +85,11 @@ impl RepoSetting {
         })
     }
 
+    /// The OWNER/NAME of a GitHub repository, preserving the configured case.
+    pub fn github(&self) -> Option<&str> {
+        self.github.as_deref()
+    }
+
     pub fn matches(&self, url: &str) -> bool {
         let Ok(other) = Self::parse(url) else {
             return false;

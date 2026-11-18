@@ -1,6 +1,9 @@
+#[path = "supervisor_legacy/process.rs"]
+mod process;
 mod support;
 
 use std::fs::{self, File};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -31,6 +34,7 @@ fn fixture() -> World {
     fs::write(world.root().join("config.laptop.toml"), "").unwrap();
     fs::remove_file(world.root().join("dots/exceptions.tsv")).unwrap();
     fs::remove_dir_all(world.root().join("dots/hooks/update.d")).unwrap();
+    fs::create_dir(world.home().join("tmp")).unwrap();
     executable(
         &world.root().join("bin/mise"),
         include_str!("supervisor_legacy/mise.sh"),
@@ -61,8 +65,48 @@ fn dots(world: &World) -> Command {
         .env("DOTS_MISE_BIN", bin.join("mise"))
         .env("SETUP_PROFILE", "laptop")
         .env("MISE_SELF_UPDATE_AVAILABLE", "0")
-        .env("CI", "1");
+        .env("CODEX_HOME", world.home().join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", world.home().join(".claude"))
+        .env(
+            "MISE_SYSTEM_CONFIG_DIR",
+            world.home().join(".config/mise-system"),
+        )
+        .env("MISE_CONFIG_DIR", world.root())
+        .env("MISE_DATA_DIR", world.home().join(".local/share/mise"))
+        .env("MISE_CACHE_DIR", world.home().join(".cache/mise"))
+        .env("MISE_STATE_DIR", world.home().join(".local/state/mise"))
+        .env("MISE_TMP_DIR", world.home().join("tmp"))
+        .env("TMPDIR", world.home().join("tmp"))
+        .env("TERM", "xterm")
+        .env_remove("CI");
+    if legacy_script(command.get_program().as_ref()) {
+        let renderer = Path::new(command.get_program()).with_file_name("dots-up");
+        assert!(
+            renderer.is_file(),
+            "the v0.4.0 oracle needs its adjacent dots-up renderer"
+        );
+        // Disable PATH and mise discovery for the archive's renderer.
+        command.env("DOTS_UP_BIN", renderer);
+    }
     command
+}
+
+fn legacy_script(path: &Path) -> bool {
+    let mut magic = [0; 2];
+    File::open(path).unwrap().read_exact(&mut magic).unwrap();
+    magic == *b"#!"
+}
+
+fn assert_legacy_renderer(world: &World, active: bool) {
+    if legacy_script(world.dots().get_program().as_ref()) {
+        assert!(
+            files(&state(world)).iter().any(|path| {
+                path.file_name().is_some_and(|name| name == "events.jsonl")
+                    && (!active || path.with_file_name(".active").is_file())
+            }),
+            "the v0.4.0 renderer did not own this update"
+        );
+    }
 }
 
 fn hook(world: &World, name: &str, script: &str) {
@@ -223,7 +267,12 @@ fn unchanged_redirected_up_defaults_to_plain_and_verbose_shows_child_output() {
             "10-Text-mode",
             "#!/bin/sh\nprintf 'run\\n' >> \"$DOTS_ROOT/invocations\"\nprintf 'fixture-hook-output\\n'\nprintf 'fixture-hook-stderr\\n' >&2\n",
         );
-        let result = output(dots(&world).args(flag).arg("up"), 0);
+        let mut command = dots(&world);
+        command.args(flag).arg("up");
+        // Give dots a working foreground TTY on stdin while stdout is captured.
+        let _master = process::foreground_terminal(&mut command);
+        let result = output(&mut command, 0);
+        assert_legacy_renderer(&world, false);
         let text = combined(&result);
         assert!(!text.contains("\x1b[?1049"));
         for expected in ["fixture-hook-output", "fixture-hook-stderr"] {
@@ -306,7 +355,15 @@ fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
         let text = combined(result);
         once(&text, FAILURE_TAIL);
         assert!(text.contains("Alpha"));
-        assert!(text.contains("dots up"), "missing rerun guidance");
+        assert!(
+            text.lines().any(|line| {
+                line.trim().strip_prefix("Next: ").is_some_and(|action| {
+                    let action = action.trim_end_matches('.');
+                    action.ends_with("then run dots up") || action.ends_with("then rerun dots up")
+                })
+            }),
+            "missing Alpha's next action to fix the error and rerun dots up"
+        );
         assert!(
             text.contains(alpha.to_str().unwrap()),
             "missing Alpha log link"
@@ -336,7 +393,9 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
     hook(
         &world,
         "10-Change",
-        &format!("#!/bin/sh\nprintf '{CHANGE}\\t11\\t22\\n' >> \"$DOTS_CHANGES\"\n"),
+        &format!(
+            "#!/bin/sh\nprintf '{CHANGE}\\tfixture-v11\\tfixture-v22\\n' >> \"$DOTS_CHANGES\"\n"
+        ),
     );
     hook(
         &world,
@@ -351,7 +410,16 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
         let text = combined(result);
         once(&text, CHANGE);
         once(&text, "fixture-review-required");
-        assert!(text.contains("11") && text.contains("22"));
+        assert!(
+            text.lines().any(|line| {
+                line.split_once(CHANGE).is_some_and(|(_, versions)| {
+                    versions
+                        .split_whitespace()
+                        .eq(["fixture-v11", "→", "fixture-v22"])
+                })
+            }),
+            "latest fixture change lacks its before and after versions"
+        );
         assert!(text.contains("Deferred"));
         assert!(text.to_ascii_lowercase().contains("needs attention"));
         assert!(!text.contains("fixture-earlier-change"));
@@ -386,29 +454,32 @@ fn unchanged_up_reports_one_config_diagnostic_when_state_is_unusable() {
     assert!(!text.contains("Log:") && !text.contains("dots up --last"));
 }
 
-struct HeldUpdate {
+struct HeldUpdate<'a> {
     child: Child,
-    release: PathBuf,
+    world: &'a World,
+    _terminal: File,
+    reaped: bool,
 }
 
-impl HeldUpdate {
-    fn start(world: &World) -> Self {
-        let child = dots(world)
-            .args(["up", "--plain"])
+impl<'a> HeldUpdate<'a> {
+    fn start(world: &'a World) -> Self {
+        let mut command = dots(world);
+        command
+            .arg("up")
             .env("FIXTURE_HOLD", "1")
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut update = Self {
-            child,
-            release: world.root().join("release-hook"),
+            .stderr(Stdio::null());
+        let terminal = process::foreground_terminal(&mut command);
+        let update = Self {
+            child: command.spawn().unwrap(),
+            world,
+            _terminal: terminal,
+            reaped: false,
         };
         let deadline = Instant::now() + Duration::from_secs(30);
         while !world.root().join("held-hook-ready").exists() {
             assert!(
-                update.child.try_wait().unwrap().is_none(),
+                process::exit_success(update.pid()).unwrap().is_none(),
                 "update exited before the fixture hook"
             );
             assert!(
@@ -417,29 +488,42 @@ impl HeldUpdate {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        assert_legacy_renderer(world, true);
         update
     }
 
+    fn pid(&self) -> libc::pid_t {
+        self.child.id().try_into().unwrap()
+    }
+
+    fn open_gate(&self) -> std::io::Result<()> {
+        fs::write(self.world.root().join("release-hook"), "")
+    }
+
     fn release(mut self) {
-        fs::write(&self.release, "").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success(), "held update exited {status}");
-                break;
-            }
-            assert!(Instant::now() < deadline, "released update did not exit");
-            thread::sleep(Duration::from_millis(10));
-        }
+        self.open_gate().unwrap();
+        assert_eq!(
+            process::wait_for_exit(self.pid(), Duration::from_secs(30)),
+            Some(true),
+            "released update must exit successfully"
+        );
+        self.child.wait().unwrap();
+        self.reaped = true;
     }
 }
 
-impl Drop for HeldUpdate {
+impl Drop for HeldUpdate<'_> {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            // Wake the bounded fixture even if an assertion failed.
-            let _ = fs::write(&self.release, "");
-            let _ = self.child.kill();
+        if self.reaped {
+            return;
+        }
+        // Keep World and its release gate alive while the hook unwinds.
+        let _ = self.open_gate();
+        let pid = self.pid();
+        if process::wait_for_exit(pid, Duration::from_secs(5)) != Some(true) {
+            process::kill_owned_groups(pid);
+        }
+        if process::wait_for_exit(pid, Duration::from_secs(2)).is_some() {
             let _ = self.child.wait();
         }
     }
@@ -483,7 +567,7 @@ fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output(
     for (path, _) in recent {
         assert_private(&world, &path);
     }
-    active.release();
+    drop(active);
     let saved = reports(&world, "up");
     assert_eq!(saved.len(), 10);
     assert!(
@@ -510,9 +594,6 @@ fn unchanged_redirected_up_ignores_window_resize() {
     holding_hook(&world);
     let active = HeldUpdate::start(&world);
     // The ready fixture guarantees the signal reaches the live supervisor.
-    assert_eq!(
-        unsafe { libc::kill(active.child.id().try_into().unwrap(), libc::SIGWINCH) },
-        0
-    );
+    assert_eq!(unsafe { libc::kill(active.pid(), libc::SIGWINCH) }, 0);
     active.release();
 }

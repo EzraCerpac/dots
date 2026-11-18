@@ -580,7 +580,7 @@ fn synchronize(
             .git
             .tree(&merged)
             .or_note("Could not verify the merged tree", GIT)?;
-        let validated = match validation::validate(
+        let mut validated = match validation::validate(
             run,
             &scratch,
             &merged,
@@ -722,7 +722,14 @@ fn synchronize(
                 .or_note("Could not update retired machine-local declarations", RERUN)?
             {
                 copies
-                    .apply(run, &git, &shared.dir, &merged_tree, &validated, receipt)
+                    .apply(
+                        run,
+                        &git,
+                        &shared.dir,
+                        &merged_tree,
+                        &mut validated,
+                        receipt,
+                    )
                     .or_note("Could not safely apply the validated dotfiles", RERUN)?;
             }
             return Ok(());

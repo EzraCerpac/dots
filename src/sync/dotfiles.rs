@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
@@ -10,7 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::{receipt::Receipt, run::Run};
 
-use super::git::{Entry, Git, Tree, invalid, relative};
+use super::git::{Entry, Git, Tree, invalid, local, relative};
 use super::guard::{CStrName, Dir, Image, private_dir, replace_exact, write_private};
 use super::validation::{self, Retirement, Validated};
 use super::{issue, path_issue};
@@ -20,7 +21,7 @@ struct Status {
     files: Vec<Target>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 struct Target {
     target: PathBuf,
     source: Option<PathBuf>,
@@ -31,7 +32,7 @@ struct Target {
     omitted: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 struct Origin {
     config: PathBuf,
     source: Option<PathBuf>,
@@ -58,27 +59,10 @@ pub(super) struct ApplyPlan {
 
 impl ApplyPlan {
     pub fn new(run: &Run<'_>, root: PathBuf, live: &Path, selectors: String) -> io::Result<Self> {
-        let remap = |path: &mut PathBuf| {
-            if let Ok(relative) = path.strip_prefix(&root) {
-                *path = live.join(relative);
-            }
-        };
-        let mut targets = status_at(run, &root, true)?;
-        for target in &mut targets {
-            remap(&mut target.target);
-            if let Some(source) = target.source.as_mut() {
-                remap(source);
-            }
-            if let Some(origin) = target.origin.as_mut() {
-                remap(&mut origin.config);
-                if let Some(source) = origin.source.as_mut() {
-                    remap(source);
-                }
-            }
-        }
+        let targets = planned_targets(run, &root, live)?;
         let mut configs = Configs::read_at(run, &root, true)?;
         for (path, _) in &mut configs.docs {
-            remap(path);
+            remap_path(path, &root, live);
         }
         let filesystem = Dir::open(Path::new("/"))?;
         let mut observed = BTreeMap::new();
@@ -138,6 +122,272 @@ impl ApplyPlan {
     }
 }
 
+fn remap_path(path: &mut PathBuf, overlay: &Path, live: &Path) {
+    if let Ok(relative) = path.strip_prefix(overlay) {
+        *path = live.join(relative);
+    }
+}
+
+fn planned_targets(run: &Run<'_>, overlay: &Path, live: &Path) -> io::Result<Vec<Target>> {
+    let mut targets = status_at(run, overlay, true)?;
+    for target in &mut targets {
+        remap_path(&mut target.target, overlay, live);
+        if let Some(source) = target.source.as_mut() {
+            remap_path(source, overlay, live);
+        }
+        if let Some(origin) = target.origin.as_mut() {
+            remap_path(&mut origin.config, overlay, live);
+            if let Some(source) = origin.source.as_mut() {
+                remap_path(source, overlay, live);
+            }
+        }
+    }
+    Ok(targets)
+}
+
+#[derive(Eq, PartialEq)]
+struct HookFile {
+    mode: Option<u32>,
+    digest: [u8; 32],
+}
+
+impl HookFile {
+    fn of(image: &Image) -> Option<Self> {
+        match image {
+            Image::Regular { bytes, mode } => Some(Self {
+                mode: Some(*mode),
+                digest: Sha256::digest(bytes).into(),
+            }),
+            Image::Link(link) => Some(Self {
+                mode: None,
+                digest: Sha256::digest(link.as_os_str().as_bytes()).into(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn hook_tree(root: &Path) -> io::Result<BTreeMap<PathBuf, HookFile>> {
+    let view = Dir::open(root)?;
+    let mut files = BTreeMap::new();
+    let mut pending = vec![PathBuf::new()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(root.join(&directory))? {
+            let path = directory.join(entry?.file_name());
+            if relative(path.as_os_str().as_bytes()).is_err()
+                || local(&path)
+                || path.components().next().is_some_and(|name| {
+                    matches!(
+                        name.as_os_str().to_str(),
+                        Some(
+                            ".dots-cache" | ".dots-state" | ".dots-tmp" | ".dots-no-system-config"
+                        )
+                    )
+                })
+            {
+                continue;
+            }
+            let image = view.read_path(&path)?;
+            if image == Image::Directory {
+                pending.push(path);
+            } else if let Some(image) = HookFile::of(&image) {
+                files.insert(path, image);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn without_deployment_permissions(mut doc: DocumentMut) -> String {
+    let remove_entry_permissions = |table: &mut dyn toml_edit::TableLike| {
+        for (_, entry) in table.iter_mut() {
+            if let Some(entry) = entry.as_table_like_mut() {
+                entry.remove("permissions");
+            }
+        }
+    };
+    if let Some(dotfiles) = doc.get_mut("dotfiles").and_then(Item::as_table_like_mut) {
+        remove_entry_permissions(dotfiles);
+    }
+    if let Some(groups) = doc
+        .get_mut("dotfile_groups")
+        .and_then(Item::as_table_like_mut)
+    {
+        for (_, group) in groups.iter_mut() {
+            if let Some(group) = group.as_table_like_mut() {
+                group.remove("permissions");
+                if let Some(entries) = group.get_mut("entries").and_then(Item::as_table_like_mut) {
+                    remove_entry_permissions(entries);
+                }
+            }
+        }
+    }
+    doc.to_string()
+}
+
+fn checked_hook_targets(run: &Run<'_>, plan: &ApplyPlan, live: &Path) -> io::Result<Vec<Target>> {
+    if validation::overlay_environments(run, &plan.root)? != plan.selectors {
+        return Err(invalid("pre-dotfiles hook changed the machine selection"));
+    }
+    let discovered = Configs::read_at(run, &plan.root, true)?;
+    if discovered.docs.len() != plan.configs.docs.len() {
+        return Err(invalid(
+            "pre-dotfiles hook changed the selected configuration files",
+        ));
+    }
+    for ((old_path, old), (mut path, current)) in plan.configs.docs.iter().zip(discovered.docs) {
+        remap_path(&mut path, &plan.root, live);
+        if old_path != &path
+            || without_deployment_permissions(old.clone())
+                != without_deployment_permissions(current)
+        {
+            return Err(invalid("pre-dotfiles hook changed a validated declaration"));
+        }
+    }
+    let mut targets = planned_targets(run, &plan.root, live)?;
+    targets.sort_by(|first, second| first.target.cmp(&second.target));
+    let mut approved = plan.targets.iter().collect::<Vec<_>>();
+    approved.sort_by(|first, second| first.target.cmp(&second.target));
+    if targets.len() != approved.len()
+        || targets.iter().zip(approved).any(|(actual, approved)| {
+            let mut actual = (*actual).clone();
+            actual.permissions.clone_from(&approved.permissions);
+            &actual != approved
+        })
+    {
+        return Err(invalid("pre-dotfiles hook changed the resolved targets"));
+    }
+    validation::probe(
+        run,
+        &plan.root,
+        [
+            "bootstrap",
+            "dotfiles",
+            "apply",
+            "--dry-run",
+            "--force",
+            "--yes",
+        ],
+        true,
+    )?;
+    Ok(targets)
+}
+
+fn apply_pre_hooks(
+    run: &Run<'_>,
+    git: &Git<'_>,
+    git_dir: &Path,
+    tree: &Tree,
+    validated: &mut Validated,
+    receipt: &mut Receipt,
+) -> io::Result<bool> {
+    let plan = &validated.apply;
+    if plan.configs.pre.is_empty() {
+        return Ok(true);
+    }
+    let initial = hook_tree(&plan.root)?;
+    let live = Dir::open(git.root())?;
+    let originals = initial
+        .keys()
+        .map(|path| {
+            live.read_path(path)
+                .map(|image| (path, HookFile::of(&image)))
+        })
+        .collect::<io::Result<BTreeMap<_, _>>>()?;
+    let mut targets = None;
+    let mut continue_apply = true;
+    for hook in &plan.configs.pre {
+        validated.check_live_inputs(git)?;
+        if hook_failed(
+            receipt,
+            "mise pre-dotfiles hook failed",
+            "Check the pre-dotfiles hook and rerun dots sync.",
+            invoke(run, &plan.root, &plan.root, &plan.selectors, hook),
+        ) {
+            continue_apply = false;
+            break;
+        }
+        match validated
+            .check_overlay_locals()
+            .and_then(|()| checked_hook_targets(run, plan, git.root()))
+        {
+            Ok(confirmed) => targets = Some(confirmed),
+            Err(_) => {
+                issue(
+                    receipt,
+                    "Pre-dotfiles hook changed validated apply inputs",
+                    "Review the hook's checkout edits and rerun dots sync.",
+                );
+                continue_apply = false;
+                break;
+            }
+        }
+    }
+    if run.cancelled() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let after = hook_tree(&plan.root)?;
+    let view = Dir::open(&plan.root)?;
+    let mut edits = Vec::new();
+    for path in initial.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+        if initial.get(path) == after.get(path) {
+            continue;
+        }
+        let current = live.read_path(path)?;
+        let mut replacement = view.read_path(path)?;
+        let original_matches = match originals.get(path) {
+            Some(before) => HookFile::of(&current) == *before,
+            None => current == Image::Absent,
+        };
+        if !original_matches || !current.git_eq(&validated.expected_source(git, tree, path)?) {
+            path_issue(
+                receipt,
+                "Kept a checkout edit that conflicts with a pre-dotfiles hook",
+                path,
+                COPY_ACTION,
+            );
+            return Ok(false);
+        }
+        if let (Image::Regular { mode, .. }, Image::Regular { mode: old, .. }) =
+            (&mut replacement, &current)
+            && initial.get(path).and_then(|before| before.mode) == Some(*mode)
+        {
+            *mode = *old;
+        }
+        edits.push((path.to_owned(), current, replacement));
+    }
+    for (path, before, after) in edits {
+        if run.cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        validated.check_live_inputs(git)?;
+        if install(
+            git.root(),
+            &path,
+            git_dir,
+            git_dir,
+            (&before, &after),
+            None,
+            receipt,
+        )
+        .is_err()
+        {
+            path_issue(
+                receipt,
+                "Kept a checkout edit after a guarded pre-dotfiles write failed",
+                &path,
+                COPY_ACTION,
+            );
+            return Ok(false);
+        }
+        validated.record_hook_file(&path, after);
+    }
+    if continue_apply && let Some(targets) = targets {
+        validated.apply.targets = targets;
+    }
+    Ok(continue_apply)
+}
+
 fn stage_external_source(source: &Path, out: &Path, live: &Path, view: &Path) -> io::Result<()> {
     if fs::symlink_metadata(source)?.is_dir() {
         fs::create_dir(out)?;
@@ -175,6 +425,22 @@ impl ApplyOutputs {
             self.files.insert(target.to_owned(), staged);
         }
         Ok(())
+    }
+
+    fn still_current(&self, filesystem: &Dir, dependencies: &[PathBuf]) -> io::Result<bool> {
+        let staged = Dir::open(&self.directory)?;
+        for dependency in dependencies {
+            if let Some(path) = self.files.get(dependency) {
+                let expected = staged.read_path(
+                    path.strip_prefix(&self.directory)
+                        .map_err(io::Error::other)?,
+                )?;
+                if filesystem.read_path(fs_relative(dependency)?)? != expected {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -498,9 +764,15 @@ impl Copies {
         git: &Git<'_>,
         git_dir: &Path,
         tree: &Tree,
-        validated: &Validated,
+        validated: &mut Validated,
         receipt: &mut Receipt,
     ) -> io::Result<()> {
+        validated.ready_to_apply(git)?;
+        if validated.apply.targets.is_empty()
+            || !apply_pre_hooks(run, git, git_dir, tree, validated, receipt)?
+        {
+            return Ok(());
+        }
         let filesystem = Dir::open(Path::new("/"))?;
         let ApplyPlan {
             root,
@@ -509,10 +781,6 @@ impl Copies {
             configs,
             ..
         } = &validated.apply;
-        validated.ready_to_apply(git)?;
-        if targets.is_empty() {
-            return Ok(());
-        }
         let mut jobs = BTreeMap::new();
         let mut results = BTreeMap::new();
         for target in targets {
@@ -597,18 +865,13 @@ impl Copies {
                 })
                 .collect::<Vec<_>>()
         };
-        for hook in &configs.pre {
-            validated.ready_to_apply(git)?;
-            if hook_failed(
-                receipt,
-                "mise pre-dotfiles hook failed",
-                "Check the pre-dotfiles hook and rerun dots sync.",
-                invoke(run, root, root, selectors, hook),
-            ) {
-                return Ok(());
-            }
+        for (path, (_, _, names, _, _)) in &jobs {
+            outputs.needed.extend(
+                dependencies(names, path)
+                    .into_iter()
+                    .filter(|dep| all_jobs.contains(dep)),
+            );
         }
-
         while !jobs.is_empty() {
             if run.cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
@@ -630,9 +893,11 @@ impl Copies {
                 break;
             };
             let (target, definition, depends, _, _) = jobs.remove(&path).expect("job was present");
-            if dependencies(&depends, &path)
+            let waiting_for = dependencies(&depends, &path);
+            if waiting_for
                 .iter()
                 .any(|dep| results.get(dep) == Some(&false))
+                || !outputs.still_current(&filesystem, &waiting_for)?
             {
                 path_issue(
                     receipt,
@@ -656,6 +921,7 @@ impl Copies {
                 definition.as_ref(),
                 validated,
                 &all_jobs,
+                &waiting_for,
                 &mut outputs,
             );
             results.insert(path.clone(), matches!(changed_now, Ok(true)));
@@ -727,6 +993,7 @@ impl Copies {
         definition: Option<&Item>,
         validated: &Validated,
         all_jobs: &BTreeSet<PathBuf>,
+        dependencies: &[PathBuf],
         outputs: &mut ApplyOutputs,
     ) -> io::Result<bool> {
         validated.ready_to_apply(git)?;
@@ -795,6 +1062,9 @@ impl Copies {
 
         let mut clean = true;
         for (path, mut replacement) in desired {
+            if !outputs.still_current(filesystem, dependencies)? {
+                return Err(invalid("a dependency changed before dotfile installation"));
+            }
             let relative_path = fs_relative(&path)?;
             let current = filesystem.read_path(relative_path)?;
             if rules.create_only && current != Image::Absent {
@@ -1690,6 +1960,9 @@ impl Configs {
                 let mut definition = item.cloned().unwrap_or_else(|| Item::Table(Table::new()));
                 if let Some(table) = definition.as_table_like_mut() {
                     table.remove("depends");
+                    if let Some(permissions) = &target.permissions {
+                        table.insert("permissions", value(permissions.as_str()));
+                    }
                     if let Some(source) = target.effective_source() {
                         let source = match approved_input {
                             Some(staged) => staged.to_owned(),

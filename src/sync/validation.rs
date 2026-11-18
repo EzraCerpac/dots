@@ -50,8 +50,35 @@ impl Validated {
     }
 
     pub fn ready_to_apply(&self, git: &Git<'_>) -> io::Result<()> {
+        self.check_live_inputs(git)?;
+        self.check_overlay_locals()?;
+        let preview = Dir::open(self._preview.path())?;
+        for (path, expected) in &self.configs {
+            if !preview.read_path(path)?.git_eq(expected) {
+                return Err(invalid("validated configuration changed"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_live_inputs(&self, git: &Git<'_>) -> io::Result<()> {
         super::verify_dev(git, &self.revision)?;
         let root = git.root();
+        self.check_local_inputs(root)?;
+        let live = Dir::open(root)?;
+        for (path, expected) in &self.configs {
+            if !live.read_path(path)?.git_eq(expected) {
+                return Err(invalid("configuration inputs changed after validation"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn check_overlay_locals(&self) -> io::Result<()> {
+        self.check_local_inputs(self._preview.path())
+    }
+
+    fn check_local_inputs(&self, root: &Path) -> io::Result<()> {
         let mut local = local_files(root)?;
         for (path, original) in &self.local {
             let expected = self
@@ -66,15 +93,17 @@ impl Validated {
         if !local.is_empty() {
             return Err(invalid("machine-local inputs changed after validation"));
         }
-        let live = Dir::open(root)?;
-        let preview = Dir::open(self._preview.path())?;
-        for (path, expected) in &self.configs {
-            if !live.read_path(path)?.git_eq(expected) || !preview.read_path(path)?.git_eq(expected)
-            {
-                return Err(invalid("configuration inputs changed after validation"));
-            }
-        }
         Ok(())
+    }
+
+    pub fn expected_source(&self, git: &Git<'_>, tree: &Tree, path: &Path) -> io::Result<Image> {
+        Image::checkout(git, &self.revision, path, tree.get(path))
+    }
+
+    pub fn record_hook_file(&mut self, path: &Path, image: Image) {
+        if let Some(input) = self.configs.get_mut(path) {
+            *input = image;
+        }
     }
 }
 
@@ -265,6 +294,18 @@ pub(super) fn historical_status(
     Ok((preview, root, data))
 }
 
+pub(super) fn overlay_environments(run: &Run<'_>, root: &Path) -> io::Result<String> {
+    let mut vars = run.ctx().env.vars.clone();
+    vars.insert("DOTS_ROOT".into(), root.as_os_str().to_owned());
+    let env = Env {
+        vars,
+        cwd: root.to_owned(),
+    };
+    let private = config::Root::resolve(&env).map_err(io::Error::other)?;
+    let selection = config::selection::read(&private, &env).map_err(io::Error::other)?;
+    Ok(selection.active_environments())
+}
+
 pub(super) fn command(
     run: &Run<'_>,
     root: &Path,
@@ -276,20 +317,14 @@ pub(super) fn command(
     argv.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
     let mut cmd = mise.command(argv).map_err(io::Error::other)?;
     let selected = if preview {
-        let mut vars = run.ctx().env.vars.clone();
-        vars.insert("DOTS_ROOT".into(), root.as_os_str().to_owned());
-        let env = Env {
-            vars,
-            cwd: root.to_owned(),
-        };
-        let private = config::Root::resolve(&env).map_err(io::Error::other)?;
-        config::selection::read(&private, &env)
+        overlay_environments(run, root)?
     } else {
         config::selection::read(&run.ctx().root, &run.ctx().env)
-    }
-    .map_err(io::Error::other)?;
+            .map_err(io::Error::other)?
+            .active_environments()
+    };
     cmd.current_dir(root)
-        .env("MISE_ENV", selected.active_environments())
+        .env("MISE_ENV", selected)
         .env("MISE_CONFIG_DIR", root)
         .env("MISE_AUTO_INSTALL", "0")
         .env("MISE_EXEC_AUTO_INSTALL", "0")
@@ -299,6 +334,7 @@ pub(super) fn command(
         // Retain the real HOME and selection so native rendering resolves paths
         // and machine overrides the same way it does after installation.
         cmd.env("MISE_TRUSTED_CONFIG_PATHS", root)
+            .env("MISE_NO_HOOKS", "1")
             .env_remove("MISE_GLOBAL_CONFIG_FILE")
             .env_remove("MISE_CONFIG_FILE")
             .env(

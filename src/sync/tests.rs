@@ -526,6 +526,37 @@ pre-dotfiles = "printf 'generated\\n' > source"
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn guarded_hook_replay_does_not_displace_a_competing_live_source() {
+    let (fixture, mut ctx) = shared_mise_fixture(
+        r#"[dotfiles]
+'~/deployed' = { mode = 'copy', source = 'source' }
+[bootstrap.hooks]
+pre-dotfiles = "printf 'generated\\n' > source; printf 'competing\\n' > \"$FIXTURE_LIVE_SOURCE\""
+"#,
+    );
+    let source = ctx.root.path().join("source");
+    ctx.env
+        .vars
+        .insert("FIXTURE_LIVE_SOURCE".into(), source.as_os_str().to_owned());
+    let git = Git::new(&ctx, ctx.root.path());
+    fs::write(&source, "approved source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "guarded hook fixture");
+    let receipt = shared_mise_sync(&ctx);
+    assert_eq!(receipt.outcome, "pushed dev");
+    assert!(
+        receipt.issues.iter().any(|issue| issue
+            .diagnostic
+            .contains("conflicts with a pre-dotfiles hook")),
+        "{:?}",
+        receipt.issues
+    );
+    assert_eq!(fs::read(source).unwrap(), b"competing\n");
+    assert!(!fixture.path().join("home/deployed").exists());
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn a_new_target_claimed_during_push_keeps_the_competing_bytes() {
     use std::os::unix::fs::PermissionsExt;
 

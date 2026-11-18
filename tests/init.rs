@@ -628,3 +628,63 @@ fn new_explicit_directory_works_with_an_impossible_ambient_root() {
     assert_eq!(fs::read(blocker).unwrap(), b"keep this file");
     assert!(!world.root().join(".git").exists());
 }
+
+#[test]
+fn new_template_only_commit_with_private_message_requires_sync() {
+    const MEMO: &str = "Synthetic private memo for this fixture";
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    assert_eq!(
+        git(&world, &root, &["show", "-s", "--format=%an <%ae>", "HEAD"]),
+        "Dots Tests <dots-tests@example.invalid>"
+    );
+    let original_tree = git(&world, &root, &["rev-parse", "HEAD^{tree}"]);
+    let fixture = world.home().join("amended-message");
+    for message in [
+        format!("Initialize dots configuration\n\n{MEMO}\n"),
+        "Initialize dots configuration\n\n".to_owned(),
+    ] {
+        fs::write(&fixture, &message).unwrap();
+        success(
+            world
+                .git()
+                .current_dir(&root)
+                .args(["commit", "--amend", "--cleanup=verbatim", "-F"])
+                .arg(&fixture)
+                .output()
+                .unwrap(),
+        );
+        git(&world, &root, &["branch", "-f", "main", "HEAD"]);
+        let amended = git(&world, &root, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(&world, &root, &["rev-parse", "HEAD^{tree}"]),
+            original_tree
+        );
+        assert_eq!(
+            git(&world, &root, &["rev-list", "--parents", "-1", "HEAD"]),
+            amended
+        );
+        let object = world
+            .git()
+            .current_dir(&root)
+            .args(["cat-file", "commit", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(object.status.success());
+        assert!(object.stdout.ends_with(message.as_bytes()));
+
+        let output = init(&world, &root);
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        let stdout = success(output);
+        assert!(stdout.contains(" remote add origin URL"), "{stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.starts_with("DOTS_ROOT=") && line.ends_with(" dots sync")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains(" push ") && !stderr.contains(" push "));
+        assert!(!stdout.contains(MEMO) && !stderr.contains(MEMO));
+    }
+}

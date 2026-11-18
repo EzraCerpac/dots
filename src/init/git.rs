@@ -13,6 +13,7 @@ use super::TEMPLATES;
 
 const MAIN: &str = "refs/heads/main";
 const DEV: &str = "refs/heads/dev";
+const SEED_MESSAGE: &[u8] = b"Initialize dots configuration\n";
 
 pub(super) struct Git<'a> {
     pub ctx: &'a Ctx,
@@ -187,14 +188,9 @@ impl Git<'_> {
                 ]);
             }
         }
-        let oid = line(checked(
-            output(cmd.args([
-                "commit-tree",
-                "--no-gpg-sign",
-                &tree,
-                "-m",
-                "Initialize dots configuration",
-            ]))?,
+        let oid = line(input(
+            cmd.args(["commit-tree", "--no-gpg-sign", &tree, "-F", "-"]),
+            SEED_MESSAGE,
             "create the seed commit",
         )?)?;
 
@@ -349,7 +345,7 @@ impl Git<'_> {
             &["--no-replace-objects", "cat-file", "commit", &oid],
             "inspect the seed commit",
         )?;
-        let Some(tree) = root_tree(&commit.stdout) else {
+        let Some(tree) = seed_tree(&commit.stdout) else {
             return Ok(None);
         };
         let actual = self.checked(
@@ -416,14 +412,17 @@ impl Git<'_> {
     }
 }
 
-fn root_tree(commit: &[u8]) -> Option<&str> {
-    let mut headers = commit.split(|byte| *byte == b'\n');
+fn seed_tree(commit: &[u8]) -> Option<&str> {
+    let separator = commit.windows(2).position(|pair| pair == b"\n\n")?;
+    if &commit[separator + 2..] != SEED_MESSAGE {
+        return None;
+    }
+    let mut headers = commit[..separator].split(|byte| *byte == b'\n');
     let tree = headers.next()?.strip_prefix(b"tree ")?;
-    (!headers
-        .take_while(|line| !line.is_empty())
-        .any(|line| line.starts_with(b"parent ")))
-    .then(|| std::str::from_utf8(tree).ok())
-    .flatten()
+    if headers.any(|line| line.starts_with(b"parent ")) {
+        return None;
+    }
+    std::str::from_utf8(tree).ok()
 }
 
 fn tree_directory(entry: &[u8]) -> Option<&[u8]> {

@@ -4,6 +4,7 @@
 An optional Git remote shares that configuration between your machines, and `dots sync` scans your changes for secrets before it pushes them.
 
 > **TODO (A-03):** Record the 1.0 binary running `dots init`, `dots add` and the `dots up` dashboard.
+> Once the interactive design is approved, verify the appearance and keys for the update dashboard, menu and report browser against the integrated binary.
 
 ## Install
 

@@ -1182,10 +1182,10 @@ sync_case!(
     || {
         let f = Repo::new();
         fs::remove_file(f.tools.join("gitleaks")).unwrap();
-        let Some(real) = &f.gitleaks_real else {
-            eprintln!("skipped: real gitleaks is unavailable");
-            return;
-        };
+        let real = f
+            .gitleaks_real
+            .as_ref()
+            .expect("real gitleaks on fixture PATH");
         symlink(real, f.tools.join("gitleaks")).unwrap();
         let marker = ["ghp", "R8tq3LwVn5Xk2Jc9Hy7Pd4Mb6Fz1Sa0Gu3Ee"].join("_");
         f.write(

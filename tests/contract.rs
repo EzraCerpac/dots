@@ -177,7 +177,6 @@ fn unchanged_help_and_command_lookup_work_without_dots_directory() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_exceptions_work_without_dots_directory() {
     let world = World::new();
     minimal_config(&world, "[vars]\ndots_profiles = \"laptop server\"\n");

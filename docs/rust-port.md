@@ -29,19 +29,27 @@ Unported handlers exit 1 naming their task, and their seams below are typed stub
 
 `Run::begin(&ctx, Sink::{Report(Command), Fragment(PathBuf), Unreported})` offers `start(label) -> StageId`, `start_alongside(label)`, `run(id, cmd, Policy::{Ordinary, Interactive}) -> io::Result<ExitStatus>`, `probe(cmd) -> io::Result<Output>`, `change(id, Change { item, before, after })`, `issue(id, Issue)`, `finish(id, Outcome)`, `cancelled()`, `snapshot() -> Snapshot` and `end(status) -> u8`.
 `run` returns spawn and I/O errors as `Err` and the child's real status even after an interrupt; `Run` tracks cancellation and `end` derives the [contracted status](contract.md#exit-status) after cleanup.
-`Outcome::{Completed, Deferred, Skipped, Failed}` maps hook and recipe statuses 0, 3, 4, other, `DOTS_CHANGES` rows becoming `Change`s; `Issue { diagnostic, next, tail, log }` has `tail` and `log` only for `Ordinary` stages in `up`; `Snapshot` exposes stage IDs, labels, progress and report fields.
+`Outcome::{Completed, Deferred, Skipped, Failed}` maps hook and recipe statuses 0, 3, 4, other, with `DOTS_CHANGES` rows becoming `Change`s.
+In full `up` or `update`, `Issue { diagnostic, next, tail, log }` carries `tail` and `log` for captured output, including captured hooks and recipes.
+`Snapshot` exposes stage IDs, labels, progress and report fields.
 R-01 runs children on caller stdio and saves stage metadata and status privately, warning on write failure; modules can test before P-11 adds retention, ordinary logs, cleanup, cancellation and the App Store stage.
 P-12 formats plain step, outcome and report-list lines from `snapshot()` and R-01's private `report::{list, load}`, without ratatui or crossterm; queries live with their data's writer.
 No run uses a PTY or relays the terminal, and one writer owns it at a time.
-Hooks, recipes and known prompts like `sudo -v` run under `Interactive`, inheriting the caller's stdin, stdout, stderr and controlling terminal from spawn, redirected or not; `dots` never reads their input, logs their output or keeps a tail.
-`Ordinary` stages write to private logs that feed issue tails, and a quiet stage finishes its progress line before the next `Interactive` spawn.
+In full `up` or `update` with interactive scrollback, hooks and recipes run under `Interactive`.
+They inherit the caller's stdin, stdout, stderr and controlling terminal from spawn, and their output reaches the terminal directly without capture.
+P-11 captures hook and recipe stdout and stderr in concise output, including headless runs and `--plain`, while passing through the caller's stdin.
+`Ordinary` stage output and captured hook and recipe output go to private logs that feed issue tails.
+`--verbose` mirrors captured output while retaining logs and tails.
+P-12 shows `Output was shown on the terminal` in place of the tail and log location for a failed foreground step in interactive scrollback.
+Individual commands still run directly as specified in [Output and reports](contract.md#output-and-reports).
+A quiet stage finishes its progress line before the next foreground spawn.
 An observed Ctrl-C starts cancellation across active groups and probes, including during drain, and blocks new spawns.
 A direct foreground child that ignores that interrupt can continue until it exits.
 The supervisor then cleans up owned remnants, including leaderless groups, before saving the report and applying the contract’s exit-status order.
 Self-detached processes are outside that scope. A guard restores the caller’s terminal on exit, cancellation and unwinding panic.
 Native mise runs `dots bootstrap complete` as a separate, direct process in its stage's group and cancellation scope; `DOTS_STAGES`, set only on that stage, names a unique private file its `Sink::Fragment` run alone atomically rewrites with stage metadata before each hook starts and after it finishes.
 After native exit the parent calls `run.fold(path)` even on failure, marking the active hook cancelled on interruption; standalone `complete` prints outcomes without saving a report.
-With valid cached administrator access, `--mas` starts the background worker as `Ordinary` without prompting, with or without a terminal.
+With valid cached administrator access, `--mas` starts the background worker as `Ordinary`, detached from the terminal and without prompting, with or without a terminal.
 Without cached access, an interactive run obtains authorization first with `sudo -v` as a foreground `Interactive` stage. A noninteractive run defers the App Store stage.
 The parent announces the worker’s result at the next stage boundary and joins it before standalone mise.
 If authorization expires, the worker defers with a next action and never prompts again.

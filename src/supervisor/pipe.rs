@@ -132,23 +132,23 @@ impl Stream {
         })
     }
 
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<Option<usize>> {
         let Some(input) = &mut self.input else {
-            return Ok(0);
+            return Ok(None);
         };
         match input.read(bytes) {
             Ok(0) => {
                 self.input = None;
-                Ok(0)
+                Ok(Some(0))
             }
-            Ok(count) => Ok(count),
+            Ok(count) => Ok(Some(count)),
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
-                Ok(0)
+                Ok(None)
             }
             Err(error) => Err(error),
         }
@@ -189,10 +189,26 @@ impl Pipes {
         })
     }
 
-    pub(super) fn collect(mut self, running: &mut Running<'_>) -> io::Result<Output> {
+    pub(super) fn collect(self, running: &mut Running<'_>) -> io::Result<Output> {
+        self.collect_limited(running, usize::MAX)
+    }
+
+    pub(super) fn collect_limited(
+        mut self,
+        running: &mut Running<'_>,
+        limit: usize,
+    ) -> io::Result<Output> {
         let mut output = [Vec::new(), Vec::new()];
+        let mut remaining = limit;
         let status = self.pump(running, false, |index, bytes| {
-            output[index].extend_from_slice(bytes)
+            remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "probe output exceeded its capture limit",
+                )
+            })?;
+            output[index].extend_from_slice(bytes);
+            Ok(())
         })?;
         let [stdout, stderr] = output;
         Ok(Output {
@@ -206,14 +222,17 @@ impl Pipes {
         &mut self,
         running: &mut Running<'_>,
         mut verbose: bool,
-        mut record: impl FnMut(usize, &[u8]),
+        mut record: impl FnMut(usize, &[u8]) -> io::Result<()>,
     ) -> io::Result<std::process::ExitStatus> {
         let mut bytes = [0; 8192];
+        let mut capture_error = None;
         loop {
             let eof = self.streams.iter().all(|stream| stream.input.is_none());
             let pending_output = self.streams.iter().any(|stream| !stream.pending.is_empty());
-            if let Some(status) = running.poll(eof, pending_output)? {
-                return Ok(status);
+            match running.poll(eof, pending_output) {
+                Ok(Some(status)) => return capture_error.map_or(Ok(status), Err),
+                Ok(None) => {}
+                Err(error) => return Err(capture_error.unwrap_or(error)),
             }
             if verbose && running.discard_display() {
                 verbose = false;
@@ -227,11 +246,20 @@ impl Pipes {
                 if !stream.pending.is_empty() {
                     progressed |= stream.flush()?;
                 }
-                if stream.pending.is_empty() {
-                    let count = stream.read(&mut bytes)?;
+                if stream.pending.is_empty()
+                    && let Some(count) = stream.read(&mut bytes)?
+                {
+                    // A new EOF can complete the probe as surely as new bytes.
+                    progressed = true;
                     if count != 0 {
-                        progressed = true;
-                        record(index, &bytes[..count]);
+                        if !running.discard_capture()
+                            && let Err(error) = record(index, &bytes[..count])
+                        {
+                            if !running.stop_capture() {
+                                return Err(error);
+                            }
+                            capture_error = Some(error);
+                        }
                         if verbose && stream.output != -1 {
                             stream.pending.extend_from_slice(&bytes[..count]);
                         }
@@ -245,4 +273,16 @@ impl Pipes {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_new_eof_counts_as_progress_once() {
+    let (read, writer) = io::pipe().unwrap();
+    let mut stream = Stream::new(read, libc::STDOUT_FILENO).unwrap();
+    let mut bytes = [0; 1];
+    assert_eq!(stream.read(&mut bytes).unwrap(), None);
+    drop(writer);
+    assert_eq!(stream.read(&mut bytes).unwrap(), Some(0));
+    assert_eq!(stream.read(&mut bytes).unwrap(), None);
 }

@@ -95,10 +95,10 @@ Adopting an existing regular file under your home directory moves it into the co
 Run `dots` or `dots help` to list the built-in commands and your configuration's own commands.
 `dots root` prints the configuration directory and `dots profile` prints the selected profile.
 
-During an update, the current step and its result stay in ordinary terminal scrollback.
+In an interactive update, the current step and its result stay in ordinary terminal scrollback.
 Answer a hook’s or installer’s prompt directly in the terminal.
 At the end, “Needs attention” lists issues and what to do next.
-For a failed step that owned the terminal, its output is in your scrollback. Other failed steps include a private log path.
+For a failed step that owned the terminal, its output is in your scrollback. With `--plain` or without a terminal, hook and recipe failures include a private log path.
 
 ## Sharing between machines
 

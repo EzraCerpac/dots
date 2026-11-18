@@ -2,7 +2,7 @@
 
 Generated snapshot from `plan/plan.json`; edit the source and regenerate.
 
-Structural dependency chain: K-01 → K-02 → S-01 → S-02 → R-01 → Q-01 → P-02 → P-04 → I-01 → D-01 → G-1 → A-04 → G-2 → A-06. Durations are incomplete; this is not a time-based critical path or schedule.
+Structural dependency chain: K-01 → K-02 → S-01 → S-02 → R-01 → Q-01 → P-07 → P-09 → P-08 → I-01 → D-01 → G-1 → A-04 → G-2 → A-06. Durations are incomplete; this is not a time-based critical path or schedule.
 
 Edges: predecessor → dependent. Layers show dependency readiness, not resource availability.
 
@@ -15,13 +15,14 @@ Edges: predecessor → dependent. Layers show dependency readiness, not resource
 - 5: R-01
 - 6: Q-01, P-11, P-12
 - 7: Q-02, P-01, P-02, P-03, P-06, P-07
-- 8: P-04, P-05, P-08, P-09, P-10
-- 9: X-01, I-01
-- 10: D-01, A-05, A-02, A-03
-- 11: C-01, G-1
-- 12: A-04
-- 13: G-2
-- 14: A-06
+- 8: P-04, P-05, P-09, P-10
+- 9: X-01, P-08
+- 10: I-01
+- 11: D-01, A-05, A-02, A-03
+- 12: C-01, G-1
+- 13: A-04
+- 14: G-2
+- 15: A-06
 
 ## Predecessors and external prerequisites
 
@@ -43,10 +44,10 @@ Edges: predecessor → dependent. Layers show dependency readiness, not resource
 - P-07 — Sync, receipt and publish scenarios in the harness; needs: Q-01; external: none
 - P-04 — dots up; needs: P-02; external: none
 - P-05 — Bootstrap, bundles, profiles and remote bootstrap; needs: P-02; external: none
-- P-08 — Sync and guarded apply; needs: P-07; external: none
 - P-09 — Sync receipt and dots sync --last; needs: P-07; external: none
 - P-10 — dots publish; needs: P-07; external: none
 - X-01 — Move Atuin and Tailscale into Ezra's configuration and migrate it; needs: P-02, P-05; external: none
+- P-08 — Sync and guarded apply; needs: P-07, P-09; external: none
 - I-01 — Integration: one binary, end to end; needs: P-01, P-03, P-04, P-05, P-06, P-08, P-09, P-10, P-11, P-12, Q-02; external: none
 - D-01 — Delete the current implementation and package the Rust binary; needs: I-01; external: none
 - A-05 — Reference docs, the agent skill and REVIEW.md; needs: I-01; external: none
@@ -80,10 +81,10 @@ flowchart TD
   n15["P-07 Sync, receipt and publish scenarios in the harness"]
   n16["P-04 dots up"]
   n17["P-05 Bootstrap, bundles, profiles and remote bootstrap"]
-  n18["P-08 Sync and guarded apply"]
-  n19["P-09 Sync receipt and dots sync --last"]
-  n20["P-10 dots publish"]
-  n21["X-01 Move Atuin and Tailscale into Ezra&#x27;s configuration and migrate it"]
+  n18["P-09 Sync receipt and dots sync --last"]
+  n19["P-10 dots publish"]
+  n20["X-01 Move Atuin and Tailscale into Ezra&#x27;s configuration and migrate it"]
+  n21["P-08 Sync and guarded apply"]
   n22["I-01 Integration: one binary, end to end"]
   n23["D-01 Delete the current implementation and package the Rust binary"]
   n24["A-05 Reference docs, the agent skill and REVIEW.md"]
@@ -116,17 +117,18 @@ flowchart TD
   n12 --> n17
   n15 --> n18
   n15 --> n19
-  n15 --> n20
-  n12 --> n21
-  n17 --> n21
+  n12 --> n20
+  n17 --> n20
+  n15 --> n21
+  n18 --> n21
   n11 --> n22
   n13 --> n22
   n16 --> n22
   n17 --> n22
   n14 --> n22
+  n21 --> n22
   n18 --> n22
   n19 --> n22
-  n20 --> n22
   n8 --> n22
   n9 --> n22
   n10 --> n22
@@ -136,7 +138,7 @@ flowchart TD
   n22 --> n26
   n23 --> n27
   n23 --> n28
-  n21 --> n28
+  n20 --> n28
   n24 --> n28
   n28 --> n29
   n28 --> n30

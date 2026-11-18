@@ -6,11 +6,11 @@
   "sections": [
     {
       "title": "Outcome",
-      "body": "**Outcome.** Someone who has never seen Ezra's setup can find `dots`, install one binary next to mise, and manage a machine in minutes. `dots` 1.0.0 is that binary, written in Rust.\n\n**First useful version: the release candidate** (milestone M3). Ezra's machines run the Rust binary and the old implementation is gone from the repository.\n\n**Public release: 1.0.0** (milestone M4), with the new README, the demo, the template repository and the listings.\n\nRequirements drop from mise, Bash, Git, Node, uv, jq, gitleaks, age and JJ to mise, Git, gitleaks and age. Bash is needed only by a configuration's own hooks, and JJ and `gh` only by `dots publish`.\n\n**Not in this plan.** The launch post (Ezra's, after 1.0.0); native Windows (WSL only); Homebrew core; a self-updater; replacing Git, gitleaks, mise, `gh` or JJ with libraries; any setting beyond those the tasks name."
+      "body": "**Outcome.** Someone who has never seen Ezra's setup can find `dots`, install one binary next to mise, and manage a machine in minutes. `dots` 1.0.0 is that binary, written in Rust.\n\n**First useful version: the release candidate** (milestone M3). Ezra's configuration pins the Rust binary and the old implementation is gone from the repository.\n\n**Public release: 1.0.0** (milestone M4), with the new README, the demo, the template repository and the listings.\n\nRequirements drop from mise, Bash, Git, Node, uv, jq, gitleaks, age and JJ to mise, Git, gitleaks and age. Bash is needed only by a configuration's own hooks, and JJ and `gh` only by `dots publish`.\n\n**Not in this plan.** The launch post (Ezra's, after 1.0.0); native Windows (WSL only); Homebrew core; a self-updater; replacing Git, gitleaks, mise, `gh` or JJ with libraries; any setting beyond those the tasks name."
     },
     {
       "title": "Current state",
-      "body": "**Verified** in this checkout at `44b626e`, on GitHub and in Ezra's configuration on 2026-11-18:\n\n- About 26,000 lines in five languages: Bash, Python (through uv), Node, Go and TOML.\n- The repository is public with 0 stars, no topics, no homepage and Discussions off. The latest release is v0.3.5.\n- `dots up` syncs first, and sync refuses a checkout without a GitHub `origin` named as `OWNER/NAME` (`lib/source-repo.mjs:34` and `:73`).\n- Bootstrap completion always runs an Atuin stage and a Tailscale stage (`bootstrap/complete.mjs:178` and `:220`).\n- `dots init` (`tasks/init`) writes `[vars] dots_profiles` and the `dots/` layout. Selecting the profile is a separate `dots internal profile`.\n- `dots add` handles tools and packages only; nothing adopts an existing dotfile.\n- Of 15 suite files, the sync, receipt, publish, bootstrap-hook, retired-declaration, GitHub and Atuin suites import implementation modules. The contract, install, home and package suites drive `bin/dots`.\n- CI runs on `ubuntu-latest` and `macos-latest` only.\n- `REVIEW.md` tells reviewers that `dots` is run by one person on their own machines.\n- On crates.io the name `dots` is taken; `dots-cli` is free.\n- Ezra's configuration is the only consumer of the contract. It sources `lib/brew-exception.sh`, `lib/setup-common.sh` and `lib/retire-dotfiles.sh`, calls `dots internal home`, and uses Atuin and Tailscale.\n- T3 offers `gpt-6.2-astra`, `gpt-6.2-sol` and `claude-opus-5-5`. Grok is disabled, so a council has two substantive members.\n\n**Reported** by the Astra research and not re-verified: the per-language line counts (15,526 implementation, 9,093 tests), current crate versions, 14 to 26 working weeks for a one-cutover port by one maintainer with agents, and the adoption statistics.\n\n**Unknown:**\n\n- Which sync scenarios cannot run against the current implementation without changing it, because they inject failures through imported modules.\n- Whether a PTY library gives the supervisor resize, Ctrl-C and an interactive `sudo` handoff on both platforms. T-01 answers this.\n- Whether an Astra lead can start Opus children; the capability is reported but not exercised. K-02 tests it."
+      "body": "**Verified** in this checkout at `44b626e`, on GitHub and in Ezra's configuration on 2026-11-18:\n\n- About 26,000 lines in five languages: Bash, Python (through uv), Node, Go and TOML.\n- The repository is public with 0 stars, no topics, no homepage and Discussions off. The latest release is v0.3.5.\n- `dots up` syncs first. Sync requires `dots_source_repo` to be a GitHub `OWNER/NAME` (`lib/source-repo.mjs:34`) and refuses a checkout whose `origin` is missing (`:73`) or is not a GitHub URL of that repository (`:38` to `:47`).\n- Bootstrap completion always runs an Atuin stage and a Tailscale stage (`bootstrap/complete.mjs:178` and `:220`).\n- `dots init` (`tasks/init`) writes `[vars] dots_profiles` and the `dots/` layout. Selecting the profile is a separate `dots internal profile`.\n- `dots add` handles tools and packages only; nothing adopts an existing dotfile.\n- Of 15 suite files, the sync, receipt, publish, bootstrap-hook, retired-declaration, GitHub and Atuin suites import implementation modules. The contract, install, home and package suites drive `bin/dots`.\n- CI runs on `ubuntu-latest` and `macos-latest` only.\n- `REVIEW.md` tells reviewers that `dots` is run by one person on their own machines.\n- On crates.io the name `dots` is taken; `dots-cli` is free.\n- Ezra's configuration is the only consumer of the contract. It sources `lib/brew-exception.sh`, `lib/setup-common.sh` and `lib/retire-dotfiles.sh`, calls `dots internal home`, and uses Atuin and Tailscale.\n- T3 offers `gpt-6.2-astra`, `gpt-6.2-sol` and `claude-opus-5-5`. Grok is disabled, so a council has two substantive members.\n\n**Reported** by the Astra research and not re-verified: the per-language line counts (15,526 implementation, 9,093 tests), current crate versions, 14 to 26 working weeks for a one-cutover port by one maintainer with agents, and the adoption statistics.\n\n**Unknown:**\n\n- Which sync scenarios cannot run against the current implementation without changing it, because they inject failures through imported modules.\n- Whether a PTY library gives the supervisor resize, Ctrl-C and an interactive `sudo` handoff on both platforms. T-01 answers this.\n- Whether an Astra lead can start Opus children; the capability is reported but not exercised. K-02 tests it."
     },
     {
       "title": "Approach",
@@ -18,7 +18,7 @@
     },
     {
       "title": "Target architecture and ownership",
-      "body": "- **One Cargo package**: crate `dots-cli`, binary `dots`. Modules: `config`, `process`, `report`, `packages`, `update`, `bootstrap`, `history`, `sync`, `receipt`, `publish`, `supervisor` and `ui`. A second crate appears only when a second consumer exists.\n- **One self-contained binary.** The `dots init` templates and the agent skill are embedded. There is no support directory, so `cargo install`, Homebrew and mise all install the same single file.\n- **No sourced shell library.** The recipe helpers in `lib/brew-exception.sh`, the dotfile retirement script and what scripts need from `lib/setup-common.sh` become subcommands, so a recipe or hook can be written in any language. S-01 fixes their names; X-01 migrates Ezra's configuration.\n- **No personal features in core.** Atuin and Tailscale enrollment move into Ezra's configuration as hooks and commands. Core gains one generic mechanism: values from the encrypted bootstrap bundle reach bootstrap hooks.\n- **Supervisor.** The default is one process that runs each stage's child under a PTY and reports in-process, with no event protocol between two programs. S-02 confirms or changes this after the spike.\n- **Crates** (Astra's shortlist, confirmed in S-02): clap, serde_json, toml_edit, ureq, nix, and ratatui with crossterm.\n- **External programs that stay**: mise, Git, gitleaks, age, `gh`, JJ and the native package managers. Sync keeps calling the Git executable, so its merge, lock and credential behaviour does not change.\n\n| Shared thing | Single writer |\n| --- | --- |\n| `docs/contract.md` and the command-line surface | Lead A; frozen after the S-01 council, changes go through the coordinator |\n| `Cargo.toml`, the command tree, the `config`, `process` and `report` modules, and the acceptance harness | Lead B |\n| Sync and receipt types | Lead C |\n| Stage and report interface between commands and the supervisor | Lead T |\n| `rust.yml` | Lead B; the existing workflows stay untouched until D-01 |\n| `plan.json` | Coordinator |\n\nEvery task is one pull request from its own worktree, into `main`. That is safe before the cutover because the Rust code only adds files and releases still build the current implementation. A lead sets the merge order for its workstream and serializes history-changing commands in the repository."
+      "body": "- **One Cargo package**: crate `dots-cli`, binary `dots`. Modules: `config`, `process`, `report`, `packages`, `update`, `bootstrap`, `history`, `sync`, `receipt`, `publish`, `supervisor` and `ui`. A second crate appears only when a second consumer exists.\n- **One self-contained binary.** The `dots init` templates and the agent skill are embedded. There is no support directory, so `cargo install`, Homebrew and mise all install the same single file.\n- **No sourced shell library.** The recipe helpers in `lib/brew-exception.sh`, the dotfile retirement script and what scripts need from `lib/setup-common.sh` become subcommands, so a recipe or hook can be written in any language. S-01 fixes their names; X-01 migrates Ezra's configuration.\n- **No personal features in core.** Atuin and Tailscale enrollment move into Ezra's configuration as hooks and commands. Core gains one generic mechanism: values from the encrypted bootstrap bundle reach bootstrap hooks.\n- **Supervisor.** The default is one process that runs each stage's child under a PTY and reports in-process, with no event protocol between two programs. S-02 confirms or changes this after the spike.\n- **Crates** (Astra's shortlist, confirmed in S-02): clap, serde_json, toml_edit, ureq, nix, and ratatui with crossterm.\n- **External programs that stay**: mise, Git, gitleaks, age, `gh`, JJ and the native package managers. Sync keeps calling the Git executable, so its merge, lock and credential behaviour does not change.\n\n| Shared thing | Single writer |\n| --- | --- |\n| `docs/contract.md` and the command-line surface | Lead A; frozen after the S-01 council, changes go through the coordinator |\n| `Cargo.toml`, the command tree, the `config`, `process` and `report` modules, and the acceptance harness | Lead B |\n| Sync and receipt types | Lead C |\n| Stage and report interface between commands and the supervisor | Lead T |\n| `rust.yml` | Lead B; the existing workflows stay untouched until D-01 |\n| `plan.json` | Coordinator, who regenerates `plan.md` and `dependencies.md` from it with `plan.py` of the implementation-planning skill; nobody edits the generated files |\n\nEvery task is one pull request from its own worktree, into `main`. That is safe before the cutover because the Rust code only adds files and releases still build the current implementation. A lead sets the merge order for its workstream and serializes history-changing commands in the repository."
     },
     {
       "title": "Agents: who does what",
@@ -38,7 +38,7 @@
     },
     {
       "title": "Acceptance and rollout",
-      "body": "**G-1, the cutover**, passes when the whole suite is green against the Rust binary on macOS, Ubuntu and the distribution containers, the old implementation is deleted, the council is satisfied, and Ezra's configuration runs the release candidate.\n\n**G-2, 1.0.0**, passes when Ezra has used the release candidate for a week, including daily sync on two machines and one restore, and the README, demo, template repository and crate are ready.\n\n**Recovery** until 1.0.0: revert the pull request in Ezra's configuration that pins the release candidate. The configuration then runs 0.3.5 with its old hooks again."
+      "body": "**G-1, the cutover**, passes when the whole suite is green against the Rust binary on macOS, Ubuntu and the distribution containers, the old implementation is deleted, the council is satisfied, and Ezra's configuration pins the release candidate, checked with `dots up` on one machine. His other machines pick it up at their next `dots up`; G-2 covers them.\n\n**G-2, 1.0.0**, passes when Ezra has used the release candidate for a week, including daily sync on two machines and one restore, and the README, demo, template repository and crate are ready.\n\n**Recovery** until 1.0.0: revert the pull request in Ezra's configuration that pins the release candidate. The configuration then runs 0.3.5 with its old hooks again."
     }
   ],
   "milestones": [
@@ -58,9 +58,9 @@
     },
     {
       "id": "M3",
-      "title": "Cutover: release candidate on Ezra's machines",
+      "title": "Cutover: release candidate in Ezra's configuration",
       "depends_on": ["G-1"],
-      "acceptance": ["The repository holds no Bash, Python, Node or Go implementation", "Ezra's machines run 1.0.0-rc.1"],
+      "acceptance": ["The repository holds no Bash, Python, Node or Go implementation", "Ezra's configuration pins 1.0.0-rc.1 and one machine has run dots up on it"],
       "owner": "Coordinator"
     },
     {
@@ -179,7 +179,7 @@
       "deliverables": ["Container jobs in rust.yml that run the suite on Fedora, Arch and Alpine", "A first-run job: a container with only mise and Git runs the README quickstart"],
       "depends_on": ["Q-01"],
       "prerequisites": [],
-      "acceptance": ["The jobs run on every pull request and report per scenario", "At I-01 they are green, or the README claims only the package managers that pass"],
+      "acceptance": ["The jobs run on every pull request and report per scenario", "A distribution that cannot pass is taken out of the matrix only by a change to this plan, which also changes I-01 and G-1"],
       "duration": null
     },
     {
@@ -203,7 +203,7 @@
       "deliverables": ["The read-only commands, apply and test", "The hook runner: name order, @PROFILE filtering, the four exit meanings and the environment contract", "The subcommands that replace brew-exception.sh, retire-dotfiles.sh and setup-common.sh", "dots status listing each required program as found with its version or missing, with the commands that need it"],
       "depends_on": ["Q-01"],
       "prerequisites": [],
-      "acceptance": ["Unchanged scenarios pass on the current implementation and all pass on the Rust binary", "Without gitleaks on PATH, dots status shows it missing for sync and dots sync names it in one line", "Each helper in lib/brew-exception.sh has a subcommand with a scenario"],
+      "acceptance": ["Unchanged scenarios pass on the current implementation and all pass on the Rust binary", "Without gitleaks on PATH, dots status shows it missing for sync", "Each helper in lib/brew-exception.sh has a subcommand with a scenario"],
       "duration": null
     },
     {
@@ -273,9 +273,9 @@
       "workstream": "Sync",
       "owner": "Sol 6.2 (xhigh) under Lead C; council before merge",
       "deliverables": ["A design note reviewed by Lead C before code", "sync, guarded checkout replacement, validation and retired declarations, calling the Git executable", "dots_source_repo and dots_state_repo accepting a Git URL as well as GitHub OWNER/NAME", "dots sync without a remote saying how to add one and exiting 0"],
-      "depends_on": ["P-07"],
+      "depends_on": ["P-07", "P-09"],
       "prerequisites": [],
-      "acceptance": ["All sync scenarios pass on the Rust binary", "dots sync always exits 0 with a receipt and never force-pushes", "Every promise in REVIEW.md about sync holds", "The scenarios pass with the remote named by URL", "Both council members are satisfied after a five-round sol loop"],
+      "acceptance": ["All sync scenarios pass on the Rust binary", "dots sync always exits 0 with a receipt and never force-pushes", "Without gitleaks on PATH, dots sync names it in one line", "Every promise in REVIEW.md about sync holds", "The scenarios pass with the remote named by URL", "Both council members are satisfied after a five-round sol loop"],
       "duration": null
     },
     {
@@ -432,7 +432,7 @@
       "deliverables": ["dots-cli ready for crates.io, installable with cargo install and cargo binstall", "The release workflow updating the Homebrew tap"],
       "depends_on": ["D-01"],
       "prerequisites": ["Ezra provides a crates.io token and a token for the tap repository"],
-      "acceptance": ["cargo publish --dry-run passes", "A release-candidate tag updates the tap without a manual step", "Each install method yields a working dots"],
+      "acceptance": ["cargo publish --dry-run passes", "The tap step of the release workflow passes a dry run against the tap repository", "Each install method yields a working dots"],
       "duration": null
     },
     {
@@ -445,7 +445,7 @@
       "deliverables": ["Tag v1.0.0", "dots-cli 1.0.0 on crates.io", "The template repository pinned to 1.0.0"],
       "depends_on": ["G-1", "A-02", "A-03", "A-04", "C-01"],
       "prerequisites": ["Ezra has used the release candidate for a week: daily sync on two machines and one restore, with no recovery step"],
-      "acceptance": ["Every fix since the release candidate has passed a sol loop", "The template repository's CI passes on 1.0.0", "CI is green"],
+      "acceptance": ["Every fix since the release candidate has passed a sol loop", "The template repository's CI passes on 1.0.0", "The tag updates the Homebrew tap without a manual step", "CI is green"],
       "duration": null
     },
     {

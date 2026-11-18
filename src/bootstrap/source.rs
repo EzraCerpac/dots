@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use crate::config::{RepoSetting, Vars, passive};
+use crate::config::{RepoSetting, Vars};
 use crate::process::Cwd;
 use crate::run::{Outcome, Run};
 use crate::{Ctx, Fail};
@@ -62,27 +62,6 @@ fn text(output: Output, diagnostic: &str) -> Result<String, Fail> {
     }
     let result = String::from_utf8(output.stdout).map_err(|_| Fail::new(1, diagnostic))?;
     Ok(result.strip_suffix('\n').unwrap_or(&result).to_owned())
-}
-
-// P-06 owns RepoSetting::transport_url. Keep the conversion local until that
-// accessor is in the base branch.
-pub(super) fn transport_url(value: &str) -> String {
-    if value.contains(':') {
-        value.to_owned()
-    } else {
-        format!("https://github.com/{value}")
-    }
-}
-
-pub(super) fn configured_transport(ctx: &Ctx, key: &str) -> Result<String, Fail> {
-    let doc = passive::toml(&ctx.root.path().join("config.toml"))?;
-    let raw = doc
-        .get("vars")
-        .and_then(|table| table.get(key))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| Fail::usage(format!("config.toml is missing [vars] {key}")))?;
-    RepoSetting::parse(raw)?;
-    Ok(transport_url(raw))
 }
 
 pub(super) fn validate_destination(
@@ -234,7 +213,7 @@ pub(super) fn validate_native_source(
         }
     }
     let setting = RepoSetting::parse(&repo)?;
-    let url = transport_url(&repo);
+    let url = setting.transport_url().into_owned();
     let expected = vars.source_repo.as_ref().unwrap_or(&setting);
     if !expected.matches(&url) {
         return Err(Fail::usage(

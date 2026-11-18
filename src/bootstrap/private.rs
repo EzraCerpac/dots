@@ -9,7 +9,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 use super::{
     Request,
     bundle::{self, Bundle},
-    env_string, source,
+    env_string,
 };
 use crate::config::{Doc, RepoSetting, Vars};
 use crate::run::{Issue, Outcome, Run, StageId};
@@ -205,8 +205,9 @@ pub(super) fn persistence_origin(ctx: &Ctx) -> Result<Option<String>, Fail> {
         // Restore and enrollment check this value before making history changes.
         return Ok(None);
     }
-    RepoSetting::parse(provided)?;
-    Ok(Some(source::transport_url(provided)))
+    Ok(Some(
+        RepoSetting::parse(provided)?.transport_url().into_owned(),
+    ))
 }
 
 pub(super) struct ResolvedHistory {
@@ -261,8 +262,8 @@ pub(super) fn resolve_history(
         }
     }
     let url = match recorded_url.or(recorded_origin).or(provided) {
-        Some(value) => source::transport_url(value),
-        None => source::configured_transport(ctx, "dots_state_repo")?,
+        Some(value) => RepoSetting::parse(value)?.transport_url().into_owned(),
+        None => expected.transport_url().into_owned(),
     };
     let origin = RepoSetting::parse(&url)?;
     if restoring {

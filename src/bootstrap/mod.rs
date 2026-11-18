@@ -204,7 +204,12 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
             selection::for_bootstrap(&ctx.root, &env, Some(machine))
         })
         .transpose()?;
-    let mut command = Mise::new(ctx)?.command(native)?;
+    let selection = match restore_selection {
+        Some(selection) => selection,
+        None => selection::read(&ctx.root, &ctx.env)?,
+    };
+    let profile = selection.profile.clone();
+    let mut command = Mise::with_selection(ctx, selection)?.command(native)?;
     source::clear_git_checkout_override(&mut command);
     let mut parent_history_enabled = OsString::new();
     if let Some(value) = ctx.env.get(HISTORY_ENABLED) {
@@ -221,14 +226,9 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         // Native checkpoints do not enforce dots' encrypted-history contract.
         .env(HISTORY_ENABLED, "0")
         .env(PARENT_HISTORY_ENABLED, parent_history_enabled);
-    if let Some(selection) = restore_selection {
-        // Use Mise::with_selection once P-06's launcher seam lands.
-        command.env("MISE_ENV", selection.environments());
-        command.env(
-            "SETUP_MACHINE_ID",
-            selection.machine_id.expect("restore machine"),
-        );
-        if let Some(profile) = selection.profile {
+    if let Some(machine) = restore {
+        command.env("SETUP_MACHINE_ID", machine);
+        if let Some(profile) = profile {
             command.env("SETUP_PROFILE", profile);
         }
     }
@@ -566,7 +566,7 @@ pub fn remote(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         None => source::origin(ctx, &run)?.ok_or_else(|| {
             Fail::usage("set dots_source_repo or configure a Git origin for dots remote")
         })?,
-        Some(_) => source::configured_transport(ctx, "dots_source_repo")?,
+        Some(repo) => repo.transport_url().into_owned(),
     };
     let expected = crate::config::RepoSetting::parse(&url)?;
     source::validate_destination(ctx, &run, &url, &expected, from_origin)?;

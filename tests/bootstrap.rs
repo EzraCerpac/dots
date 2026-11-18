@@ -247,7 +247,6 @@ fn unchanged_configuration_command_and_help_use_the_fixture_profile() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_fixture_bootstrap_hook_runs_for_each_profile() {
     let world = World::new();
     for profile in ["laptop", "server"] {
@@ -295,7 +294,6 @@ fn unchanged_fixture_update_runs_profile_recipe_and_hooks() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_bootstrap_hook_order_outcomes_and_readiness() {
     let world = World::new();
     let facts = world.home().join("facts");
@@ -349,7 +347,6 @@ fn unchanged_bootstrap_hook_order_outcomes_and_readiness() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_unknown_hook_profile_stops_listing_before_any_hook() {
     let world = World::new();
     minimal(&world);
@@ -366,7 +363,6 @@ fn unchanged_unknown_hook_profile_stops_listing_before_any_hook() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_only_the_selected_profile_implicitly_requests_its_bundle() {
     let world = World::new();
     minimal(&world);
@@ -386,7 +382,6 @@ fn unchanged_only_the_selected_profile_implicitly_requests_its_bundle() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_failed_restore_leaves_hook_readiness_false() {
     let world = World::new();
     minimal(&world);
@@ -431,7 +426,6 @@ fn new_complete_rejects_invalid_profile_configuration_with_usage_status() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_minimal_completion_has_no_service_stages_or_standalone_report() {
     let world = World::new();
     minimal(&world);
@@ -651,16 +645,45 @@ fn unchanged_bundle_round_trip_is_encrypted_and_exclusive() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_hook_bundle_descriptors_and_folded_outcomes_are_private() {
     use std::io::Write as _;
     use std::process::Stdio;
 
     let world = World::new();
     minimal(&world);
+    write(
+        &world.root().join("config.toml"),
+        &format!(
+            r#"{MINIMAL}
+[env]
+DOTS_BUNDLE_FD = "999"
+DOTS_PRIVATE_READY = "0"
+DOTS_RESTORED = "1"
+"#
+        ),
+        0o644,
+    );
+    write(&world.root().join("config.laptop.toml"), "", 0o644);
+    write(
+        &world.root().join("dots/exceptions.tsv"),
+        "base\tfixture-recipe\n",
+        0o644,
+    );
+    write(
+        &world.root().join("dots/exceptions/fixture-recipe"),
+        r#"#!/bin/sh
+set -eu
+test "$#" = 1
+test "$1" = --install-only
+test -z "${DOTS_BUNDLE_FD+x}"
+test -z "${DOTS_PRIVATE_READY+x}"
+test -z "${DOTS_RESTORED+x}"
+touch "$HOME/recipe-ready"
+exit 4
+"#,
+        0o755,
+    );
     let bin = world.home().join("bin");
-    let mut paths = vec![bin.clone()];
-    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
     let age = bin.join("age");
     write(
         &age,
@@ -671,6 +694,7 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
         0o755,
     );
     let hook_body = r#"
+        test -f "$HOME/recipe-ready"
         test "$DOTS_PRIVATE_READY" = 1
         test "$DOTS_RESTORED" = 0
         test -z "${GH_TOKEN+x}"
@@ -691,8 +715,15 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
         "fixture ciphertext",
         0o600,
     );
-    let mut child = fake(&world)
-        .env("PATH", env::join_paths(paths).unwrap())
+    let mut command = fake(&world);
+    let path = command
+        .get_envs()
+        .find(|(name, _)| *name == "PATH")
+        .and_then(|(_, value)| value)
+        .unwrap();
+    let path = env::join_paths(std::iter::once(bin).chain(env::split_paths(path))).unwrap();
+    let mut child = command
+        .env("PATH", path)
         .env("NATIVE_FIXTURE_CALLBACK", world.dots().get_program())
         .env("FIXTURE_REAL_EXEC", "1")
         .current_dir(world.home())
@@ -716,6 +747,10 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_success(&output);
+    assert!(
+        stdout(&output).contains("skipped: Installer exception: fixture-recipe"),
+        "{output:?}"
+    );
     assert!(stdout(&output).contains("completed: First"), "{output:?}");
     assert!(stdout(&output).contains("completed: Second"), "{output:?}");
     let report_dir = world.home().join(".local/state/dots/reports");
@@ -727,6 +762,7 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
         })
         .expect("parent report");
     assert!(report.contains("Native mise bootstrap"));
+    assert!(report.contains("Installer exception: fixture-recipe"));
     assert!(report.contains("First") && report.contains("Second"));
     for text in [
         &report,
@@ -1125,7 +1161,7 @@ exec sleep 30
 }
 
 #[test]
-#[ignore = "requires the P-02 hook and P-06 history implementations"]
+#[ignore = "requires the P-06 history implementation"]
 fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
     use std::collections::BTreeSet;
     use std::io::Write as _;

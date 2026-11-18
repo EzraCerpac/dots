@@ -5,17 +5,19 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { onPath } from './lib/prereq.mjs';
+import { onPath, requires } from './lib/prereq.mjs';
 import { buildReceipt, formatReceipt, inlinePatch, receiptChangeRows, saveReceipt } from '../lib/sync-receipt.mjs';
 
 const modulePath = fileURLToPath(new URL('../lib/sync-receipt.mjs', import.meta.url));
 const show = ['--input-type=module', '-e',
   'const { showLast } = await import(process.argv[1]); process.exitCode = showLast(process.argv[2]);', modulePath];
+const gitAvailable = requires('git');
 
-function fixture(t) {
+function fixture(t, inherited = process.env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dots-receipt-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !key.startsWith('GIT_')));
+  Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
   delete env.DOTS_UP_RUN_DIR;
   delete env.DOTS_UP_STREAM_NONCE;
   delete env.DOTS_UP_EVENT_FD;
@@ -58,7 +60,33 @@ process.exitCode = found ? 1 : 0;
   return { dir, root, bin, env, git, run, write, commit, scanner, showLast, receipt };
 }
 
-test('metadata preserves ranges, rename pairs, odd paths, and binary line counts', t => {
+test('fixture Git and replay ignore inherited routing and config', gitAvailable, t => {
+  const decoy = fixture(t);
+  decoy.git('config', 'user.name', 'Temporary decoy');
+  decoy.write('file', 'decoy\n');
+  const original = decoy.commit();
+  const gitDir = path.join(decoy.root, '.git');
+  const config = fs.readFileSync(path.join(gitDir, 'config'), 'utf8');
+
+  const f = fixture(t, { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: decoy.root,
+    GIT_INDEX_FILE: path.join(gitDir, 'index') });
+  assert.equal(fs.existsSync(path.join(f.root, '.git')), true);
+  f.write('file', 'old\n');
+  const before = f.commit();
+  f.write('file', 'new\n');
+  const after = f.commit();
+  assert.equal(decoy.git('rev-parse', 'HEAD'), original);
+  assert.equal(fs.readFileSync(path.join(gitDir, 'config'), 'utf8'), config);
+  assert.equal(saveReceipt(f.root, f.receipt(before, after)), true);
+
+  // This invalid config override would also make the replay's Git calls fail.
+  const replay = fixture(t, { ...process.env, GIT_DIR: gitDir, GIT_CONFIG_PARAMETERS: 'invalid' });
+  const result = replay.showLast(f.root);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /edited file/);
+});
+
+test('metadata preserves ranges, rename pairs, odd paths, and binary line counts', gitAvailable, t => {
   const f = fixture(t);
   const odd = 'a\tfile\nname', renamed = 'new name';
   f.write(odd, 'unchanged\n');
@@ -101,7 +129,7 @@ test('metadata preserves ranges, rename pairs, odd paths, and binary line counts
   assert.doesNotMatch(formatReceipt(explicit), /Legacy issue/);
 });
 
-test('format shows a clean sync in one line and limits each direction to five paths', t => {
+test('format shows a clean sync in one line and limits each direction to five paths', gitAvailable, t => {
   const f = fixture(t);
   assert.equal(formatReceipt(buildReceipt(f.root, { header: 'dots sync: no local changes · nothing to push' })), 'Sync is up to date.');
   f.write('base', '');
@@ -123,7 +151,7 @@ test('format shows a clean sync in one line and limits each direction to five pa
   assert.match(rows[5], /Shared on dev · … 1 more/);
 });
 
-test('latest finished receipt is atomic worktree-local metadata and reports pruned endpoints', t => {
+test('latest finished receipt is atomic worktree-local metadata and reports pruned endpoints', gitAvailable, t => {
   const f = fixture(t);
   f.write('file', 'original\n');
   const before = f.commit();
@@ -171,7 +199,7 @@ test('latest finished receipt is atomic worktree-local metadata and reports prun
   assert.equal(f.showLast().status, 1);
 });
 
-test('inline shows only a complete bounded patch from immutable Git endpoints', t => {
+test('inline shows only a complete bounded patch from immutable Git endpoints', gitAvailable, t => {
   const f = fixture(t);
   f.write('.gitattributes', 'text diff=marker\n');
   f.write('text', 'first\noriginal\nlast\n');
@@ -214,7 +242,7 @@ test('inline shows only a complete bounded patch from immutable Git endpoints', 
   assert.equal(terminalEdit('x'.repeat(5000) + '\n', 6000), '');
 });
 
-test('inline suppresses binary, unsafe paths and bytes, secrets on either side, and scan failure', t => {
+test('inline suppresses binary, unsafe paths and bytes, secrets on either side, and scan failure', gitAvailable, t => {
   const f = fixture(t);
   f.write('removed', 'SCAN_ALERT\n');
   f.write('context', 'SCAN_ALERT\nold\n');
@@ -253,7 +281,7 @@ test('inline suppresses binary, unsafe paths and bytes, secrets on either side, 
     scanBlocked: true,
   }), options), '');
   assert.equal(inlinePatch(f.root, f.receipt(before, after), { ...options, gitleaks: path.join(f.dir, 'missing') }), '');
-  for (const contents of ['exit 2', 'echo "scanner did not run"']) {
+  for (const contents of ['exit 2', 'exit 0', 'echo "scanner did not run"', 'echo "[]"; echo warning >&2']) {
     const failed = path.join(f.dir, 'scanner-failure');
     fs.writeFileSync(failed, '#!/bin/sh\n' + contents + '\n', { mode: 0o700 });
     assert.equal(inlinePatch(f.root, f.receipt(before, after), { ...options, gitleaks: failed }), '');
@@ -261,7 +289,7 @@ test('inline suppresses binary, unsafe paths and bytes, secrets on either side, 
   assert.match(inlinePatch(f.root, f.receipt(before, after), options), /\+visible/);
 });
 
-test('inline permits two files and suppresses a receipt with three', t => {
+test('inline permits two files and suppresses a receipt with three', gitAvailable, t => {
   const f = fixture(t);
   for (const name of ['first', 'second', 'third']) f.write(name, 'body\n');
   const before = f.commit();
@@ -275,17 +303,63 @@ test('inline permits two files and suppresses a receipt with three', t => {
   assert.equal(inlinePatch(f.root, f.receipt(before, afterThree), options), '');
 });
 
-test('interactive last screens large mixed groups and opens restricted less for search and quit', { skip:
-  spawnSync('python3', ['--version']).status !== 0 || spawnSync('less', ['--version']).status !== 0,
-}, t => {
+test('interactive replay limits retained patch bytes across groups and keeps smaller patches', requires('git', 'cat'), t => {
+  const f = fixture(t);
+  f.write('base', '');
+  const before = f.commit();
+  for (let i = 0; i < 10; i++) f.write('large-' + i, 'x'.repeat(60000) + '\n');
+  const middle = f.commit();
+  for (let i = 10; i < 20; i++) f.write('large-' + i, 'x'.repeat(60000) + '\n');
+  f.write('small', 'small screened body\n');
+  const after = f.commit();
+  assert.equal(saveReceipt(f.root, f.receipt(before, after, { groups: [
+    { kind: 'received', before, after: middle }, { kind: 'saved', before: middle, after },
+  ] })), true);
+
+  fs.writeFileSync(f.scanner, '#!/bin/sh\nif [ "$1" = stdin ]; then cat >/dev/null; fi\necho "[]"\n');
+  fs.writeFileSync(path.join(f.bin, 'less'), '#!/bin/sh\nexec cat\n', { mode: 0o700 });
+  // Exercise the byte cap independently of machine speed. The PTY test below
+  // exercises the real clock and pager.
+  const tty = 'process.stdin.isTTY = process.stdout.isTTY = true; Object.defineProperty(performance, "now", {value: () => 0}); ';
+  const result = spawnSync(process.execPath, [...show.slice(0, 2), tty + show[2], modulePath, f.root], {
+    env: { ...f.env, PATH: f.bin + path.delimiter + f.env.PATH, DOTS_RECEIPT_GITLEAKS: f.scanner },
+    encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 30000,
+  });
+  assert.equal(result.status, 0, result.stderr || result.error);
+  const [metadata, patches] = result.stdout.split('\n\nUpdated in this checkout\n');
+  assert.match(metadata, /added large-19/);
+  assert.match(metadata, /Patch omitted for 3 files\./);
+  assert.equal(patches.match(/^    \+x/gm)?.length, 17);
+  assert.match(patches, /\+small screened body/);
+  assert.ok(Buffer.byteLength(patches) <= 1024 * 1024);
+});
+
+test('interactive last keeps screened patches and opens restricted less after a slow scan',
+  requires('git', 'python3', 'less', 'bash', 'dirname'), t => {
   const f = fixture(t);
   f.write('text', 'original\n');
   for (let i = 0; i < 22; i++) f.write('binary-' + i, Buffer.from([0, 1]));
   const before = f.commit();
   f.write('text', 'new display body\n');
   for (let i = 0; i < 22; i++) f.write('binary-' + i, Buffer.from([0, 2]));
+  f.write('z-slow', 'HANG_SCAN\n');
+  f.write('zz-later', 'later unscreened body\n');
   const after = f.commit();
-  saveReceipt(f.root, f.receipt(before, after, { source: 'up' }));
+  f.write('later-group', 'later group unscreened body\n');
+  const last = f.commit();
+  saveReceipt(f.root, f.receipt(before, after, { source: 'up', groups: [
+    { kind: 'received', before, after }, { kind: 'saved', before: after, after: last },
+  ] }));
+  const stall = path.join(f.dir, 'scanner-stalled');
+  const scanned = path.join(f.dir, 'scanner-input');
+  fs.appendFileSync(f.scanner, `
+if (mode === 'stdin') fs.appendFileSync(${JSON.stringify(scanned)}, body);
+if (body.includes('HANG_SCAN')) {
+  fs.writeFileSync(${JSON.stringify(stall)}, '');
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+}
+`);
   const stamp = path.join(f.dir, 'pager-shell-escape');
   const driver = String.raw`
 import errno, fcntl, os, pty, re, select, signal, struct, sys, termios, time
@@ -315,8 +389,12 @@ def expect(needle):
 
 try:
     expect(b"Latest sync")
-    os.write(tty, b"/Patch omitted for 22 files\n")
-    expect(b"Patch omitted for 22 files.")
+    os.write(tty, b"/Patch omitted for 24 files\n")
+    expect(b"Patch omitted for 24 files.")
+    os.write(tty, b"/added later-group\n")
+    expect(b"added later-group")
+    os.write(tty, b"/Patch omitted for 1 file\n")
+    expect(b"Patch omitted for 1 file.")
     output.clear()
     os.write(tty, b"/new display body\n")
     expect(b"+new display body")
@@ -366,5 +444,7 @@ finally:
     encoding: 'utf8', timeout: 20000,
   });
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(stall), true);
+  assert.doesNotMatch(fs.readFileSync(scanned, 'utf8'), /unscreened body/);
   assert.equal(fs.existsSync(stamp), false);
 });

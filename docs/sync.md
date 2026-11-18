@@ -87,6 +87,8 @@ Use `dots sync --last` to inspect the latest finished sync for this checkout,
 including the sync at the beginning of `dots up`.
 Search with `/` in the pager and press `q` to return.
 Replay reads the recorded Git revisions locally.
+It spends up to three seconds screening patches and retains up to 1 MiB for the pager.
+The pager lists every recorded file and counts omitted patches.
 Piped output and saved reports contain metadata only.
 Binary, encrypted and unverified changes remain visible as file entries.
 Showing a patch requires Gitleaks to return a clean JSON report.

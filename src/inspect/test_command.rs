@@ -12,7 +12,10 @@ pub fn test(ctx: &Ctx, args: &[OsString]) -> Result<u8, Fail> {
     }
     let stage = run.start("Configuration tests");
     let (status, diagnostic) = match run_tests(ctx, &run, stage, args) {
-        Ok(status) => (status, format!("tests/run exited {status}")),
+        Ok(status) => (
+            status,
+            format!("Configuration tests failed (exit {status})"),
+        ),
         Err(error) => {
             if !run.cancelled() {
                 eprintln!("dots: {error}");

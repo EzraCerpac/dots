@@ -104,3 +104,58 @@ fn new_test_refuses_to_interpret_a_nonexecutable_script() {
         "{output:?}"
     );
 }
+
+#[test]
+fn new_test_runs_executable_files_directly_without_a_shell_fallback() {
+    for script in [
+        "#!/synthetic/missing/test-interpreter\nprintf 'unexpected child output\\n'\n",
+        "printf 'shell fallback ran\\n'\n",
+    ] {
+        let world = setup(script, 0o700);
+        let output = world
+            .dots()
+            .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
+            .arg("test")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(!output.stderr.is_empty());
+        let reports = world.home().join(".local/state/dots/reports");
+        let report = fs::read_dir(reports).unwrap().next().unwrap().unwrap();
+        let data: serde_json::Value =
+            serde_json::from_slice(&fs::read(report.path()).unwrap()).unwrap();
+        assert_eq!(
+            data["stages"][0]["issues"][0]["diagnostic"],
+            "Configuration tests failed (exit 1)"
+        );
+    }
+}
+
+#[test]
+fn new_test_preserves_dots_context_after_mise_applies_config_environment() {
+    let world = setup(
+        r#"#!/bin/sh
+printf '%s\n' "$DOTS_ROOT" "$DOTS_PROFILE" "$SYNTHETIC"
+dots root
+"#,
+        0o700,
+    );
+    fs::write(
+        world.root().join("config.laptop.toml"),
+        "[env]\nDOTS_ROOT='/synthetic/wrong'\nDOTS_PROFILE='wrong'\nSYNTHETIC='configured'\n",
+    )
+    .unwrap();
+    let output = world
+        .dots()
+        .env("SETUP_PROFILE", "laptop")
+        .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
+        .arg("test")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{0}\nlaptop\nconfigured\n{0}\n", world.root().display()),
+    );
+}

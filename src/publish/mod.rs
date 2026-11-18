@@ -1,8 +1,10 @@
 mod repo;
 mod scan;
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
+use nix::libc;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
 
@@ -34,10 +36,14 @@ pub fn publish(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let stage = run.start("Publish source");
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = stdin.lock();
     let mut output = stdout.lock();
     let mut terminal = Terminal {
-        input: (stdin.is_terminal() && stdout.is_terminal()).then_some(&mut input),
+        input: (stdin.is_terminal() && stdout.is_terminal()).then(|| {
+            BufReader::new(PromptInput {
+                run: &run,
+                stdin: stdin.as_fd(),
+            })
+        }),
         output: &mut output,
     };
     let result = publish_source(ctx, &run, selection, &mut terminal);
@@ -417,7 +423,7 @@ fn pull_number(url: &str, slug: &str) -> Option<u64> {
 }
 
 struct Terminal<'a> {
-    input: Option<&'a mut dyn BufRead>,
+    input: Option<BufReader<PromptInput<'a>>>,
     output: &'a mut dyn Write,
 }
 
@@ -431,12 +437,12 @@ impl Terminal<'_> {
             .input
             .as_mut()
             .ok_or_else(|| failure("publishing requires confirmation in a terminal"))?;
+        input.get_ref().check_cancelled().map_err(input_error)?;
         write!(self.output, "{label} ").map_err(output_error)?;
         self.output.flush().map_err(output_error)?;
         let mut answer = String::new();
-        input
-            .read_line(&mut answer)
-            .map_err(|_| failure("could not read publication confirmation"))?;
+        input.read_line(&mut answer).map_err(input_error)?;
+        input.get_ref().check_cancelled().map_err(input_error)?;
         Ok(answer.trim().to_owned())
     }
 
@@ -446,6 +452,103 @@ impl Terminal<'_> {
             Ok(())
         } else {
             Err(failure("publication cancelled; nothing was pushed"))
+        }
+    }
+}
+
+struct PromptInput<'a> {
+    run: &'a Run<'a>,
+    stdin: BorrowedFd<'a>,
+}
+
+impl PromptInput<'_> {
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.run.cancelled() {
+            // BufRead::read_line retries Interrupted, including when a
+            // partial line was already read.
+            return Err(io::Error::other("publication was interrupted"));
+        }
+        Ok(())
+    }
+}
+
+impl Read for PromptInput<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let fd = self.stdin.as_raw_fd();
+        if tty_flags(fd)? & libc::O_ACCMODE == libc::O_WRONLY {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        let mut input = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            self.check_cancelled()?;
+            // A bounded wait covers signals delivered just before poll starts.
+            let ready = unsafe { libc::poll(&mut input, 1, 100) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            if ready <= 0 {
+                continue;
+            }
+            self.check_cancelled()?;
+            match read_prompt_bytes(fd, bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+fn read_prompt_bytes(fd: RawFd, bytes: &mut [u8]) -> io::Result<usize> {
+    let flags = tty_flags(fd)?;
+    let restore = flags & libc::O_NONBLOCK == 0;
+    // Ctrl-C can flush the input after poll. Temporarily use a nonblocking
+    // read and restore the caller's flags before returning to the wait loop.
+    if restore {
+        set_tty_flags(fd, flags | libc::O_NONBLOCK)?;
+    }
+    let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    let result = if count < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(count as usize)
+    };
+    if restore {
+        set_tty_flags(fd, flags)?;
+    }
+    result
+}
+
+fn tty_flags(fd: RawFd) -> io::Result<libc::c_int> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+fn set_tty_flags(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
+    loop {
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } != -1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -481,4 +584,102 @@ fn failure(message: impl Into<String>) -> Fail {
 
 fn output_error(_: io::Error) -> Fail {
     failure("could not write publication output")
+}
+
+fn input_error(_: io::Error) -> Fail {
+    failure("could not read publication confirmation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{CStr, OsStr};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::PathBuf;
+
+    fn open_pty() -> (File, File, PathBuf) {
+        let (mut master, mut slave) = (-1, -1);
+        let mut name = [0; libc::PATH_MAX as usize];
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    name.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            let path = OsStr::from_bytes(CStr::from_ptr(name.as_ptr()).to_bytes()).into();
+            (File::from_raw_fd(master), File::from_raw_fd(slave), path)
+        }
+    }
+
+    #[test]
+    fn prompts_use_only_the_inherited_terminal() {
+        let (mut master, _slave, path) = open_pty();
+        let mut opts = OpenOptions::new();
+        opts.custom_flags(libc::O_NOCTTY);
+        let stdin = opts.clone().read(true).open(&path).unwrap();
+        let write_only = opts.clone().write(true).open(&path).unwrap();
+        let fd = stdin.as_raw_fd();
+        let flags = tty_flags(fd).unwrap();
+        assert_eq!(flags & (libc::O_NONBLOCK | libc::O_ACCMODE), libc::O_RDONLY);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCEXCL) }, 0);
+            assert_eq!(
+                opts.read(true).open(&path).unwrap_err().raw_os_error(),
+                Some(libc::EBUSY)
+            );
+        }
+        let (mut other_master, mut other_slave, _) = open_pty();
+        other_master.write_all(b"yes\n").unwrap();
+
+        let private = tempfile::tempdir().unwrap();
+        let env = crate::Env {
+            vars: [("XDG_STATE_HOME".into(), private.path().as_os_str().into())].into(),
+            cwd: private.path().into(),
+        };
+        let ctx = Ctx {
+            root: crate::config::Root::from_dir(&env, private.path()).unwrap(),
+            env,
+            flags: crate::Flags::default(),
+        };
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let mut terminal = Terminal {
+            input: Some(BufReader::new(PromptInput {
+                run: &run,
+                stdin: stdin.as_fd(),
+            })),
+            output: &mut other_slave,
+        };
+        master.write_all("Résumé\nno\nyes\n".as_bytes()).unwrap();
+        assert_eq!(terminal.ask("Description").unwrap(), "Résumé");
+        let decline = terminal.confirm("Publish?").unwrap_err();
+        assert_eq!(
+            decline.diagnostic,
+            "publication cancelled; nothing was pushed"
+        );
+        terminal.confirm("Publish?").unwrap();
+        assert_eq!(tty_flags(fd).unwrap(), flags);
+        master.write_all(b"\x04").unwrap();
+        assert_eq!(terminal.ask("Description").unwrap(), "");
+        assert_eq!(tty_flags(fd).unwrap(), flags);
+
+        terminal.input = Some(BufReader::new(PromptInput {
+            run: &run,
+            stdin: write_only.as_fd(),
+        }));
+        master.write_all(b"yes\n").unwrap();
+        let refusal = terminal.confirm("Publish?").unwrap_err();
+        assert_eq!(
+            refusal.diagnostic,
+            "could not read publication confirmation"
+        );
+    }
 }

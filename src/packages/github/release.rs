@@ -318,8 +318,20 @@ impl Release {
                         == 1
                 })
             });
-        let pattern = explicit.or(automatic.as_deref()).unwrap_or(&asset.name);
-        tool_options(pattern, prefix, explicit.is_none(), platform, hook)
+        // mise handles '*' and '?' as wildcards and interprets '+' as a
+        // regex metacharacter. Give it only the common wildcard subset or
+        // an exact spelling of the selected asset.
+        let portable_override = explicit.filter(|pattern| {
+            pattern
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_. -?*".contains(&byte))
+        });
+        let pattern = match explicit {
+            Some(_) => portable_override.unwrap_or(&asset.name),
+            None => automatic.as_deref().unwrap_or(&asset.name),
+        };
+        let mise_pattern = pattern.replace('+', "[+]");
+        tool_options(&mise_pattern, prefix, explicit.is_none(), platform, hook)
     }
 }
 
@@ -571,6 +583,24 @@ mod tests {
         let cli = release.declaration(asset, Some("Tool-*.zip"), MAC, None);
         assert_eq!(cli["asset_pattern"].as_str(), Some("Tool-*.zip"));
         assert!(cli.get("postinstall").is_none());
+    }
+
+    #[test]
+    fn declaration_matches_literal_plus_in_selected_asset() {
+        let release = release(&["Tool+1.2.0-macos-arm64.zip", "Tool1.2.0-macos-arm64.zip"]);
+        let explicit = "Tool+1.2.0-*.zip";
+        let asset = release
+            .select(Some(&Pattern::new(explicit).unwrap()), MAC)
+            .unwrap();
+        assert_eq!(
+            release.declaration(asset, Some(explicit), MAC, None)["asset_pattern"].as_str(),
+            Some("Tool[+]1.2.0-macos-arm64.zip")
+        );
+        assert_eq!(
+            release.declaration(asset, None, MAC, None)["platform_macos_arm64_asset_pattern"]
+                .as_str(),
+            Some("Tool[+]*-macos-arm64.zip")
+        );
     }
 
     #[test]

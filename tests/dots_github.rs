@@ -1,21 +1,37 @@
+#[path = "support/github_env.rs"]
+mod github_env;
 mod support;
 
 use std::{fs, os::unix::fs::symlink, process::Command};
 
 use support::World;
 
+fn dots(world: &World) -> Command {
+    let mut cmd = world.dots();
+    cmd.envs(github_env::private_environment(
+        world.home().parent().unwrap(),
+        world.home(),
+        world.root(),
+    ))
+    .env(
+        "PATH",
+        std::env::var_os("DOTS_TEST_TOOL_PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+    );
+    cmd
+}
+
 #[test]
 fn unchanged_homebrew_prefix_link_launches_dots_without_dots_on_path() {
     let world = World::new();
-    let dots = world.dots();
-    let expected = world.dots().arg("--version").output().unwrap();
+    let baseline = dots(&world);
+    let expected = dots(&world).arg("--version").output().unwrap();
     assert!(expected.status.success(), "{expected:?}");
     let prefix = world.home().join("brew with spaces");
     let keg = prefix.join("Cellar/dots/fixture/bin");
     let bin = prefix.join("bin");
     fs::create_dir_all(&keg).unwrap();
     fs::create_dir(&bin).unwrap();
-    symlink(dots.get_program(), keg.join("dots")).unwrap();
+    symlink(baseline.get_program(), keg.join("dots")).unwrap();
     let stable = bin.join("dots");
     symlink("../Cellar/dots/fixture/bin/dots", &stable).unwrap();
 
@@ -25,7 +41,8 @@ fn unchanged_homebrew_prefix_link_launches_dots_without_dots_on_path() {
         .current_dir(world.root())
         .env_clear()
         .envs(
-            dots.get_envs()
+            baseline
+                .get_envs()
                 .filter_map(|(key, value)| value.map(|value| (key, value))),
         )
         .env("PATH", "/usr/bin:/bin")
@@ -41,8 +58,7 @@ fn unchanged_rejects_a_github_release_page_as_a_repository() {
     let world = World::new();
     let config = world.root().join("config.toml");
     let before = fs::read(&config).unwrap();
-    let result = world
-        .dots()
+    let result = dots(&world)
         .args(["add", "--base", "https://github.com/example/tool/releases"])
         .output()
         .unwrap();
@@ -57,8 +73,7 @@ fn new_callback_preflight_needs_no_dots_configuration() {
     let world = World::new();
     fs::remove_file(world.root().join("config.toml")).unwrap();
 
-    let result = world
-        .dots()
+    let result = dots(&world)
         .args(["install-release-app", "example/tool"])
         .output()
         .unwrap();
@@ -73,8 +88,7 @@ fn new_callback_preflight_needs_no_dots_configuration() {
             fs::create_dir_all(&contents).unwrap();
             fs::write(contents.join("Info.plist"), b"synthetic").unwrap();
         }
-        let result = world
-            .dots()
+        let result = dots(&world)
             .args(["install-release-app", "example/tool"])
             .env("MISE_TOOL_INSTALL_PATH", &release)
             .output()
@@ -85,5 +99,12 @@ fn new_callback_preflight_needs_no_dots_configuration() {
     } else {
         assert!(stderr.contains("requires macOS"), "{stderr}");
     }
-    assert!(!world.home().join(".local/state/dots/github-apps").exists());
+    assert!(
+        !world
+            .home()
+            .parent()
+            .unwrap()
+            .join("xdg-state/dots/github-apps")
+            .exists()
+    );
 }

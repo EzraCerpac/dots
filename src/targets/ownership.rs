@@ -1,12 +1,13 @@
 use super::names;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedApp {
@@ -17,8 +18,52 @@ pub struct OwnedApp {
 }
 
 impl OwnedApp {
-    pub(crate) fn read_marker(marker: &Path, applications: &Path) -> Result<Self, OwnershipError> {
-        read_record(marker, applications)?.app
+    pub(crate) fn read_marker(
+        marker: &Path,
+        applications: &Path,
+    ) -> Result<(Self, Option<AppInstallation>), OwnershipError> {
+        let record = read_record(marker, applications)?;
+        Ok((record.app?, record.installation))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn for_release(
+        dir: &Path,
+        applications: &Path,
+        repo: &str,
+        bundle_id: &str,
+    ) -> Result<Vec<Self>, OwnershipError> {
+        let id = format!("github:{repo}");
+        let mut apps = Vec::new();
+        for record in read(dir, applications)? {
+            let record = record?;
+            if record.id == id && record.bundle_id == bundle_id {
+                apps.push(record.app?);
+            }
+        }
+        Ok(apps)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AppInstallation {
+    device: u64,
+    inode: u64,
+    created: SystemTime,
+}
+
+impl AppInstallation {
+    pub(crate) fn from_metadata(meta: &fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+            created: meta.created()?,
+        })
+    }
+
+    pub(crate) fn matches(self, meta: &fs::Metadata) -> bool {
+        Self::from_metadata(meta).is_ok_and(|current| current == self)
     }
 }
 
@@ -44,12 +89,16 @@ struct Marker {
     repo: String,
     path: String,
     bundle_id: String,
+    installation: Option<AppInstallation>,
 }
 
 pub(super) struct Record {
     pub id: String,
     pub alias: String,
     pub app: Result<OwnedApp, OwnershipError>,
+    #[cfg(target_os = "macos")]
+    bundle_id: String,
+    installation: Option<AppInstallation>,
 }
 
 pub(super) fn read(
@@ -146,13 +195,16 @@ fn read_record(marker: &Path, applications: &Path) -> Result<Record, OwnershipEr
                 marker: marker.to_owned(),
                 repo,
                 path: path.to_owned(),
-                bundle_id: owner.bundle_id,
+                bundle_id: owner.bundle_id.clone(),
             })
     };
     Ok(Record {
         id,
         alias: names::fold(alias),
         app,
+        #[cfg(target_os = "macos")]
+        bundle_id: owner.bundle_id,
+        installation: owner.installation,
     })
 }
 

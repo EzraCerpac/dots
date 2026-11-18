@@ -1,6 +1,9 @@
 mod app;
 mod archive;
 mod release;
+#[cfg(test)]
+#[path = "../../../tests/support/github_env.rs"]
+mod test_env;
 
 use glob::Pattern;
 use std::{fmt::Write, path::Path};
@@ -214,12 +217,15 @@ mod tests {
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&exe, fixture.path().join("bin/dots")).unwrap();
         let env = Env {
-            vars: Default::default(),
+            vars: test_env::private_environment(fixture.path(), fixture.path(), fixture.path())
+                .into_iter()
+                .collect(),
             cwd: fixture.path().to_owned(),
         };
         let result = Command::new("/bin/sh")
             .args(["-c", &app_hook(&exe, &env, "owner/tool").unwrap()])
             .env_clear()
+            .envs(&env.vars)
             .env("PATH", "")
             .output()
             .unwrap();

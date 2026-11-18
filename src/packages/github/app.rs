@@ -40,23 +40,33 @@ fn validate_ownership(
     if app.marker.as_os_str() != state.join(filename).as_os_str() {
         return Err(invalid());
     }
-    let recorded = OwnedApp::read_marker(&app.marker, applications).map_err(|error| {
-        failure(format!(
-            "invalid GitHub app ownership {}: {}",
-            error.path.display(),
-            error.detail
-        ))
-    })?;
+    let (recorded, installation) =
+        OwnedApp::read_marker(&app.marker, applications).map_err(ownership_error)?;
     if recorded != *app || recorded.path.as_os_str() != app.path.as_os_str() {
         return Err(invalid());
     }
-    if metadata(&app.path)?.is_some() && bundle_id(ctx, &app.path, true)? != app.bundle_id {
-        return Err(failure(format!(
-            "installed app identity differs at {}; refusing to change it",
-            app.path.display()
-        )));
+    if let Some(meta) = metadata(&app.path)? {
+        if let Some(installation) = installation
+            && !installation.matches(&meta)
+        {
+            return Err(invalid());
+        }
+        if bundle_id(ctx, &app.path, true)? != app.bundle_id {
+            return Err(failure(format!(
+                "installed app identity differs at {}; refusing to change it",
+                app.path.display()
+            )));
+        }
     }
     Ok(())
+}
+
+fn ownership_error(error: crate::targets::OwnershipError) -> Fail {
+    failure(format!(
+        "invalid GitHub app ownership {}: {}",
+        error.path.display(),
+        error.detail
+    ))
 }
 
 fn marker_directory(ctx: &Ctx) -> Result<PathBuf, Fail> {
@@ -222,7 +232,7 @@ mod macos {
     use nix::libc;
     use serde_json::json;
 
-    use crate::targets::{github_repo, marker_filename};
+    use crate::targets::{AppInstallation, github_repo, marker_filename};
 
     use super::*;
 
@@ -317,24 +327,32 @@ mod macos {
         let identifier = bundle_id(ctx, source, false)?;
         let target = applications.join(name);
         let marker = state.join(marker_filename(name));
-        let existed = metadata(&target)?;
-        let recorded = metadata(&marker)?.is_some();
-        if existed.is_some() && !recorded {
+        let previous = OwnedApp::for_release(state, applications, repo, &identifier)
+            .map_err(ownership_error)?;
+        let previous = match previous.as_slice() {
+            [] => None,
+            [app] => Some(app),
+            _ => {
+                return Err(failure(
+                    "multiple managed apps match this GitHub release; refusing to replace them",
+                ));
+            }
+        };
+        let previous_node = if let Some(app) = previous {
+            validate_ownership(ctx, applications, state, app)?;
+            metadata(&app.path)?.as_ref().map(node)
+        } else {
+            None
+        };
+        let same_marker = previous.is_some_and(|app| app.marker == marker);
+        if metadata(&marker)?.is_some() && !same_marker
+            || metadata(&target)?.is_some_and(|meta| Some(node(&meta)) != previous_node)
+        {
             return Err(failure(format!(
-                "{} already exists and is not managed by dots for {repo}; move it before installing",
+                "{} already exists or has an ownership record outside this GitHub release",
                 target.display()
             )));
         }
-        let ownership = OwnedApp {
-            repo: repo.to_owned(),
-            path: target.clone(),
-            bundle_id: identifier,
-            marker,
-        };
-        if recorded {
-            validate_ownership(ctx, applications, state, &ownership)?;
-        }
-        let old_node = existed.as_ref().map(node);
         let directory = tempfile::Builder::new()
             .prefix(".dots-github-")
             .tempdir_in(applications)
@@ -351,7 +369,7 @@ mod macos {
             ],
         )?;
         native(ctx, "/usr/sbin/dot_clean", [stage.as_os_str()])?;
-        if bundle_id(ctx, &stage, true)? != ownership.bundle_id {
+        if bundle_id(ctx, &stage, true)? != identifier {
             return Err(failure(
                 "GitHub release app identity changed during staging",
             ));
@@ -372,64 +390,89 @@ mod macos {
             ],
         )?;
 
-        // Build the new marker before the first visible app change. An upgrade
-        // of the same app keeps its existing ownership marker.
-        let pending_marker = if recorded {
-            validate_ownership(ctx, applications, state, &ownership)?;
-            None
-        } else {
-            fs::create_dir_all(state).map_err(|err| path_error(state, err))?;
-            let mut pending =
-                tempfile::NamedTempFile::new_in(state).map_err(|err| path_error(state, err))?;
-            serde_json::to_writer(
-                &mut pending,
-                &json!({"repo": repo, "path": target, "bundle_id": ownership.bundle_id}),
-            )
-            .map_err(|err| failure(format!("could not stage GitHub app ownership: {err}")))?;
-            pending.flush().map_err(|err| path_error(state, err))?;
-            pending
-                .as_file()
-                .sync_all()
-                .map_err(|err| path_error(state, err))?;
-            Some(pending)
-        };
-        let staged_node =
-            node(&fs::symlink_metadata(&stage).map_err(|err| path_error(&stage, err))?);
+        let stage_meta = fs::symlink_metadata(&stage).map_err(|err| path_error(&stage, err))?;
+        let staged_node = node(&stage_meta);
+        let installation =
+            AppInstallation::from_metadata(&stage_meta).map_err(|err| path_error(&stage, err))?;
+        fs::create_dir_all(state).map_err(|err| path_error(state, err))?;
+        let mut pending =
+            tempfile::NamedTempFile::new_in(state).map_err(|err| path_error(state, err))?;
+        serde_json::to_writer(
+            &mut pending,
+            &json!({
+                "repo": repo,
+                "path": target,
+                "bundle_id": identifier,
+                "installation": installation,
+            }),
+        )
+        .map_err(|err| failure(format!("could not stage GitHub app ownership: {err}")))?;
+        pending.flush().map_err(|err| path_error(state, err))?;
+        pending
+            .as_file()
+            .sync_all()
+            .map_err(|err| path_error(state, err))?;
 
-        if let Some(old_node) = old_node {
-            if metadata(&target)?.as_ref().map(node) != Some(old_node) {
-                return Err(failure(format!(
-                    "{} changed during installation",
-                    target.display()
-                )));
+        let backup = directory.path().join(".previous-app");
+        let mut backed_up = None;
+        let mut installed = false;
+        let mut new_marker = false;
+        let result = (|| {
+            if let Some(app) = previous {
+                validate_ownership(ctx, applications, state, app)?;
+                if metadata(&app.path)?.as_ref().map(node) != previous_node {
+                    return Err(failure(format!(
+                        "{} changed during installation",
+                        app.path.display()
+                    )));
+                }
+                if previous_node.is_some() {
+                    rename(&app.path, &backup, libc::RENAME_EXCL)
+                        .map_err(|err| path_error(&app.path, err))?;
+                    backed_up = Some(&app.path);
+                    if metadata(&backup)?.as_ref().map(node) != previous_node {
+                        return Err(failure(format!(
+                            "{} changed during installation",
+                            app.path.display()
+                        )));
+                    }
+                }
             }
-            rename(&stage, &target, libc::RENAME_SWAP).map_err(|err| path_error(&target, err))?;
-            if metadata(&stage).is_ok_and(|meta| meta.as_ref().map(node) == Some(old_node)) {
-                return Ok(());
+            rename(&stage, &target, libc::RENAME_EXCL).map_err(|err| path_error(&target, err))?;
+            installed = true;
+            if same_marker {
+                pending
+                    .persist(&marker)
+                    .map_err(|err| path_error(&marker, err.error))?;
+            } else {
+                pending
+                    .persist_noclobber(&marker)
+                    .map_err(|err| path_error(&marker, err.error))?;
+                new_marker = true;
+                if let Some(app) = previous {
+                    fs::remove_file(&app.marker).map_err(|err| path_error(&app.marker, err))?;
+                }
             }
-            return Err(rollback(
-                directory,
-                &stage,
-                &target,
-                staged_node,
-                libc::RENAME_SWAP,
-                failure(format!("{} changed during installation", target.display())),
-            ));
-        }
+            Ok(())
+        })();
 
-        rename(&stage, &target, libc::RENAME_EXCL).map_err(|err| path_error(&target, err))?;
-        if let Some(pending) = pending_marker
-            && let Err(err) = pending.persist_noclobber(&ownership.marker)
-        {
-            let issue = path_error(&ownership.marker, err.error);
-            return Err(rollback(
-                directory,
-                &stage,
-                &target,
-                staged_node,
-                libc::RENAME_EXCL,
-                issue,
-            ));
+        if let Err(issue) = result {
+            let marker_restored = !new_marker || fs::remove_file(&marker).is_ok();
+            let stage_restored = !installed
+                || (metadata(&target)
+                    .is_ok_and(|meta| meta.as_ref().map(node) == Some(staged_node))
+                    && rename(&target, &stage, libc::RENAME_EXCL).is_ok());
+            let previous_restored =
+                backed_up.is_none_or(|path| rename(&backup, path, libc::RENAME_EXCL).is_ok());
+            if marker_restored && stage_restored && previous_restored {
+                return Err(issue);
+            }
+            let recovery = directory.keep();
+            return Err(failure(format!(
+                "{issue}; inspect {} and {} to recover the staged app",
+                target.display(),
+                recovery.display()
+            )));
         }
         Ok(())
     }
@@ -438,34 +481,12 @@ mod macos {
         (meta.dev(), meta.ino())
     }
 
-    fn rollback(
-        directory: tempfile::TempDir,
-        stage: &Path,
-        target: &Path,
-        installed: (u64, u64),
-        flags: libc::c_uint,
-        issue: Fail,
-    ) -> Fail {
-        if metadata(target).is_ok_and(|meta| meta.as_ref().map(node) == Some(installed))
-            && rename(target, stage, flags).is_ok()
-        {
-            return issue;
-        }
-        let recovery = directory.keep();
-        failure(format!(
-            "{issue}; inspect {} and {} to recover the staged app",
-            target.display(),
-            recovery.display()
-        ))
-    }
-
     fn rename(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
         let c_path =
             |path: &Path| CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other);
         let from = c_path(from)?;
         let to = c_path(to)?;
-        // These flags let the kernel refuse a late collision or swap two apps
-        // without leaving a window where the installed app is absent.
+        // Keep an unrelated destination intact if it appears during publication.
         if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) } == 0 {
             Ok(())
         } else {
@@ -481,12 +502,12 @@ mod macos {
 
         fn ctx(config: &Path) -> Ctx {
             let env = Env {
-                vars: [
-                    ("DOTS_ROOT".into(), config.as_os_str().to_owned()),
-                    ("HOME".into(), config.as_os_str().to_owned()),
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                ]
-                .into(),
+                vars: crate::packages::github::test_env::private_environment(
+                    config, config, config,
+                )
+                .into_iter()
+                .chain([("PATH".into(), "/usr/bin:/bin".into())])
+                .collect(),
                 cwd: config.to_owned(),
             };
             Ctx {
@@ -577,9 +598,93 @@ mod macos {
                 fs::read(target.join("Contents/MacOS/fixture")).unwrap(),
                 b"upgrade"
             );
+            let trash = fixture.path().join("Trash");
+            fs::create_dir(&trash).unwrap();
+            fs::rename(&target, trash.join("Tool.app")).unwrap();
+            bundle(&target, "example.tool", b"manual replacement");
+            assert!(validate_ownership(&ctx, &applications, &state, &owned).is_err());
+            assert!(publish(&ctx, &source, "owner/tool", &applications, &state).is_err());
+            assert_eq!(
+                fs::read(target.join("Contents/MacOS/fixture")).unwrap(),
+                b"manual replacement"
+            );
             fs::remove_dir_all(&target).unwrap();
             symlink(&source, &target).unwrap();
             assert!(validate_ownership(&ctx, &applications, &state, &owned).is_err());
+        }
+
+        #[test]
+        fn unchanged_legacy_marker_allows_owned_upgrade_and_rename() {
+            for replacement in ["Tool.app", "Tool Renamed.app", "tool.app"] {
+                let fixture = tempfile::tempdir().unwrap();
+                let applications = fixture.path().join("Applications");
+                let state = fixture.path().join("markers");
+                let old = applications.join("Tool.app");
+                let marker = state.join(marker_filename("Tool.app"));
+                fs::create_dir_all(&state).unwrap();
+                bundle(&old, "example.tool", b"legacy");
+                let legacy = serde_json::to_vec(&json!({
+                    "repo": "Owner/Tool",
+                    "path": old,
+                    "bundle_id": "example.tool",
+                }))
+                .unwrap();
+                fs::write(&marker, &legacy).unwrap();
+                let ctx = ctx(fixture.path());
+                let (owned, proof) = OwnedApp::read_marker(&marker, &applications).unwrap();
+                assert!(proof.is_none());
+                validate_ownership(&ctx, &applications, &state, &owned).unwrap();
+                assert_eq!(fs::read(&marker).unwrap(), legacy);
+
+                let source = fixture.path().join("release").join(replacement);
+                bundle(&source, "example.tool", b"upgrade");
+                publish(&ctx, &source, "owner/tool", &applications, &state).unwrap();
+                let expected = applications.join(replacement);
+                let entries = children(&applications).unwrap().collect::<Vec<_>>();
+                assert_eq!(entries, [expected.clone()]);
+                let new_marker = state.join(marker_filename(replacement));
+                let (owned, proof) = OwnedApp::read_marker(&new_marker, &applications).unwrap();
+                assert!(proof.is_some());
+                validate_ownership(&ctx, &applications, &state, &owned).unwrap();
+                assert_eq!(
+                    fs::read(expected.join("Contents/MacOS/fixture")).unwrap(),
+                    b"upgrade"
+                );
+                assert_eq!(children(&state).unwrap().collect::<Vec<_>>(), [new_marker]);
+            }
+        }
+
+        #[test]
+        fn refuses_ambiguous_rename_without_replacing_either_app() {
+            let fixture = tempfile::tempdir().unwrap();
+            let applications = fixture.path().join("Applications");
+            let state = fixture.path().join("markers");
+            fs::create_dir_all(&state).unwrap();
+            for name in ["One.app", "Two.app"] {
+                let path = applications.join(name);
+                bundle(&path, "example.tool", name.as_bytes());
+                fs::write(
+                    state.join(marker_filename(name)),
+                    serde_json::to_vec(&json!({
+                        "repo": "owner/tool", "path": path, "bundle_id": "example.tool",
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let source = fixture.path().join("Renamed.app");
+            bundle(&source, "example.tool", b"new");
+            let error = publish(
+                &ctx(fixture.path()),
+                &source,
+                "owner/tool",
+                &applications,
+                &state,
+            )
+            .unwrap_err();
+            assert!(error.diagnostic.contains("multiple managed apps"));
+            assert_eq!(children(&applications).unwrap().count(), 2);
+            assert_eq!(children(&state).unwrap().count(), 2);
         }
 
         #[test]

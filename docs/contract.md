@@ -417,6 +417,7 @@ As in 0.4.0, in concise output, including headless runs and `--plain`, hooks and
 Every other individual command that `dots` supervises, `dots status` included, writes directly to the terminal's scrollback.
 Its child runs in the caller's foreground, so a native prompt such as `sudo` or `ssh` reads the terminal as usual.
 It reads the caller's stdin, which may be redirected, and its stdout and stderr reach the caller's separately and byte for byte, even when the reader is slow.
+For native transports that `dots` runs as part of [settings history](#settings-history), `dots` reports its own diagnostic and keeps the transport's verbatim error out of these streams.
 For these commands, `dots` adds no banner, footer or second copy of a diagnostic around that output.
 When such a command is marked "report", its report keeps its stages' outcomes and its exit status, but not the child's raw output or a log path that does not exist.
 

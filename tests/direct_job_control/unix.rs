@@ -7,13 +7,25 @@ use std::time::{Duration, Instant};
 pub type Pid = libc::pid_t;
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn wait_for<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+pub fn wait_for<T>(what: &str, ready: impl FnMut() -> Option<T>) -> T {
+    wait_for_with(what, ready, String::new)
+}
+
+pub fn wait_for_with<T>(
+    what: &str,
+    mut ready: impl FnMut() -> Option<T>,
+    details: impl FnOnce() -> String,
+) -> T {
     let deadline = Instant::now() + TIMEOUT;
     loop {
         if let Some(value) = ready() {
             return value;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what} {}",
+            details()
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -97,6 +109,26 @@ pub fn session(pid: Pid) -> Pid {
 
 pub fn group(pid: Pid) -> Pid {
     unsafe { libc::getpgid(pid) }
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_name(pid: Pid) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_name(pid: Pid) -> String {
+    let mut bytes = [0; 256];
+    let len = unsafe { libc::proc_name(pid, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+    if len <= 0 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes[..len as usize])
+        .trim_end_matches('\0')
+        .to_owned()
 }
 
 pub fn signal(pid: Pid, signal: libc::c_int) -> io::Result<()> {

@@ -15,7 +15,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use support::World;
 use unix::*;
 
@@ -26,6 +26,7 @@ static FIXTURE: Mutex<()> = Mutex::new(());
 struct Fixture {
     world: World,
     control: PathBuf,
+    started: SystemTime,
     _slot: MutexGuard<'static, ()>,
 }
 
@@ -34,6 +35,7 @@ impl Fixture {
         let slot = FIXTURE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started = SystemTime::now();
         let world = World::new();
         let control = world.home().join("direct");
         fixture::install(world.root(), &control);
@@ -41,6 +43,7 @@ impl Fixture {
         Self {
             world,
             control,
+            started,
             _slot: slot,
         }
     }
@@ -64,8 +67,20 @@ impl Fixture {
         command
     }
 
-    fn identity(&self, role: &str) -> Identity {
-        wait_for(role, || Identity::read(&self.control.join(role)))
+    fn launch_times(&self) -> Vec<(&'static str, u128)> {
+        ["dots-pid", "mise-start", "script-start", "stage"]
+            .into_iter()
+            .filter_map(|marker| {
+                let modified = fs::metadata(self.control.join(marker))
+                    .ok()?
+                    .modified()
+                    .ok()?;
+                Some((
+                    marker,
+                    modified.duration_since(self.started).ok()?.as_millis(),
+                ))
+            })
+            .collect()
     }
 
     fn live(&self, role: &str) -> bool {
@@ -107,6 +122,29 @@ impl Session<'_> {
 
     fn wait(&mut self) -> ExitStatus {
         wait_for("fixture session to exit", || self.child.try_wait().unwrap())
+    }
+
+    fn identity(&self, role: &str) -> Identity {
+        wait_for_with(
+            role,
+            || Identity::read(&self.fixture.control.join(role)),
+            || self.launch_details(),
+        )
+    }
+
+    fn launch_details(&self) -> String {
+        let members: Vec<_> = self
+            .members()
+            .into_iter()
+            .map(|pid| (pid, group(pid), stopped(pid), process_name(pid)))
+            .collect();
+        let mut load = [0.0; 3];
+        let count = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) }.max(0) as usize;
+        format!(
+            "fixture launch markers (elapsed ms): {:?}, session processes (pid, group, stopped, name): {members:?}, host load: {:?}",
+            self.fixture.launch_times(),
+            &load[..count],
+        )
     }
 }
 
@@ -151,6 +189,7 @@ struct Terminal<'a> {
     cursor: usize,
     observer: Option<Pid>,
     newline: &'static str,
+    case: String,
 }
 
 impl<'a> Terminal<'a> {
@@ -161,6 +200,12 @@ impl<'a> Terminal<'a> {
     }
 
     fn shell(fixture: &'a Fixture, dots: Command, tostop: bool, newline: &'static str) -> Self {
+        let case = dots
+            .get_envs()
+            .find(|(key, _)| *key == "DIRECT_CASE")
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let (master, slave) = open_pty();
         let mut modes = termios(slave.as_raw_fd());
         modes.c_lflag |= libc::ISIG | libc::ICANON | libc::ECHO;
@@ -212,6 +257,7 @@ impl<'a> Terminal<'a> {
             cursor: 0,
             observer: None,
             newline,
+            case,
         };
         terminal.expect(SHELL_PROMPT);
         terminal
@@ -238,12 +284,9 @@ impl<'a> Terminal<'a> {
             }
             assert!(
                 Instant::now() < deadline,
-                "PTY did not show {marker:?}, session processes (pid, group, stopped): {:?}, transcript:\n{}",
-                self.session
-                    .members()
-                    .into_iter()
-                    .map(|pid| (pid, group(pid), stopped(pid)))
-                    .collect::<Vec<_>>(),
+                "PTY case {:?} did not show {marker:?}, {}, transcript:\n{}",
+                self.case,
+                self.session.launch_details(),
                 String::from_utf8_lossy(&self.transcript)
             );
             let mut buffer = [0; 4096];
@@ -418,7 +461,7 @@ fn unchanged_native_sudo_prompt_uses_original_tty_without_echo() {
             terminal.start_foreground();
         }
         terminal.expect(SUDO_PROMPT);
-        let stage = fixture.identity("stage");
+        let stage = terminal.session.identity("stage");
         terminal.verify_original_tty(&stage, redirected_stdout);
         assert_eq!(stage.group, stage.foreground);
         assert_eq!(termios(terminal.slave.as_raw_fd()).c_lflag & libc::ECHO, 0);
@@ -454,7 +497,7 @@ fn new_foreground_ctrl_c_observation_without_witness() {
         let mut terminal = Terminal::start(&fixture, case, true);
         terminal.line(&format!("{OBSERVE_JOB}; {RESULT}"));
         terminal.expect(PROMPT);
-        let child = fixture.identity("stage");
+        let child = terminal.session.identity("stage");
         terminal.verify_original_tty(&child, false);
         assert_eq!(child.foreground, child.group);
         assert_ne!(child.group, group(terminal.dots_pid()));
@@ -482,7 +525,7 @@ fn new_foreground_transfers_original_tty_and_reclaims_it_on_normal_exit() {
     let mut terminal = Terminal::start(&fixture, "line", true);
     terminal.start_foreground();
     terminal.expect(PROMPT);
-    terminal.observe_foreground_group(&fixture.identity("stage"), None);
+    terminal.observe_foreground_group(&terminal.session.identity("stage"), None);
     terminal.line("ordinary input");
     terminal.expect("ordinary input accepted");
     terminal.result(0);
@@ -495,7 +538,7 @@ fn new_native_ctrl_c_preserves_nonzero_and_retires_observer_on_cancel() {
         let mut terminal = Terminal::start(&fixture, case, true);
         terminal.start_foreground();
         terminal.expect(PROMPT);
-        terminal.observe_foreground_group(&fixture.identity("stage"), None);
+        terminal.observe_foreground_group(&terminal.session.identity("stage"), None);
         terminal.send(b"\x03");
         if case != "line" {
             terminal.expect("native SIGINT handler");
@@ -510,8 +553,8 @@ fn new_first_terminal_ctrl_c_leaves_ignoring_child_interactive_then_cleans_remna
     let mut terminal = Terminal::start(&fixture, "ignoring", true);
     terminal.start_foreground();
     terminal.expect(PROMPT);
-    let stage = fixture.identity("stage");
-    let grandchild = fixture.identity("grandchild");
+    let stage = terminal.session.identity("stage");
+    let grandchild = terminal.session.identity("grandchild");
     terminal.observe_foreground_group(&stage, Some(&grandchild));
     terminal.send(b"\x03");
     // Allow the supervisor to process the interrupt before releasing the child.
@@ -548,8 +591,8 @@ fn new_normal_direct_exit_cleans_stubborn_grandchild_and_observer() {
     let mut terminal = Terminal::start(&fixture, "leader-exits", true);
     terminal.start_foreground();
     terminal.expect(PROMPT);
-    let stage = fixture.identity("stage");
-    let grandchild = fixture.identity("grandchild");
+    let stage = terminal.session.identity("stage");
+    let grandchild = terminal.session.identity("grandchild");
     terminal.observe_foreground_group(&stage, Some(&grandchild));
     assert!(fixture.live("grandchild"));
     terminal.line("ordinary input");
@@ -569,8 +612,8 @@ fn new_terminal_ctrl_z_and_shell_fg_stop_and_resume_dots_and_stage_group() {
     // terminal when its job stops, then resume that same job with builtin fg.
     terminal.line(JOB);
     terminal.expect(PROMPT);
-    let stage = fixture.identity("stage");
-    let grandchild = fixture.identity("grandchild");
+    let stage = terminal.session.identity("stage");
+    let grandchild = terminal.session.identity("grandchild");
     terminal.observe_foreground_group(&stage, Some(&grandchild));
     let dots = terminal.dots_pid();
     terminal.send(b"\x1a");
@@ -610,7 +653,7 @@ fn new_background_dots_never_takes_shell_terminal_or_starts_observer() {
     let mut terminal = Terminal::start(&fixture, "background", false);
     terminal.line(&format!("{JOB} & job=$!"));
     terminal.expect(SHELL_PROMPT);
-    let stage = fixture.identity("stage");
+    let stage = terminal.session.identity("stage");
     terminal.verify_original_tty(&stage, false);
     assert_eq!(stage.foreground, terminal.session.pid(), "{stage:?}");
     let dots = terminal.dots_pid();
@@ -642,8 +685,8 @@ fn new_detached_signals_clean_stubborn_process_group_without_observer() {
             child: command.spawn().unwrap(),
             fixture: &fixture,
         };
-        let stage = fixture.identity("stage");
-        let grandchild = fixture.identity("grandchild");
+        let stage = session.identity("stage");
+        let grandchild = session.identity("grandchild");
         assert_eq!(stage.tty, vec!["-"; 3]);
         assert_eq!((stage.foreground, stage.dev_tty_foreground), (-1, -1));
         assert_eq!(stage.group, grandchild.group);

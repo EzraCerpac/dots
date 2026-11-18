@@ -19,6 +19,7 @@ pub const SUDO_INPUT: &str = "synthetic-tty-input";
 const RUN: &str = r#"#!/bin/bash
 set -eu
 export DIRECT_CASE="$1"
+printf '%s\n' "$DIRECT_CASE" > "$DIRECT_DIR/script-start"
 shift
 case "$DIRECT_CASE" in
     streams)
@@ -52,6 +53,7 @@ pub fn install(root: &Path, control: &Path) {
             control.join("mise"),
             r#"#!/bin/sh
 set -eu
+: > "$DIRECT_DIR/mise-start"
 if [ "$1" = -C ]; then cd "$2"; shift 2; fi
 if [ "$1" = exec ] && [ "$2" = -- ]; then shift 2; exec "$@"; fi
 printf 'unexpected fixture mise arguments: %s\n' "$*" >&2

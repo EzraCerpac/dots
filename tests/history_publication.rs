@@ -470,9 +470,14 @@ fn new_backup_explicit_effective_opt_in_leaves_publication_to_native_sync() {
     history.configure(Some(false), false);
     let old = history.save();
     history.configure(Some(true), true);
+    // Prepare the encrypted tip with native mise so this test reaches the
+    // publication policy after the independent capture guard.
+    history.save();
 
     let refused = history.dots().arg("backup").output().unwrap();
-    assert!(!refused.status.success(), "{refused:?}");
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let diagnostic = String::from_utf8(refused.stderr).unwrap();
+    assert!(diagnostic.contains(UNSCOPED) && diagnostic.contains(&old));
     history.empty_remote(&old);
     ok(history
         .dots()

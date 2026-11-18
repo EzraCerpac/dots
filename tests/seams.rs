@@ -167,6 +167,35 @@ fn seams_cli_grammar_and_config_boundary() {
 }
 
 #[test]
+fn seams_cli_leading_dash_is_not_short_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+    assert_diagnostic(invoke(cwd, &["-hello"]), 2, "use dots help");
+
+    let commands = cwd.join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let hello = commands.join("hello");
+    fs::write(&hello, "#!/bin/sh\nprintf '[%s]\\n' \"$@\"\n").unwrap();
+    fs::set_permissions(&hello, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_diagnostic(invoke(cwd, &["-hello"]), 2, "use dots help");
+
+    let short = invoke(cwd, &["-h"]);
+    let long = invoke(cwd, &["--help"]);
+    assert!(short.status.success() && long.status.success());
+    assert_eq!(short.stdout, long.stdout);
+    assert!(
+        String::from_utf8(short.stdout)
+            .unwrap()
+            .contains("  hello [ARGS...]")
+    );
+
+    let output = invoke(cwd, &["hello", "-hello", "--help", "--"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"[-hello]\n[--help]\n[--]\n");
+}
+
+#[test]
 fn seams_cli_menu_is_an_ordinary_configuration_command() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();

@@ -567,7 +567,12 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
 
     let grammar = tree();
     let index = command_index(&argv);
-    let spelling = index.and_then(|index| argv[index].to_str());
+    let word = index.map(|index| &argv[index]);
+    // Clap treats a word such as -hello as a short-option cluster starting with -h.
+    if word.is_some_and(|word| word.as_encoded_bytes().starts_with(b"-h") && word != "-h") {
+        return Err(Fail::usage("invalid short option; use dots help"));
+    }
+    let spelling = word.and_then(|word| word.to_str());
     if spelling == Some("--") {
         return Err(Fail::usage(
             "unexpected '--' before the command; use dots help",

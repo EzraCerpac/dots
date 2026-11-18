@@ -1,0 +1,766 @@
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use tempfile::TempDir;
+
+const BASE: &str = include_str!("r01_config_goldens/base.toml");
+const ORIGIN: &str = "ssh://git@example.com/dots/history.git";
+const SKILL: &[u8] = include_bytes!("../skills/dots/SKILL.md");
+
+struct Fixture {
+    _dir: TempDir,
+    base: PathBuf,
+    home: PathBuf,
+    config: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let config = base.join("config");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&config).unwrap();
+        fs::write(config.join("config.toml"), BASE).unwrap();
+        Self {
+            _dir: dir,
+            base,
+            home,
+            config,
+        }
+    }
+
+    fn command(&self, executable: impl AsRef<OsStr>) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .current_dir(&self.base)
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
+            .env("HOME", &self.home)
+            .env("TMPDIR", &self.base)
+            .env("DOTS_ROOT", &self.config)
+            .env("DOTS_SKILL_LINKS", "0")
+            .env("XDG_STATE_HOME", self.base.join("xdg-state"))
+            .env("XDG_CONFIG_HOME", self.base.join("xdg-config"))
+            .env("XDG_CACHE_HOME", self.base.join("xdg-cache"))
+            .env("XDG_DATA_HOME", self.base.join("xdg-data"))
+            .env("MISE_CONFIG_DIR", &self.config)
+            .env("MISE_SYSTEM_CONFIG_DIR", self.base.join("mise-system"))
+            .env("MISE_CEILING_PATHS", &self.base)
+            .env("MISE_OFFLINE", "1")
+            .env("MISE_NO_HOOKS", "1")
+            .env("MISE_TRUSTED_CONFIG_PATHS", &self.config);
+        command
+    }
+
+    fn dots(&self) -> Command {
+        self.command(env!("CARGO_BIN_EXE_dots"))
+    }
+
+    fn select(&self, args: &[&str]) -> Output {
+        self.dots()
+            .args([
+                "profile",
+                "--profile",
+                "laptop",
+                "--machine-id",
+                "demo-machine",
+            ])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn write(&self, name: &str, contents: &str) {
+        fs::write(self.config.join(name), contents).unwrap();
+    }
+
+    fn script(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.base.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("#!/bin/sh\n{contents}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn skill_state(&self) -> PathBuf {
+        self.base.join("xdg-state/dots")
+    }
+}
+
+fn successful(output: Output) -> Vec<u8> {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn mode(path: &Path) -> u32 {
+    path.metadata().unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn unchanged_fresh_profile_bytes_match_the_legacy_fixture() {
+    let f = Fixture::new();
+    let output = String::from_utf8(successful(f.select(&["--origin", ORIGIN]))).unwrap();
+    assert!(output.contains("laptop") && output.contains("demo-machine"));
+    for (name, expected) in [
+        (
+            "miserc.toml",
+            include_bytes!("r01_config_goldens/fresh/expected-miserc.toml").as_slice(),
+        ),
+        (
+            "config.local.toml",
+            include_bytes!("r01_config_goldens/fresh/expected-local.toml").as_slice(),
+        ),
+    ] {
+        let path = f.config.join(name);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(mode(&path), 0o600);
+    }
+}
+
+#[test]
+fn unchanged_profile_edit_bytes_match_the_legacy_fixture() {
+    let f = Fixture::new();
+    f.write(
+        "miserc.toml",
+        include_str!("r01_config_goldens/managed/input-miserc.toml"),
+    );
+    let target = f.base.join("referent.toml");
+    fs::write(
+        &target,
+        include_bytes!("r01_config_goldens/managed/input-local.toml"),
+    )
+    .unwrap();
+    let outside = f.base.join("elsewhere");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, f.config.join("hop")).unwrap();
+    let link = f.config.join("config.local.toml");
+    symlink("hop/../referent.toml", &link).unwrap();
+    f.write("referent.toml", "# literal path, distinct from referent");
+    for _ in 0..2 {
+        successful(f.select(&["--origin", ORIGIN]));
+        assert_eq!(
+            fs::read(f.config.join("miserc.toml")).unwrap(),
+            include_bytes!("r01_config_goldens/managed/expected-miserc.toml")
+        );
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            include_bytes!("r01_config_goldens/managed/expected-local.toml")
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("hop/../referent.toml")
+        );
+        assert_eq!(
+            fs::read(f.config.join("referent.toml")).unwrap(),
+            b"# literal path, distinct from referent"
+        );
+    }
+}
+
+#[test]
+fn new_profile_persistence_tightens_both_existing_referents_to_0600() {
+    let f = Fixture::new();
+    let early = f.base.join("selector.toml");
+    let local = f.base.join("local.toml");
+    for (target, name, contents) in [
+        (
+            &early,
+            "miserc.toml",
+            include_str!("r01_config_goldens/fresh/expected-miserc.toml"),
+        ),
+        (
+            &local,
+            "config.local.toml",
+            include_str!("r01_config_goldens/fresh/expected-local.toml"),
+        ),
+    ] {
+        fs::write(target, contents).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(target, f.config.join(name)).unwrap();
+    }
+    successful(f.select(&["--origin", ORIGIN]));
+    assert_eq!(mode(&early), 0o600);
+    assert_eq!(mode(&local), 0o600);
+    assert_eq!(fs::read_link(f.config.join("miserc.toml")).unwrap(), early);
+    assert_eq!(
+        fs::read_link(f.config.join("config.local.toml")).unwrap(),
+        local
+    );
+}
+
+#[test]
+fn unchanged_profile_validation_keeps_both_files_and_modes() {
+    let f = Fixture::new();
+    let saved = [
+        ("miserc.toml", "env = [\"server\", \"host-old\"]\n"),
+        (
+            "config.local.toml",
+            "[env]\nSETUP_PROFILE = \"server\"\n[history.origin]\nbranch = \"host-old\"\n",
+        ),
+    ];
+    for (name, source) in saved {
+        f.write(name, source);
+        fs::set_permissions(f.config.join(name), fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let output = f.select(&[]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mise rejected staged"), "{stderr}");
+    for (name, source) in saved {
+        assert_eq!(fs::read_to_string(f.config.join(name)).unwrap(), source);
+        assert_eq!(mode(&f.config.join(name)), 0o640);
+    }
+    let output = f.select(&["--origin", "https://user:password@example.invalid/history"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("carries a password or token") && !stderr.contains("user:password"));
+}
+
+#[test]
+fn new_profile_read_refuses_ambiguity_until_explicitly_repaired() {
+    let f = Fixture::new();
+    f.write(
+        "miserc.toml",
+        "env = [\"server\", \"laptop\", \"host-foo\", \"host-bar\", \"extra\"]\n",
+    );
+    f.write(
+        "config.local.toml",
+        "[env]\nSETUP_PROFILE = \"server\"\nSETUP_MACHINE_ID = \"bar\"\n",
+    );
+    let output = f
+        .dots()
+        .args(["profile"])
+        .env("SETUP_PROFILE", "laptop")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("dots profile --profile PROFILE --machine-id ID")
+    );
+    successful(f.select(&[]));
+    assert_eq!(
+        fs::read(f.config.join("miserc.toml")).unwrap(),
+        b"env = [\"laptop\", \"host-demo-machine\", \"extra\"]\n"
+    );
+    assert_eq!(
+        successful(f.dots().arg("profile").output().unwrap()),
+        b"laptop\n"
+    );
+    assert_eq!(
+        successful(
+            f.dots()
+                .arg("profile")
+                .env("SETUP_PROFILE", "server")
+                .env("MISE_ENV", "laptop")
+                .output()
+                .unwrap()
+        ),
+        b"server\n"
+    );
+    f.write("config.local.toml", "[env]\nSETUP_PROFILE = \"server\"\n");
+    let output = f.dots().arg("profile").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("records server"));
+}
+
+#[test]
+fn new_mise_queries_effective_settings_and_excludes_the_callers_env() {
+    let f = Fixture::new();
+    f.write("config.toml", &format!("{BASE}base_value = \"base\"\n"));
+    f.write(
+        "config.laptop.toml",
+        "[vars]\nrole_value = \"laptop\"\ndots_profiles = \"decoy\"\n",
+    );
+    f.write(
+        "config.host-demo-machine.toml",
+        "[vars]\nhost_value = \"host\"\n",
+    );
+    f.write("config.server.toml", "[vars]\nrole_value = \"server\"\n");
+    f.write("config.local.toml", "[vars]\nlocal_value = \"local\"\n");
+    successful(f.select(&[]));
+    let bytes = successful(
+        f.dots()
+            .args(["mise", "vars", "--json"])
+            .env("MISE_ENV", "server")
+            .output()
+            .unwrap(),
+    );
+    let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(actual["role_value"], "laptop");
+    assert_eq!(actual["host_value"], "host");
+    assert_eq!(actual["base_value"], "base");
+    assert_eq!(actual["local_value"], "local");
+    assert_eq!(actual["dots_profiles"], "decoy");
+    assert_eq!(
+        successful(f.dots().arg("profile").output().unwrap()),
+        b"laptop\n"
+    );
+    assert_eq!(
+        successful(
+            f.dots()
+                .args(["mise", "settings", "get", "exec_auto_install"])
+                .env("MISE_EXEC_AUTO_INSTALL", "1")
+                .output()
+                .unwrap()
+        ),
+        b"false\n"
+    );
+}
+
+#[test]
+fn new_root_is_physical_and_passes_os_strings() {
+    let f = Fixture::new();
+    #[cfg(target_os = "linux")]
+    let root = f.base.join(OsString::from_vec(b"raw-\xff".to_vec()));
+    #[cfg(target_os = "macos")]
+    let root = f.base.join("settings with spaces");
+    fs::rename(&f.config, &root).unwrap();
+    let child = root.join("child");
+    fs::create_dir(&child).unwrap();
+    symlink(&child, f.base.join("dotlink")).unwrap();
+    let output = f
+        .dots()
+        .env("DOTS_ROOT", "dotlink/..")
+        .arg("root")
+        .output()
+        .unwrap();
+    let mut expected = root.as_os_str().as_bytes().to_vec();
+    expected.push(b'\n');
+    assert_eq!(successful(output), expected);
+    let from_mise = f
+        .dots()
+        .env_remove("DOTS_ROOT")
+        .env("MISE_CONFIG_DIR", "dotlink/..")
+        .arg("root")
+        .output()
+        .unwrap();
+    assert_eq!(successful(from_mise), expected);
+
+    let status = f
+        .dots()
+        .env("DOTS_ROOT", "dotlink/../missing/deep")
+        .arg("root")
+        .output()
+        .unwrap();
+    assert_eq!(status.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("missing/deep"));
+    successful(
+        f.dots()
+            .env("DOTS_ROOT", "dotlink/../missing/deep")
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    assert!(!root.join("missing").exists());
+}
+
+#[test]
+fn new_configuration_command_keeps_literal_argv_cwd_env_and_status() {
+    let f = Fixture::new();
+    f.write("config.toml", "deliberately malformed [");
+    f.script(
+        "config/dots/commands/example",
+        r#"
+printf '[%s]\n' "$@"
+printf '%s\n' "$PWD" "$DOTS_ROOT" "$DOTS_PROFILE"
+test -z "${MISE_ENV+x}" && test -z "${DOTS_HOME+x}" || exit 91
+printf 'child diagnostic\n' >&2
+dots --version
+exit 29
+"#,
+    );
+    let caller = f.base.join("caller");
+    fs::create_dir(&caller).unwrap();
+    let raw = OsString::from_vec(b"raw-\xff".to_vec());
+    let output = f
+        .dots()
+        .current_dir(&caller)
+        .arg("example")
+        .args(["--help", "two words", "", "*", "--"])
+        .arg(raw)
+        .env("DOTS_MISE_BIN", "/does/not/exist")
+        .env("DOTS_PROFILE", "supplied")
+        .env("DOTS_HOME", "/old")
+        .env("MISE_ENV", "server")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(29));
+    assert_eq!(output.stderr, b"child diagnostic\n");
+    let start = b"[--help]\n[two words]\n[]\n[*]\n[--]\n[raw-\xff]\n";
+    assert!(output.stdout.starts_with(start), "{:?}", output.stdout);
+    let rest = String::from_utf8_lossy(&output.stdout[start.len()..]);
+    assert!(rest.starts_with(&format!(
+        "{}\n{}\nsupplied\ndots ",
+        caller.display(),
+        f.config.display()
+    )));
+}
+
+#[test]
+fn new_configuration_help_lists_real_executables_and_builtins_win() {
+    let f = Fixture::new();
+    for name in [
+        "root",
+        "update",
+        "uninstall",
+        ".hidden",
+        "with space",
+        "internal",
+    ] {
+        f.script(&format!("config/dots/commands/{name}"), "echo unexpected");
+    }
+    f.script("config/dots/commands/example", r#"touch "$DOTS_ROOT/ran""#);
+    f.write("dots/commands/nonexec", "unusable");
+    let help = String::from_utf8(successful(f.dots().arg("help").output().unwrap())).unwrap();
+    let section = help.split_once("Configuration commands").unwrap().1;
+    assert!(section.contains("example [ARGS...]"));
+    for excluded in [
+        "root",
+        "update",
+        "uninstall",
+        ".hidden",
+        "with space",
+        "internal",
+        "nonexec",
+    ] {
+        assert!(!section.contains(&format!("{excluded} [ARGS...]")));
+    }
+    assert_eq!(
+        successful(f.dots().arg("root").output().unwrap()),
+        format!("{}\n", f.config.display()).as_bytes()
+    );
+    let output = f.dots().arg("nonexec").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use dots help"));
+    fs::remove_file(f.config.join("config.toml")).unwrap();
+    let output = f.dots().arg("example").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("config.toml not found"));
+    assert!(!f.config.join("ran").exists());
+    let help = String::from_utf8(successful(f.dots().arg("help").output().unwrap())).unwrap();
+    assert!(!help.contains("example [ARGS...]"));
+}
+
+#[test]
+fn new_mise_override_and_program_arguments_are_literal() {
+    let f = Fixture::new();
+    let fake = f.script(
+        "fake mise",
+        r#"
+printf '<%s>\n' "$@"
+printf '%s\n' "$PWD" "$MISE_CONFIG_DIR" "$MISE_ENV" "$MISE_AUTO_INSTALL" "$MISE_EXEC_AUTO_INSTALL"
+printf 'mise diagnostic\n' >&2
+exit 43
+"#,
+    );
+    let output = f
+        .dots()
+        .args(["mise", "--help", "--", "two words", "*", ""])
+        .arg(OsString::from_vec(b"\xff".to_vec()))
+        .env("DOTS_MISE_BIN", fake)
+        .env("SETUP_PROFILE", "laptop")
+        .env("SETUP_MACHINE_ID", "example")
+        .env("MISE_ENV", "server")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(43));
+    assert_eq!(output.stderr, b"mise diagnostic\n");
+    let prefix = b"<--help>\n<-->\n<two words>\n<*>\n<>\n<\xff>\n";
+    assert!(output.stdout.starts_with(prefix));
+    assert_eq!(
+        &output.stdout[prefix.len()..],
+        format!(
+            "{}\n{}\nlaptop,host-example\n0\n0\n",
+            f.config.display(),
+            f.config.display()
+        )
+        .as_bytes()
+    );
+    let bad = f
+        .dots()
+        .args(["mise", "--help"])
+        .env("DOTS_MISE_BIN", "")
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("DOTS_MISE_BIN is not executable"));
+}
+
+#[test]
+fn new_running_dots_survives_an_upgrade_during_a_configuration_command() {
+    let f = Fixture::new();
+    let install = f
+        .base
+        .join("mise/installs/github-ezracerpac-dots/v1/bin/dots");
+    fs::create_dir_all(install.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_dots"), &install).unwrap();
+    f.script(
+        "config/dots/commands/replace",
+        r#"
+set -eu
+rm "$1"
+mkdir -p "${1%/*}"
+printf '#!/bin/sh\nprintf "new version\\n"\n' > "$1"
+chmod +x "$1"
+command -v dots
+dots --version
+"#,
+    );
+    let output = successful(
+        f.command(&install)
+            .args([OsStr::new("replace"), install.as_os_str()])
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", install.parent().unwrap().display()),
+            )
+            .output()
+            .unwrap(),
+    );
+    let output = std::str::from_utf8(&output).unwrap();
+    let (pinned, version) = output.split_once('\n').unwrap();
+    assert!(version.starts_with(&format!("dots {} ", env!("CARGO_PKG_VERSION"))));
+    let parent = Path::new(pinned).parent().unwrap();
+    assert!(parent.starts_with(&f.base));
+    assert!(!parent.exists());
+}
+
+#[test]
+fn new_install_method_uses_the_running_binary_location() {
+    let f = Fixture::new();
+    for (relative, kind) in [
+        ("brew/Cellar/dots/1.0/bin/dots", "homebrew"),
+        ("mise/installs/github-ezracerpac-dots/1.0/bin/dots", "mise"),
+        ("cargo/bin/dots", "cargo"),
+        ("archive/dots", "other"),
+    ] {
+        let path = f.base.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::copy(env!("CARGO_BIN_EXE_dots"), &path).unwrap();
+        let link = f.base.join(format!("launch-{kind}"));
+        symlink(&path, &link).unwrap();
+        let output = successful(
+            f.command(link)
+                .arg("--version")
+                .env("CARGO_HOME", f.base.join("cargo"))
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            output,
+            format!("dots {} ({kind})\n", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+    }
+}
+
+#[test]
+fn unchanged_codex_only_gets_the_shared_skill() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".codex")).unwrap();
+    successful(
+        f.dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    let link = f.home.join(".agents/skills/dots");
+    let source = f.skill_state().join("skills/dots");
+    assert_eq!(fs::read_link(&link).unwrap(), source);
+    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), SKILL);
+    assert!(!f.home.join(".claude").exists());
+}
+
+#[test]
+fn new_missing_codex_root_inside_the_shared_skills_tree_stays_absent() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".agents")).unwrap();
+    let codex = f.home.join(".agents/skills");
+    successful(
+        f.dots()
+            .env("CODEX_HOME", &codex)
+            .env_remove("DOTS_SKILL_LINKS")
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    assert!(!codex.exists());
+    assert!(codex.join("dots").symlink_metadata().is_err());
+}
+
+#[test]
+fn unchanged_skill_link_updates_legacy_ownership_but_leaves_user_replacements() {
+    let f = Fixture::new();
+    let skills = f.home.join(".claude/skills");
+    let link = skills.join("dots");
+    let old = f.base.join("old-install/skills/dots");
+    fs::create_dir_all(&skills).unwrap();
+    fs::create_dir_all(f.skill_state()).unwrap();
+    symlink(&old, &link).unwrap();
+    fs::write(
+        f.skill_state().join("skill-links"),
+        format!("{}\t{}\n", link.display(), old.display()),
+    )
+    .unwrap();
+    successful(
+        f.dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), SKILL);
+    let source = f.skill_state().join("skills/dots/SKILL.md");
+    fs::write(&source, b"old contents").unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(&old, &link).unwrap();
+    let command = || {
+        f.dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .arg("--version")
+            .output()
+            .unwrap()
+    };
+    let first = command();
+    assert!(first.status.success());
+    assert!(String::from_utf8_lossy(&first.stderr).contains("left "));
+    assert_eq!(fs::read(&source).unwrap(), SKILL);
+    assert!(command().stderr.is_empty());
+    assert_eq!(fs::read_link(link).unwrap(), old);
+}
+
+#[test]
+fn unchanged_skill_link_checks_containment_and_completion_bypasses_refresh() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".claude")).unwrap();
+    let outside = f.base.join("outside");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, f.home.join(".claude/skills")).unwrap();
+    for args in [&["completions", "zsh"][..], &["__complete"][..]] {
+        let _ = f
+            .dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!f.skill_state().exists());
+    }
+    successful(f.dots().arg("--version").output().unwrap());
+    assert!(!f.skill_state().exists());
+    let output = f
+        .dots()
+        .env_remove("DOTS_SKILL_LINKS")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("leads outside"));
+    assert!(outside.join("dots").symlink_metadata().is_err());
+}
+
+#[test]
+fn new_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() {
+    use std::process::Stdio;
+
+    let f = Fixture::new();
+    let shadow = f.script("tool/bin/dots", "echo 'mise-selected dots'");
+    f.write(
+        "config.toml",
+        &format!(
+            "{BASE}\n[tools]\nnode = \"path:{}\"\n[env]\nFROM_MISE = \"resolved\"\nREMOVED = false\n",
+            shadow.parent().unwrap().parent().unwrap().display()
+        ),
+    );
+    let public = successful(
+        f.dots()
+            .args(["mise", "exec", "--", "dots"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(public, b"mise-selected dots\n");
+
+    let pinned = f.base.join("owned-bin/dots");
+    fs::create_dir(pinned.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_dots"), &pinned).unwrap();
+    let hook = f.script(
+        "hook",
+        r#"
+set -eu
+printf '[%s]\n' "$@"
+printf '%s\n' "$PWD" "$FROM_MISE" "${REMOVED-unset}" "$(command -v dots)"
+cat
+cat <&9
+printf 'hook stderr\n' >&2
+exit 39
+"#,
+    );
+    // Mise sees only UTF-8 paths. The private argument file carries the
+    // program and its exact argv, including a raw byte and an empty argument.
+    let mut arguments = hook.as_os_str().as_bytes().to_vec();
+    arguments.extend_from_slice(b"\0--help\0one two\0\0\xff\0");
+    let args_file = pinned.parent().unwrap().join("argv-test");
+    fs::write(&args_file, arguments).unwrap();
+    fs::set_permissions(&args_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let fd = f.base.join("fd");
+    fs::write(&fd, "inherited fd\n").unwrap();
+    let input = f.base.join("input");
+    fs::write(&input, "inherited stdin\n").unwrap();
+    let launcher = f.script(
+        "launch",
+        r#"
+exec 9<"$1"
+shift
+exec mise exec -- "$@"
+"#,
+    );
+    let output = f
+        .command(launcher)
+        .current_dir(&f.config)
+        .env("REMOVED", "from caller")
+        .env(
+            "PATH",
+            std::env::join_paths(
+                [pinned.parent().unwrap().to_path_buf()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .args([fd, pinned.clone()])
+        .arg("__exec")
+        .arg("argv-test")
+        .stdin(Stdio::from(fs::File::open(input).unwrap()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(39),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"hook stderr\n");
+    let prefix = b"[--help]\n[one two]\n[]\n[\xff]\n";
+    assert_eq!(&output.stdout[..prefix.len()], prefix);
+    assert_eq!(
+        &output.stdout[prefix.len()..],
+        format!(
+            "{}\nresolved\nunset\n{}\ninherited stdin\ninherited fd\n",
+            f.config.display(),
+            pinned.display()
+        )
+        .as_bytes()
+    );
+}

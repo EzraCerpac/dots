@@ -1,0 +1,53 @@
+use crate::config::{Exceptions, selection};
+use crate::run::{Outcome, Run, Sink};
+use crate::{Args, Ctx, Fail};
+
+use super::{ChildEnv, run_stage, stage_context};
+
+#[derive(Clone, Copy)]
+pub enum Mode {
+    Update,
+    InstallOnly,
+}
+
+pub fn install(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
+    let exceptions = Exceptions::read(&ctx.root)?;
+    let run = Run::begin(ctx, Sink::Unreported);
+    let outcomes = run_with_context(&run, ctx, &exceptions, Mode::InstallOnly)?;
+    Ok(run.end(u8::from(outcomes.contains(&Outcome::Failed))))
+}
+
+pub fn run(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<Vec<Outcome>, Fail> {
+    run_with_context(run, &stage_context()?, exceptions, mode)
+}
+
+fn run_with_context(
+    run: &Run<'_>,
+    ctx: &Ctx,
+    exceptions: &Exceptions,
+    mode: Mode,
+) -> Result<Vec<Outcome>, Fail> {
+    let selected = selection::read(&ctx.root, &ctx.env)?;
+    let profile = selected.profile.as_deref().unwrap_or_default();
+    let mut outcomes = Vec::new();
+    for recipe in exceptions.selected(profile)? {
+        if run.cancelled() {
+            break;
+        }
+        let label = format!("Installer exception: {}", recipe.name);
+        if matches!(mode, Mode::InstallOnly) {
+            println!("{label}");
+        }
+        let args = if matches!(mode, Mode::InstallOnly) || recipe.install_only {
+            &["--install-only"][..]
+        } else {
+            &[]
+        };
+        let outcome = run_stage(run, &label, &recipe.path, args, ChildEnv::Recipe(mode));
+        if matches!(mode, Mode::InstallOnly) && outcome == Outcome::Failed && !run.cancelled() {
+            eprintln!("Failed installer exception: {}", recipe.name);
+        }
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}

@@ -33,6 +33,59 @@ pub fn refresh(ctx: &Ctx) -> Result<(), Fail> {
     })
 }
 
+pub(crate) enum Status {
+    Disabled,
+    Links(Vec<(PathBuf, LinkStatus)>),
+}
+
+pub(crate) enum LinkStatus {
+    Owned(PathBuf),
+    UserProvided,
+    Missing,
+}
+
+/// Read the same link ownership records that refresh uses, without changing them.
+pub(crate) fn status(ctx: &Ctx) -> Status {
+    let env = &ctx.env;
+    if env.get("DOTS_SKILL_LINKS") == Some(OsStr::new("0")) {
+        return Status::Disabled;
+    }
+    let claude = agent_root(env, "CLAUDE_CONFIG_DIR", ".claude").filter(|path| path.is_dir());
+    let codex = agent_root(env, "CODEX_HOME", ".codex").is_some_and(|path| path.is_dir());
+    let shared = env
+        .home()
+        .map(|home| env.cwd().join(home).join(".agents"))
+        .filter(|path| codex || path.is_dir());
+    let ownership = env
+        .state_dir()
+        .ok()
+        .and_then(|state| read_records(&state.join("skill-links")).ok())
+        .unwrap_or_default();
+
+    Status::Links(
+        claude
+            .into_iter()
+            .chain(shared)
+            .map(|path| {
+                let link = path.join("skills/dots");
+                let status = match fs::read_link(&link) {
+                    Ok(target)
+                        if tsv_path(&link)
+                            .ok()
+                            .and_then(|key| ownership.get(&key))
+                            .is_some_and(|saved| saved == target.as_os_str().as_bytes()) =>
+                    {
+                        LinkStatus::Owned(target)
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => LinkStatus::Missing,
+                    _ => LinkStatus::UserProvided,
+                };
+                (link, status)
+            })
+            .collect(),
+    )
+}
+
 fn refresh_in(env: &Env, state: &Path) -> io::Result<()> {
     let claude = agent_root(env, "CLAUDE_CONFIG_DIR", ".claude");
     let codex = agent_root(env, "CODEX_HOME", ".codex");

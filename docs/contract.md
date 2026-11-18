@@ -1,11 +1,13 @@
 # dots 1.0 contract
 
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
+Amended 2026-11-18: shell completion, removal targets, the output of individual commands and cancellation, recording what 0.4.0 ships.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
 **New in 1.0** marks behaviour that 0.3.5 does not have.
 **Changed from 0.3.5** marks behaviour that differs from 0.3.5 and says how.
+**New in 0.4.0** and **Changed in 0.4.0** mark such a difference that 0.4.0 already ships; the other labels mark changes that arrive with 1.0.
 Where 0.3.5 files are cited, as `bin/dots:233`, they are historical evidence for such a label, not a specification.
 [Internal and subject to change](#internal-and-subject-to-change) lists what an implementation may choose freely.
 Messages quoted in this document show the content a line carries; their exact wording is not part of the contract unless stated.
@@ -257,7 +259,8 @@ dots [--plain | --verbose] [--no-wait] COMMAND [ARGS...]
 `--plain` prints concise progress lines instead of the dashboard.
 `--verbose` shows full child output.
 `--plain` with `--verbose` exits 2.
-`--no-wait` closes the dashboard as soon as the command finishes; `up`, `sync` and `add` do this by default.
+`--no-wait` closes the dashboard as soon as the command finishes; `up` does this by default.
+Only `dots up` has a dashboard; for every other command these flags neither wrap its output nor wait for the user, as [Output and reports](#output-and-reports) describes.
 These flags apply only to built-in commands; before a configuration command they exit 2.
 Without a terminal on stdout, output is plain.
 `dots COMMAND -h` and `dots COMMAND --help` print a built-in command's usage and exit 0.
@@ -277,7 +280,7 @@ An unknown command or option exits 2 with one line pointing to `dots help`.
 | D | Whatever the child it runs changes |
 
 A mark in parentheses applies only under the condition given.
-Every invocation may also refresh the agent skill links ([Agent skill](#agent-skill)).
+Every invocation may also refresh the agent skill links ([Agent skill](#agent-skill)), except `dots completions` and shell completion.
 Commands marked "report" save a private report.
 Read-only commands never install tools.
 
@@ -289,7 +292,7 @@ Read-only commands never install tools.
 | `dots help`, `-h`, `--help` | R/O | Built-in commands, the helpers, then the configuration's commands |
 | `dots --version` | R/O | Version and install method |
 | `dots reports [COMMAND]` | R/O | Report browser; without a terminal, exit 2 |
-| `dots completions bash\|zsh\|fish` | R/O | **New in 1.0.** Prints a completion script |
+| `dots completions bash\|zsh\|fish` | R/O | **New in 0.4.0.** Prints a completion script |
 | `dots status` | R/O, report | Programs, profile, source, packages, tools, dotfiles, history, exceptions |
 | `dots plan` | R/O, report | mise's bootstrap plan for this profile and machine |
 | `dots sync --last` | R/O | Replays the latest sync receipt |
@@ -305,9 +308,9 @@ Read-only commands never install tools.
 | `dots bootstrap [OPTIONS] [MISE-ARGS...]` | M, C, (D: mise hooks, bootstrap hooks, recipes), report | [`dots bootstrap`](#dots-bootstrap) |
 | `dots bootstrap persist-selected` | C | Callback for a `pre-dotfiles` hook |
 | `dots bootstrap complete` | M, C, D | Callback for the final `bootstrap` task |
-| `dots remote HOST --profile P [OPTIONS]` | H | `--dry-run`: R/O |
-| `dots bundle create OPTIONS` | M, (C when the output is inside the configuration) | Writes one encrypted file |
-| `dots bundle check OPTIONS` | R/O | Decrypts and validates in memory |
+| `dots remote HOST --profile P [OPTIONS]` | H, report | `--dry-run`: R/O |
+| `dots bundle create OPTIONS` | M, (C when the output is inside the configuration), report | Writes one encrypted file |
+| `dots bundle check OPTIONS` | R/O, report | Decrypts and validates in memory |
 | `dots backup` | M (history store), R (state repository), report | [Settings history](#settings-history) |
 | `dots restore [--initialize-history]` | M (history store, tracked files), C (machine-local files), report | Fetches; never pushes |
 | `dots publish [--all \| --bookmark NAME]` | C (JJ bookmarks), R (push and pull request), report | [`dots publish`](#dots-publish) |
@@ -327,7 +330,8 @@ Read-only commands never install tools.
 
 `update` is an alias of `up`, and `uninstall` of `remove`.
 Built-in names win over configuration commands of the same name.
-**Changed from 0.3.5:** `root`, `profile`, `mise`, `retire-dotfiles`, `exceptions`, `enroll-history`, `install-release-app`, `brew` and `completions` are new built-in names, so a configuration command with one of these names is no longer reachable.
+**Changed from 0.3.5:** `root`, `profile`, `mise`, `retire-dotfiles`, `exceptions`, `enroll-history`, `install-release-app` and `brew` are new built-in names, so a configuration command with one of these names is no longer reachable.
+**Changed in 0.4.0:** `completions` is a built-in name, with the same effect.
 
 ### Exit status
 
@@ -348,6 +352,10 @@ A cancellation is not a stage failure, so the rule above for `dots up` and `dots
 A cancelled run exits with the status of the interrupted foreground child, unchanged, when that child exits with one; cleaning up other active stages does not replace it.
 Otherwise it exits with a nonzero status, and no particular value is promised.
 `dots sync` still exits 0, and its receipt records the stopped run.
+Ctrl-C still cancels while descendants a stage owns drain its output after its leading process has exited, and `dots` finishes the cancellation before it saves the report or exits.
+Apart from `dots sync`, a cancellation that `dots` handles for a command it supervises is recorded as cancelled and exits 130, even when the leading process returns 0 while cleanup is under way; only a nonzero status of the interrupted foreground child replaces 130, as above.
+When signalling is refused, `dots` warns on stderr that the command's processes may still be running.
+A cancelled `dots remote` says on stderr and in its report that the remote host's state is unknown and should be inspected before retrying.
 **Changed from 0.3.5:** `dots bundle` usage errors exit 2, not 1.
 
 ### Hook and recipe outcomes
@@ -363,7 +371,7 @@ Otherwise it exits with a nonzero status, and no particular value is promised.
 
 ### Output and reports
 
-Every problem is one issue, listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
+Every problem of `dots up` is one issue, listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
 Each issue shows the last lines of the error, the command to run next, and where the step's full log is.
 Reports and logs are private to the user and live under `${XDG_STATE_HOME:-~/.local/state}/dots/`.
 Recent completed reports are kept for `dots reports` and `--last`.
@@ -371,6 +379,16 @@ In the dashboard, `A` on an issue hands it to a coding agent once the run has fi
 `dots` then suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument.
 Without `DOTS_AGENT_COMMAND`, `A` says how to set it.
 `dots help` and the menu both list the configuration's commands.
+
+**Changed in 0.4.0:** only the full `dots up` shows the live dashboard, and only in an interactive terminal large enough for it; otherwise it prints concise progress, and `--plain` or `--verbose` opts out.
+Every other command, `dots status` included, writes directly to the terminal's scrollback.
+The menu, the report browser, `dots up --last`, `dots plan`, the sync receipt and the `dots sync --last` pager keep their own displays.
+Such a command's child runs in the caller's foreground, so a native prompt such as `sudo` or `ssh` reads the terminal as usual.
+It reads the caller's stdin, which may be redirected, and its stdout and stderr reach the caller's separately and byte for byte, even when the reader is slow.
+`dots` adds no banner, footer or second copy of a diagnostic around that output.
+A command marked "report" still saves a private report with its stages' outcomes, its exit status and the command to rerun, but not the child's raw output or a log path that does not exist.
+When that report cannot be created or finished, `dots` says so on stderr, naming the command, and still exits with the command's own result.
+`dots up` keeps its stage logs and the "Needs attention" guidance above.
 
 A hook, a recipe or any other running stage may prompt.
 While the dashboard is shown, it tells the user how to open the running stage's terminal to answer and how to return to the dashboard; the keys for this are not part of the contract.
@@ -394,6 +412,9 @@ Without a configuration it prints the program list and exits 2.
 With a configuration but no usable mise it prints the program list, the version and the skill links, then exits 2.
 Otherwise it exits 1 when a section fails, and 0 when every section succeeded or only needs attention.
 A missing optional program and a source diagnostic do not fail it.
+**Changed in 0.4.0:** it names the host and profile, prints each item once under its group with its status and summary, and puts any action the item supplies underneath, including for an item that is ok, such as a pending sync.
+Each of these fields is shown as one line without control characters.
+A selected profile that `dots_profiles` does not list gives one diagnostic on stderr and exit status 2, and the report keeps that diagnosis and its next action as a startup issue.
 **Changed from 0.3.5:** the program list is new, and the Atuin section is gone.
 
 ### `dots plan`
@@ -575,6 +596,23 @@ Settings and app data stay where they are.
 `--keep-installed` deletes only the declaration.
 `--dry-run` prints the plan and changes nothing.
 
+**Changed in 0.4.0:** a short name from any declaration of the software matches it, not only one from the first; the bundle name of an app `dots` owns matches as before.
+A software target that matches nothing prints one diagnostic on stderr and exits 1 with nothing changed.
+The diagnostic suggests a name to use only when exactly one close match exists and an installer exception does not hold it; between several it never guesses.
+When the app ownership records cannot be read, a full removal suggests no GitHub app, while `--keep-installed` still may.
+An exact name shared by several targets lists their qualified names, `mise:NAME` for a mise tool, as alternatives.
+
+**New in 0.4.0:** shell completion after `dots remove` offers the software it could remove:
+
+- Tools under `[tools]`, packages under `[bootstrap.packages]` for a supported manager, and GitHub apps with a valid local ownership record.
+- Without a selector, it reads the active mise files that lie physically in the selected root, including machine-local ones, and ignores the caller's `MISE_ENV`.
+- With `--base`, `--profile` or `--path`, it reads only that file, without discovering active files; a relative `--path` is resolved against the caller's directory.
+- An app whose ownership record outlived its declaration, as after `--keep-installed`, is offered without a selector, and with one only when the selected file declares it.
+- Each spelling of a declaration gives case-insensitive names: the name without its prefix, including any tap or repository path, and its last path component; an owned app adds its bundle name without `.app`.
+- A name shared by several targets is replaced by their qualified names, `mise:NAME` for a mise tool.
+- Targets already on the command line, targets an installer exception holds under the same rule as removal, and names that are not valid targets are left out.
+- Where the shell shows descriptions, each candidate has one saying what kind of software it is.
+
 **New in 1.0:** a file target is an adopted dotfile when all of these hold, with paths compared after normalization:
 
 - the target is a symlink whose destination is exactly `ROOT/dotfiles/REL`, where `REL` is the target's path relative to `HOME`;
@@ -700,8 +738,48 @@ It opens the report browser, optionally on one command's reports.
 
 ### `dots completions bash|zsh|fish`
 
-**New in 1.0.**
-It prints a completion script for the built-in commands and their options.
+**New in 0.4.0.**
+It takes exactly one argument and prints that shell's completion script on stdout, and nothing else, with exit status 0.
+It runs before any setup and without mise, and does not refresh the agent skill links.
+A missing or unknown shell, or another argument, prints usage on stderr and exits 2.
+From 1.0, `-h` and `--help` follow [Global syntax](#global-syntax); 0.4.0 treats them as an unknown shell.
+
+Homebrew installs and upgrades the scripts in its standard completion locations, as `dots` for Bash, `_dots` for Zsh and `dots.fish` for Fish.
+With mise, a release binary, Cargo, or a Homebrew shell that does not load completions by itself, the user adds one line to the shell's interactive startup:
+
+| Shell | Startup file | Line to add |
+| --- | --- | --- |
+| Fish | `~/.config/fish/config.fish` | `dots completions fish \| source` |
+| Zsh | `~/.zshrc`, after `compinit` | `source <(dots completions zsh)` |
+| Bash | `~/.bashrc` | `eval "$(dots completions bash)"` |
+
+For a Bash login shell, the login profile sources `~/.bashrc` or holds the loader itself.
+Each new shell then completes with the active release.
+`dots` never edits a startup file, adds a setting or copies a script for the user to maintain.
+
+Completing a word is local, quiet and bounded, and works offline.
+It never prompts, runs no hook and no configuration command, evaluates no environment, installs or updates nothing, and writes no persistent state, cache, log or skill link.
+Commands and options are offered before any setup and without mise.
+A dynamic input that is unavailable, such as an unreadable file or a mise that does not answer in time, is skipped; completion never guesses which configuration files are active.
+
+Candidates:
+
+- Commands: the public built-in commands, the aliases `update` and `uninstall`, and each configuration command that [Configuration commands](#configuration-commands) would run, only where that command could start; a configuration command's arguments are not completed.
+- Global flags: `--plain` or `--verbose`, and `--no-wait`, before the command; `-h`, `--help` and `--version` only as the first word.
+- A command's options, with short forms such as `-n`, only where it accepts them: never one that conflicts with an option already given, a repeat of an option that takes one value, or any option after `--` where the command accepts `--`.
+- An option's value, inline as `--option=VALUE` or as a comma-separated list, only where the option accepts that form.
+- Profile names, for `--profile` and `dots bootstrap --env` or `-E`, from `dots_profiles` in `ROOT/config.toml`.
+- `bash`, `fish` and `zsh` for `dots completions`; `create` and `check` for `dots bundle`; the commands that save reports for `dots reports`.
+- `python`, `node` and `shell` for `dots test`, as hints for a conventional `tests/run`; any other argument still passes through.
+- For `dots add`, prefixes only, with no registry search: the native managers `apk:`, `apt:`, `brew:`, `brew-cask:`, `dnf:`, `mas:` and `pacman:`, the mise backends `aqua:`, `asdf:`, `cargo:`, `conda:`, `dotnet:`, `gem:`, `github:`, `go:`, `npm:`, `pipx:`, `spm:`, `ubi:` and `vfox:`, and `https://github.com/`.
+- For `dots remove`, the targets that [`dots remove`](#dots-remove-target) describes.
+- For `dots apply`, `--force` (`-f`), `--dry-run` (`-n`), `--yes` (`-y`), `--prune` and `--prompt-secrets`.
+- For `dots bootstrap`, its own options and the native bootstrap options it passes on: `--from`, `--adopt`, `--from-dir`, `--config-dir`, `--replace-history`, `--take-remote-all`, `--dry-run` (`-n`), `--yes` (`-y`), `--skip-dirty`, `--force-dotfiles`, `--prune-dotfiles`, `--only`, `--skip`, `--prompt-secrets`, `--prompt-vars`, `--save-env`, `--env` (`-E`), `--update` and `--upgrade`.
+  `--only` and `--skip` exclude each other, `--only` and `--restore` exclude each other, and both take the parts `plugins`, `packages`, `accounts`, `files`, `services`, `firewall`, `compose`, `repos`, `dotfiles`, `mise-shell-activate`, `macos-defaults`, `settings`, `macos-launchd-agents`, `linux-systemd-units`, `user`, `tools`, `task` and `final-hook`.
+- Local files for `--path`, `--bundle`, `--identity`, `--identity-file`, `--input` and `--output`; directories for `dots init` and `--from-dir`; nothing for free text, such as `--asset`, `--bookmark`, `--restore`, a port, a repository, and `--config-dir`, which is relative to the checkout, not to the caller's directory.
+
+Each script keeps its shell's usual behaviour: quoting and escapes, completion at a cursor with text after it, a prefix such as `brew:` left open for typing, and the shell's own path completion, including names with spaces or tabs, a literal `=` and names that look like options.
+An unquoted `~/` at the start of an earlier word means the home directory, as when the shell runs the command; a quoted or escaped `~/` is literal.
 
 ## The `dots/` directory
 
@@ -1003,7 +1081,7 @@ Variables that are flags take exactly `0` or `1`.
 ## Agent skill
 
 The agent skill is embedded in the executable.
-On every invocation, `dots` keeps a copy of it in storage `dots` owns and links that copy for the agents in use:
+On every invocation except `dots completions` and shell completion, `dots` keeps a copy of it in storage `dots` owns and links that copy for the agents in use:
 
 | Link | Made when |
 | --- | --- |
@@ -1037,6 +1115,8 @@ An implementation may choose and change these freely; nothing outside `dots` may
 - The variables `dots bootstrap` uses to pass options, such as `--restore`, to its own callbacks, `persist-selected` and `complete`.
 - The exact Git and mise commands `dots` runs to produce the behaviour described here.
 - The wording of messages, beyond what each line must say.
+- How the completion scripts get their candidates: the protocol between a script and `dots` and its tokens, the wording of descriptions, the matching algorithm, time and file-size limits, temporary state and the environment of any mise probe; the commands and behaviour each shell sees, under [`dots completions`](#dots-completions-bashzshfish), are public.
+- The repository's CI and test fixtures.
 
 ## What 1.0 drops
 
@@ -1045,7 +1125,9 @@ An implementation may choose and change these freely; nothing outside `dots` may
 | `DOTS_HOME` and `dots internal home` | One executable has no manager directory |
 | The `dots internal` namespace | Replaced by public commands; see [Replacing 0.3.5 interfaces](#replacing-035-interfaces) |
 | The sourced libraries in `lib/` | Replaced by subcommands, so hooks need no Bash |
-| The separate `dots-up` renderer, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend` and its event protocol | The dashboard is part of the one executable |
+| The separate `dots-up` renderer, its build from a checkout, path search and fallback, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend`, its event protocol and its event, acknowledgement and stream-nonce variables | The dashboard is part of the one executable |
+| From 0.4.0: `dots internal shell-complete`, `dots-up complete` and the completion scripts in the support tree | The completion protocol is internal; `dots completions` prints the scripts |
+| From 0.4.0: the quiet `uv run` wrapper of `dots remove` | The executable needs no Python or uv |
 | The Bash updater fallback and its logs | There is nothing to fall back from |
 | Bash, Node.js, uv and jq as requirements | The executable needs none of them |
 | `dots atuin-bundle`, `dots atuin-login`, `dots_atuin_username`, `encrypted/atuin.json.age`, the Atuin status section and bootstrap stage | App enrollment belongs to configurations, as hooks and commands |

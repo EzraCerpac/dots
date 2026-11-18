@@ -150,7 +150,7 @@ fn unchanged_invalid_update_configuration_stops_dependent_work() {
     // and the absence of dependent work expose the failure without that protocol.
     let f = UpdateFixture::new();
     f.hook("10-unexpected", "touch \"$HOME/unexpected\"");
-    let output = run(f.up("--plain").env("FIXTURE_CONFIG_FAILURE", "1"));
+    let output = run(f.up("--verbose").env("FIXTURE_CONFIG_FAILURE", "1"));
     assert!(
         matches!(output.status.code(), Some(1 | 2)),
         "{}",
@@ -253,7 +253,6 @@ fn unchanged_update_hooks_run_in_name_order_with_environment_and_outcomes() {
     for (name, code) in [
         ("50-after-failure", 0),
         ("40-broken", 7),
-        ("30-skipped.sh", 4),
         ("20-deferred_step", 3),
         ("45-laptop-only@laptop", 0),
         ("46-server-only@server", 0),
@@ -265,6 +264,10 @@ fn unchanged_update_hooks_run_in_name_order_with_environment_and_outcomes() {
             &format!("echo '{name}' >> \"$HOME/hooks\"\nexit {code}"),
         );
     }
+    f.hook(
+        "30-skipped.sh",
+        "echo 30-skipped.sh >> \"$HOME/hooks\"; echo 'fixture requested skip'; exit 4",
+    );
     f.hook(
         "10-first",
         r#"echo 10-first >> "$HOME/hooks"
@@ -286,7 +289,7 @@ if grep -q '^self-update' "$HOME/mise-calls"; then exit 1; fi"#,
             "deferred step",
             "deferred",
             "skipped",
-            "skipped",
+            "fixture requested skip",
             "broken",
             "exit 7",
         ],
@@ -371,13 +374,15 @@ fn unchanged_hook_labels_and_profiles_are_visible_when_run() {
 }
 
 // Also covers HookListingTests.test_unknown_profile_suffix_fails_without_listing.
+// The private listing helper's exit code and tab-separated output disappeared
+// with the helper. Assert the public update failure and no hook execution.
 #[test]
 #[ignore = "P-04"]
 fn unchanged_unknown_hook_profile_prevents_all_hooks_in_that_directory() {
     let f = UpdateFixture::new();
     f.hook("10-valid", "touch \"$HOME/unexpected\"");
     f.hook("20-typo@labtop", ":");
-    let text = exit(&run(&mut f.up("--plain")), 1);
+    let text = exit(&run(&mut f.up("--verbose")), 1);
     mentions(&text, &["20-typo@labtop", "laptop", "server"]);
     assert!(!f.world.home().join("unexpected").exists());
 }
@@ -387,8 +392,10 @@ fn unchanged_unknown_hook_profile_prevents_all_hooks_in_that_directory() {
 fn unchanged_deferred_hook_is_visible_without_failing_the_update() {
     let f = UpdateFixture::new();
     f.hook("10-Later", "exit 3");
+    f.hook("20-Skip-alone", "touch \"$HOME/skipped\"; exit 4");
     let text = exit(&run(&mut f.up("--plain")), 0);
     mentions(&text, &["Later", "deferred"]);
+    assert!(f.world.home().join("skipped").is_file());
 }
 
 #[test]
@@ -444,9 +451,9 @@ printf '%s\n' "$DOTS_ROOT" "$DOTS_PROFILE" "$PWD" > "$HOME/recipe-env""#,
 
 #[test]
 #[ignore = "P-04"]
-fn unchanged_recipes_read_the_callers_stdin() {
-    // The f5c8a0e source archive's public CLI supports redirected input here.
-    // The separately shipped v0.4.0 Go renderer did not forward it.
+fn new_recipes_read_the_callers_redirected_stdin() {
+    // The packaged v0.4.0 supervisor forwarded stdin only for an interactive
+    // run. 1.0 also forwards redirected caller input to each recipe.
     let f = UpdateFixture::new();
     for name in ["reader", "after-reader"] {
         f.script(

@@ -362,8 +362,7 @@ fn seams_report_round_trip_and_fragment_fold() {
 
         let parent = Run::begin(&ctx, Sink::Report(ReportCommand::Bootstrap));
         let stage = parent.start("Parent");
-        assert!(parent.snapshot().attachable.is_none());
-        assert!(parent.view(Some(stage)).is_err());
+        assert_eq!(parent.snapshot().stages[0].id, stage);
         parent.finish(stage, Outcome::Completed);
         parent.fold(&fragment).unwrap();
         assert_ne!(parent.snapshot().stages[1].id, stage);

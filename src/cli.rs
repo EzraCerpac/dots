@@ -663,10 +663,7 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
     }
     if name != "menu" && known.is_none() {
         let ctx = context(flags)?;
-        if config_commands::list(&ctx.root)
-            .iter()
-            .any(|command| command == name)
-        {
+        if config_commands::is_external(&ctx.root, name) {
             if flags != Flags::default() {
                 return Err(Fail::usage(
                     "global flags apply only to built-in commands; use dots help",

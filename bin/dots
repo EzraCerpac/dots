@@ -22,14 +22,6 @@ else
     DOTS_HOME="$own_home"
 fi
 export DOTS_HOME
-# Keep the bundled agent skill linked to this installation, so installing or
-# upgrading dots by any method updates the skill too. A run with another
-# DOTS_HOME (development, or a child of such a run) leaves the links alone.
-if [[ -f "$own_home/lib/dots-manager.sh" ]]; then
-    source "$own_home/lib/dots-manager.sh"
-    [[ "$DOTS_HOME" != "$own_home" ]] || dots_skill_refresh "$DOTS_HOME"
-fi
-
 # Built-in commands always win over configuration commands of the same name.
 builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall help internal init "
 
@@ -64,7 +56,8 @@ Your machine setup, from any directory.
 
   dots up [--mas] [--plain|--verbose] [--no-wait] [--last]
                                    Sync configuration, then update tools and plugins
-  dots sync                       Save, merge and share configuration through dev
+  dots sync                       Share configuration and show changed files
+  dots sync --last                Inspect the previous sync and its diff (read-only)
   dots publish [--all | --bookmark NAME]   Open/update a PR from the JJ workspace you are in
   dots atuin-bundle [ARGS...]       Securely prepare the Atuin-only bundle
   dots atuin-login [--browser]     Finish Atuin login, including two-factor/Hub steps
@@ -127,6 +120,24 @@ if [[ " $frontend_flags " == *' --plain '* && " $frontend_flags " == *' --verbos
 fi
 backend_mode=0
 if [[ "${1:-}" == --backend ]]; then backend_mode=1; shift; fi
+# Reading a receipt must also work when the sync stopped on a broken setup.
+if [[ "$#" -eq 2 && "$1" == sync && "$2" == --last ]] ||
+   [[ "$#" -eq 3 && "$1" == internal && "$2" == sync-present ]]; then
+    root="$(config_root)"
+    action=sync-last
+    if [[ "$1" == internal ]]; then action=sync-present; fi
+    shift 2
+    if [[ "$action" == sync-last && " $frontend_flags " == *' --plain '* ]]; then set -- --plain; fi
+    if command -v node >/dev/null 2>&1; then exec node "$DOTS_HOME/lib/source-repo.mjs" "$action" "$root" "$@"; fi
+    mise_bin="${DOTS_MISE_BIN:-$HOME/.local/bin/mise}"
+    [[ -x "$mise_bin" ]] || mise_bin=mise
+    MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_NO_HOOKS=1 exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/lib/source-repo.mjs" "$action" "$root" "$@"
+fi
+# A normal invocation refreshes the bundled skill for this installation.
+if [[ -f "$own_home/lib/dots-manager.sh" ]]; then
+    source "$own_home/lib/dots-manager.sh"
+    [[ "$DOTS_HOME" != "$own_home" ]] || dots_skill_refresh "$DOTS_HOME"
+fi
 case "${1:-}" in
     help|-h|--help) usage; exit 0 ;;
     --version)
@@ -230,7 +241,7 @@ renderer_supported() {
     local capabilities
     [[ -n "$1" && -x "$1" ]] &&
         capabilities="$("$1" --capabilities 2>/dev/null)" &&
-        [[ "$capabilities" == dots-shared-cli/2 ]]
+        [[ "$capabilities" == dots-shared-cli/3 ]]
 }
 resolve_renderer() {
     if [[ -n "${DOTS_UP_BIN:-}" ]]; then
@@ -256,7 +267,8 @@ if (($#)); then shift; fi
 [[ "$command_name" != uninstall ]] || command_name=remove
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$command_name" in
-    sync|status|backup|plan) [[ $# -eq 0 ]] || { echo "dots: $command_name takes no arguments" >&2; exit 2; } ;;
+    sync) [[ $# -eq 0 ]] || { echo 'dots: usage: dots sync [--last]' >&2; exit 2; } ;;
+    status|backup|plan) [[ $# -eq 0 ]] || { echo "dots: $command_name takes no arguments" >&2; exit 2; } ;;
 esac
 # Shared flags belong to the frontend, never to the maintenance backend.
 if [[ "$backend_mode" -eq 0 && "$command_name" != up && "$command_name" != update && "$command_name" != plan ]]; then
@@ -336,6 +348,7 @@ case "$command_name" in
                 echo "dots: could not create private logs under $fallback_state; continuing without saved stage logs" >&2
                 if [[ -d "$fallback_run" ]]; then rm -rf -- "$fallback_run" 2>/dev/null || true; fi
                 fallback_run=""
+                export DOTS_UP_NO_LOGS=1
                 unset DOTS_UP_RUN_DIR
             fi
         fi
@@ -343,7 +356,7 @@ case "$command_name" in
         (exec_in_setup bash "$DOTS_HOME/tasks/update" ${fallback_args[@]+"${fallback_args[@]}"}) || result=$?
         if [[ -n "$fallback_run" && -f "$fallback_run/.active" ]]; then
             rm -f -- "$fallback_run/.active" || echo "dots: could not finalize $fallback_run" >&2
-            if [[ "$result" -eq 0 ]]; then
+            if [[ "$result" -eq 0 && ! -e "$fallback_run/.attention" ]]; then
                 rm -rf -- "$fallback_run" || echo "dots: could not remove successful run logs in $fallback_run" >&2
             else
                 printf 'Logs: %s\n' "$fallback_run"
@@ -359,13 +372,15 @@ case "$command_name" in
         fi
         exit "$result"
         ;;
-    sync|status|backup|plan)
-        [[ $# -eq 0 ]] || { echo "dots: $command_name takes no arguments" >&2; exit 2; }
-        ;;
 esac
 case "$command_name" in
     up|update) exec_in_setup bash "$DOTS_HOME/tasks/update" "$@" ;;
-    sync) exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/lib/source-repo.mjs" sync "$root" ;;
+    sync)
+        sync_args=()
+        [[ "$backend_mode" -eq 0 ]] || sync_args+=(--report)
+        if [[ " $frontend_flags " == *' --verbose '* || "${DOTS_UP_VERBOSE:-0}" == 1 ]]; then sync_args+=(--verbose); fi
+        exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/lib/source-repo.mjs" sync "$root" ${sync_args[@]+"${sync_args[@]}"}
+        ;;
     publish) exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/tasks/publish.mjs" "$root" "$PWD" "$@" ;;
     atuin-bundle) exec "$mise_bin" -C "$root" exec -- bash "$DOTS_HOME/bootstrap/atuin-bundle" "$@" ;;
     atuin-login)

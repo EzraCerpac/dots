@@ -130,7 +130,7 @@ test('producer reports a clean sync with no changes or issues', available, t => 
   const f = fixture(t), before = f.dev(f.a);
   assert.deepEqual(f.producer(f.a), {
     header: 'dots sync: no local changes · pulled dev +0, main +0 · nothing to push',
-    before, after: before, lines: [], groups: [], issues: [], notices: [],
+    status: 'complete', scanBlocked: false, before, after: before, lines: [], groups: [], issues: [], notices: [],
   });
 });
 
@@ -140,7 +140,7 @@ test('producer reports queued edits as saved offline and shared on the next run'
   f.write(f.a, 'local', 'save offline\n');
   const offline = f.producer(f.a), snapshot = f.dev(f.a);
   assert.deepEqual(offline.groups, [{ kind: 'saved', before, after: snapshot }]);
-  assert.deepEqual(offline.issues, [{ summary: 'Origin unreachable', detail: '1 commits unpushed', action: 'The next sync will retry.' }]);
+  assert.deepEqual(offline.issues, [{ summary: 'Origin unreachable', detail: '1 unpushed commit', action: 'The next sync will retry.' }]);
   fs.renameSync(`${f.origin}.offline`, f.origin);
   const online = f.producer(f.a);
   assert.deepEqual(online.groups, [{ kind: 'shared', before, after: snapshot }]);
@@ -271,7 +271,8 @@ test('sync stops before snapshotting Git metadata stored inside the worktree', a
   assert.match(git(f.a, 'status', '--porcelain'), /\?\? metadata\//);
   const result = f.sync(f.a);
   assert.equal(result.code, 0);
-  assert.match(result.text, /^dots sync: failed .*Git metadata at .*metadata is in the worktree; move it outside the worktree before rerunning sync$/);
+  assert.match(result.text, /^dots sync: failed .*Git metadata at .*metadata is in the worktree; move it outside the worktree before rerunning sync/m);
+  assert.equal(fs.existsSync(path.join(metadata, 'dots-sync-receipt.json')), false);
   assert.equal(f.remote(), before);
 });
 
@@ -314,15 +315,19 @@ test('a remote change arrives on disk', available, t => {
   assert.equal(f.dev(f.a), f.remote()); f.clean(f.a);
 });
 
-test('dots up sees the configuration source move as one change event', available, t => {
-  const f = fixture(t); const before = f.dev(f.a);
+test('dots up receives the changed path once and finishes each sync stage', available, t => {
+  const f = fixture(t);
   f.write(f.b, 'remote', 'from b\n'); f.sync(f.b);
   const events = path.join(f.dir, 'events');
   const fd = fs.openSync(events, 'w');
   process.env.DOTS_UP_EVENT_FD = String(fd);
-  try { f.sync(f.a); f.sync(f.a); } finally { delete process.env.DOTS_UP_EVENT_FD; fs.closeSync(fd); }
+  try { f.sync(f.a, { stage: 'source-sync' }); f.sync(f.a, { stage: 'source-sync' }); } finally { delete process.env.DOTS_UP_EVENT_FD; fs.closeSync(fd); }
   const changes = fs.readFileSync(events, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(changes, [{ v: 1, kind: 'change', stage: 'source-sync', item: 'Configuration source', action: 'updated', before, after: f.dev(f.a) }]);
+  const paths = changes.filter(e => e.kind === 'change');
+  assert.equal(paths.length, 1);
+  assert.equal(paths[0].stage, 'source-sync');
+  assert.match(paths[0].item, /Updated in this checkout.*added.*remote/);
+  assert.deepEqual(changes.filter(e => e.kind === 'stage_end').map(e => e.status), ['ok', 'ok']);
 });
 
 test('non-conflicting edits on both sides merge', available, t => {
@@ -868,7 +873,7 @@ test('a checkout in the wrong shape stops with one message pointing at the sync 
   expect('legacy sync state \\(\\.git/dots-dev\\.json\\) is present', () => f.write(f.a, '.git/dots-dev.json', '{}'), () => fs.rmSync(path.join(f.a, '.git/dots-dev.json')));
   assert.equal(f.remote(), before);
   const foreign = [];
-  assert.equal(syncSource(f.a, { expectedRemote: '/elsewhere', print: text => foreign.push(text) }), 0);
+  assert.equal(syncSource(f.a, { expectedRemote: '/elsewhere', verbose: true, print: text => foreign.push(text) }), 0);
   assert.deepEqual(foreign, ['dots sync: stopped · Refusing source operations: origin is not /elsewhere']);
 });
 

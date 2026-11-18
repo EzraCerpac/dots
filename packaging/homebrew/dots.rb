@@ -60,6 +60,6 @@ class Dots < Formula
   test do
     assert_match "dots #{version} (homebrew)", shell_output("#{bin}/dots --version")
     assert_predicate libexec/"bin/dots-up", :executable?
-    assert_match "dots-shared-cli/2", shell_output("#{libexec}/bin/dots-up --capabilities")
+    assert_match "dots-shared-cli/3", shell_output("#{libexec}/bin/dots-up --capabilities")
   end
 end

@@ -2,7 +2,6 @@
 """Structured status and progress bridge for the dots dashboard."""
 import json
 import os
-import re
 import shlex
 import socket
 import subprocess
@@ -43,25 +42,6 @@ def stage_end(id, label, code, state=None, summary=None, action=""):
         action = f"Review the stage log and rerun {shlex.join(['dots', command, *arguments])}."
     emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action)
     return state
-
-# Sync always exits 0 and prints one block; the rule tasks/update applies to it:
-# a header that did not complete or an upper-case line needs attention.
-SYNC_ATTENTION = re.compile(r"^dots sync: (stopped|skipped|failed)|^  [A-Z][A-Z ]+[ :(]")
-
-def sync(argv, env, pass_fds):
-    result = subprocess.run(argv, env=env, pass_fds=pass_fds, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    sys.stdout.buffer.write(result.stdout)
-    sys.stdout.flush()
-    lines = result.stdout.decode(errors="replace").splitlines()
-    attention = [line.strip() for line in lines if SYNC_ATTENTION.match(line)]
-    header = next((line for line in lines if line.startswith("dots sync: ")), None)
-    if not attention:
-        return result.returncode, stage_end("sync", "sync", result.returncode, None, header)
-    # One issue: the first attention line, with the rest and the output under
-    # each in the stage log.
-    summary = attention[0] + (f" (+{len(attention) - 1} more)" if len(attention) > 1 else "")
-    action = f"Fix what the sync output says, then run dots sync; {os.environ.get('DOTS_HOME', 'DOTS_HOME')}/docs/sync.md explains every line"
-    return result.returncode, stage_end("sync", "sync", result.returncode, "attention" if result.returncode == 0 else None, summary, action)
 
 def item(group, key, state, summary, action=""):
     emit("item_upsert", id=f"{group.lower()}:{key}", group=group, label=str(key), status=state, summary=str(summary), action=action, before="", after="")
@@ -242,10 +222,11 @@ def main():
             event_fd = os.environ.get("DOTS_UP_EVENT_FD")
             pass_fds = tuple(int(os.environ[key]) for key in ("DOTS_UP_EVENT_FD", "DOTS_UP_ACK_FD") if os.environ.get(key, "").isdecimal())
             argv, env = [home + "/bin/dots", "--backend", command, *arguments], {**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise}
-            if command == "sync":
-                code, state = sync(argv, env, pass_fds)
+            code = subprocess.call(argv, env=env, pass_fds=pass_fds)
+            if command == "sync" and code in (0, 3):
+                # The producer emitted its own stage result and typed issues.
+                state, code = ("attention" if code == 3 else "ok"), 0
             else:
-                code = subprocess.call(argv, env=env, pass_fds=pass_fds)
                 stage_end(command, command, code)
     except (OSError, RuntimeError) as error:
         print(f"dots: {error}", file=sys.stderr)

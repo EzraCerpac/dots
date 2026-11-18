@@ -73,9 +73,9 @@ print(str(value).lower() if isinstance(value, bool) else "table" if isinstance(v
         shift
         [[ "${1:-}" == -- ]] && shift
         for ((i = 1; i <= $#; i++)); do
-            if [[ "${!i}" == */source-repo.mjs ]]; then
+            if [[ "${!i}" == */source-repo.mjs && -z "${FIXTURE_REAL_SYNC:-}" ]]; then
                 # Keep any wrapper before node (env ...), so FAKE_SYNC sees sync's environment.
-                [[ -z "${FAKE_SYNC:-}" ]] || "${@:1:i-2}" bash -c "$FAKE_SYNC"
+                [[ -z "${FAKE_SYNC:-}" ]] || exec "${@:1:i-2}" bash -c "$FAKE_SYNC"
                 exit 0
             fi
         done
@@ -366,49 +366,28 @@ class UpdateHookTests(ContractTestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"auto-install={seen}\n", result.stdout)
 
-    def test_update_continues_after_any_sync_outcome_and_repeats_attention(self) -> None:
-        for name, script, attention in (
-            ("stopped", "echo 'dots sync: stopped · HEAD is detached, not on dev. See docs'", "dots sync: stopped · HEAD is detached"),
-            ("failed", "echo 'dots sync: failed · git -c failed: Author identity unknown'", "dots sync: failed · git -c failed"),
-            ("partial", "printf 'dots sync: saved 1 file locally · offline · not pushed\\n  OFFLINE: 1 commits unpushed, retried next run\\n  changed on disk: 1 file changed\\n'",
-             "  OFFLINE: 1 commits unpushed, retried next run"),
-        ):
-            with self.subTest(name):
-                result = self.f.update(DOTS_SOURCE_SYNC_DONE="0", FAKE_SYNC=script)
+    def test_sync_issues_and_crashes_allow_maintenance_to_continue(self) -> None:
+        for code in (3, 127):
+            with self.subTest(code=code):
+                result = self.f.update(DOTS_SOURCE_SYNC_DONE="0", FAKE_SYNC=f"echo 'Origin unreachable'; exit {code}")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                summary = result.stdout.split("Source sync needs attention:\n", 1)[1]
-                self.assertTrue(summary.startswith(attention), summary)
-                self.assertNotIn("changed on disk", summary)
+                self.assertEqual(result.stdout.count("Origin unreachable"), 1)
                 self.assertIn("Update report: completed; needs attention: source sync;", result.stdout)
 
-
-    def test_each_sync_attention_line_is_one_issue_with_its_output_and_command(self) -> None:
-        import json
+    @requires("node")
+    def test_update_carries_typed_sync_issue_and_continues(self) -> None:
         events = self.f.base / "events"
-        script = ("printf 'dots sync: no local changes · pulled dev +1, main +0 · nothing to push\\n"
-                  "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply\\n"
-                  "    mise $ dots internal persist-selected\\n    mise ERROR pre-dotfiles hook failed\\n"
-                  "  changed on disk: 1 file changed\\n  LATE EDIT: config.toml not updated; rerun\\n"
-                  "  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots sync\\n'")
         result = subprocess.run(["bash", "-c", 'exec 3>>"$0"; exec bash "$1"', str(events), str(self.f.manager / "tasks/update")],
                                 cwd=self.f.config, env={**self.f.env, "SETUP_PROFILE": "laptop", "DOTS_SOURCE_SYNC_DONE": "0",
-                                                        "DOTS_UP_EVENT_FD": "3", "FAKE_SYNC": script},
+                                                        "DOTS_UP_EVENT_FD": "3", "FIXTURE_REAL_SYNC": "1"},
                                 capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         parsed = [json.loads(line) for line in events.read_text().splitlines()]
-        end = next(e for e in parsed if e["kind"] == "stage_end" and e["id"] == "source-sync")
-        self.assertEqual((end["label"], end["status"], end["action"]), ("Sync configuration", "attention", "dots apply"))
-        self.assertTrue(end["summary"].startswith("APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), end)
-        self.assertEqual(end["detail"], "mise $ dots internal persist-selected\nmise ERROR pre-dotfiles hook failed")
-        notices = [e for e in parsed if e["kind"] == "notice" and e.get("stage") == "source-sync"]
-        self.assertEqual([(e["summary"], e["detail"], e["action"]) for e in notices],
-                         [("LATE EDIT: config.toml not updated; rerun", "", "dots sync"),
-                          ("APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots sync", "", "dots sync")])
-        # The final summary repeats the attention line with the output under it.
-        summary = result.stdout.split("Source sync needs attention:\n", 1)[1]
-        self.assertTrue(summary.startswith("  APPLY FAILED: mise bootstrap dotfiles apply (exit 1)"), summary)
-        self.assertIn("\n    mise ERROR pre-dotfiles hook failed\n  LATE EDIT", summary)
-        self.assertNotIn("changed on disk", summary)
+        issues = [e for e in parsed if e.get("status") == "attention" and e.get("id") == "source-sync"]
+        self.assertEqual(len(issues), 1)
+        self.assertIn("not a Git repository", issues[0]["summary"])
+        self.assertIn("dots sync", issues[0]["action"])
+        self.assertIn("Update report: completed; needs attention: source sync;", result.stdout)
 
     def test_failed_and_deferred_stages_carry_their_output_in_plain_mode(self) -> None:
         self.f.hook("update.d", "10-Waits", "echo 'needs a login: run gh auth login'\nexit 3\n")
@@ -416,36 +395,63 @@ class UpdateHookTests(ContractTestCase):
         result = self.f.update("--plain")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         output = result.stdout + result.stderr
-        self.assertRegex(output, r"Result: deferred; needs attention\nRecent output:\nneeds a login: run gh auth login\nFull log: \S+/stages/Waits\.log")
+        self.assertRegex(output, r"Waits · deferred; needs attention\nRecent output:\nneeds a login: run gh auth login\nFull log: \S+/stages/Waits\.log")
         self.assertRegex(output, r"Recent output:\nstep one\nboom: disk full\nFull log: \S+/stages/Breaks\.log")
         self.assertRegex(result.stdout, r"Logs of the steps that need attention:\n  Waits: \S+Waits\.log\n  Breaks: \S+Breaks\.log")
 
 class CommandBackendTests(ContractTestCase):
-    def test_standalone_sync_reports_its_outcome_and_attention_lines(self) -> None:
-        import json
+    @requires("node")
+    def test_standalone_sync_attaches_its_own_stage_and_preserves_public_exit(self) -> None:
         events = self.f.base / "events"
-        for name, script, status, attention in (
-            ("ok", "echo 'dots sync: no local changes · pulled dev +0, main +0 · nothing to push'", "ok", []),
-            ("stopped", "echo 'dots sync: stopped · HEAD is detached, not on dev. See docs'", "attention",
-             ["dots sync: stopped · HEAD is detached, not on dev. See docs"]),
-            ("partial", "printf 'dots sync: saved 1 file locally · offline · not pushed\\n  OFFLINE: 1 commits unpushed, retried next run\\n  changed on disk: 1 file changed\\n'",
-             "attention", ["OFFLINE: 1 commits unpushed, retried next run"]),
-        ):
-            with self.subTest(name):
-                result = subprocess.run(["bash", "-c", 'exec 3>"$0"; exec "$@"', str(events), sys.executable,
-                                         str(self.f.manager / "lib/dots-command-backend.py"), str(self.f.mise), str(self.f.config), "sync"],
-                                        cwd=self.f.config, env={**self.f.env, "DOTS_UP_EVENT_FD": "3", "FAKE_SYNC": script},
-                                        capture_output=True, text=True, timeout=60, check=False)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                header = result.stdout.splitlines()[0]
-                self.assertTrue(header.startswith("dots sync: "), result.stdout)
-                parsed = [json.loads(line) for line in events.read_text().splitlines()]
-                # One issue per sync: its summary is the first attention line, never a second notice.
-                self.assertEqual([e for e in parsed if e["kind"] == "notice"], [])
-                end = next(e for e in parsed if e["kind"] == "stage_end")
-                self.assertEqual((end["status"], end["exit_code"], end["summary"]), (status, 0, attention[0] if attention else header))
-                self.assertEqual(bool(end["action"]), bool(attention))
-                self.assertEqual([(e["status"], e["exit_code"]) for e in parsed if e["kind"] == "run_end"], [(status, 0)])
+        result = subprocess.run(["bash", "-c", 'exec 3>"$0"; exec "$@"', str(events), sys.executable,
+                                 str(self.f.manager / "lib/dots-command-backend.py"), str(self.f.mise), str(self.f.config), "sync"],
+                                cwd=self.f.config, env={**self.f.env, "DOTS_UP_EVENT_FD": "3", "FIXTURE_REAL_SYNC": "1"},
+                                capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a Git repository", result.stdout)
+        parsed = [json.loads(line) for line in events.read_text().splitlines()]
+        self.assertEqual([(e["id"], e["status"]) for e in parsed if e["kind"] == "stage_end"], [("sync", "attention")])
+        self.assertEqual([(e["status"], e["exit_code"]) for e in parsed if e["kind"] == "run_end"], [("attention", 0)])
+
+    @requires("git", "node", "gitleaks")
+    def test_public_sync_records_changed_files_and_replays_without_syncing(self) -> None:
+        env = {**self.f.env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=self.f.config, env=env, text=True).strip()
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        write(self.f.config / ".gitignore", "/miserc.toml\n/config.local.toml\n/config.host-*.toml\n/mise.lock\n/.setup-state/\n/locks/\n")
+        write(self.f.config / "config.toml", '[vars]\ndots_source_repo = "fixture/config"\n')
+        git("add", ".")
+        git("commit", "-qm", "base")
+        origin = str(self.f.base / "origin.git")
+        git("clone", "-q", "--bare", ".", origin)
+        git("remote", "add", "origin", "https://github.com/fixture/config")
+        git("config", "url." + origin + ".insteadOf", "https://github.com/fixture/config")
+        git("switch", "-qc", "dev")
+        git("push", "-q", "origin", "dev")
+        write(self.f.config / "editor.ini", "tab_size = 4\n")
+        self.f.env.update(FIXTURE_REAL_SYNC="1", FAKE_HISTORY_STATUS='{"files": [], "edits": []}', GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
+        run = self.f.dots("sync")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("Shared on dev", run.stdout)
+        self.assertIn("editor.ini", run.stdout)
+        self.assertNotIn("tab_size", run.stdout)
+        head = git("rev-parse", "HEAD")
+        write(self.f.config / "editor.ini", "tab_size = 8\n")
+        replay = self.f.dots("sync", "--last")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertIn("editor.ini", replay.stdout)
+        self.assertNotIn("tab_size", replay.stdout)
+        self.assertEqual(git("rev-parse", "HEAD"), head)
+        self.assertEqual(git("status", "--porcelain"), "M editor.ini")
+        git("restore", "editor.ini")
+        clean = self.f.dots("sync")
+        self.assertEqual(clean.returncode, 0)
+        self.assertEqual(len(clean.stdout.strip().splitlines()), 1, clean.stdout)
+        self.assertIn("up to date", clean.stdout.lower())
+        self.assertNotIn("editor.ini", self.f.dots("sync", "--last").stdout)
 
     def test_failed_standalone_command_names_the_command_to_rerun(self) -> None:
         import json
@@ -663,7 +669,7 @@ class CommandTests(ContractTestCase):
         self.command("sync", f"touch {marker}\n")
         result = self.f.dots("sync", "extra")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("dots: sync takes no arguments", result.stderr)
+        self.assertIn("dots sync [--last]", result.stderr)
         self.assertFalse(marker.exists())
 
     def test_names_with_a_slash_or_leading_dash_are_rejected(self) -> None:
@@ -703,7 +709,7 @@ class CommandTests(ContractTestCase):
         available = write(self.f.base / "bin/dots-up", r"""
             #!/bin/sh
             if [ "$1" = --capabilities ]; then
-                echo dots-shared-cli/2
+                echo dots-shared-cli/3
             else
                 printf '%s\n' "$0" "$@"
             fi

@@ -70,12 +70,29 @@ A `dev` moved with plumbing in another worktree of the live checkout is merged t
 
 ## The outcome block
 
-Every run prints one block.
-Its first line has three parts:
+A clean run fits on one line.
+When files change, the receipt leads with any issue and its next action,
+then lists up to five paths per group.
 
-```text
-dots sync: shared 2 files · pulled dev +1, main +0 · pushed 3f2a9c1
-```
+- **Shared on dev** covers the change accepted by the remote,
+  including work saved on an earlier offline run.
+- **Saved locally** covers edits recorded on this machine's `dev`.
+- **Updated in this checkout** covers files that reached the configuration checkout.
+  A later failure to deploy a dotfile is reported separately.
+- **Finished pending checkout** covers an update completed after an interruption.
+
+In a terminal, standalone sync can show a complete small text diff
+for up to two paths and twelve displayed lines across the run.
+Use `dots sync --last` to inspect the latest finished sync for this checkout,
+including the sync at the beginning of `dots up`.
+Search with `/` in the pager and press `q` to return.
+Replay reads the recorded Git revisions locally.
+Piped output and saved reports contain metadata only.
+Binary, encrypted and unverified changes remain visible as file entries.
+
+### Verbose diagnostics
+
+`dots --verbose sync` includes the Git summary and the underlying diagnostics.
 
 | Part | Values |
 | --- | --- |
@@ -84,7 +101,7 @@ dots sync: shared 2 files · pulled dev +1, main +0 · pushed 3f2a9c1
 | Push | `pushed COMMIT`, `nothing to push`, `not pushed` |
 
 Indented lines follow.
-Upper-case lines need attention; `dots up` repeats them in its final summary and reports the sync stage as one issue, whose details show the whole block and the path of its log.
+The updater records each issue with its diagnostic and recovery action.
 When a command failed, the last lines it printed follow its attention line, indented further; they are the error to fix.
 Lower-case lines are information.
 
@@ -130,8 +147,8 @@ A run can also end with a single line instead:
 | `dots sync: skipped · GIT cannot merge-tree -X; install Git 2.43 or newer` | See [requirements](#requirements). |
 | `dots sync: failed · ERROR` | An unexpected error. Read it, fix the cause and sync again. |
 
-Every run exits 0; the printed outcome, not the exit status, says how it ended.
-`dots sync` and `dots up` report `stopped`, `skipped` and `failed` lines and upper-case lines as needing attention; `dots up` continues with its other stages whatever the sync outcome.
+A normal sync exits zero and reports its outcome in the receipt.
+The updater continues with its remaining stages after a sync issue.
 
 ## Requirements
 

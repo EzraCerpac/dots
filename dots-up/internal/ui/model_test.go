@@ -392,6 +392,19 @@ func TestNoticeOnlyMarksSuccessfulRunForAttention(t *testing.T) {
 	}
 }
 
+func TestSyncIssuesPreserveDistinctDetails(t *testing.T) {
+	m := NewModel(t.TempDir(), false)
+	m = send(m, Event{Kind: "stage_start", ID: "sync", Label: "Sync configuration"})
+	m = send(m, Event{Kind: "stage_end", ID: "sync", Status: "attention", Summary: "Copy capture failed", Detail: "alpha"})
+	for _, detail := range []string{"alpha", "beta", "gamma", "beta"} {
+		m = send(m, Event{Kind: "notice", Stage: "sync", Severity: "attention", Summary: "Copy capture failed", Detail: detail})
+	}
+	issues := m.issues()
+	if len(issues) != 3 || issues[1].key == issues[2].key || issues[1].detail != "beta" || issues[2].detail != "gamma" {
+		t.Fatalf("expected three separately selectable issues, got %+v", issues)
+	}
+}
+
 func TestBackKeysReturnOneLevelWithoutCancelling(t *testing.T) {
 	for _, code := range []rune{tea.KeyLeft, tea.KeyEscape, 'q'} {
 		for _, finished := range []bool{false, true} {

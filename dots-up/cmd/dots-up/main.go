@@ -40,7 +40,7 @@ func run(args []string) int {
 		return 2
 	}
 	if capabilities {
-		fmt.Println("dots-shared-cli/2")
+		fmt.Println("dots-shared-cli/3")
 		return 0
 	}
 	if opts.Plain && opts.Verbose {

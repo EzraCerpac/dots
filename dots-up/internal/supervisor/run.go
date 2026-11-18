@@ -193,6 +193,7 @@ func Run(opts Options) int {
 		}()
 		go readControls(controlReader, controls)
 	}
+	terminalSync := opts.Command == "sync" && interactive && files != nil && !opts.Verbose
 	dashboardStarted := dashboard
 	defer func() {
 		if originalTerminalState != nil && backend.tty != nil {
@@ -308,7 +309,7 @@ func Run(opts Options) int {
 		if opts.Command == "status" && printStatusEvent(e) {
 			return
 		}
-		if !opts.Verbose && e.ID != startupStage {
+		if !opts.Verbose && opts.Command != "sync" && e.ID != startupStage {
 			if opts.Command == "up" {
 				if e.Kind == "stage_start" || e.Kind == "app_store_start" {
 					fmt.Printf("→ %s · %s\n", e.Label, time.Since(started).Truncate(time.Second))
@@ -673,7 +674,7 @@ func Run(opts Options) int {
 				}
 				writeLog(stageLog, globalLog, clean)
 			}
-			if !relaying && opts.Verbose && len(b) > 0 {
+			if !relaying && (opts.Verbose || (opts.Command == "sync" && !terminalSync)) && len(b) > 0 {
 				_, _ = os.Stdout.Write(b)
 			}
 		case err := <-eventErr:
@@ -801,7 +802,7 @@ func Run(opts Options) int {
 		plain = true
 		flushDashboardStatus()
 	}
-	if (plain && !opts.Verbose) || dashboardStarted {
+	if opts.Command != "sync" && ((plain && !opts.Verbose) || dashboardStarted) {
 		report := Report{Command: opts.Command, ExitCode: exitCode, Events: unsavedUpEvents}
 		dir := ""
 		if files != nil {
@@ -831,6 +832,20 @@ func Run(opts Options) int {
 	}
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)
+	}
+	// The sync backend writes metadata to the captured stream. Only the
+	// original terminal receives patch text, after all captured output drains.
+	if terminalSync {
+		receipt := filepath.Join(files.runDir, "sync.json")
+		preview := exec.Command("bash", filepath.Join(opts.Home, "bin", "dots"), "internal", "sync-present", receipt)
+		preview.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root, "DOTS_HOME="+opts.Home)
+		preview.Stdin, preview.Stdout, preview.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := preview.Run(); err != nil {
+			// Keep the original diagnostic if sync stopped before writing a receipt.
+			if output, err := os.ReadFile(filepath.Join(files.runDir, "backend.log")); err == nil {
+				_, _ = os.Stdout.Write(output)
+			}
+		}
 	}
 	return exitCode
 }

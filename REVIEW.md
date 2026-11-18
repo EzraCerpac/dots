@@ -8,11 +8,11 @@ For anyone reviewing a pull request here, human or automated.
   one person's configuration: owner- and machine-specific behaviour comes only
   from the configuration contract (`[vars] dots_*` and the `dots/` directory).
 - It runs on macOS and Linux. Updates never prune packages or restart services.
-- `dots sync` always exits 0 and prints one outcome block. Anything that needs
-  attention is a line starting with an upper-case label (`NOT APPLIED`,
-  `SAVE REFUSED`, ...), or the single line `dots sync: stopped` or
-  `dots sync: failed`. It never force-pushes, never skips validation of the
-  merged configuration and never discards uncommitted local edits.
+- `dots sync` always exits 0 and prints a receipt.
+  The receipt records verified sharing, local saves and checkout updates.
+  Issues carry a diagnostic and recovery action.
+  Patch contents appear only on an interactive terminal.
+  Sync never force-pushes, skips validation or discards uncommitted edits.
 - A tracked history file is never saved unless it is declared `encrypt = true`.
 - Tests build their own configuration or copy `tests/fixtures`; they must pass
   from a copy of this repository alone.

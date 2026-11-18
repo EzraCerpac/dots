@@ -116,7 +116,10 @@ test('format shows a clean sync in one line and limits each direction to five pa
   assert.match(text, /Finished pending checkout/);
   assert.equal(text.match(/… 1 more/g).length, groups.length);
   assert.doesNotMatch(text, /change5/);
-  assert.deepEqual(receiptChangeRows(receipt), text.split('\n').slice(0, -1));
+  const rows = receiptChangeRows(receipt);
+  assert.equal(rows.length, groups.length * 6);
+  assert.match(rows[0], /Shared on dev · added change0/);
+  assert.match(rows[5], /Shared on dev · … 1 more/);
 });
 
 test('latest finished receipt is atomic worktree-local metadata and reports pruned endpoints', t => {
@@ -138,11 +141,19 @@ test('latest finished receipt is atomic worktree-local metadata and reports prun
   assert.equal(first.status, 0, first.stderr);
   assert.match(first.stdout, new RegExp(before + ' → ' + after));
   assert.doesNotMatch(first.stdout, /PAYLOAD_MUST_NOT_PERSIST|diff --git/);
+  const older = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+  delete older.scanBlocked;
+  fs.writeFileSync(receiptFile, JSON.stringify(older));
+  const oldReplay = f.showLast();
+  assert.equal(oldReplay.status, 0);
+  assert.match(oldReplay.stdout, /older sync receipt/);
+  assert.match(oldReplay.stdout, /edited file/);
+  saveReceipt(f.root, receipt);
 
   const linked = path.join(f.dir, 'linked');
   f.git('worktree', 'add', '-q', '-b', 'other', linked);
   assert.equal(f.showLast(linked).status, 1);
-  const stopped = buildReceipt(linked, { header: 'dots sync: stopped · Git operation in progress', source: 'up' });
+  const stopped = buildReceipt(linked, { source: 'up', status: 'stopped', issues: [{ summary: 'Sync stopped', detail: 'Git operation in progress' }] });
   assert.equal(saveReceipt(linked, stopped), true);
   const nested = f.showLast(linked);
   assert.equal(nested.status, 0, nested.stderr);
@@ -186,6 +197,9 @@ test('inline shows only a complete bounded patch from immutable Git endpoints', 
   assert.equal(inlinePatch(f.root, receipt, { ...options, width: 12 }), '');
   assert.equal(inlinePatch(f.root, { ...receipt, source: 'up' }, options), '');
   assert.equal(inlinePatch(f.root, { ...receipt, status: 'attention' }, options), '');
+  for (const files of [null, [], [{ ...receipt.groups[0].files[0], name: 'different-file' }]]) {
+    assert.equal(inlinePatch(f.root, { ...receipt, groups: [{ ...receipt.groups[0], files }] }, options), '');
+  }
   const two = { ...receipt, groups: [...receipt.groups, ...receipt.groups] };
   assert.equal(inlinePatch(f.root, two, options).trimEnd().split('\n').length, 12);
   assert.equal(inlinePatch(f.root, { ...receipt, groups: [...two.groups, ...receipt.groups] }, options), '');
@@ -235,7 +249,7 @@ test('inline suppresses binary, unsafe paths and bytes, secrets on either side, 
   f.write('ordinary', 'visible\n');
   const after = f.commit();
   assert.equal(inlinePatch(f.root, f.receipt(before, after, {
-    lines: ['NOT SHARED (gitleaks custom-rule): ordinary:1'],
+    scanBlocked: true,
   }), options), '');
   assert.equal(inlinePatch(f.root, f.receipt(before, after), { ...options, gitleaks: path.join(f.dir, 'missing') }), '');
   for (const contents of ['exit 2', 'echo "scanner did not run"']) {

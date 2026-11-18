@@ -28,16 +28,15 @@ setup_init || exit $?
 # install cleanup would delete the old keg mid-run; dots up removes no
 # installed version, so keep Homebrew's cleanup for later as well.
 export HOMEBREW_NO_INSTALL_CLEANUP=1
-if [[ "$plain_output" -eq 1 ]] && ! dots_up_event_sink_enabled && [[ -z "${DOTS_UP_RUN_DIR:-}" ]]; then
+if [[ "$plain_output" -eq 1 ]] && ! dots_up_event_sink_enabled && [[ -z "${DOTS_UP_RUN_DIR:-}" && "${DOTS_UP_NO_LOGS:-0}" != 1 ]]; then
     state_root="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dots/up"
-    mkdir -p "$state_root" || exit 1
-    chmod 700 "$state_root" || exit 1
-    DOTS_UP_RUN_DIR="$state_root/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    mkdir -p "$DOTS_UP_RUN_DIR/stages" || exit 1
-    chmod 700 "$DOTS_UP_RUN_DIR" "$DOTS_UP_RUN_DIR/stages" || exit 1
-    : > "$DOTS_UP_RUN_DIR/.active"
-    chmod 600 "$DOTS_UP_RUN_DIR/.active"
-    export DOTS_UP_RUN_DIR
+    run="$state_root/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    if (umask 077; mkdir -p "$state_root" && chmod 700 "$state_root" && mkdir "$run" "$run/stages" && : > "$run/.active"); then
+        export DOTS_UP_RUN_DIR="$run"
+    else
+        printf 'Could not save stage logs under %s. Showing output here.\n' "$state_root" >&2
+        export DOTS_UP_NO_LOGS=1
+    fi
 fi
 if dots_up_event_sink_enabled && [[ -z "${DOTS_UP_EVENT_JQ:-}" ]]; then
     DOTS_UP_EVENT_JQ="$(setup_mise which jq 2>/dev/null || true)"
@@ -102,7 +101,6 @@ snapshot_stage() {
 }
 emit_snapshot_changes() {
     local stage="$1" before="$2" after="$3" changes
-    dots_up_event_sink_enabled || return 0
     changes="$(setup_mise exec -- jq -cn --arg stage "$stage" --argjson before "${before:-[]}" --argjson after "${after:-[]}" '
         ($before | map({key:.item,value:.value}) | from_entries) as $b |
         ($after | map({key:.item,value:.value}) | from_entries) as $a |
@@ -111,7 +109,11 @@ emit_snapshot_changes() {
         {v:1,kind:"change",stage:$stage,item:$item,action:(if ($b | has($item) | not) then "installed" elif ($a | has($item) | not) then "removed" else "updated" end),before:($b[$item] // "not installed"),after:($a[$item] // "not installed")}
     ' 2>/dev/null || true)"
     [[ -n "$changes" ]] || return 0
-    while IFS= read -r event; do [[ -n "$event" ]] && emit_event "$event"; done <<< "$changes"
+    if dots_up_event_sink_enabled; then
+        while IFS= read -r event; do [[ -n "$event" ]] && emit_event "$event"; done <<< "$changes"
+    else
+        printf '%s\n' "$changes" | setup_mise exec -- jq -r '"  \(.item)  \(.before) → \(.after)"'
+    fi
 }
 # Hooks and installer exception recipes may append "ITEM<TAB>BEFORE<TAB>AFTER"
 # lines to $DOTS_CHANGES; each becomes a change in its stage report, like the
@@ -139,6 +141,9 @@ emit_reported_changes() {
         if [[ "$line" != *$'\t'*$'\t'* || "$after" == *$'\t'* || -z "$item" ]]; then
             ignored=$((ignored + 1))
             continue
+        fi
+        if [[ "${plain_output:-0}" -eq 1 ]] && ! dots_up_event_sink_enabled; then
+            printf '  %s  %s → %s\n' "$item" "${before:-not installed}" "${after:-removed}"
         fi
         emit_event "$(event_json --arg stage "$stage" --arg item "$item" --arg action "$(change_action "$before" "$after")" --arg before "$before" --arg after "$after" '{v:1,kind:"change",stage:$stage,item:$item,action:$action,before:$before,after:$after}')"
     done < "$file"
@@ -184,45 +189,28 @@ validate_update_config || abort_invalid_config
 if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
     sync_result=0
     if [[ "$plain_output" -eq 1 ]]; then printf 'Working: Sync configuration\n'; fi
-    if dots_up_event_sink_enabled; then
-        start_event_stage source-sync 'Source & settings' 'Sync configuration' hidden
-    fi
+    emit_event '{"v":1,"kind":"stage_start","id":"source-sync","group":"Source & settings","label":"Sync configuration","terminal":"hidden"}'
     # setup_mise turns off auto-install for its own mise call only. Sync applies
     # the incoming configuration, whose hooks may run a tool it newly pins with
     # `mise x`, so sync keeps the caller's setting, as `dots sync` does.
     restore=(-u MISE_AUTO_INSTALL)
     [[ -z "${MISE_AUTO_INSTALL+set}" ]] || restore=("MISE_AUTO_INSTALL=$MISE_AUTO_INSTALL")
-    sync_output="$(setup_mise exec -- env "${restore[@]}" node "$DOTS_HOME/lib/source-repo.mjs" sync "$SETUP_ROOT" 2>&1)" || sync_result=$?
+    sync_args=(--up)
+    if [[ "$verbose_output" -eq 1 ]]; then sync_args+=(--verbose); fi
+    sync_output="$(setup_mise exec -- env "${restore[@]}" node "$DOTS_HOME/lib/source-repo.mjs" sync "$SETUP_ROOT" "${sync_args[@]}" 2>&1)" || sync_result=$?
     printf '%s\n' "$sync_output"
     if [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
-        # The log keeps the output, not the event records it carries to the dashboard.
-        (umask 077; printf '%s\n' "$sync_output" | LC_ALL=C sed $'s/\036dots-up\\/1:[^\037]*\037//g' > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true
+        (umask 077; printf '%s\n' "$sync_output" | LC_ALL=C sed $'s/\036dots-up\/1:[^\037]*\037//g' > "$DOTS_UP_RUN_DIR/stages/source-sync.log") || true
     fi
-    # Attention: a header that did not complete, an uppercase notice line, or a
-    # crash, each with the deeper-indented output lines that explain it.
-    sync_attention="$(printf '%s\n' "$sync_output" | awk '
-        /^dots sync: (stopped|skipped|failed)/ || /^  [A-Z][A-Z ]+[ :(]/ { keep = 1; print; next }
-        keep && /^    / { print; next }
-        { keep = 0 }')"
-    if [[ "$sync_result" -ne 0 && -z "$sync_attention" ]]; then sync_attention="dots sync exited $sync_result"; fi
-    if [[ -n "$sync_attention" ]]; then
-        if [[ "$plain_output" -eq 1 ]]; then printf 'Result: needs attention\n'; fi
-        # One issue per attention line, with the output under it and the one
-        # command to run next; the first ends the stage, the rest are notices.
-        while IFS= read -r sync_event; do emit_event "$sync_event"; done < <(event_json --arg text "$sync_attention" '
-            [$text | split("\n")[] | select(length > 0)]
-            | reduce .[] as $line ([]; if ($line | startswith("    ")) then .[-1].detail += [$line[4:]]
-                                       else . + [{summary: ($line | ltrimstr("  ")), detail: []}] end)
-            | to_entries[] | .key as $first | .value
-            | {v:1, summary, detail: (.detail | join("\n")),
-               action: (if (.summary | startswith("APPLY FAILED") and endswith("then run dots apply")) then "dots apply" else "dots sync" end)}
-            | if $first == 0 then . + {kind:"stage_end", id:"source-sync", label:"Sync configuration", status:"attention", exit_code:0}
-              else . + {kind:"notice", severity:"attention", stage:"source-sync"} end')
-    else
-        if [[ "$plain_output" -eq 1 ]]; then printf 'Result: completed\n'; fi
-        emit_event "$(event_json --arg id source-sync --arg summary "${sync_output%%$'\n'*}" '{v:1,kind:"stage_end",id:$id,label:"Sync configuration",status:"ok",exit_code:0,summary:$summary}')"
+    # Internal exit 3 carries typed attention across mise re-exec without
+    # interpreting human output or putting the entire receipt in the environment.
+    if [[ "$sync_result" -ne 0 ]]; then
+        export DOTS_SOURCE_SYNC_ATTENTION=1
+        if [[ "$sync_result" -ne 3 ]]; then
+            emit_event "$(event_json --arg detail "$sync_output" --argjson code "$sync_result" '{v:1,kind:"stage_end",id:"source-sync",label:"Sync configuration",status:"failed",summary:"Sync could not finish",detail:$detail,action:"dots sync",exit_code:$code}')"
+        fi
     fi
-    export DOTS_SOURCE_SYNC_DONE=1 DOTS_SOURCE_SYNC_ATTENTION="$sync_attention"
+    export DOTS_SOURCE_SYNC_DONE=1
     exec "$(resolve_mise_bin)" -C "$SETUP_ROOT" -E "$SETUP_ENVIRONMENTS" exec -- bash "$DOTS_HOME/tasks/update" "$@"
 fi
 
@@ -259,7 +247,7 @@ run_stage() {
             fi
         fi
     fi
-    if dots_up_event_sink_enabled; then
+    if dots_up_event_sink_enabled || [[ "$plain_output" -eq 1 ]]; then
         before_snapshot="$(snapshot_stage "$group" "$label" "$manager" 2>/dev/null)" && [[ "$before_snapshot" == \[*\] ]] && before_valid=1 || true
     fi
     if [[ "$plain_output" -eq 1 ]] && ! dots_up_event_sink_enabled && [[ -n "${DOTS_UP_RUN_DIR:-}" ]]; then
@@ -269,7 +257,15 @@ run_stage() {
             stage_log=""
         fi
     fi
-    if [[ "$plain_output" -eq 1 ]]; then printf 'Working: %s\n' "$label"; else printf '\n== %s ==\n' "$label"; fi
+    local transient=0
+    if [[ "$plain_output" -eq 0 ]]; then
+        printf '\n== %s ==\n' "$label"
+    elif [[ -t 1 && "$terminal" != handoff && -n "$stage_log" ]]; then
+        printf 'Working: %s' "$label"
+        transient=1
+    elif [[ -t 1 || -z "$stage_log" ]]; then
+        printf 'Working: %s\n' "$label"
+    fi
     local result=0 changes_file="" action=""
     if [[ "$reports_changes" -eq 1 ]]; then
         if changes_file="$(mktemp "${TMPDIR:-/tmp}/dots-changes.XXXXXX")"; then
@@ -285,12 +281,13 @@ run_stage() {
     else
         "$@" || result=$?
     fi
+    if [[ "$transient" -eq 1 ]]; then printf '\r\033[K'; fi
     if [[ -n "$changes_file" ]]; then
         unset DOTS_CHANGES
         emit_reported_changes "$event_id" "$changes_file"
         rm -f -- "$changes_file"
     fi
-    if dots_up_event_sink_enabled; then
+    if dots_up_event_sink_enabled || [[ "$plain_output" -eq 1 ]]; then
         after_snapshot="$(snapshot_stage "$group" "$label" "$manager" 2>/dev/null)" && [[ "$after_snapshot" == \[*\] ]] && after_valid=1 || true
         if [[ "$before_valid" -eq 1 && "$after_valid" -eq 1 ]]; then
             emit_snapshot_changes "$event_id" "$before_snapshot" "$after_snapshot"
@@ -298,7 +295,7 @@ run_stage() {
     fi
     if [[ "$result" -eq 0 ]]; then
         local summary="completed"
-        printf 'Result: completed\n'
+        if [[ "$plain_output" -eq 0 ]]; then printf 'Result: completed\n'; fi
         if dots_up_event_sink_enabled; then
             emit_event "$(event_json --arg id "$event_id" --arg label "$label" --arg summary "$summary" '{v:1,kind:"stage_end",id:$id,label:$label,status:"ok",exit_code:0,summary:$summary}')"
         fi
@@ -309,7 +306,8 @@ run_stage() {
             deferred+=("$label")
             action="Do what the hook's output asks, then run dots up again"
         fi
-        printf 'Result: %s\n' "$summary"
+        if [[ "$plain_output" -eq 0 ]]; then printf 'Result: %s\n' "$summary"
+        elif [[ "$status" == attention ]]; then printf '%s · %s\n' "$label" "$summary"; fi
         if [[ "$status" == attention && -n "$stage_log" ]]; then
             printf 'Recent output:\n'
             tail -n 30 "$stage_log" || true
@@ -321,7 +319,8 @@ run_stage() {
         fi
         return 0
     else
-        printf 'Result: failed (exit %s)\n' "$result"
+        if [[ "$plain_output" -eq 1 ]]; then printf '%s · failed (exit %s)\n' "$label" "$result"
+        else printf 'Result: failed (exit %s)\n' "$result"; fi
         if [[ -n "$stage_log" ]]; then
             printf 'Recent output:\n' >&2
             tail -n 30 "$stage_log" >&2 || true
@@ -768,9 +767,6 @@ if ! run_stage 'Post-update settings checkpoint' settings_checkpoint; then
 fi
 
 if [[ -n "${DOTS_SOURCE_SYNC_ATTENTION:-}" ]]; then
-    printf '\nSource sync needs attention:\n%s\n' "$DOTS_SOURCE_SYNC_ATTENTION"
-    [[ -z "${DOTS_UP_RUN_DIR:-}" ]] || printf 'Full log: %s\n' "$DOTS_UP_RUN_DIR/stages/source-sync.log"
-    printf 'Next: fix what the sync output says, then run dots sync; %s explains every line\n' "$DOTS_HOME/docs/sync.md"
     deferred+=("source sync")
 fi
 if [[ "${#attention_logs[@]}" -gt 0 ]]; then
@@ -779,6 +775,7 @@ if [[ "${#attention_logs[@]}" -gt 0 ]]; then
 fi
 if [[ "${#failures[@]}" -eq 0 ]]; then
     if [[ "${#deferred[@]}" -gt 0 ]]; then
+        if [[ -n "${DOTS_UP_RUN_DIR:-}" && -f "$DOTS_UP_RUN_DIR/.fallback" ]]; then : > "$DOTS_UP_RUN_DIR/.attention"; fi
         printf '\nUpdate report: completed; needs attention: '
         printf '%s; ' "${deferred[@]}"
         printf '\n'

@@ -734,6 +734,9 @@ type issue struct {
 func (m Model) issues() []issue {
 	var result []issue
 	seen := make(map[string]bool)
+	identity := func(stage, summary, detail, action string) string {
+		return strings.Join([]string{stage, strings.ToLower(summary), detail, action}, "\x00")
+	}
 	for i, s := range m.Stages {
 		if s.Status != "attention" && s.Status != "failed" && s.Status != "missing" && s.Status != "drift" && s.Status != "unknown" {
 			continue
@@ -748,14 +751,14 @@ func (m Model) issues() []issue {
 		}
 		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, detail: s.Detail, action: s.Action, logPath: s.LogPath})
 		if s.Summary != "" {
-			seen[strings.ToLower(s.Summary)] = true
+			seen[identity(s.ID, s.Summary, s.Detail, s.Action)] = true
 		}
 	}
 	for _, n := range m.Notices {
 		if n.Severity != "attention" && n.Severity != "error" {
 			continue
 		}
-		key := strings.ToLower(n.Summary)
+		key := identity(n.Stage, n.Summary, n.Detail, n.Action)
 		if seen[key] {
 			continue
 		}
@@ -768,7 +771,7 @@ func (m Model) issues() []issue {
 		if i := m.stageIndex(n.Stage); n.Stage != "" && i >= 0 {
 			text, logPath, stage = m.Stages[i].Label+" — "+n.Summary, m.Stages[i].LogPath, i
 		}
-		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
+		result = append(result, issue{key: "notice:" + key, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
 	}
 	return result
 }

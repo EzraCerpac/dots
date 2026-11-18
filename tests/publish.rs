@@ -11,7 +11,7 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use isolation::{IsolatedWorld, executable_on_path};
+use isolation::{IsolatedWorld, executable_on_path, fixture_file};
 use pty::Pty;
 
 const REPOSITORY: &str = "example/p07-fixture";
@@ -758,6 +758,81 @@ fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmatio
         );
         fixture.assert_no_publication();
     }
+}
+
+#[test]
+#[ignore = "P-10 publish approval cancellation"]
+fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    let bookmark = "wip/interrupt";
+    fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
+    let bookmarks = fixture.jj(&["bookmark", "list"]);
+    let working = fixture.jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let command = fixture.dots(&["publish", "--bookmark", bookmark]);
+    let state = command
+        .get_envs()
+        .find_map(|(name, value)| (name == "XDG_STATE_HOME").then_some(value).flatten())
+        .map(PathBuf::from)
+        .expect("private fixture state");
+    let reports = state.join("dots/reports");
+    let report_paths = || match fs::read_dir(&reports) {
+        Ok(entries) => entries
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read fixture reports: {error}"),
+    };
+    let before = report_paths();
+    let mut terminal = Pty::spawn(command);
+    terminal.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    fixture.assert_no_publication();
+    terminal.send("\x03");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(130), "{transcript}");
+    fixture.assert_no_publication();
+    assert_eq!(fixture.jj(&["bookmark", "list"]), bookmarks);
+    assert_eq!(
+        fixture.jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        working
+    );
+    assert!(
+        !fixture.optional_log("jj").lines().any(|line| {
+            [
+                "bookmark create",
+                "bookmark set",
+                "bookmark delete",
+                "bookmark move",
+            ]
+            .iter()
+            .any(|command| line.contains(command))
+        }),
+        "cancelled publish attempted a bookmark mutation"
+    );
+    let mut publish_reports = Vec::new();
+    for path in report_paths()
+        .into_iter()
+        .filter(|path| !before.contains(path))
+    {
+        let path = fixture_file(&state, &path).expect("private regular fixture report");
+        let report: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        if report["command"] == "publish" {
+            publish_reports.push(report);
+        }
+    }
+    assert_eq!(publish_reports.len(), 1);
+    let report = &publish_reports[0];
+    assert_eq!(report["status"], 130);
+    assert_eq!(report["cancelled"], true);
+    assert!(
+        report["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stage| stage["label"] == "Publish source" && stage["outcome"] == "cancelled")
+    );
 }
 
 #[test]

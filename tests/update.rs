@@ -3,10 +3,10 @@ mod support;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::Value;
-use support::World;
+use support::{FixtureCommand, World};
 
 struct Fixture {
     world: World,
@@ -56,7 +56,8 @@ impl Fixture {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    fn command(&self, mut command: Command) -> Command {
+    fn command(&self) -> FixtureCommand<'_> {
+        let mut command = self.world.dots();
         let paths = [self.bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")];
         let home = self.world.home();
         for (key, dir) in [
@@ -85,20 +86,6 @@ impl Fixture {
             .env("MISE_TRUSTED_CONFIG_PATHS", self.world.root())
             .env("DOTS_UP_STATE_DIR", self.world.home().join("old-reports"))
             .env("MISE_SELF_UPDATE_AVAILABLE", "true");
-        for key in [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_STATE_HOME",
-            "XDG_CACHE_HOME",
-        ] {
-            assert!(
-                command.get_envs().any(|(name, value)| {
-                    name == key && value.is_some_and(|path| Path::new(path).starts_with(home))
-                }),
-                "{key} must point inside this fixture's HOME"
-            );
-        }
         command
     }
 
@@ -107,10 +94,10 @@ impl Fixture {
     }
 
     fn run_args(&self, args: &[&str], expected: i32) -> Value {
-        self.run_command(self.command(self.world.dots()).args(args), expected)
+        self.run_command(self.command().args(args), expected)
     }
 
-    fn run_command(&self, command: &mut Command, expected: i32) -> Value {
+    fn run_command(&self, command: &mut FixtureCommand<'_>, expected: i32) -> Value {
         let result = command.output().unwrap();
         assert_exit(&result, expected);
         self.read_report()
@@ -201,7 +188,7 @@ fn brew_up(fixture: &Fixture, kind: &str, expected: i32) -> Value {
     fixture.write("fail-version", "");
     fixture.run_command(
         fixture
-            .command(fixture.world.dots())
+            .command()
             .env("KIND", kind)
             .env("TOKEN", "fixture")
             .args(["--plain", "up"]),
@@ -256,7 +243,7 @@ fn unchanged_brew_recipe_without_a_change_sink_can_install() {
         BREW_RECIPE,
     );
     let output = fixture
-        .command(fixture.world.dots())
+        .command()
         .env("KIND", "cask")
         .env("TOKEN", "fixture")
         .arg("fixture-brew")
@@ -428,7 +415,7 @@ fn new_pre_checkpoint_failure_stops_before_sync_and_updates() {
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
     let output = fixture
-        .command(fixture.world.dots())
+        .command()
         .args(["--plain", "update"])
         .output()
         .unwrap();

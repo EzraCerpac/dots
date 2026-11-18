@@ -502,6 +502,11 @@ test('sync does not recreate dev if it disappears after fetch', available, async
       assert.equal(fs.existsSync(path.join(f.a, 'withdrawn')), false);
       f.clean(f.a);
       delete process.env.DEV_TEST_CONFIG_HOOK;
+      assert.equal(git(f.a, 'for-each-ref', 'refs/remotes/origin/dev'), '');
+      fs.renameSync(f.origin, f.origin + '.offline');
+      assert.match(f.sync(f.a).text, /offline/);
+      assert.equal(fs.existsSync(path.join(f.a, 'withdrawn')), false);
+      fs.renameSync(f.origin + '.offline', f.origin);
       assert.match(f.sync(f.a).text, /· pushed /);
       assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'withdrawn'), '');
     });
@@ -535,6 +540,31 @@ test('a retry leaves withdrawn remote history withdrawn', available, t => {
   assert.equal(fs.existsSync(path.join(f.a, 'upstream')), false);
   assert.match(f.sync(f.a).text, /· pushed /);
   assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'upstream'), '');
+});
+
+test('the final retry checks the tip used for that merge', available, t => {
+  const f = fixture(t);
+  f.write(f.a, 'local', 'local edit\n');
+  prePush(f, `set -eu
+cd '${f.b}'
+for n in 1 2 3; do
+  if [ ! -e "change-$n" ]; then
+    echo "$n" > "change-$n"
+    git add "change-$n"
+    git commit -qm "Advance $n"
+    git push -q origin dev
+    exit 0
+  fi
+done
+git -C '${f.origin}' update-ref refs/heads/dev "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)"
+rm '${f.a}/.git/hooks/pre-push'`);
+  const result = f.producer(f.a);
+  assert.match(result.header, /not applied/);
+  assert.match(result.issues[0].detail, /previously published history was removed/);
+  assert.equal(fs.existsSync(path.join(f.a, 'change-3')), false);
+  assert.equal(git(f.a, 'show', 'dev:local'), 'local edit');
+  assert.match(f.sync(f.a).text, /· pushed /);
+  assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'change-3'), '');
 });
 
 test('a rejected push keeps its reason without copying hook output to receipts or logs', available, t => {

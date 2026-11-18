@@ -1,6 +1,7 @@
 mod checkpoint;
 mod keys;
 mod native;
+mod publication;
 mod recovery;
 mod tracked;
 mod watcher;
@@ -88,6 +89,18 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     checkpoint::save(native)?;
     native.bare(&store)?;
     native.destinations(Some(&store), &origin, expected, &vars)?;
+    let policy = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
+    if !publication::allows_plaintext(native.probe(
+        policy,
+        "could not read mise's effective history.allow_plaintext_history setting",
+    )?)? {
+        publication::preflight(
+            || native.git(Some(&store)),
+            |cmd| native.probe(cmd, "could not verify the history publication range"),
+            &branch,
+            &origin,
+        )?;
+    }
     let cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
     native.output(
         cmd,

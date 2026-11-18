@@ -220,6 +220,13 @@ struct Captured {
 const STATE: &str = "dots-sync-copies.json";
 const COPY_ACTION: &str = "Review the source and deployed copy, then rerun dots sync.";
 
+fn copy_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn native_deployments(run: &Run<'_>) -> io::Result<BTreeMap<PathBuf, String>> {
     let env = &run.ctx().env;
     let state = env
@@ -352,9 +359,10 @@ impl Copies {
                     let digest: [u8; 32] = Sha256::digest(bytes).into();
                     let matches = read_copy(source, target.permissions.as_deref())
                         .is_ok_and(|image| image == self.observed[&destination])
-                        || self.deployments.get(&destination).is_some_and(|native| {
-                            *native == format!("{:x}", Sha256::digest(bytes))
-                        });
+                        || self
+                            .deployments
+                            .get(&destination)
+                            .is_some_and(|native| *native == copy_digest(bytes));
                     if matches {
                         self.state.known.entry(destination).or_insert(KnownCopy {
                             source: source.to_owned(),
@@ -567,6 +575,7 @@ impl Copies {
             return Ok(());
         }
         let active = status_at(run, git.root(), false)?;
+        let active_configs = Configs::read_at(run, git.root(), false)?;
 
         let ApplyPlan {
             selectors,
@@ -596,6 +605,18 @@ impl Copies {
             let group = declaration
                 .and_then(|decl| decl.group)
                 .or_else(|| configs.group(run, target, &path));
+            if configs.declaration_signature(run, target, &path)
+                != active_configs.declaration_signature(run, target, &path)
+            {
+                path_issue(
+                    receipt,
+                    "Kept a dotfile whose validated declaration changed",
+                    &path,
+                    COPY_ACTION,
+                );
+                results.insert(path, false);
+                continue;
+            }
             if target.origin.is_some() && definition.is_none() && group.is_none() {
                 path_issue(
                     receipt,
@@ -657,6 +678,13 @@ impl Copies {
                 })
                 .collect::<Vec<_>>()
         };
+        let reload = ReloadQueue::new(run, git.root(), git_dir, selectors, &configs.reload)?;
+        let directory_copies = targets
+            .iter()
+            .filter(|target| target.mode == "copy")
+            .filter(|target| target.effective_source().is_some_and(Path::is_dir))
+            .filter_map(|target| absolute_target(run, &target.target).ok())
+            .collect::<Vec<_>>();
         while !jobs.is_empty() {
             if run.cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
@@ -692,21 +720,46 @@ impl Copies {
                 results.insert(path, false);
                 continue;
             }
-            let changed_now = self.apply_target(
-                run,
-                git,
-                git_dir,
-                tree,
-                receipt,
-                &filesystem,
-                &observed,
-                &path,
-                target,
-                definition.as_ref(),
-                validated,
-                &all_jobs,
-                &sealed_sources,
-            );
+            let former_directory_leaf = directory_copies.iter().any(|directory| {
+                path.starts_with(directory)
+                    && directory != &path
+                    && self.state.known.keys().any(|leaf| {
+                        leaf.starts_with(directory)
+                            && (leaf.starts_with(&path) || path.starts_with(leaf))
+                    })
+            });
+            let changed_now = if target.mode == "copy" || former_directory_leaf {
+                self.apply_guarded(
+                    run,
+                    git,
+                    git_dir,
+                    tree,
+                    receipt,
+                    &filesystem,
+                    &observed,
+                    &path,
+                    target,
+                    definition.as_ref(),
+                    validated,
+                    &all_jobs,
+                    &sealed_sources,
+                    former_directory_leaf,
+                )
+            } else {
+                self.apply_native(
+                    run,
+                    git,
+                    validated,
+                    tree,
+                    &path,
+                    target,
+                    &filesystem,
+                    &observed,
+                    &sealed_sources,
+                    reload.as_ref(),
+                    receipt,
+                )
+            };
             results.insert(path.clone(), matches!(changed_now, Ok(true)));
             if changed_now.is_err() {
                 path_issue(
@@ -722,16 +775,17 @@ impl Copies {
         }
         self.persist(git_dir)?;
 
-        if native_reload(
-            run,
-            git_dir,
-            git.root(),
-            selectors,
-            &configs.reload,
-            &self.written,
-            receipt,
-        )
-        .is_err()
+        if let Some(reload) = reload
+            && reload
+                .finish(
+                    run,
+                    git.root(),
+                    selectors,
+                    &configs.reload,
+                    &self.written,
+                    receipt,
+                )
+                .is_err()
         {
             issue(
                 receipt,
@@ -756,7 +810,93 @@ impl Copies {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn apply_target(
+    fn apply_native(
+        &mut self,
+        run: &Run<'_>,
+        git: &Git<'_>,
+        validated: &Validated,
+        tree: &Tree,
+        path: &Path,
+        target: &Target,
+        filesystem: &Dir,
+        observed: &BTreeMap<PathBuf, Image>,
+        sealed_sources: &BTreeSet<PathBuf>,
+        reload: Option<&ReloadQueue>,
+        receipt: &mut Receipt,
+    ) -> io::Result<bool> {
+        if let Some(source) = target.effective_source() {
+            if sealed_sources.contains(source) {
+                path_issue(
+                    receipt,
+                    "Kept a dotfile with an omitted live source",
+                    path,
+                    COPY_ACTION,
+                );
+                return Ok(false);
+            }
+            source_for_apply(&validated.apply, git.root(), tree, source)?;
+        }
+        let current = filesystem.read_path(fs_relative(path)?)?;
+        let previous_copy = self.state.known.get(path);
+        let copy_is_edited = match previous_copy {
+            Some(copy) if current != Image::Absent => {
+                let common = Image::from_git(git, copy.entry.as_ref())?;
+                !copy.matches(&current, &common, copy.mode)
+            }
+            _ => false,
+        };
+        if observed
+            .get(path)
+            .map_or(current != Image::Absent, |before| *before != current)
+            || copy_is_edited
+        {
+            path_issue(
+                receipt,
+                "Kept a changed or unmanaged dotfile",
+                path,
+                COPY_ACTION,
+            );
+            return Ok(false);
+        }
+        validated.check_overlay_locals()?;
+        let mut command = validation::command(
+            run,
+            git.root(),
+            [
+                "bootstrap",
+                "dotfiles",
+                "apply",
+                "--yes",
+                "--",
+                utf8(&target.target)?,
+            ],
+            false,
+        )?;
+        command
+            .env("DOTS_ROOT", git.root())
+            .env("MISE_NO_HOOKS", "1")
+            .env(
+                "MISE_ENV",
+                reload.map_or(validated.apply.selectors.as_str(), |queue| {
+                    queue.selectors.as_str()
+                }),
+            );
+        if hook_failed(
+            receipt,
+            "mise dotfile apply failed",
+            COPY_ACTION,
+            run.probe(command).map(|output| output.status),
+        ) {
+            return Ok(false);
+        }
+        if previous_copy.is_some() {
+            self.state.known.remove(path);
+        }
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_guarded(
         &mut self,
         run: &Run<'_>,
         git: &Git<'_>,
@@ -771,6 +911,7 @@ impl Copies {
         validated: &Validated,
         all_jobs: &BTreeSet<PathBuf>,
         sealed_sources: &BTreeSet<PathBuf>,
+        former_directory_leaf: bool,
     ) -> io::Result<bool> {
         let configs = &validated.apply.configs;
         let rules = configs.rules(run, target, destination);
@@ -793,26 +934,33 @@ impl Copies {
                 }
             })
             .transpose()?;
-        let copy_child = target.mode == "template"
-            && validated.apply.targets.iter().any(|candidate| {
-                candidate.mode == "copy"
-                    && absolute_target(run, &candidate.target).is_ok_and(|parent| {
-                        destination != parent && destination.starts_with(parent)
-                    })
-            });
-        if target.mode == "template"
-            && (filesystem.read_path(fs_relative(destination)?)? == Image::Directory
-                || copy_child
-                    && self.state.known.contains_key(destination)
-                    && filesystem.read_path(fs_relative(destination)?)? != Image::Absent)
-        {
-            path_issue(
-                receipt,
-                "Kept a former directory copy",
-                destination,
-                COPY_ACTION,
-            );
-            return Ok(false);
+        if former_directory_leaf {
+            if filesystem.read_path(fs_relative(destination)?)? != Image::Absent {
+                path_issue(
+                    receipt,
+                    "Kept a former directory copy",
+                    destination,
+                    COPY_ACTION,
+                );
+                return Ok(false);
+            }
+            if target.mode == "absent" {
+                return Ok(true);
+            }
+            if target.mode != "template"
+                || definition
+                    .and_then(|item| item.get("remove_empty"))
+                    .and_then(Item::as_bool)
+                    == Some(true)
+            {
+                path_issue(
+                    receipt,
+                    "Kept a former directory copy whose takeover needs manual review",
+                    destination,
+                    COPY_ACTION,
+                );
+                return Ok(false);
+            }
         }
         let mut desired = BTreeMap::new();
         match target.mode.as_str() {
@@ -847,28 +995,7 @@ impl Copies {
                     read_copy(source, target.permissions.as_deref())?,
                 );
             }
-            "symlink" => {
-                let source = source
-                    .as_deref()
-                    .ok_or_else(|| invalid("link has no source"))?;
-                if let Ok(relative) = source.strip_prefix(git.root()) {
-                    let live = Dir::open(git.root())?.read_path(relative)?;
-                    let staged = Dir::open(&validated.apply.root)?.read_path(relative)?;
-                    if std::mem::discriminant(&live) != std::mem::discriminant(&staged)
-                        || matches!(&live, Image::Link(_)) && live != staged
-                    {
-                        return Err(invalid("link source changed after validation"));
-                    }
-                }
-                desired.insert(
-                    destination.to_owned(),
-                    Image::Link(link_target(source, destination, rules.relative)?),
-                );
-            }
-            "absent" => {
-                desired.insert(destination.to_owned(), Image::Absent);
-            }
-            "template" | "inline" | "content" => {
+            "template" if former_directory_leaf => {
                 desired.insert(
                     destination.to_owned(),
                     stage_handoff(
@@ -949,7 +1076,7 @@ impl Copies {
                     {
                         self.deployments
                             .get(&path)
-                            .is_some_and(|digest| *digest == format!("{:x}", Sha256::digest(bytes)))
+                            .is_some_and(|digest| *digest == copy_digest(bytes))
                     }
                     (Image::Regular { .. }, None, _) => matches!(
                         target.mode.as_str(),
@@ -1348,7 +1475,6 @@ struct Rules {
     dot_prefix: bool,
     manifest: bool,
     permissions: Option<String>,
-    relative: bool,
     create_only: bool,
 }
 
@@ -1496,29 +1622,6 @@ fn read_copy(source: &Path, permissions: Option<&str>) -> io::Result<Image> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
     Ok(Image::Regular { bytes, mode })
-}
-
-fn link_target(source: &Path, destination: &Path, relative: bool) -> io::Result<PathBuf> {
-    if !relative {
-        return Ok(source.to_owned());
-    }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| invalid("symlink target has no parent"))?;
-    let common = parent
-        .ancestors()
-        .find(|path| source.starts_with(path))
-        .ok_or_else(|| invalid("symlink paths have no common ancestor"))?;
-    let mut result = PathBuf::new();
-    for _ in parent
-        .strip_prefix(common)
-        .map_err(io::Error::other)?
-        .components()
-    {
-        result.push("..");
-    }
-    result.push(source.strip_prefix(common).map_err(io::Error::other)?);
-    Ok(result)
 }
 
 #[derive(Default)]
@@ -1713,6 +1816,22 @@ impl Configs {
             })
     }
 
+    fn declaration_signature(
+        &self,
+        run: &Run<'_>,
+        target: &Target,
+        path: &Path,
+    ) -> (Option<String>, Option<String>) {
+        let declaration = self.definition(run, target, path);
+        let group = declaration
+            .and_then(|declaration| declaration.group)
+            .or_else(|| self.group(run, target, path));
+        (
+            declaration.map(|declaration| declaration.item.to_string()),
+            group.map(|(_, item)| item.to_string()),
+        )
+    }
+
     fn rules(&self, run: &Run<'_>, target: &Target, path: &Path) -> Rules {
         let definition = self.definition(run, target, path);
         let group = definition
@@ -1729,9 +1848,6 @@ impl Configs {
             .and_then(Item::as_bool)
             .unwrap_or(false);
         let manifest = property("manifest").and_then(Item::as_str) == Some("git");
-        let relative = property("relative")
-            .and_then(Item::as_bool)
-            .unwrap_or(false);
         let create_only = property("create_if_missing")
             .and_then(Item::as_bool)
             .unwrap_or(false);
@@ -1740,7 +1856,6 @@ impl Configs {
             dot_prefix,
             manifest,
             permissions: target.permissions.clone(),
-            relative,
             create_only,
         }
     }
@@ -1772,7 +1887,13 @@ fn stage_handoff(
     if let Some(permissions) = &target.permissions {
         definition.insert("permissions", value(permissions.as_str()));
     }
-    let config = dotfile_config(&output, Item::Table(definition))?;
+    let mut config = reload_config(
+        &plan.configs.reload,
+        &stage.path().join("ignored-reloads"),
+        |pattern| Ok(pattern.to_owned()),
+    )?;
+    let dotfiles = dotfile_config(&output, Item::Table(definition))?;
+    config.insert("dotfiles", dotfiles["dotfiles"].clone());
     let profile = stage
         .path()
         .file_name()
@@ -1816,71 +1937,142 @@ fn stage_handoff(
     Ok(output)
 }
 
-fn native_reload(
-    run: &Run<'_>,
-    git_dir: &Path,
-    live: &Path,
-    selectors: &str,
-    rules: &[(String, String)],
-    paths: &BTreeSet<PathBuf>,
-    receipt: &mut Receipt,
-) -> io::Result<()> {
-    if paths.is_empty() || rules.is_empty() {
-        return Ok(());
+struct ReloadQueue {
+    _override: tempfile::NamedTempFile,
+    stage: tempfile::TempDir,
+    selectors: String,
+}
+
+impl ReloadQueue {
+    fn new(
+        run: &Run<'_>,
+        live: &Path,
+        git_dir: &Path,
+        selectors: &str,
+        rules: &[(String, String)],
+    ) -> io::Result<Option<Self>> {
+        if rules.is_empty() {
+            return Ok(None);
+        }
+        let stage = private_dir(git_dir, "copy-reload-")?;
+        let mut config = tempfile::Builder::new()
+            .prefix("config.host-")
+            .suffix(".override.toml")
+            .tempfile_in(live)?;
+        let profile = config
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_prefix("config."))
+            .and_then(|name| name.strip_suffix(".override.toml"))
+            .ok_or_else(|| invalid("invalid mise reload profile"))?;
+        let selectors = if selectors.is_empty() {
+            profile.to_owned()
+        } else {
+            format!("{selectors},{profile}")
+        };
+        let doc = reload_config(rules, &stage.path().join("matches"), |pattern| {
+            Ok(pattern.to_owned())
+        })?;
+        config.write_all(doc.to_string().as_bytes())?;
+        let mut command = validation::command(run, live, ["config", "ls", "--json"], false)?;
+        command
+            .env("MISE_ENV", &selectors)
+            .env("MISE_NO_HOOKS", "1");
+        let output = run.probe(command)?;
+        #[derive(Deserialize)]
+        struct LoadedConfig {
+            path: PathBuf,
+        }
+        if !output.status.success()
+            || !serde_json::from_slice::<Vec<LoadedConfig>>(&output.stdout)
+                .map_err(io::Error::other)?
+                .iter()
+                .any(|loaded| loaded.path == config.path())
+        {
+            return Err(invalid("mise did not load the temporary reload profile"));
+        }
+        Ok(Some(Self {
+            _override: config,
+            stage,
+            selectors,
+        }))
     }
-    let stage = private_dir(git_dir, "copy-reload-")?;
-    let marker = stage.path().join("matches");
-    let root = stage.path().join("paths");
+
+    fn finish(
+        self,
+        run: &Run<'_>,
+        live: &Path,
+        selectors: &str,
+        rules: &[(String, String)],
+        paths: &BTreeSet<PathBuf>,
+        receipt: &mut Receipt,
+    ) -> io::Result<()> {
+        let marker = self.stage.path().join("matches");
+        if !paths.is_empty() {
+            let root = self.stage.path().join("paths");
+            let mut config = reload_config(rules, &marker, |pattern| {
+                let pattern = absolute_target(run, Path::new(pattern))?;
+                Ok(utf8(&root.join(fs_relative(&pattern)?))?.to_owned())
+            })?;
+            let mut files = Table::new();
+            for path in paths {
+                let mut definition = Table::new();
+                definition.insert("content", value(""));
+                files.insert(
+                    utf8(&root.join(fs_relative(path)?))?,
+                    Item::Table(definition),
+                );
+            }
+            config.insert("dotfiles", Item::Table(files));
+            isolated_apply(run, self.stage.path(), &config)?;
+        }
+        let ids = match fs::read_to_string(marker) {
+            Ok(ids) => ids,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let ids = ids
+            .lines()
+            .filter_map(|id| id.parse::<usize>().ok())
+            .collect::<BTreeSet<_>>();
+        let mut ran = BTreeSet::new();
+        for (id, (_, command)) in rules.iter().enumerate() {
+            if ids.contains(&id) && ran.insert(command) {
+                hook_failed(
+                    receipt,
+                    "mise dotfile reload failed",
+                    "Check the matching history.reload command, then rerun dots sync.",
+                    invoke(run, live, live, selectors, command),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn reload_config(
+    rules: &[(String, String)],
+    marker: &Path,
+    pattern_key: impl Fn(&str) -> io::Result<String>,
+) -> io::Result<DocumentMut> {
     let mut reload = Table::new();
+    let marker = utf8(marker)?.replace(char::from(39), "'\\''");
     for (id, (pattern, _)) in rules.iter().enumerate() {
-        let pattern = absolute_target(run, Path::new(pattern))?;
-        let pattern = root.join(fs_relative(&pattern)?);
-        let key = utf8(&pattern)?;
+        let key = pattern_key(pattern)?;
         let mut command = reload
-            .get(key)
+            .get(&key)
             .and_then(Item::as_str)
             .unwrap_or_default()
             .to_owned();
-        let marker = utf8(&marker)?.replace(char::from(39), "'\\''");
         command.push_str(&format!("printf '%s\\n' {id} >> '{marker}'; "));
-        reload.insert(key, value(command));
-    }
-    let mut files = Table::new();
-    for path in paths {
-        let mut definition = Table::new();
-        definition.insert("content", value(""));
-        files.insert(
-            utf8(&root.join(fs_relative(path)?))?,
-            Item::Table(definition),
-        );
+        reload.insert(&key, value(command));
     }
     let mut history = Table::new();
     history.insert("reload", Item::Table(reload));
     let mut config = DocumentMut::new();
-    config.insert("dotfiles", Item::Table(files));
     config.insert("history", Item::Table(history));
-    isolated_apply(run, stage.path(), &config)?;
-    let ids = match fs::read_to_string(marker) {
-        Ok(ids) => ids,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let ids = ids
-        .lines()
-        .filter_map(|id| id.parse::<usize>().ok())
-        .collect::<BTreeSet<_>>();
-    let mut ran = BTreeSet::new();
-    for (id, (_, command)) in rules.iter().enumerate() {
-        if ids.contains(&id) && ran.insert(command) {
-            hook_failed(
-                receipt,
-                "mise dotfile reload failed",
-                "Check the matching history.reload command, then rerun dots sync.",
-                invoke(run, live, live, selectors, command),
-            );
-        }
-    }
-    Ok(())
+    Ok(config)
 }
 
 fn strings(item: &Item) -> Vec<String> {

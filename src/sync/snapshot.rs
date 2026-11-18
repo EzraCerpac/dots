@@ -31,42 +31,16 @@ pub(super) struct Scratch<'a> {
     pub dir: TempDir,
     pub git: Git<'a>,
     pub live: Git<'a>,
-    objects: PathBuf,
-    scanner: PathBuf,
 }
 
 impl<'a> Scratch<'a> {
-    pub fn new(live: &Git<'a>, git_dir: &Path, common: &Path) -> io::Result<Self> {
+    pub fn new(live: &Git<'a>, git_dir: &Path) -> io::Result<Self> {
         let dir = private_dir(git_dir, "dots-sync-")?;
-        let scanner = dir.path().join("scan.git");
-        let format = live.text(["rev-parse", "--show-object-format"])?;
-        let arg = format!("--object-format={format}");
-        live.get([
-            std::ffi::OsStr::new("init"),
-            "--quiet".as_ref(),
-            "--bare".as_ref(),
-            "--template=".as_ref(),
-            arg.as_ref(),
-            scanner.as_os_str(),
-        ])?;
-        let objects = scanner.join("objects");
-        let live_objects = common.join("objects").canonicalize()?;
-        let bytes = live_objects.as_os_str().as_bytes();
-        if bytes.contains(&b'\n') {
-            return Err(invalid("unsupported Git object directory"));
-        }
-        let mut alternate = File::create(objects.join("info/alternates"))?;
-        alternate.write_all(bytes)?;
-        alternate.write_all(b"\n")?;
-        let git = live
-            .quarantined(&objects)
-            .indexed(&dir.path().join("snapshot.index"));
+        let git = live.indexed(&dir.path().join("snapshot.index"));
         Ok(Self {
             dir,
             git,
             live: live.clone(),
-            objects,
-            scanner,
         })
     }
 
@@ -76,35 +50,6 @@ impl<'a> Scratch<'a> {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| invalid("invalid temporary path"))
-    }
-
-    /// Transfer only objects reachable from the approved, frozen revision.
-    /// Blobs from rejected candidates stay in quarantine.
-    pub fn promote(&self, revision: &str, base: &str) -> io::Result<()> {
-        if revision == base {
-            return Ok(());
-        }
-        let mut revisions = tempfile::tempfile_in(self.dir.path())?;
-        writeln!(revisions, "{revision}\n^{base}")?;
-        revisions.rewind()?;
-        let mut pack = tempfile::tempfile_in(self.dir.path())?;
-        let output = self
-            .git
-            .command(["pack-objects", "--revs", "--stdout"])?
-            .stdin(Stdio::from(revisions))
-            .stdout(Stdio::from(pack.try_clone()?))
-            .output()?;
-        checked(output)?;
-        pack.rewind()?;
-        checked(
-            self.live
-                .command(["unpack-objects", "-q"])?
-                .stdin(Stdio::from(pack))
-                .output()?,
-        )?;
-        self.live
-            .id(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])?;
-        Ok(())
     }
 
     pub fn capture(&self, base: &str) -> io::Result<String> {
@@ -252,10 +197,7 @@ impl<'a> Scratch<'a> {
         .arg(format!("--log-opts={revs}"))
         .arg("--report-path")
         .arg(&report)
-        // The private bare repository contains no graft file. Setting
-        // GIT_GRAFT_FILE even to /dev/null makes Git warn on stderr.
-        // Gitleaks can treat that as an empty scan and still return zero.
-        .env_remove("GIT_GRAFT_FILE");
+        .env("GIT_GRAFT_FILE", self.dir.path().join("no-grafts"));
         // Match the native scanner: explicitly select the live policy files
         // when present, and otherwise let gitleaks select its defaults.
         let config = self.live.root().join(".gitleaks.toml");
@@ -277,7 +219,7 @@ impl<'a> Scratch<'a> {
         if ignore.exists() {
             cmd.arg("--gitleaks-ignore-path").arg(ignore);
         }
-        cmd.arg(&self.scanner).stdin(Stdio::null());
+        cmd.arg(self.live.root()).stdin(Stdio::null());
         let output = bounded(cmd, run, Duration::from_secs(60)).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 ScanError::Missing
@@ -293,10 +235,6 @@ impl<'a> Scratch<'a> {
             return Err(ScanError::Failed);
         }
         Ok(findings)
-    }
-
-    pub fn objects(&self) -> &Path {
-        &self.objects
     }
 }
 
@@ -454,7 +392,7 @@ mod tests {
 
     fn scratch<'a>(git: &Git<'a>) -> Scratch<'a> {
         let git_dir = git.root().join(".git");
-        Scratch::new(git, &git_dir, &git_dir).unwrap()
+        Scratch::new(git, &git_dir).unwrap()
     }
 
     #[test]

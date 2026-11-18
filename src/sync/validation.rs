@@ -182,7 +182,16 @@ pub(super) fn validate(
         "--template=",
         &format!("--object-format={format}"),
     ])?;
-    let mut alternate = scratch.objects().as_os_str().as_encoded_bytes().to_vec();
+    let objects = scratch
+        .live
+        .file_path([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ])?
+        .canonicalize()?;
+    let mut alternate = objects.as_os_str().as_encoded_bytes().to_vec();
     if alternate.contains(&b'\n') {
         return Err(invalid("unsupported Git object directory"));
     }

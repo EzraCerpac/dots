@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    git::{Git, index_row, invalid, oid, records, relative},
+    git::{index_row, invalid, oid, relative},
     snapshot::Scratch,
 };
 
@@ -26,69 +26,59 @@ pub(super) fn with_published(
     if scratch.git.ancestor(local, published)? {
         return Ok(published.into());
     }
-    let directory = scratch.dir.path().join(format!("merge-{label}"));
-    if directory.exists() {
-        fs::remove_dir_all(&directory)?;
-    }
-    fs::create_dir(&directory)?;
-    let object_format = scratch.git.text(["rev-parse", "--show-object-format"])?;
-    scratch.live.get([
-        "init",
-        "--quiet",
-        "--template=",
-        &format!("--object-format={object_format}"),
-        directory
-            .to_str()
-            .ok_or_else(|| invalid("invalid scratch path"))?,
-    ])?;
-    let git = scratch.live.at(&directory).quarantined(scratch.objects());
-    git.get(["-c", "core.hooksPath=/dev/null", "reset", "--hard", local])?;
-    let whole = whole_conflicts(&git, local, published)?;
-
-    let merged = git.output([
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "merge.autoStash=false",
-        "-c",
-        "rerere.enabled=false",
-        "-c",
-        "merge.verifySignatures=false",
-        "-c",
-        "user.name=dots sync",
-        "-c",
-        "user.email=dots@localhost",
-        "merge",
-        "-s",
-        "ort",
+    let git = scratch
+        .live
+        .indexed(&scratch.dir.path().join("merge.index"));
+    let output = git.output([
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "-z",
         "-X",
         "theirs",
-        "--no-edit",
-        "--no-commit",
-        "--no-ff",
         "--allow-unrelated-histories",
+        local,
         published,
     ])?;
-    if !matches!(merged.status.code(), Some(0 | 1)) {
+    if !matches!(output.status.code(), Some(0 | 1)) {
         return Err(invalid("could not merge published configuration"));
     }
-    if !whole.is_empty() {
-        let take_whole = |path: &Path| whole.iter().any(|item| path.starts_with(item));
-        let tree = git.tree(published)?;
-        let mut entries = Vec::new();
-        let listed = git.get(["ls-files", "-z"])?;
-        let indexed = records(&listed)
+    let mut rows = output.stdout.split(|byte| *byte == 0);
+    let native = oid(rows.next().ok_or_else(|| invalid("missing merged tree"))?)?;
+    let tree = if output.status.success() {
+        native
+    } else {
+        let remaining = rows
+            .take_while(|row| !row.is_empty())
             .map(relative)
             .collect::<io::Result<BTreeSet<_>>>()?;
-        for path in indexed.iter().filter(|path| take_whole(path)) {
-            index_row(&mut entries, path, None, local.len());
+        if remaining.is_empty() {
+            return Err(invalid("merge has no classified conflicting paths"));
         }
-        for (path, entry) in tree.iter().filter(|(path, _)| take_whole(path)) {
-            index_row(&mut entries, path, Some(entry), local.len());
+        let roots = remaining
+            .iter()
+            .map(|path| conflict_root(path, [local, published]))
+            .collect::<BTreeSet<_>>();
+        let includes = |path: &Path| roots.iter().any(|root| path.starts_with(root));
+        git.get(["read-tree", &native])?;
+        let mut rows = Vec::new();
+        for path in git
+            .tree(&native)?
+            .keys()
+            .filter(|path| remaining.contains(*path) || includes(path))
+        {
+            index_row(&mut rows, path, None, local.len());
         }
-        git.update_index(&entries)?;
-    }
-    let tree = git.id(["write-tree"])?;
+        for (path, entry) in git
+            .tree(published)?
+            .iter()
+            .filter(|(path, _)| includes(path))
+        {
+            index_row(&mut rows, path, Some(entry), local.len());
+        }
+        git.update_index(&rows)?;
+        git.id(["write-tree"])?
+    };
     scratch.git.id([
         "-c",
         "commit.gpgSign=false",
@@ -103,47 +93,24 @@ pub(super) fn with_published(
     ])
 }
 
-fn whole_conflicts(git: &Git<'_>, local: &str, published: &str) -> io::Result<BTreeSet<PathBuf>> {
-    let output = git.output([
-        "merge-tree",
-        "--write-tree",
-        "--messages",
-        "--name-only",
-        "-z",
-        "--allow-unrelated-histories",
-        local,
-        published,
-    ])?;
-    if !matches!(output.status.code(), Some(0 | 1)) {
-        return Err(invalid("could not classify merge conflicts"));
-    }
-    let mut tokens = output.stdout.split(|b| *b == 0);
-    let mut next = || {
-        tokens
-            .next()
-            .ok_or_else(|| invalid("incomplete merge diagnostics"))
+fn conflict_root(path: &Path, parents: [&str; 2]) -> PathBuf {
+    let bytes = path.as_os_str().as_bytes();
+    let Some(tilde) = bytes.iter().rposition(|byte| *byte == b'~') else {
+        return path.to_owned();
     };
-    oid(next()?)?;
-    while !next()?.is_empty() {}
-    let mut whole = BTreeSet::new();
-    loop {
-        let count = next()?;
-        if count.is_empty() {
-            return Ok(whole);
-        }
-        let count = std::str::from_utf8(count)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .ok_or_else(|| invalid("invalid merge diagnostic path count"))?;
-        let mut paths = Vec::new();
-        for _ in 0..count {
-            paths.push(relative(next()?)?);
-        }
-        let kind = next()?;
-        let _message = next()?;
-        if kind.starts_with(b"CONFLICT") && kind != b"CONFLICT (contents)" {
-            whole.extend(paths);
-        }
+    if parents.iter().any(|parent| {
+        bytes[tilde + 1..]
+            .strip_prefix(parent.as_bytes())
+            .is_some_and(|suffix| {
+                suffix.is_empty()
+                    || suffix.strip_prefix(b"_").is_some_and(|number| {
+                        !number.is_empty() && number.iter().all(u8::is_ascii_digit)
+                    })
+            })
+    }) {
+        PathBuf::from(std::ffi::OsString::from_vec(bytes[..tilde].to_vec()))
+    } else {
+        path.to_owned()
     }
 }
 
@@ -151,6 +118,7 @@ fn whole_conflicts(git: &Git<'_>, local: &str, published: &str) -> io::Result<BT
 mod tests {
     use super::*;
     use crate::sync::tests::{fixture_commit, git_fixture};
+    use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
@@ -199,7 +167,7 @@ mod tests {
         git.get(["add", "-A"]).unwrap();
         let published = fixture_commit(&git, "published");
 
-        let scratch = Scratch::new(&git, &root.join(".git"), &root.join(".git")).unwrap();
+        let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
         let merged = with_published(&scratch, &local, Some(&published), "dev").unwrap();
         assert_eq!(
             scratch.git.tree(&merged).unwrap(),

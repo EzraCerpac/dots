@@ -21,7 +21,6 @@ pub(super) struct Git<'a> {
     ctx: &'a Ctx,
     cwd: PathBuf,
     index: Option<PathBuf>,
-    objects: Option<PathBuf>,
     run: Option<&'a Run<'a>>,
 }
 
@@ -31,7 +30,6 @@ impl<'a> Git<'a> {
             ctx,
             cwd: cwd.into(),
             index: None,
-            objects: None,
             run: None,
         }
     }
@@ -54,13 +52,6 @@ impl<'a> Git<'a> {
     pub fn indexed(&self, index: &Path) -> Self {
         Self {
             index: Some(index.into()),
-            ..self.clone()
-        }
-    }
-
-    pub fn quarantined(&self, objects: &Path) -> Self {
-        Self {
-            objects: Some(objects.into()),
             ..self.clone()
         }
     }
@@ -120,9 +111,6 @@ impl<'a> Git<'a> {
             .stdin(Stdio::null());
         if let Some(index) = &self.index {
             cmd.env("GIT_INDEX_FILE", index);
-        }
-        if let Some(objects) = &self.objects {
-            cmd.env("GIT_OBJECT_DIRECTORY", objects);
         }
         Ok(cmd)
     }

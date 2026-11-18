@@ -364,7 +364,7 @@ fn synchronize(
     let base = git
         .tree(&before)
         .or_note("Could not read the dev tree", GIT)?;
-    let scratch = Scratch::new(&git, &shared.dir, &shared.common).or_note(
+    let scratch = Scratch::new(&git, &shared.dir).or_note(
         "Could not create a private sync workspace",
         "Check free space and permissions, then rerun dots sync.",
     )?;
@@ -483,9 +483,6 @@ fn synchronize(
         verify_dev(&git, &before)
             .or_note("The dev checkout changed before saving local edits", GIT)?;
         dense_index(&git)?;
-        scratch
-            .promote(&approved, &before)
-            .or_note("Could not retain the clean local commit", GIT)?;
         checkout::begin(&git, &shared.dir, &index, &before, &approved, false).or_note(
             "Could not prepare the local index update; edits remain on disk",
             GIT,
@@ -623,9 +620,6 @@ fn synchronize(
             ))
         };
         active(run)?;
-        scratch
-            .promote(&merged, &approved)
-            .or_note("Could not retain the validated merged revision", GIT)?;
         let push_record = prepare_push_record(&shared.dir, heads.dev(), &merged)
             .or_note("Could not record the planned dev push", GIT)?;
         active(run)?;

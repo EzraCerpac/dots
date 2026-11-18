@@ -11,6 +11,14 @@ const BASE: &str = include_str!("r01_config_goldens/base.toml");
 const ORIGIN: &str = "ssh://git@example.com/dots/history.git";
 const SKILL: &[u8] = include_bytes!("../skills/dots/SKILL.md");
 
+fn dots_bin() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var_os("DOTS_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_dots").into()),
+    );
+    assert!(path.is_absolute(), "DOTS_BIN must be an absolute path");
+    path
+}
+
 struct Fixture {
     _dir: TempDir,
     base: PathBuf,
@@ -62,7 +70,7 @@ impl Fixture {
     }
 
     fn dots(&self) -> Command {
-        self.command(env!("CARGO_BIN_EXE_dots"))
+        self.command(dots_bin())
     }
 
     fn select(&self, args: &[&str]) -> Output {
@@ -94,6 +102,14 @@ impl Fixture {
     fn skill_state(&self) -> PathBuf {
         self.base.join("xdg-state/dots")
     }
+
+    fn refresh_skill(&self) -> Output {
+        self.dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .arg("--version")
+            .output()
+            .unwrap()
+    }
 }
 
 fn successful(output: Output) -> Vec<u8> {
@@ -110,7 +126,7 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[test]
-fn unchanged_fresh_profile_bytes_match_the_legacy_fixture() {
+fn new_fresh_profile_bytes_match_the_legacy_fixture() {
     let f = Fixture::new();
     let output = String::from_utf8(successful(f.select(&["--origin", ORIGIN]))).unwrap();
     assert!(output.contains("laptop") && output.contains("demo-machine"));
@@ -131,7 +147,7 @@ fn unchanged_fresh_profile_bytes_match_the_legacy_fixture() {
 }
 
 #[test]
-fn unchanged_profile_edit_bytes_match_the_legacy_fixture() {
+fn new_profile_edit_bytes_match_the_legacy_fixture() {
     let f = Fixture::new();
     f.write(
         "miserc.toml",
@@ -202,7 +218,7 @@ fn new_profile_persistence_tightens_both_existing_referents_to_0600() {
 }
 
 #[test]
-fn unchanged_profile_validation_keeps_both_files_and_modes() {
+fn new_profile_validation_keeps_both_files_and_modes() {
     let f = Fixture::new();
     let saved = [
         ("miserc.toml", "env = [\"server\", \"host-old\"]\n"),
@@ -507,7 +523,7 @@ fn new_running_dots_survives_an_upgrade_during_a_configuration_command() {
         .base
         .join("mise/installs/github-ezracerpac-dots/v1/bin/dots");
     fs::create_dir_all(install.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_dots"), &install).unwrap();
+    fs::copy(dots_bin(), &install).unwrap();
     f.script(
         "config/dots/commands/replace",
         r#"
@@ -549,7 +565,7 @@ fn new_install_method_uses_the_running_binary_location() {
     ] {
         let path = f.base.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_dots"), &path).unwrap();
+        fs::copy(dots_bin(), &path).unwrap();
         let link = f.base.join(format!("launch-{kind}"));
         symlink(&path, &link).unwrap();
         let output = successful(
@@ -570,18 +586,16 @@ fn new_install_method_uses_the_running_binary_location() {
 fn unchanged_codex_only_gets_the_shared_skill() {
     let f = Fixture::new();
     fs::create_dir(f.home.join(".codex")).unwrap();
-    successful(
-        f.dots()
-            .env_remove("DOTS_SKILL_LINKS")
-            .arg("--version")
-            .output()
-            .unwrap(),
-    );
+    successful(f.refresh_skill());
     let link = f.home.join(".agents/skills/dots");
-    let source = f.skill_state().join("skills/dots");
-    assert_eq!(fs::read_link(&link).unwrap(), source);
-    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), SKILL);
+    assert_dots_skill_link(&link);
     assert!(!f.home.join(".claude").exists());
+}
+
+fn assert_dots_skill_link(link: &Path) {
+    assert!(link.is_symlink(), "{} is not a symlink", link.display());
+    let skill = fs::read_to_string(link.join("SKILL.md")).unwrap();
+    assert!(skill.lines().any(|line| line == "name: dots"));
 }
 
 #[test]
@@ -615,64 +629,99 @@ fn unchanged_skill_link_updates_legacy_ownership_but_leaves_user_replacements() 
         format!("{}\t{}\n", link.display(), old.display()),
     )
     .unwrap();
-    successful(
-        f.dots()
-            .env_remove("DOTS_SKILL_LINKS")
-            .arg("--version")
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), SKILL);
-    let source = f.skill_state().join("skills/dots/SKILL.md");
-    fs::write(&source, b"old contents").unwrap();
+    successful(f.refresh_skill());
+    assert_dots_skill_link(&link);
+    assert_ne!(fs::read_link(&link).unwrap(), old);
     fs::remove_file(&link).unwrap();
     symlink(&old, &link).unwrap();
-    let command = || {
-        f.dots()
-            .env_remove("DOTS_SKILL_LINKS")
-            .arg("--version")
-            .output()
-            .unwrap()
-    };
-    let first = command();
-    assert!(first.status.success());
+    let first = f.refresh_skill();
+    assert!(first.status.success(), "{first:?}");
     assert!(String::from_utf8_lossy(&first.stderr).contains("left "));
-    assert_eq!(fs::read(&source).unwrap(), SKILL);
-    assert!(command().stderr.is_empty());
+    let second = f.refresh_skill();
+    assert!(second.status.success(), "{second:?}");
+    assert!(second.stderr.is_empty(), "{second:?}");
     assert_eq!(fs::read_link(link).unwrap(), old);
 }
 
 #[test]
-fn unchanged_skill_link_checks_containment_and_completion_bypasses_refresh() {
+fn unchanged_skill_link_stays_inside_the_agent_directory() {
     let f = Fixture::new();
     fs::create_dir(f.home.join(".claude")).unwrap();
     let outside = f.base.join("outside");
     fs::create_dir(&outside).unwrap();
     symlink(&outside, f.home.join(".claude/skills")).unwrap();
-    for args in [&["completions", "zsh"][..], &["__complete"][..]] {
-        let _ = f
-            .dots()
-            .env_remove("DOTS_SKILL_LINKS")
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(!f.skill_state().exists());
-    }
-    successful(f.dots().arg("--version").output().unwrap());
-    assert!(!f.skill_state().exists());
-    let output = f
-        .dots()
-        .env_remove("DOTS_SKILL_LINKS")
-        .arg("--version")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
+    let output = f.refresh_skill();
+    assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("leads outside"));
     assert!(outside.join("dots").symlink_metadata().is_err());
 }
 
 #[test]
-fn new_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() {
+fn unchanged_completion_loader_leaves_skill_links_alone() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".claude")).unwrap();
+    // Check side effects while the Rust completion loader is still a stub.
+    f.dots()
+        .env_remove("DOTS_SKILL_LINKS")
+        .args(["completions", "zsh"])
+        .output()
+        .unwrap();
+    assert!(!f.home.join(".claude/skills").exists());
+    assert!(!f.base.join("xdg-state").exists());
+}
+
+#[test]
+fn rust_skill_extraction_refreshes_the_embedded_copy() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".codex")).unwrap();
+    successful(f.refresh_skill());
+    let link = f.home.join(".agents/skills/dots");
+    let source = f.skill_state().join("skills/dots");
+    assert_eq!(fs::read_link(&link).unwrap(), source);
+    let skill = source.join("SKILL.md");
+    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), SKILL);
+    fs::write(&skill, b"old contents").unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink(f.base.join("user-skill"), link).unwrap();
+    successful(f.refresh_skill());
+    assert_eq!(fs::read(skill).unwrap(), SKILL);
+}
+
+#[test]
+fn rust_skill_extraction_skips_private_completion_and_opt_out() {
+    let f = Fixture::new();
+    fs::create_dir(f.home.join(".claude")).unwrap();
+    f.dots()
+        .env_remove("DOTS_SKILL_LINKS")
+        .arg("__complete")
+        .output()
+        .unwrap();
+    assert!(!f.skill_state().exists());
+    successful(f.dots().arg("--version").output().unwrap());
+    assert!(!f.skill_state().exists());
+}
+
+#[test]
+fn new_mise_exec_uses_the_configured_dots() {
+    let f = Fixture::new();
+    let shadow = f.script("tool/bin/dots", "echo 'mise-selected dots'");
+    f.write(
+        "config.toml",
+        &format!(
+            "{BASE}\n[tools]\nnode = \"path:{}\"\n",
+            shadow.parent().unwrap().parent().unwrap().display()
+        ),
+    );
+    let output = f
+        .dots()
+        .args(["mise", "exec", "--", "dots"])
+        .output()
+        .unwrap();
+    assert_eq!(successful(output), b"mise-selected dots\n");
+}
+
+#[test]
+fn rust_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() {
     use std::process::Stdio;
 
     let f = Fixture::new();
@@ -684,14 +733,6 @@ fn new_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() {
             shadow.parent().unwrap().parent().unwrap().display()
         ),
     );
-    let public = successful(
-        f.dots()
-            .args(["mise", "exec", "--", "dots"])
-            .output()
-            .unwrap(),
-    );
-    assert_eq!(public, b"mise-selected dots\n");
-
     let pinned = f.base.join("owned-bin/dots");
     fs::create_dir(pinned.parent().unwrap()).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_dots"), &pinned).unwrap();

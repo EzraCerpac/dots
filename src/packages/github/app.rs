@@ -641,7 +641,7 @@ mod macos {
                 publish(&ctx, &source, "owner/tool", &applications, &state).unwrap();
                 let expected = applications.join(replacement);
                 let entries = children(&applications).unwrap().collect::<Vec<_>>();
-                assert_eq!(entries, [expected.clone()]);
+                assert_eq!(entries.as_slice(), std::slice::from_ref(&expected));
                 let new_marker = state.join(marker_filename(replacement));
                 let (owned, proof) = OwnedApp::read_marker(&new_marker, &applications).unwrap();
                 assert!(proof.is_some());

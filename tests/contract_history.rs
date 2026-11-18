@@ -83,6 +83,8 @@ impl History {
             .env("DOTS_MISE_BIN", &fake)
             .env("SETUP_MISE_BIN", &fake)
             .env("DOTS_UP_BIN", self.bin.join("absent-renderer"))
+            .env("CODEX_HOME", base.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", base.join("claude"))
             .env("GIT_ALLOW_PROTOCOL", "file")
             .env("MISE_OFFLINE", "1")
             .env("MISE_SYSTEM_CONFIG_DIR", base.join("system"))
@@ -92,6 +94,8 @@ impl History {
             .env("CONTRACT_HISTORY_LOG", &self.log)
             .env("CONTRACT_HISTORY_PATHS", EMPTY)
             .env("CONTRACT_HISTORY_STATUS", "{}")
+            .env("CONTRACT_HISTORY_ORIGIN", "")
+            .env("CONTRACT_HISTORY_BRANCH", "")
             .env("CONTRACT_HISTORY_MACHINE_KEY", MACHINE_KEY);
         command
     }
@@ -185,9 +189,18 @@ impl History {
     }
 
     fn backup(&self, inventory: &str, status: Value) -> Output {
+        let sync = &status["history"]["sync"];
         self.selected()
             .arg("backup")
             .env("CONTRACT_HISTORY_PATHS", inventory)
+            .env(
+                "CONTRACT_HISTORY_ORIGIN",
+                sync["origin"].as_str().unwrap_or_default(),
+            )
+            .env(
+                "CONTRACT_HISTORY_BRANCH",
+                sync["branch"].as_str().unwrap_or_default(),
+            )
             .env("CONTRACT_HISTORY_STATUS", status.to_string())
             .output()
             .unwrap()
@@ -255,7 +268,6 @@ fn status(store: &Path, origin: &str, branch: &str) -> Value {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_secures_files_and_keeps_recipients_local() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -291,7 +303,6 @@ fn unchanged_enrollment_secures_files_and_keeps_recipients_local() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_defers_when_no_files_are_declared() {
     let h = History::new();
     expect(&h.enroll(Some(EMPTY)), 3, &[HOST, "track"]);
@@ -309,7 +320,6 @@ fn unchanged_enrollment_defers_when_no_files_are_declared() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_rejects_an_unencrypted_entry() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -322,7 +332,6 @@ fn unchanged_enrollment_rejects_an_unencrypted_entry() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_rejects_a_symlinked_tracked_path() {
     let h = History::new();
     let target = h.world.root().with_file_name("outside-home");
@@ -340,7 +349,6 @@ fn unchanged_enrollment_rejects_a_symlinked_tracked_path() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_backup_refuses_an_unencrypted_entry_before_saving() {
     let h = History::new();
     h.tracked_file();
@@ -351,7 +359,6 @@ fn unchanged_backup_refuses_an_unencrypted_entry_before_saving() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_backup_checks_effective_push_urls_and_branch_before_saving() {
     // These GitHub spellings are checked as text by local Git's offline
     // destination resolution. The fake save and sync never contact them.
@@ -420,7 +427,6 @@ fn unchanged_backup_checks_effective_push_urls_and_branch_before_saving() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
     let mut h = History::new();
     let store = h.create_store();
@@ -492,7 +498,6 @@ fn unchanged_up_saves_encrypted_entries_twice() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_checks_absolute_declarations_for_home_relative_paths() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -514,7 +519,6 @@ fn unchanged_enrollment_checks_absolute_declarations_for_home_relative_paths() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_refuses_invalid_history_inventory_but_defers_for_an_empty_list() {
     let h = History::new();
     for inventory in [

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 from contextlib import ExitStack
 from copy import deepcopy
 import hashlib
@@ -155,15 +156,12 @@ def discover(paths):
     return declarations
 
 
-def resolve(targets, declarations, records):
+def resolve(targets, declarations, records, *, allow_app_hint=True):
     index = {}
     for identity, entries in declarations.items():
-        names = aliases(entries[0]["key"])
-        for marker, owner in records.get(identity, []):
-            if isinstance(owner.get("path"), str):
-                names.add(Path(owner["path"]).stem.casefold())
-        for name in names:
-            index.setdefault(name, set()).add(identity)
+        for entry in entries:
+            for name in aliases(entry["key"]):
+                index.setdefault(name, set()).add(identity)
     # Ownership survives --keep-installed, allowing a later full uninstall.
     for identity, owners in records.items():
         for name in aliases(identity) | {Path(owner["path"]).stem.casefold()
@@ -178,7 +176,16 @@ def resolve(targets, declarations, records):
         else:
             matches = {name} if ":" in name and (name in declarations or name in records) else index.get(name.casefold(), set())
         if not matches:
-            raise ValueError(f"no declaration or managed app matches {request!r}")
+            message = f"no declaration or managed app matches {request!r}"
+            close = difflib.get_close_matches(name.casefold(), index, n=max(1, len(index)), cutoff=0.8)
+            suggestions = {identity for alias in close for identity in index[alias]}
+            if len(suggestions) == 1 and held_by(suggestion := suggestions.pop()) is None:
+                if suggestion.startswith("github:") and not allow_app_hint:
+                    raise ValueError(message)
+                if ":" not in suggestion and len(index[suggestion.casefold()]) > 1:
+                    suggestion = f"mise:{suggestion}"
+                message += f". Did you mean {suggestion!r}?"
+            raise ValueError(message)
         if len(matches) != 1:
             choices = sorted(identity if ":" in identity else f"mise:{identity}" for identity in matches)
             raise ValueError(f"ambiguous target {request!r}; use one of: {', '.join(choices)}")
@@ -207,12 +214,13 @@ def read_holds(root):
     return holds
 
 
-def check_held(identity):
+def held_by(identity):
     manager, _, tail = identity.partition(":")
     name = tail.rsplit("/", 1)[-1]
     for key in (f"{manager}:{name}", f"{manager}:{name.split('@', 1)[0]}"):
         if key in HELD:
-            raise ValueError(f"{identity} is held by installer exception {HELD[key]}; change its recipe instead")
+            return HELD[key]
+    return None
 
 
 def validate_app(identity, marker, owner, applications=Path("/Applications")):
@@ -274,7 +282,8 @@ def release_sources(mise, root, identity):
 
 
 def prepare(identity, entries, records, keep, packages, shared=False):
-    check_held(identity)
+    if (holder := held_by(identity)) is not None:
+        raise ValueError(f"{identity} is held by installer exception {holder}; change its recipe instead")
     plan = {"identity": identity, "entries": entries, "apps": [], "package": None, "shared": shared}
     if not keep and not shared:
         for marker, owner in records.get(identity, []):
@@ -405,7 +414,7 @@ def main(argv=None):
     if args.path or args.base or args.profile:
         records = {key: value for key, value in records.items() if key in declarations}
     try:
-        identities = resolve(args.targets, declarations, records)
+        identities = resolve(args.targets, declarations, records, allow_app_hint=args.keep_installed or not ownership_errors)
     except ValueError:
         if ownership_errors and not args.keep_installed and any(target.startswith(("github:", "https://")) for target in args.targets):
             raise ValueError("unknown managed app ownership; refusing removal: " + "; ".join(ownership_errors)) from None

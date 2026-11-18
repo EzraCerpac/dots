@@ -68,7 +68,7 @@ func TestManualToAutomaticHandoffWithPTY(t *testing.T) {
 				for {
 					n, err := terminal.Read(buf)
 					output.Write(buf[:n])
-					if !manualSeen && strings.Contains(output.String(), "dots add keeps running") {
+					if !manualSeen && strings.Contains(output.String(), "dots up keeps running") {
 						manualSeen = true
 						close(manualReady)
 					}
@@ -125,7 +125,7 @@ func TestManualToAutomaticHandoffWithPTY(t *testing.T) {
 				}
 				return nil
 			}
-			if code := Run(Options{Root: t.TempDir(), StateDir: filepath.Join(dir, "state"), Command: "add"}); code != 0 {
+			if code := Run(Options{Root: t.TempDir(), StateDir: filepath.Join(dir, "state"), Command: "up"}); code != 0 {
 				t.Fatalf("handover exited with code %d", code)
 			}
 			if starts != 1 {

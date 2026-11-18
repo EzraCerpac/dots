@@ -476,6 +476,18 @@ class CommandBackendTests(ContractTestCase):
         self.assertIn("up to date", replay.stdout.lower())
         self.assertNotIn("editor.ini", replay.stdout)
 
+    def test_status_backend_prints_and_emits_profile_diagnosis(self) -> None:
+        events = self.f.base / "events"
+        mise = write(self.f.base / "bin/profiles-mise", "#!/bin/sh\necho laptop\n", 0o755)
+        result = subprocess.run(["bash", "-c", 'exec 3>"$0"; exec "$@"', str(events), sys.executable,
+                                 str(self.f.manager / "lib/dots-command-backend.py"), str(mise), str(self.f.config), "status"],
+                                env={**self.f.env, "DOTS_STATUS_IN_ENV": "1", "DOTS_UP_EVENT_FD": "3",
+                                     "SETUP_PROFILE": "unknown"}, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.splitlines(), ["setup: SETUP_PROFILE must be one of [vars] dots_profiles: laptop"])
+        stages = [e for line in events.read_text().splitlines() if (e := json.loads(line))["kind"] == "stage_end"]
+        self.assertEqual([(e["id"], e["detail"]) for e in stages], [("startup", result.stderr.strip())])
+
     def test_failed_standalone_command_names_the_command_to_rerun(self) -> None:
         import json
         events = self.f.base / "events"
@@ -489,7 +501,7 @@ class CommandBackendTests(ContractTestCase):
         parsed = [json.loads(line) for line in events.read_text().splitlines()]
         end = next(e for e in parsed if e["kind"] == "stage_end")
         self.assertEqual(end["status"], "failed")
-        self.assertEqual(end["action"], "Review the stage log and rerun dots apply missing-target.")
+        self.assertEqual(end["action"], "Review the command output and rerun dots apply missing-target.")
 
 
 @requires("mise")

@@ -208,12 +208,13 @@ class ShellCompletions(unittest.TestCase):
     def test_bash_preserves_tab_in_filename(self):
         self.assert_completion("bash", b"dots file config\t", ["file", "config"], ["file", "config\tlocal.toml"])
 
-    def test_bash_prior_home_path(self):
-        for source, expand in [(b"~/chosen", True), (b"'~/chosen'", False), (b"\\~/chosen", False)]:
-            with self.subTest(source=source):
-                calls = self.run_completion("bash", b"dots remove --path " + source + b" rip\t")
-                self.assertEqual(calls[0][4], calls[-1][2])
-                self.assertEqual(os.path.isabs(calls[0][4]), expand)
+    def test_prior_home_path(self):
+        for shell in ("bash", "zsh"):
+            for source, expand in [(b"~/chosen", True), (b"'~/chosen'", False), (b"\\~/chosen", False)]:
+                with self.subTest(shell=shell, source=source):
+                    calls = self.run_completion(shell, b"dots remove --path " + source + b" rip\t")
+                    self.assertEqual(calls[0][4], calls[-1][2])
+                    self.assertEqual(os.path.isabs(calls[0][4]), expand)
 
     def test_zsh_autoload(self):
         self.assert_completion("zsh", b"dots a\t", ["a"], ["add"], autoload=True)

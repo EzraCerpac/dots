@@ -5,7 +5,13 @@
 _dots() {
     local line value description display
     local -a args values descriptions prefixes prefix_descriptions
-    args=( "${(@Q)words[2,CURRENT-1]}" "${(Q)PREFIX}" )
+    local i
+    for ((i=2; i<CURRENT; i++)); do
+        value=${(Q)words[i]}
+        [[ ${words[i]} == '~/'* ]] && value="$HOME${value[2,-1]}"
+        args+=( "$value" )
+    done
+    args+=( "${(Q)PREFIX}" )
     local reply
     reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${args[@]}" 2>/dev/null) || return 1
     case $reply in

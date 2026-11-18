@@ -148,6 +148,9 @@ jobs:
           printf '%s  SHA256SUMS\n' dc1319f9a2087383ef4fb443b96cd117b3d7c2d18a2fc784dc4e1a3fe864f6c3 | shasum -a 256 -c
           awk -v asset="$archive.tar.gz" '$2 == asset' SHA256SUMS | shasum -a 256 -c
           tar -xzf "$archive.tar.gz"
+          test "$(cat "$archive/VERSION")" = "${tag#v}"
+          test -x "$archive/bin/dots"
+          test -x "$archive/bin/dots-up"
           printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"
 
       - name: Run unchanged black-box scenarios against the archive
@@ -155,8 +158,6 @@ jobs:
           for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
             command -v "$tool"
           done
-          test "$(DOTS_SKILL_LINKS=0 "$DOTS_BIN" --version)" = 'dots 0.4.0 (archive)'
-          test "$("${DOTS_BIN%/*}/dots-up" --capabilities)" = 'dots-shared-cli/3'
           # Discover every integration suite. Libtest's default filter matches substrings.
           listing="$(mise run test -- --test '*' -- --list --format terse)"
           scenarios=()

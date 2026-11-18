@@ -1087,7 +1087,7 @@ fn new_age_ssh_recipient_stanzas_require_the_builtin_fields() {
             bytes.extend_from_slice(line);
             bytes.push(b'\n');
         }
-        if body.len() % 64 == 0 {
+        if body.len().is_multiple_of(64) {
             bytes.push(b'\n');
         }
         bytes.extend(format!("--- {share}\n").as_bytes());

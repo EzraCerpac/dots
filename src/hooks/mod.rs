@@ -128,14 +128,29 @@ enum ChildEnv<'a> {
 }
 
 pub fn run(run: &Run<'_>, hook: &Hook, env: HookEnv<'_>) -> Outcome {
-    run_stage(run, &hook.label, &hook.path, &[], ChildEnv::Hook(env))
+    run_stage(
+        run,
+        hook.label.as_str(),
+        ChildEnv::Hook(env),
+        |stage, env| run_child(run, stage, &hook.path, &[], env),
+    )
 }
 
-fn run_stage(run: &Run<'_>, label: &str, path: &Path, args: &[&str], env: ChildEnv<'_>) -> Outcome {
+fn run_stage<'a>(
+    run: &Run<'_>,
+    label: impl Into<String>,
+    env: ChildEnv<'a>,
+    execute: impl FnOnce(StageId, ChildEnv<'a>) -> Result<u8, Fail>,
+) -> Outcome {
     if run.cancelled() {
         return Outcome::Cancelled;
     }
-    let stage = run.start(label);
+    let label = label.into();
+    let stage = run.start(&label);
+    if run.cancelled() {
+        run.finish(stage, Outcome::Cancelled);
+        return Outcome::Cancelled;
+    }
     let next = match env {
         ChildEnv::Hook(HookEnv::Bootstrap { .. }) => {
             "Review the hook output, then rerun dots bootstrap."
@@ -147,7 +162,7 @@ fn run_stage(run: &Run<'_>, label: &str, path: &Path, args: &[&str], env: ChildE
             "Review the recipe output, then rerun dots exceptions."
         }
     };
-    let outcome = match run_child(run, stage, path, args, env) {
+    let outcome = match execute(stage, env) {
         Ok(status) => {
             let outcome = Outcome::from_hook_status(status);
             if !run.cancelled() && matches!(outcome, Outcome::Deferred | Outcome::Failed) {
@@ -323,6 +338,119 @@ mod tests {
         let error = list_in(dir.path(), &profiles, "laptop").err().unwrap();
         assert_eq!(error.status, 2);
         assert!(error.diagnostic.contains("90-error@unknown"));
+    }
+
+    #[test]
+    fn cancellation_at_stage_admission_preserves_only_admitted_stages() {
+        use crate::run::Sink;
+        use crate::{Ctx, Env, Flags};
+
+        const CASE: &str = "DOTS_TEST_HOOK_ADMISSION";
+        let Some(case) = std::env::var_os(CASE) else {
+            let fixture = tempfile::tempdir_in("/tmp").unwrap();
+            let names = [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "TMPDIR",
+                "DOTS_ROOT",
+                "MISE_CONFIG_DIR",
+                "MISE_DATA_DIR",
+                "MISE_CACHE_DIR",
+                "MISE_STATE_DIR",
+                "MISE_TMP_DIR",
+                "MISE_INSTALLS_DIR",
+                "MISE_INSTALL_STORE_DIR",
+                "MISE_DOWNLOADS_DIR",
+                "MISE_PLUGINS_DIR",
+                "MISE_SHIMS_DIR",
+                "MISE_SYSTEM_CONFIG_DIR",
+                "MISE_SYSTEM_DATA_DIR",
+                "MISE_SYSTEM_PLUGINS_DIRS",
+                "MISE_SYSTEM_INSTALLS_DIR",
+                "MISE_SYSTEM_SHIMS_DIR",
+                "MISE_SHARED_INSTALL_DIRS",
+            ];
+            for case in ["update hook", "bootstrap hook", "recipe", "admitted"] {
+                // Isolate the process-wide signal handler from other tests.
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .env_clear()
+                    .envs(names.map(|name| (name, fixture.path())))
+                    .env(CASE, case)
+                    .current_dir(fixture.path())
+                    .args([
+                        "--exact",
+                        "hooks::tests::cancellation_at_stage_admission_preserves_only_admitted_stages",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{case}: {output:?}");
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        };
+
+        fn interrupt() {
+            assert_eq!(unsafe { nix::libc::raise(nix::libc::SIGINT) }, 0);
+        }
+
+        struct InterruptOnAdmission;
+        impl From<InterruptOnAdmission> for String {
+            fn from(_: InterruptOnAdmission) -> Self {
+                interrupt();
+                "Interrupted stage".into()
+            }
+        }
+
+        let env = Env::current().unwrap();
+        let ctx = Ctx {
+            root: Root::resolve(&env).unwrap(),
+            env,
+            flags: Flags::default(),
+        };
+        let run = Run::begin(&ctx, Sink::Unreported);
+        if case == "admitted" {
+            let outcome = run_stage(
+                &run,
+                "Admitted stage",
+                ChildEnv::Recipe(Mode::Update),
+                |_, _| {
+                    interrupt();
+                    Ok(0)
+                },
+            );
+            assert_eq!(outcome, Outcome::Cancelled);
+            let snapshot = run.snapshot();
+            let [stage] = snapshot.stages.as_slice() else {
+                panic!("expected one admitted stage");
+            };
+            assert_eq!(stage.outcome, Some(Outcome::Cancelled));
+            assert!(stage.issues.is_empty());
+        } else {
+            let env = match case.to_str().unwrap() {
+                "update hook" => ChildEnv::Hook(HookEnv::Update {
+                    tools_ok: true,
+                    tools_upgraded: true,
+                }),
+                "bootstrap hook" => ChildEnv::Hook(HookEnv::Bootstrap {
+                    private_ready: true,
+                    restored: false,
+                    bundle_json: b"{}",
+                }),
+                "recipe" => ChildEnv::Recipe(Mode::Update),
+                _ => panic!("unexpected case: {case:?}"),
+            };
+            let outcome = run_stage(&run, InterruptOnAdmission, env, |_, _| {
+                panic!("denied stage ran setup");
+            });
+            assert_eq!(outcome, Outcome::Cancelled);
+            assert!(run.snapshot().stages.is_empty());
+        }
+        assert_eq!(run.end(0), 130);
     }
 
     #[test]

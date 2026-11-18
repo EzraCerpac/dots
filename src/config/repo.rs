@@ -1,3 +1,8 @@
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
 use crate::Fail;
 
 #[derive(Debug)]
@@ -107,4 +112,82 @@ fn repository_name(path: &str) -> Option<String> {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)))
     .then(|| path.to_owned())
+}
+
+#[derive(Debug)]
+pub struct CheckoutShape {
+    pub head: Option<OsString>,
+    pub has_commit: bool,
+    pub jj_workspace: bool,
+    pub legacy_sync: bool,
+    pub operations: Vec<&'static str>,
+    pub git_too_old: bool,
+    pub common_dir: PathBuf,
+}
+
+/// Inspect a Git worktree without changing it. The caller supplies its
+/// read-only Git launcher rooted at the worktree.
+pub fn checkout_shape(
+    root: &Path,
+    mut git: impl FnMut(&[&str]) -> Result<Output, Fail>,
+) -> Result<CheckoutShape, Fail> {
+    let mut read = |args: &[&str], absent_ok: bool| -> Result<Option<Vec<u8>>, Fail> {
+        let out = git(args)?;
+        match out.status.code() {
+            Some(0) => Ok(Some(out.stdout)),
+            Some(1) if absent_ok => Ok(None),
+            _ => Err(Fail::new(1, "Git could not inspect the checkout shape")),
+        }
+    };
+    let head = read(&["symbolic-ref", "--no-recurse", "-q", "HEAD"], true)?
+        .map(|out| OsString::from_vec(unline(&out).to_vec()));
+    let has_commit = read(&["rev-parse", "--verify", "-q", "HEAD^{commit}"], true)?.is_some();
+    let common = read(&["rev-parse", "--git-common-dir"], false)?.unwrap_or_default();
+    let common = root.join(OsStr::from_bytes(unline(&common)));
+    let common_dir = common
+        .canonicalize()
+        .map_err(|err| super::file_error(&common, err))?;
+    let version = read(&["--version"], false)?.unwrap_or_default();
+    let mut exists = |marker: &str| -> Result<bool, Fail> {
+        let path = read(&["rev-parse", "--git-path", marker], false)?.unwrap_or_default();
+        let path = root.join(OsStr::from_bytes(unline(&path)));
+        path.try_exists()
+            .map_err(|err| super::file_error(&path, err))
+    };
+    let legacy_sync = exists("dots-dev.json")?;
+    let mut operations = Vec::new();
+    for marker in [
+        "MERGE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "sequencer",
+    ] {
+        if exists(marker)? {
+            operations.push(marker);
+        }
+    }
+    Ok(CheckoutShape {
+        head,
+        has_commit,
+        jj_workspace: root.join(".jj").is_dir(),
+        legacy_sync,
+        operations,
+        git_too_old: git_too_old(&version),
+        common_dir,
+    })
+}
+
+fn unline(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+
+fn git_too_old(version: &[u8]) -> bool {
+    let version = String::from_utf8_lossy(version);
+    let mut fields = version.trim_start_matches("git version ").split('.');
+    let major = fields.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = fields.next().and_then(|part| part.parse::<u32>().ok());
+    major.zip(minor).is_some_and(|version| version < (2, 43))
 }

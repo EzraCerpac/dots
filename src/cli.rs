@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write as _};
+use std::path::Path;
 
 use clap::builder::{OsStringValueParser, PossibleValue, PossibleValuesParser};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -534,9 +535,16 @@ fn validate_requests(name: &str, args: &ArgMatches) -> Result<(), Fail> {
 }
 
 fn context(flags: Flags) -> Result<Ctx, Fail> {
+    context_at(flags, None)
+}
+
+fn context_at(flags: Flags, directory: Option<&Path>) -> Result<Ctx, Fail> {
     let env = Env::current()
         .map_err(|error| Fail::new(1, format!("could not read the current directory: {error}")))?;
-    let root = Root::resolve(&env)?;
+    let root = match directory {
+        Some(directory) => Root::from_dir(&env, directory)?,
+        None => Root::resolve(&env)?,
+    };
     let ctx = Ctx { env, root, flags };
     if let Err(error) = skill::refresh(&ctx)
         && !error.is_unported()
@@ -666,7 +674,12 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         }
         return config_commands::dispatch(&ctx, Invocation::External { name, args: tail });
     }
-    let ctx = context(flags)?;
+    let directory = if name == "init" {
+        args.get_one::<OsString>("DIR").map(Path::new)
+    } else {
+        None
+    };
+    let ctx = context_at(flags, directory)?;
     if !matches!(
         name,
         "init" | "bundle" | "brew" | "install-release-app" | "status" | "sync"

@@ -79,6 +79,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     let store = native.store()?;
     let _lock = native::lock(&store)?;
     checkpoint::require_no_pending(&store)?;
+    native.require_no_pending_operations()?;
     let existing = exists(&store)?.then_some(store.as_path());
     if let Some(store) = existing {
         native.bare(store)?;
@@ -89,8 +90,12 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     let saved = recovery::revision(native, &store, recovery::MAIN_REF)?;
     native.require_origin(&origin, &branch)?;
     native.destinations(Some(&store), &origin, expected, &vars)?;
+    tracked::capture_paths(native, Some(&branch))?.check_binding(paths.binding(), false)?;
+    native.require_no_pending_operations()?;
     let mut cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    recovery::unmodified_git_graph(&mut cmd)
+        .env_remove("__MISE_HISTORY_LOCAL")
+        .env("GIT_TERMINAL_PROMPT", "0");
     // A native exit status does not prove whether its push reached the host ref.
     native.probe(
         cmd,

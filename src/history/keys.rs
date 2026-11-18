@@ -231,7 +231,7 @@ pub(super) fn check_recipients(
         })
 }
 
-fn recipient_shape(key: &str) -> bool {
+pub(super) fn recipient_shape(key: &str) -> bool {
     key.len() == 62
         && key.starts_with("age1")
         && key[4..]

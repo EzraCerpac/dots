@@ -157,15 +157,17 @@ func wrapIndented(line string, width int) string {
 }
 
 func (m *Model) scrollToOutcomeGroup() {
+	rows := m.outcomeRows()
+	selected := m.outcomeSelection(rows)
 	line := 0
 	groups := m.groups()
-	for _, i := range m.outcomeRows() {
-		if i == m.SelectedGroup {
+	for _, i := range rows {
+		if i == selected {
 			break
 		}
 		line += 1 + len(m.groupChanges(groups[i]))
 	}
-	if m.SelectedGroup < 0 {
+	if selected < 0 {
 		m.viewport.SetYOffset(line)
 	} else {
 		m.viewport.SetYOffset(max(0, line-m.viewport.Height()+1))

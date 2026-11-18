@@ -380,6 +380,12 @@ func (m *Model) applyEvent(e Event) {
 			if p := safeLogPath(m.StateDir, e.LogPath); p != "" {
 				s.LogPath = p
 			}
+		} else if e.Status == "failed" {
+			m.Stages = append(m.Stages, Stage{
+				ID: e.ID, Group: "Packages", Label: "Mac App Store updates",
+				Status: e.Status, Summary: e.Summary, Action: "Check free space and log directory permissions, then rerun dots up --mas.",
+				LogPath: safeLogPath(m.StateDir, e.LogPath), Detail: e.Detail,
+			})
 		}
 	case "stage_end":
 		if i := m.stageIndex(e.ID); i >= 0 {
@@ -811,11 +817,14 @@ func (m Model) overviewContent() string {
 }
 
 func (m *Model) refreshDetail() {
-	content := m.overviewContent()
-	if m.outcomesView() {
+	var content string
+	outcomes := m.outcomesView()
+	switch {
+	case outcomes:
 		content = m.outcomesContent(false)
-	}
-	if !m.overview() {
+	case m.overview():
+		content = m.overviewContent()
+	default:
 		content = "Select a stage to see details."
 		if item := m.selectedIssue(); m.AttentionExpanded && item != nil && !m.ShowLog {
 			content = m.issueDetail(*item)
@@ -857,13 +866,18 @@ func (m *Model) refreshDetail() {
 			}
 		}
 	}
-	if content != m.lastLog || m.lastLogStage != fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch) {
+	key := fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch)
+	changed := content != m.lastLog || m.lastLogStage != key
+	if changed {
 		m.viewport.SetContent(content)
 		m.viewport.GotoTop()
 		m.lastLog = content
-		m.lastLogStage = fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch)
+		m.lastLogStage = key
 	}
 	m.resize()
+	if changed && outcomes && m.ExpandedGroup < 0 {
+		m.scrollToOutcomeGroup()
+	}
 }
 
 func (m *Model) resize() {

@@ -105,13 +105,14 @@ func (r *runFiles) record(e ui.Event) error {
 	if e.LogPath != "" && !inside(r.runDir, e.LogPath) {
 		return errors.New("event log path escapes the update report directory")
 	}
-	if err := json.NewEncoder(r.eventLog).Encode(e); err != nil {
-		return fmt.Errorf("write update event log: %w", err)
-	}
+	// Keep the live outcome even if the event log cannot accept this event.
 	if e.Kind == "run_start" {
 		r.report.Command = e.Command
 	}
 	r.report.Events = append(r.report.Events, e)
+	if err := json.NewEncoder(r.eventLog).Encode(e); err != nil {
+		return fmt.Errorf("write update event log: %w", err)
+	}
 	return nil
 }
 

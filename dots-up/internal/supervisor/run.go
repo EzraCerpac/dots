@@ -193,7 +193,7 @@ func Run(opts Options) int {
 		}()
 		go readControls(controlReader, controls)
 	}
-	terminalSync := opts.Command == "sync" && interactive && files != nil && !opts.Verbose
+	terminalSync := opts.Command == "sync" && interactive && files != nil && !opts.Verbose && !backend.directTerminal
 	dashboardStarted := dashboard
 	defer func() {
 		if originalTerminalState != nil && backend.tty != nil {
@@ -231,6 +231,7 @@ func Run(opts Options) int {
 	var stageID, profile, host string
 	var runStarted, workReported, childFinished, outputFinished bool
 	var diagnosticOutput []byte
+	var syncOutput bytes.Buffer
 	var consoleFailure *ui.Event
 	runEnd := ui.Event{V: 1, Kind: "run_end"}
 	eventFinished := backend.streamNonce != ""
@@ -673,6 +674,9 @@ func Run(opts Options) int {
 					}
 				}
 				writeLog(stageLog, globalLog, clean)
+				if terminalSync && !relaying {
+					syncOutput.Write(clean)
+				}
 			}
 			if !relaying && (opts.Verbose || (opts.Command == "sync" && !terminalSync)) && len(b) > 0 {
 				_, _ = os.Stdout.Write(b)
@@ -833,18 +837,15 @@ func Run(opts Options) int {
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)
 	}
-	// The sync backend writes metadata to the captured stream. Only the
-	// original terminal receives patch text, after all captured output drains.
+	// The captured output includes startup diagnostics and stage output in order.
+	// Only the original terminal receives patch text, after that stream drains.
 	if terminalSync {
 		receipt := filepath.Join(files.runDir, "sync.json")
 		preview := exec.Command("bash", filepath.Join(opts.Home, "bin", "dots"), "internal", "sync-present", receipt)
 		preview.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root, "DOTS_HOME="+opts.Home)
 		preview.Stdin, preview.Stdout, preview.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := preview.Run(); err != nil {
-			// Keep the original diagnostic if sync stopped before writing a receipt.
-			if output, err := os.ReadFile(filepath.Join(files.runDir, "backend.log")); err == nil {
-				_, _ = os.Stdout.Write(output)
-			}
+			_, _ = syncOutput.WriteTo(os.Stdout)
 		}
 	}
 	return exitCode

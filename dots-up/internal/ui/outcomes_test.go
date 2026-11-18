@@ -72,6 +72,30 @@ func TestAttentionRowFollowsLastArea(t *testing.T) {
 	}
 }
 
+func TestOutcomeRefreshKeepsSelectedGroupVisible(t *testing.T) {
+	m := NewModel(t.TempDir(), false)
+	m.Width, m.Height = 80, 16
+	m.apply(Event{Kind: "stage_start", ID: "source", Group: "Source"})
+	for i := range 15 {
+		m.apply(Event{Kind: "change", Stage: "source", Item: fmt.Sprintf("source-%d", i)})
+	}
+	m.apply(Event{Kind: "stage_start", ID: "tools", Group: "Tools"})
+	m.apply(Event{Kind: "change", Stage: "tools", Item: "fixture-tool"})
+	m = press(m, tea.KeyPressMsg{Code: tea.KeyDown})
+	m = press(m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if m.ExpandedGroup != m.groupIndex("Tools") || !m.viewport.AtTop() {
+		t.Fatal("expected to open Tools at the top")
+	}
+	m = press(m, tea.KeyPressMsg{Code: tea.KeyEsc})
+	if view := m.View().Content; !strings.Contains(view, "› > Tools") {
+		t.Fatalf("Tools selection is off-screen after returning to the overview:\n%s", view)
+	}
+	m.apply(Event{Kind: "change", Stage: "source", Item: "late-source-change"})
+	if view := m.View().Content; !strings.Contains(view, "› > Tools") {
+		t.Fatalf("Tools selection is off-screen after an incoming change:\n%s", view)
+	}
+}
+
 func TestFinishedReportDoesNotClaimUnfinishedStepIsRunning(t *testing.T) {
 	m := NewModel(t.TempDir(), false)
 	m.apply(Event{Kind: "item_upsert", ID: "source:validate", Group: "Source", Label: "Validate source", Status: "unknown", Summary: "running"})

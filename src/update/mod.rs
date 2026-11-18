@@ -116,7 +116,9 @@ fn update(run: &Run<'_>, mas: bool) {
             && !run.cancelled()
         {
             let id = run.start_alongside("Mac App Store updates");
-            scope.spawn(move || finish(run, id, packages.update_store(id, store)));
+            if !finish_if_cancelled(run, id) {
+                scope.spawn(move || finish(run, id, packages.update_store(id, store)));
+            }
         }
 
         let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise);
@@ -239,18 +241,32 @@ fn record_sync_receipt(run: &Run<'_>, id: StageId, receipt: Receipt) -> Outcome 
     receipt.stage_outcome
 }
 
-fn step(run: &Run<'_>, label: &str, f: impl FnOnce(StageId) -> Step) -> Option<Outcome> {
+fn step(
+    run: &Run<'_>,
+    label: impl Into<String>,
+    f: impl FnOnce(StageId) -> Step,
+) -> Option<Outcome> {
     if run.cancelled() {
         return None;
     }
     let id = run.start(label);
+    if finish_if_cancelled(run, id) {
+        return Some(Outcome::Cancelled);
+    }
     finish(run, id, f(id))
 }
 
+fn finish_if_cancelled(run: &Run<'_>, id: StageId) -> bool {
+    if !run.cancelled() {
+        return false;
+    }
+    run.finish(id, Outcome::Cancelled);
+    true
+}
+
 fn finish(run: &Run<'_>, id: StageId, result: Step) -> Option<Outcome> {
-    if run.cancelled() {
+    if finish_if_cancelled(run, id) {
         // Run owns the interrupted stage and derives the exit status at end.
-        run.finish(id, Outcome::Cancelled);
         return Some(Outcome::Cancelled);
     }
     let outcome = result.unwrap_or_else(|error| {
@@ -352,21 +368,90 @@ fn differences(before: &Versions, after: &Versions) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    #[test]
-    fn embedded_sync_records_the_verified_revision_and_issue() {
-        let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path();
+    fn context(root: &Path) -> Ctx {
         std::fs::write(root.join("config.toml"), "[vars]\ndots_profiles = 'test'\n").unwrap();
         let env = crate::Env {
             vars: [("DOTS_ROOT".into(), root.as_os_str().into())].into(),
             cwd: root.into(),
         };
-        let ctx = Ctx {
+        Ctx {
             root: crate::config::Root::resolve(&env).unwrap(),
             env,
             flags: crate::Flags::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn denied_stage_admission_does_not_run_the_step() {
+        const CHILD: &str = "DOTS_TEST_DENIED_UPDATE_STAGE";
+        let fixture = tempfile::tempdir_in("/tmp").unwrap();
+        if std::env::var_os(CHILD).is_none() {
+            let dirs = [
+                "HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "CODEX_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "TMPDIR",
+                "MISE_CONFIG_DIR",
+                "MISE_DATA_DIR",
+                "MISE_STATE_DIR",
+                "MISE_CACHE_DIR",
+                "MISE_TMP_DIR",
+                "MISE_SYSTEM_CONFIG_DIR",
+                "MISE_SYSTEM_DATA_DIR",
+                "MISE_INSTALLS_DIR",
+                "MISE_INSTALL_STORE_DIR",
+                "MISE_DOWNLOADS_DIR",
+                "MISE_PLUGINS_DIR",
+                "MISE_SHIMS_DIR",
+                "MISE_SYSTEM_INSTALLS_DIR",
+                "MISE_SYSTEM_SHIMS_DIR",
+            ];
+            // Run the signal handler in a process with only this test active.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .envs(dirs.map(|name| (name, fixture.path())))
+                .env(CHILD, "1")
+                .current_dir(fixture.path())
+                .args([
+                    "--exact",
+                    "update::tests::denied_stage_admission_does_not_run_the_step",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        struct InterruptOnAdmission;
+        impl From<InterruptOnAdmission> for String {
+            fn from(_: InterruptOnAdmission) -> Self {
+                // Run converts the label after step's first check and before admission.
+                assert_eq!(unsafe { nix::libc::raise(nix::libc::SIGINT) }, 0);
+                "Interrupted step".into()
+            }
+        }
+
+        let ctx = context(fixture.path());
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let outcome = step(&run, InterruptOnAdmission, |_| {
+            panic!("denied stage ran its closure");
+        });
+        assert_eq!(outcome, Some(Outcome::Cancelled));
+        assert!(run.snapshot().stages.is_empty());
+        assert_eq!(run.end(0), 130);
+    }
+
+    #[test]
+    fn embedded_sync_records_the_verified_revision_and_issue() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ctx = context(fixture.path());
         let run = Run::begin(&ctx, Sink::Unreported);
         let id = run.start("Sync configuration");
         let mut receipt = Receipt::new(None, "not pushed");

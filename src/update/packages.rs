@@ -107,9 +107,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                     self.update_manager(name, &manager, mas.as_ref(), resolved.as_ref());
                 }
                 Err(error) => {
-                    step(self.run, &format!("Inspect {name} packages"), |_| {
-                        Err(error)
-                    });
+                    step(self.run, format!("Inspect {name} packages"), |_| Err(error));
                 }
                 _ => (),
             }
@@ -356,13 +354,13 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             Ok(Some(specs)) => specs,
             Ok(None) => return,
             Err(error) => {
-                step(self.run, &format!("{name} packages"), |_| Err(error));
+                step(self.run, format!("{name} packages"), |_| Err(error));
                 return;
             }
         };
         let tracked = self.tracked_names(name, manager, resolved.is_some());
         for action in ["apply", "upgrade"] {
-            let outcome = step(self.run, &format!("{name} packages: {action}"), |id| {
+            let outcome = step(self.run, format!("{name} packages: {action}"), |id| {
                 let Some(manager) = self
                     .inspect_manager(name, resolved, None)?
                     .filter(|manager| manager.available)

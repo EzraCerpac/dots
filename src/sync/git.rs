@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{Ctx, process::Cwd, run::Run};
 
@@ -304,60 +303,8 @@ pub(super) fn index_row(buf: &mut Vec<u8>, path: &Path, entry: Option<&Entry>, o
     buf.push(0);
 }
 
-/// No network child owns the user's terminal. Killing the process group
-/// also stops transports and credential helpers spawned by Git.
-pub(super) fn bounded(mut cmd: Command, run: &Run<'_>, budget: Duration) -> io::Result<Output> {
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
-    cmd.stdout(Stdio::from(stdout.try_clone()?))
-        .stderr(Stdio::from(stderr.try_clone()?));
-    // SAFETY: setsid is async-signal-safe. The child gets its own process
-    // group and has no controlling terminal to open for a credential prompt.
-    unsafe {
-        cmd.pre_exec(|| {
-            if nix::libc::setsid() < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    if run.cancelled() {
-        return Err(io::ErrorKind::Interrupted.into());
-    }
-    let deadline = Instant::now() + budget;
-    let mut child = cmd.spawn()?;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if !run.cancelled() && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            result => {
-                // SAFETY: setsid created a group with child.id() as
-                // its PGID. Its leader is still owned by this Child.
-                unsafe { nix::libc::kill(-(child.id() as i32), nix::libc::SIGKILL) };
-                let _ = child.wait();
-                result?;
-                let kind = if run.cancelled() {
-                    io::ErrorKind::Interrupted
-                } else {
-                    io::ErrorKind::TimedOut
-                };
-                return Err(kind.into());
-            }
-        }
-    };
-    stdout.rewind()?;
-    let mut output = Output {
-        status,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
-    stdout.read_to_end(&mut output.stdout)?;
-    stderr.rewind()?;
-    stderr.read_to_end(&mut output.stderr)?;
-    Ok(output)
+pub(super) fn bounded(cmd: Command, run: &Run<'_>, budget: Duration) -> io::Result<Output> {
+    run.probe_detached(cmd, budget)
 }
 
 pub(super) fn repository_dirs(git: &Git<'_>) -> io::Result<(PathBuf, PathBuf)> {
@@ -373,4 +320,156 @@ pub(super) fn repository_dirs(git: &Git<'_>) -> io::Result<(PathBuf, PathBuf)> {
         git.file_path(["rev-parse", "--path-format=absolute", "--git-common-dir"])?
             .canonicalize()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Root;
+    use crate::run::Sink;
+    use crate::sync::remote::{self, Origin, PushError};
+    use crate::sync::tests::{fixture_commit, git_fixture};
+    use crate::{Env, Flags};
+    use nix::libc;
+    use std::ffi::CString;
+    use std::fs::{self, File, OpenOptions};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::time::Instant;
+
+    const MODE: &str = "DOTS_TEST_SYNC_NETWORK_MODE";
+    const FIFO: &str = "DOTS_TEST_SYNC_HOOK_FIFO";
+    const CLEANUP: &str = "DOTS_TEST_SYNC_HOOK_CLEANUP";
+
+    fn hook_writer(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+
+    fn wait_for_hook<T>(mut check: impl FnMut() -> Option<T>) -> T {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = check() {
+                return result;
+            }
+            assert!(Instant::now() < until, "pre-push hook did not change state");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Run in a separate process so a real SIGINT cannot cancel any parallel test.
+    #[test]
+    fn git_transport_waits_for_the_pre_push_group() {
+        if let Ok(mode) = std::env::var(MODE) {
+            transport_child(&mode);
+            return;
+        }
+        for mode in ["graceful", "stubborn", "timeout"] {
+            let (_world, ctx) = git_fixture();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .envs(&ctx.env.vars)
+                .env(MODE, mode)
+                .current_dir(ctx.root.path())
+                .args([
+                    "--exact",
+                    "sync::git::tests::git_transport_waits_for_the_pre_push_group",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn transport_child(mode: &str) {
+        let mut env = Env::current().unwrap();
+        let root = Root::resolve(&env).unwrap();
+        let fifo = root.path().with_file_name("hook-fifo");
+        let marker = root.path().with_file_name("hook-cleanup");
+        env.vars.insert(FIFO.into(), fifo.as_os_str().into());
+        env.vars.insert(CLEANUP.into(), marker.as_os_str().into());
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: This is a valid C path inside the private fixture.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let ctx = Ctx {
+            root,
+            env,
+            flags: Flags::default(),
+        };
+        let git = Git::new(&ctx, ctx.root.path());
+        let remote_path = ctx.root.path().with_file_name("remote");
+        let url = format!("file://{}", remote_path.display());
+        git.get(["init", "--quiet", "--bare", remote_path.to_str().unwrap()])
+            .unwrap();
+        git.get(["remote", "add", "origin", &url]).unwrap();
+        let revision = fixture_commit(&git, "candidate");
+        let hook = ctx.root.path().join(".git/hooks/pre-push");
+        let trap = if mode == "graceful" {
+            "trap 'printf cleanup > \"$DOTS_TEST_SYNC_HOOK_CLEANUP\"; exit 0' INT"
+        } else {
+            "trap '' INT TERM"
+        };
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n{trap}\nexec 3<\"$DOTS_TEST_SYNC_HOOK_FIFO\"\nIFS= read -r wait <&3\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let git = Git::supervised(&run);
+        let origin = Origin::load(&git, None).unwrap().unwrap();
+        let interrupt = mode != "timeout";
+        let controller = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || {
+                // Keep the writer alive so EOF cannot retire a stubborn hook.
+                let writer = wait_for_hook(|| hook_writer(&fifo).ok());
+                let attached = Instant::now();
+                if interrupt {
+                    // SAFETY: only this isolated child has installed the tested Run.
+                    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
+                }
+                (writer, attached)
+            }
+        });
+        let budget = Duration::from_secs(2);
+        let start = Instant::now();
+        if interrupt {
+            assert_eq!(
+                remote::push(&git, &run, &origin, None, &revision),
+                Err(PushError::Unconfirmed)
+            );
+            assert!(run.cancelled());
+        } else {
+            let command = git
+                .command(["push", "origin", "HEAD:refs/heads/dev"])
+                .unwrap();
+            assert_eq!(
+                bounded(command, &run, budget).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            assert!(start.elapsed() >= budget);
+            assert!(!run.cancelled());
+        }
+        let (_writer, attached) = controller.join().unwrap();
+        if mode == "graceful" {
+            assert_eq!(fs::read(marker).unwrap(), b"cleanup");
+        } else if mode == "stubborn" {
+            assert!(attached.elapsed() >= Duration::from_millis(500));
+        }
+        // ENXIO means the hook closed its read end, independent of PID reuse.
+        assert_eq!(
+            hook_writer(&fifo).unwrap_err().raw_os_error(),
+            Some(libc::ENXIO)
+        );
+    }
 }

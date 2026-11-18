@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -9,10 +11,10 @@ use dots_cli::report::{self, Command as ReportCommand};
 use dots_cli::run::{Change, Issue, Outcome, Policy, Run, Sink, exit_code};
 use dots_cli::{Ctx, Env, Flags, cli};
 
-fn invoke(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_dots"))
+fn invoke(world: &support::World, cwd: &Path, args: &[&str]) -> Output {
+    world
+        .dots()
         .current_dir(cwd)
-        .env_clear()
         .env("DOTS_ROOT", cwd)
         .args(args)
         .output()
@@ -32,15 +34,16 @@ fn assert_diagnostic(output: Output, status: i32, expected: &str) {
 
 #[test]
 fn seams_cli_grammar_and_config_boundary() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path();
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let cwd = world.base();
     let grammar = cli::tree();
     grammar.clone().debug_assert();
     assert!(grammar.find_subcommand("__exec").is_none());
     assert!(grammar.find_subcommand("__complete").is_none());
-    let help = invoke(cwd, &["--help"]);
+    let help = invoke(&world, cwd, &["--help"]);
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
+    assert!(!stdout.contains("--no-wait"));
     for command in grammar.get_subcommands() {
         assert!(
             stdout.lines().any(|line| line
@@ -50,40 +53,48 @@ fn seams_cli_grammar_and_config_boundary() {
             command.get_name()
         );
     }
-    assert_eq!(invoke(cwd, &[]).stdout, stdout.as_bytes());
+    let bare = invoke(&world, cwd, &[]);
+    assert!(bare.status.success());
+    assert_eq!(bare.stdout, stdout.as_bytes());
     assert!(
-        invoke(cwd, &["bootstrap", "complete", "--help"])
+        invoke(&world, cwd, &["bootstrap", "complete", "--help"])
             .status
             .success()
     );
-    assert!(invoke(cwd, &["init", "--help"]).status.success());
-    assert!(invoke(cwd, &["completions", "--help"]).status.success());
+    assert!(invoke(&world, cwd, &["init", "--help"]).status.success());
+    assert!(
+        invoke(&world, cwd, &["completions", "--help"])
+            .status
+            .success()
+    );
     assert_diagnostic(
-        invoke(cwd, &["completions", "bash", "fish"]),
+        invoke(&world, cwd, &["completions", "bash", "fish"]),
         2,
         "dots completions bash|zsh|fish",
     );
-    let brew_without_home = Command::new(env!("CARGO_BIN_EXE_dots"))
-        .current_dir(cwd)
-        .env_clear()
-        .args(["brew", "path"])
-        .output()
-        .unwrap();
+    let brew_without_config = invoke(&world, cwd, &["brew", "path"]);
     assert!(
-        matches!(brew_without_home.status.code(), Some(0 | 1)),
-        "{brew_without_home:?}"
+        matches!(brew_without_config.status.code(), Some(0 | 1)),
+        "{brew_without_config:?}"
     );
-    assert_diagnostic(invoke(cwd, &["sync", "--other"]), 2, "dots help");
+    assert_diagnostic(invoke(&world, cwd, &["sync", "--other"]), 2, "dots help");
     assert_diagnostic(
-        invoke(cwd, &["publish", "--bookmark=secret", "--all"]),
+        invoke(&world, cwd, &["publish", "--bookmark=secret", "--all"]),
         2,
         "dots help",
     );
-    assert_diagnostic(invoke(cwd, &["help", "status"]), 2, "dots COMMAND --help");
-    assert_diagnostic(invoke(cwd, &["reports", "update"]), 2, "needs a terminal");
-    assert_diagnostic(invoke(cwd, &["missing", "--help"]), 2, "unknown command");
     assert_diagnostic(
-        invoke(cwd, &["--plain", "update", "--verbose"]),
+        invoke(&world, cwd, &["help", "status"]),
+        2,
+        "dots COMMAND --help",
+    );
+    assert_diagnostic(
+        invoke(&world, cwd, &["missing", "--help"]),
+        2,
+        "unknown command",
+    );
+    assert_diagnostic(
+        invoke(&world, cwd, &["--plain", "update", "--verbose"]),
         2,
         "cannot be combined",
     );
@@ -94,13 +105,16 @@ fn seams_cli_grammar_and_config_boundary() {
         &["--", "completions", "bash"],
         &["init", "--bogus"],
     ] {
-        assert_diagnostic(invoke(cwd, args), 2, "dots help");
+        assert_diagnostic(invoke(&world, cwd, args), 2, "dots help");
     }
     assert_diagnostic(
-        invoke(cwd, &["--plain", "update", "--verbose", "--help"]),
+        invoke(&world, cwd, &["--plain", "update", "--verbose", "--help"]),
         2,
         "cannot be combined",
     );
+    for args in [&["--no-wait", "up"][..], &["update", "--no-wait"]] {
+        assert_diagnostic(invoke(&world, cwd, args), 2, "unknown option '--no-wait'");
+    }
 
     for args in [
         &["root"][..],
@@ -116,7 +130,7 @@ fn seams_cli_grammar_and_config_boundary() {
         } else {
             "config.toml not found"
         };
-        assert_diagnostic(invoke(cwd, args), 2, expected);
+        assert_diagnostic(invoke(&world, cwd, args), 2, expected);
     }
 
     for args in [
@@ -145,20 +159,84 @@ fn seams_cli_grammar_and_config_boundary() {
         );
     }
     assert_diagnostic(
-        invoke(cwd, &["bootstrap", "--only", "tools", "--skip", "files"]),
+        invoke(
+            &world,
+            cwd,
+            &["bootstrap", "--only", "tools", "--skip", "files"],
+        ),
         2,
         "dots help",
     );
     assert_diagnostic(
-        invoke(cwd, &["remove", "--keep-installed", "./example"]),
+        invoke(&world, cwd, &["remove", "--keep-installed", "./example"]),
         2,
         "file request",
     );
     assert_diagnostic(
-        invoke(cwd, &["add", "--asset", "example", "npm:example"]),
+        invoke(&world, cwd, &["add", "--asset", "example", "npm:example"]),
         2,
         "one GitHub repository URL",
     );
+}
+
+#[test]
+fn seams_cli_leading_dash_is_not_short_help() {
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let cwd = world.base();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+    assert_diagnostic(invoke(&world, cwd, &["-hello"]), 2, "use dots help");
+
+    let commands = cwd.join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let hello = commands.join("hello");
+    fs::write(&hello, "#!/bin/sh\nprintf '[%s]\\n' \"$@\"\n").unwrap();
+    fs::set_permissions(&hello, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_diagnostic(invoke(&world, cwd, &["-hello"]), 2, "use dots help");
+
+    let short = invoke(&world, cwd, &["-h"]);
+    let long = invoke(&world, cwd, &["--help"]);
+    assert!(short.status.success() && long.status.success());
+    assert_eq!(short.stdout, long.stdout);
+    assert!(
+        String::from_utf8(short.stdout)
+            .unwrap()
+            .contains("  hello [ARGS...]")
+    );
+
+    let output = invoke(&world, cwd, &["hello", "-hello", "--help", "--"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"[-hello]\n[--help]\n[--]\n");
+}
+
+#[test]
+fn seams_cli_menu_is_an_ordinary_configuration_command() {
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let cwd = world.base();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+    let commands = cwd.join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let menu = commands.join("menu");
+    fs::write(&menu, "#!/bin/sh\nprintf '[%s]\\n' \"$@\"\nexit 23\n").unwrap();
+    assert_diagnostic(invoke(&world, cwd, &["menu"]), 2, "unknown command 'menu'");
+    fs::set_permissions(&menu, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bare = invoke(&world, cwd, &[]);
+    assert!(bare.status.success());
+    let help = String::from_utf8(bare.stdout).unwrap();
+    let (_, config_commands) = help.split_once("Configuration commands").unwrap();
+    assert!(config_commands.contains("  menu [ARGS...]\n"));
+
+    let output = invoke(
+        &world,
+        cwd,
+        &["menu", "--help", "two words", "", "--", "--no-wait"],
+    );
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(
+        output.stdout,
+        b"[--help]\n[two words]\n[]\n[--]\n[--no-wait]\n"
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -188,6 +266,7 @@ fn seams_direct_child_helper() {
             next: "dots test".into(),
             tail: Some("ignored stream".into()),
             log: Some("ignored path".into()),
+            terminal_exit: None,
         },
     );
     run.finish(stage, Outcome::Failed);
@@ -196,15 +275,15 @@ fn seams_direct_child_helper() {
 
 #[test]
 fn seams_direct_inherited_streams_and_private_report() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path();
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let cwd = world.base();
     let state = cwd.join("state");
     // The surrounding manager state can predate the Rust reports directory.
     fs::create_dir_all(state.join("dots")).unwrap();
     fs::set_permissions(state.join("dots"), fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut child = world
+        .command(std::env::current_exe().unwrap())
         .current_dir(cwd)
-        .env_clear()
         .env("DOTS_TEST_DIRECT_HELPER", "1")
         .env("DOTS_ROOT", cwd)
         .env("XDG_STATE_HOME", &state)
@@ -286,8 +365,7 @@ fn seams_report_round_trip_and_fragment_fold() {
 
         let parent = Run::begin(&ctx, Sink::Report(ReportCommand::Bootstrap));
         let stage = parent.start("Parent");
-        assert!(parent.snapshot().attachable.is_none());
-        assert!(parent.view(Some(stage)).is_err());
+        assert_eq!(parent.snapshot().stages[0].id, stage);
         parent.finish(stage, Outcome::Completed);
         parent.fold(&fragment).unwrap();
         assert_ne!(parent.snapshot().stages[1].id, stage);
@@ -314,12 +392,12 @@ fn seams_report_round_trip_and_fragment_fold() {
         assert_eq!(run.end(31), 31);
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .env_clear()
-        .env("DOTS_TEST_REPORT_ROUND_TRIP", dir.path())
-        .env("XDG_STATE_HOME", dir.path())
-        .env("DOTS_ROOT", dir.path())
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let output = world
+        .command(std::env::current_exe().unwrap())
+        .env("DOTS_TEST_REPORT_ROUND_TRIP", world.base())
+        .env("XDG_STATE_HOME", world.base())
+        .env("DOTS_ROOT", world.base())
         .args([
             "--exact",
             "seams_report_round_trip_and_fragment_fold",

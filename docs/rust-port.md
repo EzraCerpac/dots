@@ -4,7 +4,7 @@ S-02 decisions; [the contract](contract.md) wins, the oracle is v0.4.0 at `f5c8a
 
 ## Toolchain and release
 
-Root package `dots-cli`, binary `dots`, committed `Cargo.lock`, release `panic = "unwind"`; crates (checked 2026-11-18) arrive with first users: clap 4.6.8, serde 1.0.229, serde_json 1.0.154, toml_edit 0.25.19+spec-1.1.0, nix 0.32.0, tempfile 3.27.0 (R-01); ureq 3.5.2 on rustls (P-01); ratatui 0.30.2, crossterm 0.29.0 (P-11, P-12).
+Root package `dots-cli`, binary `dots`, committed `Cargo.lock`, release `panic = "unwind"`; crates (checked 2026-11-18) arrive with first users: clap 4.6.8, serde 1.0.229, serde_json 1.0.154, toml_edit 0.25.19+spec-1.1.0, nix 0.32.0, tempfile 3.27.0 (R-01); ureq 3.5.2 on rustls (P-01).
 `mise.toml` pins Rust 1.100.0; tasks `check` and `test -- FILTER` (small local checks), `build` and `clippy` run `rustup run 1.100.0 cargo … --locked`; `format` touches only changed or named files.
 CI's `rust.yml` runs the full suite, clippy and `cargo fmt --check` on x86_64 and aarch64 macOS and musl Linux; Q-02 adds distribution and first-run jobs.
 D-01 ships four `dots-VERSION-{darwin,linux}-{amd64,arm64}.tar.gz` archives of only `dots`, static on Linux, plus separate `SHA256SUMS` and a Homebrew formula with completions for C-01's tap.
@@ -27,17 +27,24 @@ Unported handlers exit 1 naming their task, and their seams below are typed stub
 
 ## Runs, reports and seams (Lead T's interface)
 
-`Run::begin(&ctx, Sink::{Report(Command), Fragment(PathBuf), Unreported})` offers `start(label) -> StageId`, `start_alongside(label)`, `run(id, cmd, Policy::{Ordinary, Interactive}) -> io::Result<ExitStatus>`, `probe(cmd) -> io::Result<Output>`, `change(id, Change { item, before, after })`, `issue(id, Issue)`, `finish(id, Outcome)`, `cancelled()`, `snapshot() -> Snapshot`, `view(Option<StageId>)` and `end(status) -> u8`.
+`Run::begin(&ctx, Sink::{Report(Command), Fragment(PathBuf), Unreported})` offers `start(label) -> StageId`, `start_alongside(label)`, `run(id, cmd, Policy::{Ordinary, Interactive}) -> io::Result<ExitStatus>`, `probe(cmd) -> io::Result<Output>`, `change(id, Change { item, before, after })`, `issue(id, Issue)`, `finish(id, Outcome)`, `cancelled()`, `snapshot() -> Snapshot` and `end(status) -> u8`.
 `run` returns spawn and I/O errors as `Err` and the child's real status even after an interrupt; `Run` tracks cancellation and `end` derives the [contracted status](contract.md#exit-status) after cleanup.
-`Outcome::{Completed, Deferred, Skipped, Failed}` maps hook and recipe statuses 0, 3, 4, other, `DOTS_CHANGES` rows becoming `Change`s; `Issue { diagnostic, next, tail, log }` has `tail` and `log` only in `up`; `Snapshot` exposes stage IDs, labels, progress, report fields and `attachable: Option<StageId>` for the foreground PTY.
-R-01 runs children on caller stdio and saves stage metadata and status privately, warning on write failure; modules can test before P-11 adds retention, logs, cancellation, PTYs and nonblocking view requests (`Some(id)` attaches, `None` returns).
-P-12's views read `snapshot()` and R-01's private `report::{list, load}`; queries live with their data's writer.
-Only the contract's `up` dashboard uses PTYs, an `openpty` per stage; other runs stay direct, where an `Interactive` stage like `sudo -v` still prompts.
-A handoff flushes stale input, resizes and relays the caller's terminal, which `dots` keeps, to the child's PTY byte for byte; output from then on may echo input, even late, and is never logged or reported.
-Ctrl-C, even mid-drain, escalates on every stage group and probe, leaderless included, self-detached exempt, blocks new spawns and finishes cleanup before saving; a separate guard restores termios on exit, cancellation and unwinding panic.
+`Outcome::{Completed, Deferred, Skipped, Failed}` maps hook and recipe statuses 0, 3, 4, other, `DOTS_CHANGES` rows becoming `Change`s; `Issue { diagnostic, next, tail, log }` has `tail` and `log` only for `Ordinary` stages in `up`; `Snapshot` exposes stage IDs, labels, progress and report fields.
+R-01 runs children on caller stdio and saves stage metadata and status privately, warning on write failure; modules can test before P-11 adds retention, ordinary logs, cleanup, cancellation and the App Store stage.
+P-12 formats plain step, outcome and report-list lines from `snapshot()` and R-01's private `report::{list, load}`, without ratatui or crossterm; queries live with their data's writer.
+No run uses a PTY or relays the terminal, and one writer owns it at a time.
+Hooks, recipes and known prompts like `sudo -v` run under `Interactive`, inheriting the caller's stdin, stdout, stderr and controlling terminal from spawn, redirected or not; `dots` never reads their input, logs their output or keeps a tail.
+`Ordinary` stages write to private logs that feed issue tails, and a quiet stage finishes its progress line before the next `Interactive` spawn.
+An observed Ctrl-C starts cancellation across active groups and probes, including during drain, and blocks new spawns.
+A direct foreground child that ignores that interrupt can continue until it exits.
+The supervisor then cleans up owned remnants, including leaderless groups, before saving the report and applying the contract’s exit-status order.
+Self-detached processes are outside that scope. A guard restores the caller’s terminal on exit, cancellation and unwinding panic.
 Native mise runs `dots bootstrap complete` as a separate, direct process in its stage's group and cancellation scope; `DOTS_STAGES`, set only on that stage, names a unique private file its `Sink::Fragment` run alone atomically rewrites with stage metadata before each hook starts and after it finishes.
 After native exit the parent calls `run.fold(path)` even on failure, marking the active hook cancelled on interruption; standalone `complete` prints outcomes without saving a report.
-`--mas` runs `mas` alongside with cached `sudo`, `sudo -v` on a TTY, or deferral.
+With valid cached administrator access, `--mas` starts the background worker as `Ordinary` without prompting, with or without a terminal.
+Without cached access, an interactive run obtains authorization first with `sudo -v` as a foreground `Interactive` stage. A noninteractive run defers the App Store stage.
+The parent announces the worker’s result at the next stage boundary and joins it before standalone mise.
+If authorization expires, the worker defers with a next action and never prompts again.
 `hooks::list(&Root, Dir, &Vars, profile)?`, `hooks::run(&Run, &Hook, HookEnv) -> Outcome`, `exceptions::run(&Run, &Exceptions, Update | InstallOnly)?`.
 P-05 selects, validates and persists the profile, machine or restore ID, history origin and `host-ID` branch, and recovery identity, checks bundle recipients and private readiness, then calls `history::restore(&Run, StageId, Restore { machine, origin, identity, initialize })` and `enroll(&Run, StageId, Enroll { profile, machine, origin, identity, recipients })` `-> Outcome`; only restore's `Outcome` feeds `DOTS_RESTORED` and its share of `DOTS_PRIVATE_READY` and hook secrets; P-06 re-derives nothing.
 `history::checkpoint(&Run, StageId, &Ctx) -> Result<Saved | NothingTracked, Issue>`; `sync::load(&Ctx) -> LocalOnly | Problem | Ready` and `sync::run(&Run, StageId, Loaded, Display) -> Receipt` never fail; only shared runs checkpoint.

@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal as _, Write as _};
+use std::io::{self, Write as _};
+use std::path::Path;
 
 use clap::builder::{OsStringValueParser, PossibleValue, PossibleValuesParser};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -72,10 +73,6 @@ fn globals(command: Command) -> Command {
     command
         .arg(flag("plain", "Print concise progress lines").conflicts_with("verbose"))
         .arg(flag("verbose", "Show full output of every step"))
-        .arg(flag(
-            "no-wait",
-            "Close the dashboard when the command finishes",
-        ))
 }
 
 fn sub(name: &'static str, about: &'static str) -> Command {
@@ -142,7 +139,6 @@ pub fn tree() -> Command {
         .external_subcommand_value_parser(OsStringValueParser::new())
         .color(ColorChoice::Never)
         .arg(flag("version", "Print the version and how dots was installed"))
-        .subcommand(sub("menu", "Open the command menu"))
         .subcommand(sub("help", "List commands and usage"))
         .subcommand(sub("completions", "Print a shell completion script")
             .override_usage("dots completions bash|zsh|fish")
@@ -154,7 +150,7 @@ pub fn tree() -> Command {
                 "  bash  ~/.bashrc                     eval \"$(dots completions bash)\"\n",
                 "Homebrew installs the scripts in its standard completion locations."
             )))
-        .subcommand(sub("reports", "Browse saved reports")
+        .subcommand(sub("reports", "List saved reports")
             .arg(Arg::new("COMMAND").value_parser(PossibleValuesParser::new(crate::report::Command::ALL.map(|command| {
                 use crate::report::Command::{Remove, Up};
                 let value = PossibleValue::new(command.name());
@@ -163,14 +159,13 @@ pub fn tree() -> Command {
                     Remove => value.alias("uninstall"),
                     _ => value,
                 }
-            }))))
-            .after_help("Needs a terminal."))
+            })))))
         .subcommand(sub("status", "Show programs, profile and this machine's state"))
         .subcommand(sub("plan", "Preview mise's bootstrap plan for this machine"))
         .subcommand(globals(sub("up", "Checkpoint settings, sync, and update packages, tools, hooks and mise"))
             .visible_alias("update")
             .arg(flag("mas", "Include Mac App Store updates (macOS)").conflicts_with("last"))
-            .arg(flag("last", "Reopen the last update report")))
+            .arg(flag("last", "Print the last update report")))
         .subcommand(sub("sync", "Share configuration edits and apply others' changes")
             .arg(flag("last", "Replay the latest receipt without the network"))
             .after_help("A sync with valid arguments always exits 0."))
@@ -399,7 +394,6 @@ fn flags(matches: &ArgMatches) -> Flags {
     Flags {
         plain: matches.get_flag("plain"),
         verbose: matches.get_flag("verbose"),
-        no_wait: matches.get_flag("no-wait"),
     }
 }
 
@@ -411,7 +405,6 @@ fn display_flags(root: Flags, command: Option<(&str, &ArgMatches)>) -> Result<Fl
     for (a, b, name) in [
         (root.plain, after.plain, "--plain"),
         (root.verbose, after.verbose, "--verbose"),
-        (root.no_wait, after.no_wait, "--no-wait"),
     ] {
         if a && b {
             return Err(Fail::usage(format!(
@@ -422,7 +415,6 @@ fn display_flags(root: Flags, command: Option<(&str, &ArgMatches)>) -> Result<Fl
     let flags = Flags {
         plain: root.plain || after.plain,
         verbose: root.verbose || after.verbose,
-        no_wait: root.no_wait || after.no_wait,
     };
     if flags.plain && flags.verbose {
         return Err(display_conflict());
@@ -501,7 +493,7 @@ fn command_index(argv: &[OsString]) -> Option<usize> {
     argv.iter()
         .enumerate()
         .skip(1)
-        .find(|(_, word)| !matches!(word.to_str(), Some("--plain" | "--verbose" | "--no-wait")))
+        .find(|(_, word)| !matches!(word.to_str(), Some("--plain" | "--verbose")))
         .map(|(index, _)| index)
 }
 
@@ -543,9 +535,16 @@ fn validate_requests(name: &str, args: &ArgMatches) -> Result<(), Fail> {
 }
 
 fn context(flags: Flags) -> Result<Ctx, Fail> {
+    context_at(flags, None)
+}
+
+fn context_at(flags: Flags, directory: Option<&Path>) -> Result<Ctx, Fail> {
     let env = Env::current()
         .map_err(|error| Fail::new(1, format!("could not read the current directory: {error}")))?;
-    let root = Root::resolve(&env)?;
+    let root = match directory {
+        Some(directory) => Root::from_dir(&env, directory)?,
+        None => Root::resolve(&env)?,
+    };
     let ctx = Ctx { env, root, flags };
     if let Err(error) = skill::refresh(&ctx)
         && !error.is_unported()
@@ -555,7 +554,7 @@ fn context(flags: Flags) -> Result<Ctx, Fail> {
     Ok(ctx)
 }
 
-fn require_config(root: &Root) -> Result<(), Fail> {
+pub(crate) fn require_config(root: &Root) -> Result<(), Fail> {
     if !root.path().join("config.toml").is_file() {
         return Err(Fail::usage(format!(
             "no configuration at {} (config.toml not found); create one with dots init or set DOTS_ROOT",
@@ -576,7 +575,12 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
 
     let grammar = tree();
     let index = command_index(&argv);
-    let spelling = index.and_then(|index| argv[index].to_str());
+    let word = index.map(|index| &argv[index]);
+    // Clap treats a word such as -hello as a short-option cluster starting with -h.
+    if word.is_some_and(|word| word.as_encoded_bytes().starts_with(b"-h") && word != "-h") {
+        return Err(Fail::usage("invalid short option; use dots help"));
+    }
+    let spelling = word.and_then(|word| word.to_str());
     if spelling == Some("--") {
         return Err(Fail::usage(
             "unexpected '--' before the command; use dots help",
@@ -637,10 +641,10 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         return print(&format!("{version}\n"));
     }
 
-    let (name, args) = command.unwrap_or(("menu", &matches));
-    if name == "help"
-        || (name == "menu" && !(io::stdin().is_terminal() && io::stdout().is_terminal()))
-    {
+    let Some((name, args)) = command else {
+        return print_help();
+    };
+    if name == "help" {
         return print_help();
     }
     if name == "completions" {
@@ -652,16 +656,13 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         };
         return print(completion::script(shell)?);
     }
-    if name == "reports" && !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
-        return Err(Fail::usage("dots reports needs a terminal"));
-    }
     validate_requests(name, args)?;
 
     let tail = index.map_or(&[][..], |index| &argv[index + 1..]);
     if name == "mise" && tail.is_empty() {
         return Err(Fail::usage("usage: dots mise ARGS...; use dots help"));
     }
-    if name != "menu" && known.is_none() {
+    if known.is_none() {
         let ctx = context(flags)?;
         if config_commands::is_external(&ctx.root, name) {
             if flags != Flags::default() {
@@ -673,10 +674,23 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         }
         return config_commands::dispatch(&ctx, Invocation::External { name, args: tail });
     }
-    let ctx = context(flags)?;
+    let directory = if name == "init" {
+        args.get_one::<OsString>("DIR").map(Path::new)
+    } else {
+        None
+    };
+    let ctx = context_at(flags, directory)?;
     if !matches!(
         name,
-        "init" | "menu" | "bundle" | "brew" | "install-release-app" | "status" | "sync"
+        "init"
+            | "bundle"
+            | "brew"
+            | "install-release-app"
+            | "status"
+            | "sync"
+            | "plan"
+            | "apply"
+            | "test"
     ) {
         require_config(&ctx.root)?;
     }
@@ -684,7 +698,6 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         "root" => config_commands::dispatch(&ctx, Invocation::Root),
         "profile" => config_commands::dispatch(&ctx, Invocation::Profile(args)),
         "mise" => config_commands::dispatch(&ctx, Invocation::Mise(tail)),
-        "menu" => ui::menu(&ctx, args),
         "reports" => ui::reports(&ctx, args),
         "up" if args.get_flag("last") => ui::last(&ctx, args),
         "up" => update::up(&ctx, args),

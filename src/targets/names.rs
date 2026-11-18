@@ -32,7 +32,7 @@ pub(super) fn canonical(key: &str) -> Option<Cow<'_, str>> {
     Some(key.into())
 }
 
-pub(super) fn github_repo(repo: &str) -> Option<String> {
+pub(crate) fn github_repo(repo: &str) -> Option<String> {
     let repo = repo.strip_suffix('/').unwrap_or(repo);
     let (owner, name) = repo.split_once('/')?;
     let name = name
@@ -99,7 +99,7 @@ pub(super) fn valid(text: &str) -> bool {
         && safe_text(text)
 }
 
-pub(super) fn safe_text(text: &str) -> bool {
+pub(crate) fn safe_text(text: &str) -> bool {
     use GeneralCategory::*;
     text.chars().all(|c| {
         c == ' '

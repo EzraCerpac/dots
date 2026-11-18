@@ -1,0 +1,4 @@
+legacy_case	reason
+UpdateHookTests.test_update_leaves_a_checkout_manager_alone	1.0 removes checkout as a manager installation type, so a sibling .git no longer triggers advice to update the executable with Git.
+UpdateHookTests.test_source_sync_that_changes_the_manager_reexecs_once_into_the_new_code	1.0 keeps the executable that started the run. Sync reloads the configuration, and the Bash updater task and mise re-exec are gone.
+UpdateHookTests.test_source_sync_keeps_the_callers_auto_install_for_the_hooks_it_applies	The fixture replaced the private Node sync entry point and printed MISE_AUTO_INSTALL without applying a dotfile or running a mise hook. 1.0 defines sync apply with the usual mise hooks but does not specify this wrapper environment.

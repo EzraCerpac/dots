@@ -53,7 +53,7 @@ Update or unset it if it points to an older renderer.
 ### Shell completions
 
 Homebrew installs completions for Fish, Zsh and Bash in their standard directories.
-With mise or a release archive, add the line for your shell to its interactive configuration:
+For mise, release archives, or a Homebrew shell that does not load completions automatically, add the line for your shell to its interactive configuration:
 
 | Shell | Startup file | Line to add |
 | --- | --- | --- |
@@ -149,6 +149,7 @@ Run `dots help` for the full list with examples.
 In a terminal, `dots` alone opens a menu of the same commands.
 `dots up` shows the live update dashboard.
 Individual commands print in scrollback and return to the prompt when finished.
+To browse a saved sync receipt in your terminal pager, use `dots sync --last`.
 `--plain`, `--verbose` and `--no-wait` before a command choose how its output is shown, for example `dots --plain status`.
 
 Update issues are listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
@@ -340,7 +341,7 @@ To remove the skill, set that and delete the two links; after `brew uninstall do
 | `skills/` | The agent skill |
 | `tests/` | The test suites and a fixture configuration |
 
-Run the tests from the repository root; they need nothing outside it and never touch your machine:
+Run the tests from the repository root. The Python suite uses PyYAML and tomlkit.
 
 ```sh
 tests/run              # Python, Node and shell suites; tests/run python, node or shell

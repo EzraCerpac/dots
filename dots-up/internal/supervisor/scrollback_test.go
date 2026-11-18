@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"os/exec"
@@ -101,7 +102,7 @@ func TestScrollbackStreamsToSlowReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Wait(); err != nil || len(data) != 128*1024 {
+	if err := cmd.Wait(); err != nil || !bytes.Equal(data, make([]byte, 128*1024)) {
 		t.Fatalf("received %d bytes, process error %v", len(data), err)
 	}
 }

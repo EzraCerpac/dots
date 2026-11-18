@@ -71,6 +71,9 @@ class ShellCompletions(unittest.TestCase):
             dots = root / "dots"
             dots.write_text(f"#!{sys.executable}\n" + MOCK)
             dots.chmod(0o755)
+            (root / "env=prod").mkdir()
+            (root / "env=prod/config.toml").touch()
+            (root / "config\tlocal.toml").touch()
             (root / "path file").touch()
             (root / "path folder").mkdir()
             log = root / "calls"
@@ -182,6 +185,23 @@ class ShellCompletions(unittest.TestCase):
                     shell, b"dots dir pa\tchild",
                     ["dir", "pa"], ["dir", "path folder/child"],
                 )
+
+    def test_inline_path_containing_equals(self):
+        for shell in SHELL_FILES:
+            with self.subTest(shell=shell):
+                self.assert_completion(shell, b"dots file --path=env=prod/con\t",
+                                       ["file", "--path=env=prod/con"],
+                                       ["file", "--path=env=prod/config.toml"])
+
+    def test_bash_preserves_tab_in_filename(self):
+        self.assert_completion("bash", b"dots file config\t", ["file", "config"], ["file", "config\tlocal.toml"])
+
+    def test_bash_prior_home_path(self):
+        for source, expand in [(b"~/chosen", True), (b"'~/chosen'", False), (b"\\~/chosen", False)]:
+            with self.subTest(source=source):
+                calls = self.run_completion("bash", b"dots remove --path " + source + b" rip\t")
+                self.assertEqual(calls[0][4], calls[-1][2])
+                self.assertEqual(os.path.isabs(calls[0][4]), expand)
 
     def test_zsh_autoload(self):
         self.assert_completion("zsh", b"dots a\t", ["a"], ["add"], autoload=True)

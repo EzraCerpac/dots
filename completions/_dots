@@ -10,7 +10,7 @@ _dots() {
     reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${args[@]}" 2>/dev/null) || return 1
     case $reply in
         (:files|:dirs)
-            [[ $PREFIX == -*=* ]] && compset -P '*='
+            [[ $PREFIX == -*=* ]] && compset -P 1 '*='
             if [[ $reply == :dirs ]]; then _directories; else _files; fi
             return ;;
     esac

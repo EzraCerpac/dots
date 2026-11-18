@@ -215,17 +215,19 @@ esac
         config = self.root / "a"
         config.mkdir()
         source = config / "config.toml"
-        source.write_text(BASE + '\n[bootstrap.packages]\n"brew-cask:codexbar" = "latest"\n')
-        for ambiguous in (False, True):
-            with self.subTest(ambiguous=ambiguous):
+        (config / "dots").mkdir()
+        for held, ambiguous in [(False, False), (True, False), (True, True), (False, True)]:
+            with self.subTest(held=held, ambiguous=ambiguous):
+                declarations = BASE + '\n[bootstrap.packages]\n"brew-cask:codexbar" = "latest"\n'
                 if ambiguous:
-                    with source.open("a") as stream:
-                        stream.write('"brew:codexbar" = "latest"\n')
+                    declarations += '"brew:codexbar" = "latest"\n'
+                source.write_text(declarations)
+                (config / "dots/exceptions.tsv").write_text("base\tmanual\thold=brew-cask:codexbar\n" if held else "")
                 before = source.read_bytes()
                 result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
                                       str(self.bin / "mise"), str(config), "codex-bar")
                 message = "dots: no declaration or managed app matches 'codex-bar'"
-                if not ambiguous:
+                if not held and not ambiguous:
                     message += ". Did you mean 'brew-cask:codexbar'?"
                 self.assertEqual(result.returncode, 1)
                 self.assertEqual(result.stderr.strip(), message)

@@ -85,7 +85,9 @@ func TestCommandGrammar(t *testing.T) {
 		{[]string{"init", "dir", ""}, nil},
 		{[]string{"remote", "host", "--identity-file", ""}, []string{":files"}},
 		{[]string{"remote", "host", "--profile", "l"}, []string{"laptop"}},
-		{[]string{"bootstrap", "--config-dir", ""}, []string{":dirs"}},
+		{[]string{"bootstrap", "--config-dir", ""}, nil},
+		{[]string{"bootstrap", "--restore", "laptop", "--on"}, nil},
+		{[]string{"bootstrap", "--only=tools", "--rest"}, nil},
 		{[]string{"bootstrap", "--only=tools,dot"}, []string{"--only=tools,dotfiles"}},
 		{[]string{"bundle", "ch"}, []string{"check"}},
 		{[]string{"bundle", "check", "--identity", ""}, []string{":files"}},
@@ -118,6 +120,8 @@ ignored = "latest"
 `, 0600)
 	fixture(t, root, "config.server.toml", "[tools]\nserver = 'latest'\n", 0600)
 	fixture(t, caller, "chosen.toml", "[tools]\nchosen = { version = 'latest' }\n", 0600)
+	fixture(t, caller, "trailing.toml", "[tools]\n'github:Owner/Widget/' = 'latest'\n", 0600)
+	expect(t, root, []string{"remove", "--path", "trailing.toml", "wid"}, nil)
 	fixture(t, caller, "broken.toml", "[tools]\nbroken = {\n", 0600)
 	expect(t, root, []string{"remove", "--base", ""}, []string{"@scope/foo", "brew:fd", "foo", "homebrew/core/fd", "mise:fd"})
 	expect(t, root, []string{"remove", "--base", "fd"}, []string{"brew:fd", "mise:fd"})
@@ -182,11 +186,14 @@ func TestActiveRemoveAndOwnership(t *testing.T) {
 	}
 	list, _ := json.Marshal(files)
 	t.Setenv("COMPLETION_PROBE_OUTPUT", string(list))
+	oldDir := applicationsDir
+	applicationsDir = t.TempDir()
+	t.Cleanup(func() { applicationsDir = oldDir })
 	app := func(repo, name, filename string) {
 		if filename == "" {
 			filename = fmt.Sprintf("%x.json", sha256.Sum256([]byte(name)))
 		}
-		data, _ := json.Marshal(map[string]string{"repo": repo, "path": "/Applications/" + name, "bundle_id": "test.example"})
+		data, _ := json.Marshal(map[string]string{"repo": repo, "path": filepath.Join(applicationsDir, name), "bundle_id": "test.example"})
 		fixture(t, state, "dots/github-apps/"+filename, string(data), 0600)
 	}
 	app("owner/widget", "Dots Completion Fixture Widget.app", "")

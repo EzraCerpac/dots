@@ -146,7 +146,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/dist/dots-0.0.0-ci-$platform.tar.gz" -C "$prefix"
           dots="$prefix/dots-0.0.0-ci-$platform/bin/dots"
           export HOME="$RUNNER_TEMP/home"
-          "$dots" internal shell-complete sy | cut -f1 | grep -qx sync
+          "$dots" completions bash | cmp - "${dots%/bin/dots}/completions/dots.bash"
+          printf "[tools]\nexample = '1'\n" > "$RUNNER_TEMP/selected.toml"
+          "$dots" internal shell-complete remove --path "$RUNNER_TEMP/selected.toml" ex | cut -f1 | grep -qx example
           test ! -e "$HOME/.claude/skills/dots"
           test "$("$dots" --version)" = "dots 0.0.0-ci (archive)"
           "$dots" --help | grep -q 'Your machine setup'

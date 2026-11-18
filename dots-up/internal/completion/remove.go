@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+var applicationsDir = "/Applications"
+
 var githubRepo = regexp.MustCompile(`^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$`)
 
 func canonicalTarget(key string) string {
@@ -57,7 +59,7 @@ func (t *target) addAliases(key string) {
 		tail = suffix
 	}
 	t.aliases[strings.ToLower(tail)] = true
-	t.aliases[strings.ToLower(path.Base(tail))] = true
+	t.aliases[strings.ToLower(tail[strings.LastIndexByte(tail, '/')+1:])] = true
 }
 
 type targets map[string]*target
@@ -90,7 +92,7 @@ func (all targets) readMarkers(scoped bool) {
 		app := owner["path"]
 		name := filepath.Base(app)
 		if id == "" || (scoped && all[id] == nil) ||
-			app != "/Applications/"+name || name == ".app" || name == "..app" ||
+			app != filepath.Join(applicationsDir, name) || name == ".app" || name == "..app" ||
 			!strings.HasSuffix(name, ".app") || !safeText(app) || !safeText(owner["bundle_id"]) ||
 			file.Name() != fmt.Sprintf("%x.json", sha256.Sum256([]byte(name))) {
 			continue
@@ -99,7 +101,7 @@ func (all targets) readMarkers(scoped bool) {
 		if err == nil && !info.IsDir() {
 			continue
 		}
-		parent, err := os.Lstat("/Applications")
+		parent, err := os.Lstat(applicationsDir)
 		if err == nil && !parent.IsDir() {
 			continue
 		}

@@ -36,7 +36,7 @@ func run(args []string) int {
 	fs.BoolVar(&opts.NoWait, "no-wait", false, "close when the command finishes")
 	fs.BoolVar(&opts.Last, "last", false, "reopen the latest saved report")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: dots-up [--mas] [--plain | --verbose] [--no-wait] [--last]\n       dots-up --command COMMAND [display flags] -- [ARGS...]\nThe full update opens a dashboard in a terminal. Individual commands print to scrollback.")
+		fmt.Fprintln(fs.Output(), "Usage: dots-up [--mas] [--plain | --verbose] [--no-wait] [--last]\n       dots-up --command COMMAND [display flags] -- [ARGS...]\nThe full update defaults to a dashboard in a suitable interactive terminal. Individual commands print to scrollback.")
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

@@ -63,7 +63,7 @@ var commandOptions = map[string][]option{
 		{name: "--from", description: "Bootstrap from a setup repository", value: "text", inline: true},
 		{name: "--adopt", description: "Adopt a setup or settings history repository", value: "text", inline: true},
 		{name: "--from-dir", description: "Use this checkout directory", value: ":dirs", inline: true},
-		{name: "--config-dir", description: "Use this configuration directory in the checkout", value: ":dirs", inline: true},
+		{name: "--config-dir", description: "Use this configuration directory in the checkout", value: "text", inline: true},
 		{name: "--replace-history", description: "Replace unrelated settings history"},
 		{name: "--take-remote-all", description: "Adopt all remote settings"},
 		{name: "--dry-run", short: "-n", description: "Preview bootstrap actions"},
@@ -112,6 +112,9 @@ func markUsed(used map[string]bool, flag option) {
 }
 
 func available(used map[string]bool, flag option) bool {
+	if (flag.name == "--only" && used["--restore"]) || (flag.name == "--restore" && used["--only"]) {
+		return false
+	}
 	return (flag.repeat || !used[flag.name]) && (flag.group == "" || !used[flag.group] || used[flag.name])
 }
 

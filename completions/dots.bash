@@ -2,7 +2,7 @@
 _dots_complete() {
     local LC_ALL=C
     local line=${COMP_LINE:0:COMP_POINT} word='' quote='' ch next
-    local started=0 split=0 i
+    local started=0 split=0 home_prefix=0 i
     local -a words
     words=()
 
@@ -31,12 +31,17 @@ _dots_complete() {
                             started=1
                             continue ;;
                         ' '|$'\t')
-                            if ((started)); then words+=( "$word" ); fi
-                            word='' started=0 split=0
+                            if ((started)); then
+                                if ((home_prefix)); then word=$HOME${word:1}; fi
+                                words+=( "$word" )
+                            fi
+                            word='' started=0 split=0 home_prefix=0
                             continue ;;
                         [\;\|\&\(\)]|$'\n')
-                            words=() word='' started=0 split=0
+                            words=() word='' started=0 split=0 home_prefix=0
                             continue ;;
+                        '~')
+                            if ((!started)) && [[ ${line:i+1:1} == / ]]; then home_prefix=1; fi ;;
                     esac
                     if [[ $COMP_WORDBREAKS == *"$ch"* ]]; then
                         split=$((${#word} + 1))
@@ -48,16 +53,17 @@ _dots_complete() {
     done
 
     COMPREPLY=()
-    local reply value file_prefix='' file_word=$word
+    local reply value native_paths=0 file_prefix='' file_word=$word
     reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${words[@]:1}" "$word" 2>/dev/null) || return
     case $reply in
         :files|:dirs)
+            native_paths=1
             if [[ $word == -*=* ]]; then file_prefix=${word%%=*}=; file_word=${word#*=}; fi
             if [[ $reply == :dirs ]]; then reply=$(compgen -d -- "$file_word")
             else reply=$(compgen -f -- "$file_word"); fi ;;
     esac
     while IFS= read -r value; do
-        value=${value%%$'\t'*}
+        if ((!native_paths)); then value=${value%%$'\t'*}; fi
         [[ -n $value ]] || continue
         value=$file_prefix$value
         if ((split)) && [[ $value != "${word:0:split}"* ]]; then continue; fi

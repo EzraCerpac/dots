@@ -107,8 +107,8 @@ func Run(opts Options) int {
 	scrollback := opts.scrollback()
 	started := time.Now()
 	files, err := newRunFiles(started, opts.StateDir)
-	if err != nil && !scrollback {
-		fmt.Fprintf(os.Stderr, "dots up: reports unavailable: %v\nContinuing without saved logs.\n", err)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "dots %s: reports unavailable: %v\n", opts.Command, err)
 	}
 	if files != nil {
 		files.report.Command = opts.Command

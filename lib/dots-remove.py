@@ -179,8 +179,7 @@ def resolve(targets, declarations, records):
             message = f"no declaration or managed app matches {request!r}"
             close = difflib.get_close_matches(name.casefold(), index, n=max(1, len(index)), cutoff=0.8)
             suggestions = {identity for alias in close for identity in index[alias]}
-            if len(suggestions) == 1:
-                suggestion = suggestions.pop()
+            if len(suggestions) == 1 and held_by(suggestion := suggestions.pop()) is None:
                 if ":" not in suggestion and len(index[suggestion.casefold()]) > 1:
                     suggestion = f"mise:{suggestion}"
                 message += f". Did you mean {suggestion!r}?"
@@ -213,12 +212,13 @@ def read_holds(root):
     return holds
 
 
-def check_held(identity):
+def held_by(identity):
     manager, _, tail = identity.partition(":")
     name = tail.rsplit("/", 1)[-1]
     for key in (f"{manager}:{name}", f"{manager}:{name.split('@', 1)[0]}"):
         if key in HELD:
-            raise ValueError(f"{identity} is held by installer exception {HELD[key]}; change its recipe instead")
+            return HELD[key]
+    return None
 
 
 def validate_app(identity, marker, owner, applications=Path("/Applications")):
@@ -280,7 +280,8 @@ def release_sources(mise, root, identity):
 
 
 def prepare(identity, entries, records, keep, packages, shared=False):
-    check_held(identity)
+    if (holder := held_by(identity)) is not None:
+        raise ValueError(f"{identity} is held by installer exception {holder}; change its recipe instead")
     plan = {"identity": identity, "entries": entries, "apps": [], "package": None, "shared": shared}
     if not keep and not shared:
         for marker, owner in records.get(identity, []):

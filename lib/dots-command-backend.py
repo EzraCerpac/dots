@@ -36,11 +36,11 @@ def stage_start(id, group, label, handoff=False):
         if line.decode().strip() != f"go:{id}":
             raise RuntimeError("invalid terminal handoff")
 
-def stage_end(id, label, code, state=None, summary=None, action=""):
+def stage_end(id, label, code, state=None, summary=None, action="", detail=""):
     state = state or ("ok" if code == 0 else "attention" if code == 3 else "failed")
     if state != "ok" and not action:
-        action = f"Review the stage log and rerun {shlex.join(['dots', command, *arguments])}."
-    emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action)
+        action = f"Review the command output and rerun {shlex.join(['dots', command, *arguments])}."
+    emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action, detail=detail)
     return state
 
 def item(group, key, state, summary, action=""):
@@ -85,11 +85,13 @@ def status():
     profile = os.environ.get("SETUP_PROFILE", "")
     try:
         profiles = dots_profiles()
+        if profile not in profiles:
+            raise ValueError("SETUP_PROFILE must be one of [vars] dots_profiles: " + ", ".join(profiles))
     except ValueError as error:
-        print(f"setup: {error}", file=sys.stderr)
-        return 2
-    if profile not in profiles:
-        print("setup: SETUP_PROFILE must be one of [vars] dots_profiles: " + ", ".join(profiles), file=sys.stderr)
+        detail = f"setup: {error}"
+        print(detail, file=sys.stderr)
+        stage_start("startup", "Inspection", "Startup")
+        stage_end("startup", "Startup", 2, detail=detail, action="Fix the setup profile, then rerun dots status.")
         return 2
     selector = profile + (",host-" + os.environ["SETUP_MACHINE_ID"] if os.environ.get("SETUP_MACHINE_ID") else "")
     base = [mise, "-C", root, "-E", selector]

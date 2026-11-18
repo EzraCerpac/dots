@@ -77,8 +77,12 @@ fn native_mise_adapter_is_private_after_nested_environment_reset() {
     let nested = fixture.join("native-call");
     fs::create_dir(&nested).unwrap();
     let native = fixture.join("observe-native-env");
-    script(&native, "exec /usr/bin/env");
+    let marker = fixture.join("native-started");
+    script(&native, &format!(": > {}\nexec /usr/bin/env", sh(&marker)));
     let adapter = world.native_mise_adapter(&native);
+    let other = IsolatedWorld::new();
+    let symlink = fixture.join("redirected-native-path");
+    std::os::unix::fs::symlink(other.root(), &symlink).unwrap();
     let reset = fixture.join("reset-native-env");
     let command = world.tool(&reset);
     let mise_keys = command
@@ -94,11 +98,15 @@ fn native_mise_adapter_is_private_after_nested_environment_reset() {
 export HOME={home}
 export MISE_CONFIG_DIR="$HOME" MISE_SYSTEM_CONFIG_DIR="$HOME/system"
 export MISE_DATA_DIR="$HOME/data" MISE_STATE_DIR="$HOME/state" MISE_CACHE_DIR="$HOME/cache"
-if [ "$1" = override ]; then
-    export MISE_SYSTEM_DATA_DIR="$HOME/override-system-data"
-    export MISE_SYSTEM_PLUGINS_DIRS="$HOME/override-plugins"
-fi
-exec {adapter}"#,
+case "$1" in
+    override)
+        export MISE_SYSTEM_DATA_DIR="$HOME/override-system-data"
+        export MISE_SYSTEM_PLUGINS_DIRS="$HOME/override-plugins" ;;
+    cwd) cd "$2" ;;
+    argv) exec {adapter} -C "$2" --version ;;
+    env) export "$2=$3" ;;
+esac
+exec {adapter} -C "$HOME" --version"#,
             home = sh(&nested),
             adapter = sh(&adapter),
         ),
@@ -142,6 +150,31 @@ exec {adapter}"#,
         }
         assert_eq!(values.get("MISE_OFFLINE"), Some(&"1"));
         assert_eq!(values.get("MISE_AUTO_INSTALL"), Some(&"0"));
+        fs::remove_file(&marker).unwrap();
+    }
+    for path in [other.root(), &symlink] {
+        for input in ["cwd", "argv"] {
+            let output = finish(world.tool(&reset).arg(input).arg(path));
+            assert!(!output.status.success(), "{output:?}");
+            has(
+                &String::from_utf8_lossy(&output.stderr),
+                "fixture boundary refused",
+            );
+            assert!(!marker.exists());
+        }
+        for key in [
+            "MISE_CONFIG_DIR",
+            "MISE_SYSTEM_DATA_DIR",
+            "MISE_SYSTEM_PLUGINS_DIRS",
+            "MISE_INSTALLS_DIR",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+        ] {
+            let output = finish(world.tool(&reset).args(["env", key]).arg(path));
+            assert!(!output.status.success(), "{output:?}");
+            has(&String::from_utf8_lossy(&output.stderr), key);
+            assert!(!marker.exists());
+        }
     }
 }
 
@@ -263,6 +296,22 @@ impl Repo {
             Path::new("/bin"),
         ])
         .unwrap()
+    }
+
+    fn path_without_gitleaks(&self) -> std::ffi::OsString {
+        for tool in [
+            "awk", "bash", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "dirname",
+            "env", "find", "grep", "head", "mkdir", "mktemp", "mv", "readlink", "rm", "sed",
+            "sort", "stat", "tail", "touch", "tr", "wc",
+        ] {
+            let path = self.tools.join(tool);
+            if !path.exists() {
+                let executable = executable_on_path(&self.world.git(), tool)
+                    .unwrap_or_else(|| panic!("fixture requires {tool}"));
+                symlink(executable, path).unwrap();
+            }
+        }
+        std::env::join_paths([&self.tools]).unwrap()
     }
 
     fn git_command(&self, root: &Path) -> FixtureCommand<'_> {
@@ -1379,10 +1428,7 @@ sync_case!(
     unchanged_toml_diagnostic_has_location_without_source_bytes,
     || {
         let f = Repo::new();
-        let Some(mise) = &f.mise_real else {
-            eprintln!("skipped: real mise is unavailable");
-            return;
-        };
+        let mise = f.mise_real.as_ref().expect("real mise on fixture PATH");
         f.publish("config.toml", format!("value = {PRIVATE_MARKER:?} stray\n"));
         let parser = f.tools.join("fixture-mise-parser");
         script(
@@ -2192,24 +2238,21 @@ struct Machine<'a> {
 }
 
 impl<'a> Machine<'a> {
-    fn new(repo: &'a Repo, root: &'a Path, name: &str, hooks: bool) -> Option<Self> {
-        let Some(mise) = repo.mise_real.clone() else {
-            eprintln!("skipped: real mise is unavailable");
-            return None;
-        };
+    fn new(repo: &'a Repo, root: &'a Path, name: &str, hooks: bool) -> Self {
+        let mise = repo.mise_real.clone().expect("real mise on fixture PATH");
         let state = repo.scratch.join(name);
         let home = state.join("home");
         for directory in [&home, &state.join("system")] {
             fs::create_dir_all(directory).unwrap();
         }
-        Some(Self {
+        Self {
             repo,
             root,
             home,
             state,
             mise,
             hooks,
-        })
+        }
     }
 
     fn isolate(&self, command: &mut FixtureCommand<'_>) {
@@ -2278,7 +2321,7 @@ const TEMPLATE_DECLARATION: &str =
 
 sync_case!(new_shared_sync_saves_encrypted_history_before_push, || {
     let f = Repo::new();
-    let machine = Machine::new(&f, &f.a, "machine-a", false).expect("real mise on fixture PATH");
+    let machine = Machine::new(&f, &f.a, "machine-a", false);
     let key = machine.home.join("fixture-age-key");
     let keygen = || {
         let mut command = f.world.tool(f.tools.join("age-keygen"));
@@ -2404,10 +2447,8 @@ macro_rules! copies_case {
     ($name:ident, $hooks:expr, |$f:ident, $a:ident, $b:ident, $config:ident| $body:block) => {
         sync_case!($name, || {
             let $f = Repo::new();
-            let Some($a) = Machine::new(&$f, &$f.a, "machine-a", $hooks) else {
-                return;
-            };
-            let $b = Machine::new(&$f, &$f.b, "machine-b", $hooks).unwrap();
+            let $a = Machine::new(&$f, &$f.a, "machine-a", $hooks);
+            let $b = Machine::new(&$f, &$f.b, "machine-b", $hooks);
             let $config = copies(&$f, &$a, &$b);
             $body
         });
@@ -2562,10 +2603,8 @@ copies_case!(
 
 fn guarded_hooks(only_copy: bool) {
     let f = Repo::new();
-    let Some(a) = Machine::new(&f, &f.a, "machine-a", true) else {
-        return;
-    };
-    let b = Machine::new(&f, &f.b, "machine-b", true).unwrap();
+    let a = Machine::new(&f, &f.a, "machine-a", true);
+    let b = Machine::new(&f, &f.b, "machine-b", true);
     let mixed = copies(&f, &a, &b);
     let config = if only_copy {
         format!("{}\n[dotfiles]\n{COPY_DECLARATION}\n", f.config)
@@ -3179,10 +3218,8 @@ copies_case!(
 
 fn incoming_copy_replacement(declaration: &str, deployed: Option<&str>) {
     let f = Repo::new();
-    let Some(a) = Machine::new(&f, &f.a, "machine-a", false) else {
-        return;
-    };
-    let b = Machine::new(&f, &f.b, "machine-b", false).unwrap();
+    let a = Machine::new(&f, &f.a, "machine-a", false);
+    let b = Machine::new(&f, &f.b, "machine-b", false);
     let config = copies(&f, &a, &b);
     a.target(".copied", "keep my copy\n");
     a.source("copy.txt", "keep my source\n");
@@ -3228,10 +3265,8 @@ sync_case!(
 
 fn former_copy_edit(interrupted: bool) {
     let f = Repo::new();
-    let Some(a) = Machine::new(&f, &f.a, "machine-a", false) else {
-        return;
-    };
-    let b = Machine::new(&f, &f.b, "machine-b", false).unwrap();
+    let a = Machine::new(&f, &f.a, "machine-a", false);
+    let b = Machine::new(&f, &f.b, "machine-b", false);
     let config = copies(&f, &a, &b).replace(COPY_DECLARATION, ABSENT_COPY);
     if interrupted {
         b.source("config.toml", &config);
@@ -3268,10 +3303,8 @@ sync_case!(
 
 fn former_copy_after_declaration_removal(remembered: bool) {
     let f = Repo::new();
-    let Some(a) = Machine::new(&f, &f.a, "machine-a", false) else {
-        return;
-    };
-    let b = Machine::new(&f, &f.b, "machine-b", false).unwrap();
+    let a = Machine::new(&f, &f.a, "machine-a", false);
+    let b = Machine::new(&f, &f.b, "machine-b", false);
     let config = if remembered {
         let config = copies(&f, &a, &b);
         a.source("config.toml", config.replace(COPY_DECLARATION, ""));
@@ -3348,9 +3381,7 @@ copies_case!(
 
 fn retire_native_mise(listed: bool) {
     let f = Repo::new();
-    let Some(a) = Machine::new(&f, &f.a, "machine-a", false) else {
-        return;
-    };
+    let a = Machine::new(&f, &f.a, "machine-a", false);
     const LOCAL: &str = "config.local.toml";
     let local = format!("{KEEP_LOCAL}{RETIRED_DECLARATION}");
     let source = "templates/fixture.tera";
@@ -3630,17 +3661,12 @@ sync_case!(
         let f = Repo::new();
         let before = f.remote();
         fs::remove_file(f.tools.join("gitleaks")).unwrap();
-        if ["/usr/bin/gitleaks", "/bin/gitleaks"]
-            .iter()
-            .any(|path| Path::new(path).exists())
-        {
-            eprintln!(
-                "skipped: this platform directory provides gitleaks; broken-scanner scenario still runs"
-            );
-            return;
-        }
+        let path = f.path_without_gitleaks();
+        let mut command = f.dots(&f.a, &["--verbose", "sync"]);
+        command.env("PATH", path);
+        assert!(executable_on_path(&command, "gitleaks").is_none());
         f.write(&f.a, "local", "never publish without scanning\n");
-        let receipt = f.sync(&f.a);
+        let receipt = dots_zero(&mut command);
         has(&receipt, "gitleaks");
         assert_eq!(f.remote(), before);
         assert_eq!(f.tip(&f.a), before);
@@ -3716,6 +3742,7 @@ copies_case!(
         a.source("config.local.toml", "[history.reload]\n\"~/.tree/leaf\" = 'cat \"$HOME/.tree/leaf\" >> \"$HOME/reloads\"'\n");
         let marker = f.scratch.join("takeover-child");
         let wrapper = f.tools.join("mise-takeover");
+        let reader = f.world.fixture_reader();
         script(
             &wrapper,
             &format!(
@@ -3729,7 +3756,8 @@ copies_case!(
             # The guarded renderer uses this staged destination for every
             # template. Select only the configuration for the takeover.
             [ "$PWD" = "${{argument%/rendered}}/config" ] || continue
-            grep -Fq 'takeover.tera' config.toml || continue ;;
+            definition=$({reader} config.toml) || exit 88
+            printf '%s\n' "$definition" | grep -Fq 'takeover.tera' || continue ;;
           '~/.tree/leaf'|{target}|*/copy-handoff-*/output) ;;
           *) continue ;;
         esac
@@ -3741,6 +3769,7 @@ copies_case!(
 esac
 exec {mise} "$@""#,
                 marker = sh(&marker),
+                reader = sh(&reader),
                 target = sh(&target),
                 mise = sh(&a.mise)
             ),

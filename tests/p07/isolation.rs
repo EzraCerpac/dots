@@ -125,12 +125,37 @@ impl IsolatedWorld {
         command
     }
 
+    fn boundary(&self) -> String {
+        let interpreter = executable_on_path(&self.world.command("python3"), "python3")
+            .expect("P-07 fixture boundary requires python3 on PATH");
+        let program = self.private.join("native-boundary.py");
+        fs::write(&program, include_bytes!("native-boundary.py")).unwrap();
+        format!(
+            "{} -I -S {} {}",
+            quote(&interpreter),
+            quote(&program),
+            quote(self.world.base())
+        )
+    }
+
+    #[allow(dead_code)] // Only fixtures reading a subprocess-selected input need this.
+    pub fn fixture_reader(&self) -> PathBuf {
+        let reader = self.private.join("read-fixture-file");
+        fs::write(
+            &reader,
+            format!("#!/bin/sh\nexec {} read \"$@\"\n", self.boundary()),
+        )
+        .unwrap();
+        fs::set_permissions(&reader, fs::Permissions::from_mode(0o700)).unwrap();
+        reader
+    }
+
     #[allow(dead_code)] // The receipt suite supplies a mise double.
     pub fn native_mise_adapter(&self, executable: &Path) -> PathBuf {
         let adapter = self.private.join("native-mise");
-        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
         let base = quote(self.root().parent().unwrap());
         let executable = quote(executable);
+        let boundary = self.boundary();
         fs::write(
             &adapter,
             format!(
@@ -162,7 +187,7 @@ export MISE_SYSTEM_PLUGINS_DIRS="${{MISE_SYSTEM_PLUGINS_DIRS:-$MISE_SYSTEM_DATA_
 export MISE_CEILING_PATHS="${{MISE_CEILING_PATHS:-$fixture}}"
 export MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0
 export MISE_NOT_FOUND_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0
-exec {executable} "$@"
+exec {boundary} mise {executable} "$@"
 "#
             ),
         )
@@ -224,6 +249,10 @@ exec {executable} "$@"
     }
 }
 
+fn quote(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
 pub fn executable_on_path(command: &Command, name: &str) -> Option<PathBuf> {
     let path = command
         .get_envs()
@@ -236,5 +265,7 @@ pub fn executable_on_path(command: &Command, name: &str) -> Option<PathBuf> {
                 .any(|part| part.as_os_str() == "shims")
         })
         .map(|directory| directory.join(name))
-        .find(|path| path.is_file())
+        .find(|path| {
+            fs::metadata(path).is_ok_and(|info| info.is_file() && info.mode() & 0o111 != 0)
+        })
 }

@@ -98,7 +98,7 @@ func TestCapabilitiesReportsHomeAwareProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 0 || strings.TrimSpace(string(output)) != "dots-shared-cli/2" {
+	if code != 0 || strings.TrimSpace(string(output)) != "dots-shared-cli/3" {
 		t.Fatalf("capabilities = %q (exit %d)", output, code)
 	}
 }

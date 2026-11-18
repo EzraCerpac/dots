@@ -367,3 +367,110 @@ func captureOutput(t *testing.T, run func() int) (int, string) {
 	}
 	return code, string(data)
 }
+
+func TestInteractiveSyncShowsOneReceipt(t *testing.T) {
+	oldInteractive, oldStart := hasInteractiveTerminal, startUpdaterBackend
+	t.Cleanup(func() { hasInteractiveTerminal, startUpdaterBackend = oldInteractive, oldStart })
+	hasInteractiveTerminal = func() bool { return true }
+	startUpdaterBackend = func(opts Options, files *runFiles, _ bool) (*backend, *os.File, io.Reader, error) {
+		return startBackend(opts, files, false)
+	}
+	const staged = runnerEvents + `
+emit '{"v":1,"kind":"stage_start","id":"sync","label":"sync"}'
+printf 'Plain receipt from this sync\n'
+emit '{"v":1,"kind":"stage_end","id":"sync","status":"ok"}'
+`
+	for _, tc := range []struct {
+		name, script, preview, want string
+		code                        int
+	}{
+		{"stage log", staged, "exit 1", "Plain receipt from this sync", 0},
+		{"early startup", "echo 'Invalid sync profile' >&2\nexit 2", "exit 1", "Invalid sync profile", 2},
+		{"preview succeeds", staged, "echo 'Rendered current receipt'", "Rendered current receipt", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useTextRunner(t, tc.script)
+			home := t.TempDir()
+			bin := filepath.Join(home, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "dots"), []byte(tc.preview), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			state := t.TempDir()
+			code, output := captureRun(t, Options{Command: "sync", Home: home, StateDir: state, Plain: true})
+			if code != tc.code || output != tc.want+"\n" {
+				t.Fatalf("exit %d, output %q, want exit %d and one %q", code, output, tc.code, tc.want)
+			}
+			if tc.name == "stage log" {
+				_, dir, err := latestReport(state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				stageLog, err := os.ReadFile(filepath.Join(dir, "stages", "sync.log"))
+				if err != nil || string(stageLog) != output {
+					t.Fatalf("receipt did not come from staged output: log %q, error %v", stageLog, err)
+				}
+			}
+		})
+	}
+}
+
+func TestUpLiveSummarySurvivesEventLogFailure(t *testing.T) {
+	useTextRunner(t, runnerEvents+`
+emit '{"v":1,"kind":"stage_start","id":"tools","group":"Tools","label":"Update tools"}'
+emit '{"v":1,"kind":"change","stage":"tools","item":"fixture-tool","action":"installed","after":"1.2.3"}'
+emit '{"v":1,"kind":"stage_end","id":"tools","status":"ok"}'
+`)
+	oldStart := startUpdaterBackend
+	t.Cleanup(func() { startUpdaterBackend = oldStart })
+	startUpdaterBackend = func(opts Options, files *runFiles, interactive bool) (*backend, *os.File, io.Reader, error) {
+		if err := files.eventLog.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return startBackend(opts, files, interactive)
+	}
+	code, output := captureRun(t, Options{StateDir: t.TempDir(), Plain: true})
+	if code != 0 || strings.Count(output, "installed  fixture-tool  1.2.3") != 1 ||
+		!strings.Contains(output, "write update event log") || strings.Contains(output, "dots up --last") {
+		t.Fatalf("exit %d, expected one verified change and no replay hint:\n%s", code, output)
+	}
+}
+
+func TestPlainUpPrintsOneCompactSummaryAndReplaysIt(t *testing.T) {
+	const change = "Shared on dev · edited config.toml (+1 −1)"
+	useTextRunner(t, runnerEvents+`
+emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture"}'
+emit '{"v":1,"kind":"stage_start","id":"source-sync","group":"Source & settings","label":"Sync configuration"}'
+emit '{"v":1,"kind":"change","stage":"source-sync","item":"`+change+`","action":"changed"}'
+emit '{"v":1,"kind":"stage_end","id":"source-sync","status":"ok","summary":"Source sync succeeded"}'
+emit '{"v":1,"kind":"stage_start","id":"tools","group":"Tools","label":"Update tools"}'
+emit '{"v":1,"kind":"stage_end","id":"tools","status":"attention","summary":"Tool upgrade deferred","action":"Free up disk space and rerun dots up"}'
+emit '{"v":1,"kind":"app_store_end","id":"mac-app-store","status":"failed","summary":"could not start (exit 1)","exit_code":1}'
+emit '{"v":1,"kind":"run_end","exit_code":0}'
+`)
+	opts := Options{StateDir: t.TempDir(), Plain: true}
+	code, live := captureRun(t, opts)
+	replayCode, replay := captureOutput(t, func() int { return ShowLast(opts) })
+	if code != 0 || replayCode != 0 {
+		t.Fatalf("live exit %d, replay exit %d", code, replayCode)
+	}
+	for _, output := range []string{live, replay} {
+		for _, want := range []string{"dots up · Completed with issues", change, "Tool upgrade deferred", "Next: Free up disk space", "Mac App Store updates — could not start (exit 1)", "rerun dots up --mas"} {
+			if strings.Count(output, want) != 1 {
+				t.Fatalf("expected %q once:\n%s", want, output)
+			}
+		}
+		for _, hidden := range []string{"changed  " + change, "Source sync succeeded", "Report:", "no verified changes"} {
+			if strings.Contains(output, hidden) {
+				t.Fatalf("unexpected %q:\n%s", hidden, output)
+			}
+		}
+	}
+	if !strings.HasPrefix(live, "→ Sync configuration · ") || !strings.Contains(live, "dots up --last") ||
+		strings.Contains(replay, "→ Sync configuration") || strings.Contains(replay, "dots up --last") {
+		t.Fatalf("unexpected progress or replay hints:\n%s\n%s", live, replay)
+	}
+	t.Logf("Plain run:\n%sSaved replay:\n%s", live, replay)
+}

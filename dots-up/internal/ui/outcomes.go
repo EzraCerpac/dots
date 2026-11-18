@@ -2,7 +2,9 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -49,31 +51,40 @@ func ChangeLine(action, item, before, after string) string {
 
 func (m Model) isUp() bool { return m.Command == "" || m.Command == "up" }
 
-// OutcomeReport is the printed form of the outcomes area of the run in
-// RUNDIR, without areas that have nothing to report.
+// OutcomeReport prints the same changes and issues as the dashboard.
 func OutcomeReport(events []Event, runDir string) string {
 	m := NewModel(runDir, false)
 	for _, event := range events {
-		m.apply(event)
+		m.applyEvent(event)
 	}
 	m.Width = 0 // the terminal wraps printed lines
-	var lines []string
-	for _, line := range strings.Split(m.outcomesContent(), "\n") {
-		if area, ok := strings.CutPrefix(line, "› > "); ok {
-			line = area
-		} else if area, ok := strings.CutPrefix(line, "  > "); ok {
-			line = area
-		} else {
-			lines = append(lines, line)
-			continue
-		}
-		if strings.HasSuffix(line, " · no verified changes") {
-			continue
-		}
-		lines = append(lines, line)
+	status := "dots up · " + m.outcomeStatus()
+	if content := m.outcomesContent(true); content != "" {
+		return status + "\n" + content
 	}
-	return strings.Join(lines, "\n")
+	return status
 }
+
+func (m Model) outcomeRows() []int {
+	var rows []int
+	for i, group := range m.groups() {
+		if len(m.groupChanges(group)) > 0 {
+			rows = append(rows, i)
+		}
+	}
+	if len(m.issues()) > 0 {
+		rows = append(rows, -1)
+	}
+	return rows
+}
+
+func (m Model) outcomeSelection(rows []int) int {
+	if len(rows) > 0 && !slices.Contains(rows, m.SelectedGroup) {
+		return rows[0]
+	}
+	return m.SelectedGroup
+}
+
 func (m Model) outcomesView() bool {
 	return m.isUp() && !m.Diagnostics && !m.AttentionExpanded && m.overview()
 }
@@ -88,77 +99,46 @@ func (m Model) groupChanges(group string) []Change {
 	return changes
 }
 
-func (m Model) groupOutcome(group string) string {
-	counts := map[string]int{}
-	for _, c := range m.groupChanges(group) {
-		counts[ChangeAction(c.Action, c.Before, c.After)]++
+func (s Stage) changeLine(c Change) string {
+	if s.ID == "source-sync" && c.Action == "changed" && c.Before == "" && c.After == "" {
+		return c.Item
 	}
-	var parts []string
-	for _, action := range []string{"installed", "updated", "removed", "changed"} {
-		if counts[action] > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", counts[action], action))
-		}
-	}
-	failed, attention, running, total := 0, 0, false, 0
-	for _, stage := range m.Stages {
-		if stageGroup(stage) != group {
-			continue
-		}
-		total++
-		switch stage.Status {
-		case "failed":
-			failed++
-		case "attention", "missing", "drift", "unknown":
-			attention++
-		case "running":
-			running = true
-		}
-	}
-	if len(parts) == 0 {
-		text := "no verified changes"
-		if total == 0 && !m.Finished {
-			text = "waiting"
-		}
-		parts = append(parts, text)
-	}
-	if running {
-		parts = append(parts, "running")
-	}
-	if failed > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", failed))
-	}
-	if attention > 0 {
-		parts = append(parts, fmt.Sprintf("%d attention", attention))
-	}
-	return strings.Join(parts, " · ")
+	return ChangeLine(c.Action, c.Item, c.Before, c.After)
 }
 
-func (m Model) outcomesContent() string {
+func (m Model) outcomesContent(plain bool) string {
 	var b strings.Builder
 	groups := m.groups()
-	for i, group := range groups {
-		if m.ExpandedGroup >= 0 && i != m.ExpandedGroup {
+	rows := m.outcomeRows()
+	if m.ExpandedGroup >= 0 {
+		rows = []int{m.ExpandedGroup}
+	}
+	for _, i := range rows {
+		prefix := ""
+		if !plain {
+			prefix = "  > "
+			if i == m.outcomeSelection(rows) {
+				prefix = "› > "
+			}
+		}
+		if i < 0 {
+			issues := m.issues()
+			fmt.Fprintf(&b, "%s!  Needs attention · %d\n", prefix, len(issues))
+			for _, item := range issues {
+				for _, line := range strings.Split(m.issueDetail(item), "\n") {
+					b.WriteString(wrapIndented("    "+line, m.Width) + "\n")
+				}
+			}
 			continue
 		}
-		prefix := "  > "
-		if i == m.SelectedGroup {
-			prefix = "› > "
-		}
-		fmt.Fprintf(&b, "%s%s · %s\n", prefix, group, m.groupOutcome(group))
-		for _, c := range m.groupChanges(group) {
-			fmt.Fprintf(&b, "    %s\n", ChangeLine(c.Action, c.Item, c.Before, c.After))
-		}
-	}
-	if m.ExpandedGroup < 0 {
-		prefix := "  > "
-		if m.SelectedGroup < 0 {
-			prefix = "› > "
-		}
-		issues := m.issues()
-		fmt.Fprintf(&b, "%s!  Needs attention · %d", prefix, len(issues))
-		for _, item := range issues {
-			for _, line := range strings.Split(m.issueDetail(item), "\n") {
-				b.WriteString("\n" + wrapIndented("    "+line, m.Width))
+		group := groups[i]
+		fmt.Fprintln(&b, prefix+group)
+		for _, stage := range m.Stages {
+			if stageGroup(stage) != group {
+				continue
+			}
+			for _, change := range stage.Changes {
+				fmt.Fprintf(&b, "    %s\n", stage.changeLine(change))
 			}
 		}
 	}
@@ -177,60 +157,82 @@ func wrapIndented(line string, width int) string {
 }
 
 func (m *Model) scrollToOutcomeGroup() {
+	rows := m.outcomeRows()
+	selected := m.outcomeSelection(rows)
 	line := 0
-	for i, group := range m.groups() {
-		if i == m.SelectedGroup {
+	groups := m.groups()
+	for _, i := range rows {
+		if i == selected {
 			break
 		}
-		line += 1 + len(m.groupChanges(group))
+		line += 1 + len(m.groupChanges(groups[i]))
 	}
-	if m.SelectedGroup < 0 {
-		m.viewport.SetYOffset(line) // the issues start at the top
-		return
-	}
-	if line >= m.viewport.Height() {
-		m.viewport.ScrollDown(line - m.viewport.Height() + 1)
+	if selected < 0 {
+		m.viewport.SetYOffset(line)
+	} else {
+		m.viewport.SetYOffset(max(0, line-m.viewport.Height()+1))
 	}
 }
 
-func (m Model) outcomeView() tea.View {
-	status := "Running"
+func (m Model) outcomeStatus() string {
 	if m.Finished {
-		status = "Complete"
-		if m.ExitCode != 0 || len(m.issues()) > 0 {
-			status = "Needs attention"
+		switch {
+		case m.ExitCode == 130:
+			return "Cancelled"
+		case m.ExitCode != 0:
+			return fmt.Sprintf("Failed (exit %d)", m.ExitCode)
+		case len(m.issues()) > 0:
+			return "Completed with issues"
+		case m.changeCount() == 0:
+			return "Complete · no verified changes"
+		default:
+			return "Complete"
 		}
 	}
+	label := "Starting…"
+	for _, i := range []int{m.CurrentMain, m.AppStoreIndex} {
+		if i >= 0 && m.Stages[i].Status == "running" {
+			label = m.Stages[i].Label
+			break
+		}
+	}
+	if label == "Starting…" && len(m.Stages) > 0 {
+		label = "Updating…"
+	}
+	return fmt.Sprintf("%s · %s", label, m.Elapsed.Truncate(time.Second))
+}
+
+func (m Model) outcomeView() tea.View {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s  %s\n", accent.Render("DOTS  /  UP"), muted.Render(strings.TrimSpace(m.Host+"  "+m.Profile)))
-	fmt.Fprintf(&b, "%s · %d verified changes · %d need attention\n", status, m.changeCount(), len(m.issues()))
-	if m.ExpandedGroup >= 0 {
-		b.WriteString(accent.Render("AREA OUTCOMES") + "\n")
-	} else {
-		b.WriteString(accent.Render("OUTCOMES") + "\n")
+	fmt.Fprintln(&b, m.outcomeStatus())
+	if m.lastLog != "" {
+		b.WriteString(m.viewport.View() + "\n")
 	}
-	b.WriteString(m.viewport.View() + "\n")
-	footer := "↑↓ areas  Enter open  PgUp/PgDn scroll"
+	footer := "d diagnostics"
+	if len(m.outcomeRows()) > 0 {
+		footer += "  ↑↓ select  Enter open  PgUp/PgDn scroll"
+	}
 	if m.viewport.TotalLineCount() > m.viewport.Height() {
 		footer += fmt.Sprintf("  %d%%", int(m.viewport.ScrollPercent()*100))
 	}
 	if m.ExpandedGroup >= 0 {
-		footer = "↑↓/PgUp/PgDn scroll  d diagnostics  ←/Esc/q back"
+		footer = "←/Esc/q back  d diagnostics  ↑↓ scroll"
 	}
 	if m.ExpandedGroup < 0 {
 		if m.Finished {
 			footer += "  q close"
 		} else {
 			footer += "  Ctrl+C cancel  t terminal"
+			if m.AppStoreIndex >= 0 {
+				footer += "  a App Store"
+			}
 		}
 	}
 	if m.Help {
-		footer = "Open an area for all changes; d shows its stages and logs. ←/Esc/q returns one level."
+		footer = "Enter opens changes or issues. d shows stages and logs. ←/Esc/q goes back."
 	}
 	b.WriteString(muted.Render(ansi.Truncate(footer, max(1, m.Width), "…")))
-	if m.Finished {
-		b.WriteString("\n" + accent.Render("Finished"))
-	}
 	lines := strings.Split(b.String(), "\n")
 	for i := range lines {
 		lines[i] = ansi.Truncate(lines[i], max(1, m.Width), "…")

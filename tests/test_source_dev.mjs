@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { syncDev } from '../lib/source-dev.mjs';
 import { syncSource, withRepositoryLock } from '../lib/source-repo.mjs';
 import { miseBinary, requires } from './lib/prereq.mjs';
 
@@ -82,9 +83,11 @@ case "$*" in
   *'dotfiles status --json'*) echo '{"files": [], "edits": []}' ;;
   *'.encrypt'*) exit 1 ;;
   *'dotfiles save'*)
+    if [ -n "\${DEV_TEST_SAVE_OUTPUT:-}" ]; then "$DEV_TEST_SAVE_OUTPUT"; fi
     if [ -n "\${DEV_TEST_SAVE_FAIL:-}" ]; then echo "$DEV_TEST_SAVE_FAIL" >&2; exit 1; fi
     if [ -n "\${DEV_TEST_SAVED:-}" ]; then touch "$DEV_TEST_SAVED"; fi ;;
   *'config ls'*)
+    if [ -n "\${DEV_TEST_CONFIG_HOOK:-}" ]; then "$DEV_TEST_CONFIG_HOOK"; fi
     if [ -n "\${DEV_TEST_MUTATE:-}" ]; then echo late > "$DEV_TEST_MUTATE"; fi
     if grep -q INVALID "$2/config.toml"; then echo 'invalid config' >&2; exit 1; fi ;;
   *'dotfiles apply'*)
@@ -106,15 +109,165 @@ esac
   fs.chmodSync(gitleaks, 0o755);
   const sync = (root, options = {}) => {
     const lines = [];
-    const code = syncSource(root, { expectedRemote: origin, miseBin, gitleaks, print: text => lines.push(text), ...options });
+    const code = syncSource(root, { expectedRemote: origin, miseBin, gitleaks, verbose: true, print: text => lines.push(text), ...options });
     return { code, text: lines.join('\n') };
   };
+  const producer = (root, options = {}) => syncDev(root, { gitDir: git(root, 'rev-parse', '--absolute-git-dir'), miseBin, gitleaks, ...options });
   const write = (root, file, contents) => { fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), contents); };
   const dev = root => git(root, 'rev-parse', 'refs/heads/dev');
   const remote = () => git(origin, 'rev-parse', 'dev');
   const clean = root => assert.equal(git(root, 'status', '--porcelain'), '', `${root} has uncommitted changes`);
-  return { dir, a, b, origin, sync, write, dev, remote, clean, gitleaks };
+  return { dir, a, b, origin, sync, producer, write, dev, remote, clean, gitleaks };
 }
+
+function duringValidation(f, command) {
+  const hook = path.join(f.dir, 'validation-hook');
+  fs.writeFileSync(hook, `#!/bin/sh\nset -eu\n${command}\n`, { mode: 0o755 });
+  process.env.DEV_TEST_CONFIG_HOOK = hook;
+  return () => { delete process.env.DEV_TEST_CONFIG_HOOK; };
+}
+
+function syncWithLogs(f, sync, verbose) {
+  const runDir = fs.mkdtempSync(path.join(f.dir, 'logged-sync-'));
+  const events = path.join(runDir, 'events');
+  const fd = fs.openSync(events, 'w');
+  process.env.DOTS_UP_EVENT_FD = String(fd);
+  process.env.DOTS_UP_RUN_DIR = runDir;
+  let result;
+  try { result = sync({ stage: 'sync', verbose }); }
+  finally {
+    fs.closeSync(fd);
+    delete process.env.DOTS_UP_EVENT_FD;
+    delete process.env.DOTS_UP_RUN_DIR;
+  }
+  const gitDir = git(f.a, 'rev-parse', '--absolute-git-dir');
+  const replay = run(process.execPath, [path.resolve(import.meta.dirname, '../lib/source-repo.mjs'), 'sync-last', f.a, '--plain'], f.a);
+  return { ...result, stage: read(runDir, 'sync.json'), events: read(runDir, 'events'),
+    receipt: read(gitDir, 'dots-sync-receipt.json'), replay };
+}
+
+test('producer reports a clean sync with no changes or issues', available, t => {
+  const f = fixture(t), before = f.dev(f.a);
+  assert.deepEqual(f.producer(f.a), {
+    header: 'dots sync: no local changes · pulled dev +0, main +0 · nothing to push',
+    status: 'complete', scanBlocked: false, before, after: before, lines: [], groups: [], issues: [], notices: [],
+  });
+});
+
+test('producer reports queued edits as saved offline and shared on the next run', available, t => {
+  const f = fixture(t), before = f.remote();
+  fs.renameSync(f.origin, `${f.origin}.offline`);
+  f.write(f.a, 'local', 'save offline\n');
+  const offline = f.producer(f.a), snapshot = f.dev(f.a);
+  assert.deepEqual(offline.groups, [{ kind: 'saved', before, after: snapshot }]);
+  assert.deepEqual(offline.issues, [{ summary: 'Origin unreachable', detail: '1 unpushed commit', action: 'The next sync will retry.' }]);
+  fs.renameSync(`${f.origin}.offline`, f.origin);
+  const online = f.producer(f.a);
+  assert.deepEqual(online.groups, [{ kind: 'shared', before, after: snapshot }]);
+  assert.deepEqual(online.issues, []);
+  assert.equal(f.remote(), snapshot);
+});
+
+test('producer reports reviewed main as shared and received from their respective tips', available, t => {
+  const f = fixture(t), before = f.remote();
+  git(f.b, 'switch', '-qc', 'main', 'origin/main');
+  f.write(f.b, 'reviewed', 'reviewed change\n');
+  git(f.b, 'add', '.'); git(f.b, 'commit', '-qm', 'Reviewed'); git(f.b, 'push', '-q', 'origin', 'main');
+  const reviewed = git(f.b, 'rev-parse', 'main');
+  const result = f.producer(f.a);
+  assert.deepEqual(result.groups, [
+    { kind: 'shared', before, after: reviewed },
+    { kind: 'received', before, after: reviewed },
+  ]);
+  assert.deepEqual(result.issues, []);
+  assert.deepEqual(result.notices, [], 'the legacy checkout shortstat is replaced by the received group');
+  assert.equal(f.remote(), reviewed);
+  assert.equal(read(f.a, 'reviewed'), 'reviewed change\n');
+});
+
+test('producer uses the empty tree when it creates a missing remote branch', available, t => {
+  const f = fixture(t), tip = f.dev(f.a);
+  git(f.origin, 'update-ref', '-d', 'refs/heads/dev');
+  assert.equal(git(f.a, 'rev-parse', 'origin/dev'), tip, 'a stale tracking ref is still present');
+  const empty = run('git', ['mktree'], f.a, { input: '' });
+  const result = f.producer(f.a);
+  assert.deepEqual(result.groups, [{ kind: 'shared', before: empty, after: tip }]);
+  assert.equal(f.remote(), tip);
+});
+
+test('producer uses the remote tip actually replaced by the accepted push', available, t => {
+  const f = fixture(t), before = f.remote();
+  f.write(f.a, 'queued', 'queued first\n');
+  git(f.a, 'add', '.'); git(f.a, 'commit', '-qm', 'Queued');
+  const advanced = f.dev(f.a);
+  const stop = duringValidation(f, `git -C '${f.b}' fetch -q '${f.a}' '${advanced}'\ngit -C '${f.b}' push -q origin FETCH_HEAD:dev`);
+  f.write(f.a, 'local', 'saved second\n');
+  const result = f.producer(f.a);
+  stop();
+  assert.deepEqual(result.groups, [{ kind: 'shared', before: advanced, after: f.remote() }]);
+  assert.deepEqual(result.notices, [`origin/dev moved to ${advanced.slice(0, 12)} between fetch and push`]);
+  assert.equal(git(f.a, 'rev-parse', `${advanced}^`), before);
+  assert.equal(f.remote(), f.dev(f.a));
+});
+
+test('producer reports no share or local-only save when another push already published the snapshot', available, t => {
+  const f = fixture(t);
+  const stop = duringValidation(f, `git -C '${f.b}' fetch -q '${f.a}' dev\ngit -C '${f.b}' push -q origin FETCH_HEAD:dev`);
+  f.write(f.a, 'local', 'concurrently shared\n');
+  const result = f.producer(f.a);
+  stop();
+  assert.deepEqual(result.groups, []);
+  assert.deepEqual(result.issues, []);
+  assert.match(result.notices[0], /^origin\/dev already pointed to [0-9a-f]{12} /);
+  assert.match(result.header, /^dots sync: already shared 1 file .* nothing to push$/);
+  assert.equal(f.remote(), f.dev(f.a));
+  assert.equal(git(f.origin, 'show', 'dev:local'), 'concurrently shared');
+});
+
+test('a concurrent share is distinguished from the reviewed changes this run pushes', available, t => {
+  const f = fixture(t);
+  git(f.b, 'switch', '-qc', 'main', 'origin/main');
+  f.write(f.b, 'reviewed', 'reviewed change\n');
+  git(f.b, 'add', '.'); git(f.b, 'commit', '-qm', 'Reviewed'); git(f.b, 'push', '-q', 'origin', 'main');
+  const stop = duringValidation(f, `git -C '${f.b}' fetch -q '${f.a}' dev\ngit -C '${f.b}' push -q origin FETCH_HEAD:dev`);
+  f.write(f.a, 'local', 'concurrently shared\n');
+  const result = f.producer(f.a);
+  stop();
+  const shared = result.groups.find(group => group.kind === 'shared');
+  assert.match(result.header, /^dots sync: already shared 1 file .* pushed /);
+  assert.equal(git(f.a, 'diff', '--name-only', shared.before, shared.after), 'reviewed');
+  assert.equal(f.remote(), f.dev(f.a));
+});
+
+test('producer keeps a completed share when checkout stops and reports recovery separately', available, t => {
+  const f = fixture(t);
+  f.write(f.b, 'incoming', 'first incoming change\n'); f.sync(f.b);
+  const remoteBefore = f.remote(), lock = path.join(f.a, '.git/refs/heads/dev.lock');
+  const stop = duringValidation(f, `touch '${lock}'`);
+  f.write(f.a, 'local', 'local snapshot\n');
+  const partial = f.producer(f.a);
+  stop();
+  const snapshot = f.dev(f.a), pending = f.remote();
+  assert.deepEqual(partial.groups, [{ kind: 'shared', before: remoteBefore, after: pending }]);
+  assert.notEqual(snapshot, pending);
+  assert.match(partial.issues[0].detail, /could not update dev/);
+  assert.match(partial.issues[0].action, /checkout pending/);
+
+  fs.rmSync(lock);
+  git(f.b, 'pull', '-q', '--ff-only', 'origin', 'dev');
+  f.write(f.b, 'later', 'second incoming change\n'); f.sync(f.b);
+  const latest = f.remote();
+  process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR cannot apply file';
+  const retry = f.producer(f.a);
+  assert.deepEqual(retry.groups, [
+    { kind: 'recovered', before: snapshot, after: pending },
+    { kind: 'received', before: pending, after: latest },
+  ]);
+  assert.deepEqual(retry.issues, [{ summary: 'Dotfile apply failed',
+    detail: 'mise bootstrap dotfiles apply (exit 1)\napplying 3 dotfiles\nmise ERROR cannot apply file',
+    action: 'fix the error below, then run dots apply' }]);
+  assert.equal(f.dev(f.a), latest);
+});
 
 // An older host: its tree still has the Herdr template and its local config the
 // declaration an old setup script appended. The incoming commit archives the
@@ -153,7 +306,8 @@ test('sync stops before snapshotting Git metadata stored inside the worktree', a
   assert.match(git(f.a, 'status', '--porcelain'), /\?\? metadata\//);
   const result = f.sync(f.a);
   assert.equal(result.code, 0);
-  assert.match(result.text, /^dots sync: failed .*Git metadata at .*metadata is in the worktree; move it outside the worktree before rerunning sync$/);
+  assert.match(result.text, /^dots sync: failed .*Git metadata at .*metadata is in the worktree; move it outside the worktree before rerunning sync/m);
+  assert.equal(fs.existsSync(path.join(metadata, 'dots-sync-receipt.json')), false);
   assert.equal(f.remote(), before);
 });
 
@@ -196,15 +350,19 @@ test('a remote change arrives on disk', available, t => {
   assert.equal(f.dev(f.a), f.remote()); f.clean(f.a);
 });
 
-test('dots up sees the configuration source move as one change event', available, t => {
-  const f = fixture(t); const before = f.dev(f.a);
+test('dots up receives the changed path once and finishes each sync stage', available, t => {
+  const f = fixture(t);
   f.write(f.b, 'remote', 'from b\n'); f.sync(f.b);
   const events = path.join(f.dir, 'events');
   const fd = fs.openSync(events, 'w');
   process.env.DOTS_UP_EVENT_FD = String(fd);
-  try { f.sync(f.a); f.sync(f.a); } finally { delete process.env.DOTS_UP_EVENT_FD; fs.closeSync(fd); }
+  try { f.sync(f.a, { stage: 'source-sync' }); f.sync(f.a, { stage: 'source-sync' }); } finally { delete process.env.DOTS_UP_EVENT_FD; fs.closeSync(fd); }
   const changes = fs.readFileSync(events, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(changes, [{ v: 1, kind: 'change', stage: 'source-sync', item: 'Configuration source', action: 'updated', before, after: f.dev(f.a) }]);
+  const paths = changes.filter(e => e.kind === 'change');
+  assert.equal(paths.length, 1);
+  assert.equal(paths[0].stage, 'source-sync');
+  assert.match(paths[0].item, /Updated in this checkout.*added.*remote/);
+  assert.deepEqual(changes.filter(e => e.kind === 'stage_end').map(e => e.status), ['ok', 'ok']);
 });
 
 test('non-conflicting edits on both sides merge', available, t => {
@@ -273,12 +431,27 @@ test('offline work is queued as origin/dev..dev and pushed next time', available
   f.write(f.a, 'text', 'saved offline\n');
   const offline = f.sync(f.a);
   assert.equal(offline.code, 0);
-  assert.match(offline.text, /^dots sync: saved 1 file locally · offline · not pushed\n {2}OFFLINE: 1 commits unpushed, retried next run$/);
+  assert.match(offline.text, /^dots sync: saved 1 file locally · offline · not pushed\n {2}OFFLINE: 1 commit unpushed, retried next run$/);
   assert.equal(git(f.a, 'rev-list', '--count', 'origin/dev..dev'), '1'); f.clean(f.a);
   fs.renameSync(`${f.origin}.offline`, f.origin);
   const online = f.sync(f.a);
   assert.match(online.text, /^dots sync: no local changes · pulled dev \+0, main \+0 · pushed/);
   assert.equal(f.remote(), f.dev(f.a));
+});
+
+test('the offline count includes the local snapshot recorded during checkout', available, t => {
+  const f = fixture(t);
+  f.write(f.b, 'upstream', 'updated remotely\n');
+  f.sync(f.b);
+  git(f.a, 'fetch', '-q', 'origin', 'dev');
+  git(f.a, 'update-ref', 'refs/heads/dev', f.remote());
+  f.write(f.a, 'local', 'queued offline\n');
+  fs.renameSync(f.origin, f.origin + '.offline');
+  const result = f.producer(f.a);
+  const count = Number(git(f.a, 'rev-list', '--count', 'dev', '^origin/dev', '^origin/main'));
+  assert.ok(count > 0);
+  assert.equal(result.issues.find(issue => issue.summary === 'Origin unreachable').detail,
+    `${count} unpushed commit${count === 1 ? '' : 's'}`);
 });
 
 test('a push race is merged and retried', available, t => {
@@ -307,6 +480,116 @@ const prePush = (f, body) => {
   fs.chmodSync(hook, 0o755);
 };
 
+test('sync does not recreate dev if it disappears after fetch', available, async t => {
+  for (const timing of ['before push', 'while pushing']) {
+    await t.test(timing, t => {
+      const f = fixture(t), before = f.remote();
+      f.write(f.b, 'withdrawn', 'remote only\n');
+      f.sync(f.b);
+      const withdrawn = f.remote();
+      const remove = `git -C '${f.origin}' update-ref -d refs/heads/dev '${withdrawn}'`;
+      if (timing === 'before push') duringValidation(f, remove);
+      else prePush(f, `set -eu\nrm "$0"\n${remove}`);
+      f.write(f.a, 'local', 'saved before deletion\n');
+      const result = f.producer(f.a);
+      assert.match(result.header, /^dots sync: saved 1 file locally .* not pushed$/);
+      assert.match(result.issues[0].detail, /origin\/dev disappeared after fetch/);
+      assert.match(result.issues[0].action, /before rerunning sync/);
+      assert.deepEqual(result.groups, [{ kind: 'saved', before, after: f.dev(f.a) }]);
+      assert.equal(git(f.origin, 'for-each-ref', 'refs/heads/dev'), '');
+      assert.equal(git(f.a, 'show', 'dev:local'), 'saved before deletion');
+      assert.match(result.header, /not applied/);
+      assert.equal(fs.existsSync(path.join(f.a, 'withdrawn')), false);
+      f.clean(f.a);
+      delete process.env.DEV_TEST_CONFIG_HOOK;
+      assert.equal(git(f.a, 'for-each-ref', 'refs/remotes/origin/dev'), '');
+      fs.renameSync(f.origin, f.origin + '.offline');
+      assert.match(f.sync(f.a).text, /offline/);
+      assert.equal(fs.existsSync(path.join(f.a, 'withdrawn')), false);
+      fs.renameSync(f.origin + '.offline', f.origin);
+      assert.match(f.sync(f.a).text, /· pushed /);
+      assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'withdrawn'), '');
+    });
+  }
+});
+
+test('sync publishes only dev even with push.followTags enabled', available, t => {
+  const f = fixture(t);
+  git(f.a, 'config', 'push.followTags', 'true');
+  git(f.origin, 'config', 'receive.denyNonFastForwards', 'true');
+  git(f.a, 'tag', '-am', 'Local label', 'local-label');
+  f.write(f.a, 'local', 'to origin/dev\n');
+  assert.match(f.sync(f.a).text, /· pushed /);
+  assert.equal(f.remote(), f.dev(f.a));
+  assert.equal(git(f.origin, 'tag', '--list'), '');
+});
+
+test('a retry leaves withdrawn remote history withdrawn', available, t => {
+  const f = fixture(t), original = f.remote();
+  f.write(f.b, 'upstream', 'first remote update\n');
+  f.sync(f.b);
+  const withdrawn = f.remote();
+  f.write(f.a, 'local', 'local edit\n');
+  prePush(f, `set -eu\nrm "$0"\ngit -C '${f.origin}' update-ref refs/heads/dev '${original}' '${withdrawn}'`);
+  const result = f.producer(f.a);
+  assert.match(result.issues[0].detail, /previously published history was removed/);
+  assert.equal(f.remote(), original);
+  assert.equal(git(f.a, 'show', 'dev:local'), 'local edit');
+  assert.deepEqual(result.groups.map(group => group.kind), ['saved']);
+  assert.match(result.header, /not applied/);
+  assert.equal(fs.existsSync(path.join(f.a, 'upstream')), false);
+  assert.match(f.sync(f.a).text, /· pushed /);
+  assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'upstream'), '');
+});
+
+test('the final retry checks the tip used for that merge', available, t => {
+  const f = fixture(t);
+  f.write(f.a, 'local', 'local edit\n');
+  prePush(f, `set -eu
+cd '${f.b}'
+for n in 1 2 3; do
+  if [ ! -e "change-$n" ]; then
+    echo "$n" > "change-$n"
+    git add "change-$n"
+    git commit -qm "Advance $n"
+    git push -q origin dev
+    exit 0
+  fi
+done
+git -C '${f.origin}' update-ref refs/heads/dev "$(git rev-parse HEAD~1)" "$(git rev-parse HEAD)"
+rm '${f.a}/.git/hooks/pre-push'`);
+  const result = f.producer(f.a);
+  assert.match(result.header, /not applied/);
+  assert.match(result.issues[0].detail, /previously published history was removed/);
+  assert.equal(fs.existsSync(path.join(f.a, 'change-3')), false);
+  assert.equal(git(f.a, 'show', 'dev:local'), 'local edit');
+  assert.match(f.sync(f.a).text, /· pushed /);
+  assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'change-3'), '');
+});
+
+test('a rejected push keeps its reason without copying hook output to receipts or logs', available, t => {
+  const f = fixture(t);
+  const hook = path.join(f.origin, 'hooks/pre-receive');
+  fs.writeFileSync(hook, `#!/bin/sh
+echo PRIVATE_REMOTE_HOOK_STDOUT
+echo PRIVATE_REMOTE_HOOK_STDERR >&2
+exit 1
+`, { mode: 0o755 });
+  prePush(f, `printf '%s\\n' PRIVATE_LOCAL_HOOK_STDOUT
+printf '%s\\n' PRIVATE_LOCAL_HOOK_STDERR >&2
+git show --format= HEAD >&2
+`);
+  f.write(f.a, 'local', 'PRIVATE_PATCH_LINE\n');
+  for (const verbose of [false, true]) {
+    const { code, text, stage, events, receipt, replay } = syncWithLogs(f, options => f.sync(f.a, options), verbose);
+    assert.equal(code, 3);
+    for (const output of [text, stage, events, receipt, replay]) {
+      assert.match(output, /pre-receive hook declined/);
+      assert.doesNotMatch(output, /PRIVATE_|diff --git/);
+    }
+  }
+});
+
 test('a push that fails for another reason says why, not that dev kept moving', available, t => {
   const f = fixture(t); const before = f.remote();
   prePush(f, "echo 'remote: Invalid username or password.' >&2\necho \"fatal: Authentication failed for 'https://example.invalid/dots.git/'\" >&2\nexit 1");
@@ -324,7 +607,7 @@ test('a push that fails and leaves origin unreachable keeps its reason next to O
   const { text } = f.sync(f.a);
   fs.renameSync(`${f.origin}.gone`, f.origin);
   assert.match(text, /\n {2}NOT PUSHED: git push failed: fatal: unable to access origin: Could not resolve host\n/);
-  assert.match(text, /\n {2}OFFLINE: 1 commits unpushed, retried next run/);
+  assert.match(text, /\n {2}OFFLINE: 1 commit unpushed, retried next run/);
 });
 
 test('credentials in a URL never reach the sync output', available, t => {
@@ -372,6 +655,29 @@ test('a failed save carries the output that explains it', available, t => {
   process.env.DEV_TEST_SAVE_FAIL = 'mise ERROR cannot read ~/.config/app/state.json';
   const { text } = f.sync(f.a);
   assert.match(text, /\n {2}SAVE FAILED: mise bootstrap dotfiles save \(exit 1\); tracked history not saved\n {4}mise ERROR cannot read ~\/\.config\/app\/state\.json(\n|$)/);
+});
+
+test('a long native diagnostic keeps the sync attention event readable', available, t => {
+  const f = fixture(t);
+  const output = path.join(f.dir, 'save-output');
+  fs.writeFileSync(output, `#!/bin/sh
+awk 'BEGIN { for (i = 0; i < 18; i++) printf "mise ERROR line %d %065536d\\n", i, 0 }' >&2
+`, { mode: 0o755 });
+  process.env.DEV_TEST_SAVE_OUTPUT = output;
+  process.env.DEV_TEST_SAVE_FAIL = 'mise ERROR cannot read ~/.config/app/state.json';
+  const { code, text, events, receipt } = syncWithLogs(f, options => f.sync(f.a, options), true);
+  assert.equal(code, 3);
+  const line = events.trim().split('\n').find(line => JSON.parse(line).kind === 'stage_end');
+  assert(Buffer.byteLength(line) < 4096);
+  const end = JSON.parse(line);
+  assert.equal(end.status, 'attention');
+  assert.equal(end.summary, 'Tracked history save failed');
+  assert.match(end.action, /rerun sync/);
+  assert.match(end.detail, /mise ERROR cannot read ~\/\.config\/app\/state\.json/);
+  for (const result of [text, receipt]) {
+    assert.match(result, /mise ERROR cannot read ~\/\.config\/app\/state\.json/);
+    assert(result.length < 16 * 1024);
+  }
 });
 
 test('a push retry merges main again over a racing dev change to the same hunk', available, t => {
@@ -463,6 +769,25 @@ test('an invalid merged config is neither pushed nor applied', available, t => {
   f.write(f.a, 'config.toml', '# fixed\n');
   assert.match(f.sync(f.a).text, /pushed/);
   assert.equal(read(f.a, 'remote'), 'from b\n'); assert.equal(f.remote(), f.dev(f.a));
+});
+
+test('a rejected TOML reports its location without copying source to the receipt or logs', requires('git', 'jq', 'mise'), t => {
+  const f = fixture(t);
+  f.write(f.b, 'config.toml', 'value = "PRIVATE_FIXTURE_LINE" stray\n');
+  git(f.b, 'commit', '-qam', 'Incoming config');
+  git(f.b, 'push', '-q', 'origin', 'dev');
+  const validator = path.join(f.dir, 'validate-with-mise');
+  process.env.FIXTURE_MISE_PARSER = miseBinary();
+  process.env.FIXTURE_MISE_STUB = path.join(f.dir, 'mise');
+  fs.writeFileSync(validator, '#!/bin/sh\ncase "$*" in *"config ls"*) exec "$FIXTURE_MISE_PARSER" "$@" ;; esac\nexec "$FIXTURE_MISE_STUB" "$@"\n', { mode: 0o755 });
+  for (const verbose of [false, true]) {
+    const { text } = f.sync(f.a, { miseBin: validator, stage: 'source-sync', verbose });
+    const saved = read(f.a, '.git/dots-sync-receipt.json');
+    for (const output of [text, saved]) {
+      assert.match(output, /Invalid TOML in config\.toml at line 1, column \d+/);
+      assert.doesNotMatch(output, /PRIVATE_FIXTURE_LINE/);
+    }
+  }
 });
 
 test('a file edited during advancement is not overwritten', available, t => {
@@ -750,7 +1075,7 @@ test('a checkout in the wrong shape stops with one message pointing at the sync 
   expect('legacy sync state \\(\\.git/dots-dev\\.json\\) is present', () => f.write(f.a, '.git/dots-dev.json', '{}'), () => fs.rmSync(path.join(f.a, '.git/dots-dev.json')));
   assert.equal(f.remote(), before);
   const foreign = [];
-  assert.equal(syncSource(f.a, { expectedRemote: '/elsewhere', print: text => foreign.push(text) }), 0);
+  assert.equal(syncSource(f.a, { expectedRemote: '/elsewhere', verbose: true, print: text => foreign.push(text) }), 0);
   assert.deepEqual(foreign, ['dots sync: stopped · Refusing source operations: origin is not /elsewhere']);
 });
 
@@ -1232,6 +1557,25 @@ test('guarded copies run between real mise pre and post hooks', requires('git', 
   }
 });
 
+test('a real mise hook failure keeps its phase and exit without copying output into sync logs', requires('git', 'jq', 'mise'), t => {
+  const f = copiedFixture(t, { hooks: true }), a = f.machineA;
+  const hook = 'echo PRIVATE_MISE_STDOUT; echo PRIVATE_MISE_STDERR >&2; ' +
+    'printf "%s\\n" "diff --git a/a b/a" "--- a/a" "+++ b/a" "@@ -1 +1 @@" "+PRIVATE_MISE_PATCH" >&2; exit 7';
+  f.write(f.a, 'config.toml', read(f.a, 'config.toml') + `[bootstrap.hooks]\npre-dotfiles = ${JSON.stringify(hook)}\n`);
+  for (const mode of ['normal', 'verbose', 'quiet']) {
+    const verbose = mode === 'verbose';
+    process.env.MISE_VERBOSE = verbose ? '1' : '0';
+    process.env.MISE_QUIET = mode === 'quiet' ? '1' : '0';
+    const { code, text, stage, events, receipt, replay } = syncWithLogs(f, a.sync, verbose);
+    assert.equal(code, 3);
+    for (const output of [text, stage, events, receipt, replay]) {
+      if (mode !== 'quiet') assert.match(output, /pre-dotfiles hook failed/);
+      assert.match(output, /exit code 7/);
+      assert.doesNotMatch(output, /PRIVATE_MISE_|diff --git/);
+    }
+  }
+});
+
 test('real mise sync installs hook-generated copy contents in the same run', requires('git', 'jq', 'mise'), t => {
   const f = copiedFixture(t, { hooks: true }), a = f.machineA;
   let config = read(f.a, 'config.toml').replace('source = "copy.txt", mode = "copy"',
@@ -1607,8 +1951,10 @@ test('real mise reloads changed guarded copies once before the post hook', requi
   f.write(a.home, 'events', '');
   f.write(f.a, 'copy.txt', 'sync copy\n');
   f.write(f.a, 'template.tera', '{{ "sync template" }}\n');
-  const updated = a.sync();
-  assert.doesNotMatch(updated.text, /APPLY FAILED|RELOAD FAILED/);
+  Object.assign(process.env, a.env);
+  const updated = f.producer(f.a, { miseBin: f.miseBin });
+  assert.deepEqual(updated.issues, []);
+  assert.match(updated.notices.find(line => line.startsWith('previous copy of ~/.copied: ')) ?? '', /\.dots-copy-.*\/previous$/);
   assert.equal(read(a.home, 'events'), 'pre\nsync copy\nnative\nboth\npost\n');
 
   f.write(a.home, 'events', '');

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -106,6 +107,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		}
+		if m.outcomesView() && m.ExpandedGroup < 0 {
+			switch v.String() {
+			case "enter", "right", "space":
+				rows := m.outcomeRows()
+				if len(rows) == 0 {
+					return m, nil
+				}
+				m.SelectedGroup = m.outcomeSelection(rows)
+			case "d":
+				m.Diagnostics = true
+				if m.SelectedGroup < 0 || !m.hasSelectedChild() {
+					if m.CurrentMain >= 0 {
+						m.selectGroup(m.groupIndex(stageGroup(m.Stages[m.CurrentMain])))
+					} else if len(m.Stages) > 0 {
+						m.selectGroup(m.groupIndex(stageGroup(m.Stages[0])))
+					} else {
+						m.selectGroup(0)
+					}
+				}
+				m.refreshDetail()
+				return m, nil
+			}
 		}
 		if m.outcomesView() && m.ExpandedGroup >= 0 {
 			switch v.String() {
@@ -288,6 +312,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) apply(e Event) {
+	m.applyEvent(e)
+	m.refreshDetail()
+}
+
+func (m *Model) applyEvent(e Event) {
 	selectedGroup, expandedGroup := "", ""
 	if m.isUp() {
 		groups := m.groups()
@@ -351,6 +380,12 @@ func (m *Model) apply(e Event) {
 			if p := safeLogPath(m.StateDir, e.LogPath); p != "" {
 				s.LogPath = p
 			}
+		} else if e.Status == "failed" {
+			m.Stages = append(m.Stages, Stage{
+				ID: e.ID, Group: "Packages", Label: "Mac App Store updates",
+				Status: e.Status, Summary: e.Summary, Action: "Check free space and log directory permissions, then rerun dots up --mas.",
+				LogPath: safeLogPath(m.StateDir, e.LogPath), Detail: e.Detail,
+			})
 		}
 	case "stage_end":
 		if i := m.stageIndex(e.ID); i >= 0 {
@@ -391,8 +426,6 @@ func (m *Model) apply(e Event) {
 	if m.AttentionExpanded {
 		m.syncIssueSelection()
 	}
-	m.resize()
-	m.refreshDetail()
 }
 
 func (m Model) stageIndex(id string) int {
@@ -496,19 +529,25 @@ func (m *Model) selectGroup(index int) {
 }
 
 func (m *Model) moveGroup(delta int) {
-	index := m.SelectedGroup + delta
 	if m.outcomesView() {
-		if delta > 0 && m.SelectedGroup == len(m.groups())-1 {
-			index = -1
+		rows := m.outcomeRows()
+		if len(rows) == 0 {
+			return
 		}
-		if delta < 0 && m.SelectedGroup < 0 {
-			index = len(m.groups()) - 1
+		index := slices.Index(rows, m.SelectedGroup)
+		if index < 0 {
+			index = 0
+			if delta < 0 {
+				index = len(rows) - 1
+			}
+		} else {
+			index = (index + delta + len(rows)) % len(rows)
 		}
-	}
-	m.selectGroup(index)
-	if m.outcomesView() {
+		m.selectGroup(rows[index])
 		m.scrollToOutcomeGroup()
+		return
 	}
+	m.selectGroup(m.SelectedGroup + delta)
 }
 
 func (m *Model) moveChild(delta int) {
@@ -701,6 +740,9 @@ type issue struct {
 func (m Model) issues() []issue {
 	var result []issue
 	seen := make(map[string]bool)
+	identity := func(stage, summary, detail, action string) string {
+		return strings.Join([]string{stage, strings.ToLower(summary), detail, action}, "\x00")
+	}
 	for i, s := range m.Stages {
 		if s.Status != "attention" && s.Status != "failed" && s.Status != "missing" && s.Status != "drift" && s.Status != "unknown" {
 			continue
@@ -715,14 +757,14 @@ func (m Model) issues() []issue {
 		}
 		result = append(result, issue{key: "stage:" + s.ID, stage: i, text: prefix + " " + text, detail: s.Detail, action: s.Action, logPath: s.LogPath})
 		if s.Summary != "" {
-			seen[strings.ToLower(s.Summary)] = true
+			seen[identity(s.ID, s.Summary, s.Detail, s.Action)] = true
 		}
 	}
 	for _, n := range m.Notices {
 		if n.Severity != "attention" && n.Severity != "error" {
 			continue
 		}
-		key := strings.ToLower(n.Summary)
+		key := identity(n.Stage, n.Summary, n.Detail, n.Action)
 		if seen[key] {
 			continue
 		}
@@ -735,7 +777,7 @@ func (m Model) issues() []issue {
 		if i := m.stageIndex(n.Stage); n.Stage != "" && i >= 0 {
 			text, logPath, stage = m.Stages[i].Label+" — "+n.Summary, m.Stages[i].LogPath, i
 		}
-		result = append(result, issue{key: "notice:" + n.Stage + ":" + n.Summary, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
+		result = append(result, issue{key: "notice:" + key, stage: stage, text: prefix + " " + text, detail: n.Detail, action: n.Action, logPath: logPath, notice: true})
 	}
 	return result
 }
@@ -775,11 +817,14 @@ func (m Model) overviewContent() string {
 }
 
 func (m *Model) refreshDetail() {
-	content := m.overviewContent()
-	if m.outcomesView() {
-		content = m.outcomesContent()
-	}
-	if !m.overview() {
+	var content string
+	outcomes := m.outcomesView()
+	switch {
+	case outcomes:
+		content = m.outcomesContent(false)
+	case m.overview():
+		content = m.overviewContent()
+	default:
 		content = "Select a stage to see details."
 		if item := m.selectedIssue(); m.AttentionExpanded && item != nil && !m.ShowLog {
 			content = m.issueDetail(*item)
@@ -808,7 +853,11 @@ func (m *Model) refreshDetail() {
 					fmt.Fprintf(&b, "Next: %s\n", s.Action)
 				}
 				for _, c := range s.Changes {
-					fmt.Fprint(&b, "\n"+ChangeLine(c.Action, c.Item, c.Before, c.After))
+					line := ChangeLine(c.Action, c.Item, c.Before, c.After)
+					if m.isUp() {
+						line = s.changeLine(c)
+					}
+					fmt.Fprint(&b, "\n"+line)
 				}
 				if s.Summary == "" && len(s.Changes) == 0 {
 					b.WriteString("Working…")
@@ -817,13 +866,18 @@ func (m *Model) refreshDetail() {
 			}
 		}
 	}
-	if content != m.lastLog || m.lastLogStage != fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch) {
+	key := fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch)
+	changed := content != m.lastLog || m.lastLogStage != key
+	if changed {
 		m.viewport.SetContent(content)
 		m.viewport.GotoTop()
 		m.lastLog = content
-		m.lastLogStage = fmt.Sprint(m.Selected, m.SelectedIssue, m.ShowLog, m.RawLog, m.DetailFocus, m.AppliedSearch)
+		m.lastLogStage = key
 	}
 	m.resize()
+	if changed && outcomes && m.ExpandedGroup < 0 {
+		m.scrollToOutcomeGroup()
+	}
 }
 
 func (m *Model) resize() {
@@ -831,7 +885,7 @@ func (m *Model) resize() {
 	if m.outcomesView() {
 		m.viewport.SetWidth(max(1, m.Width))
 		m.viewport.SoftWrap = m.ExpandedGroup >= 0
-		m.viewport.SetHeight(max(1, min(m.Height-6, m.viewport.TotalLineCount())))
+		m.viewport.SetHeight(max(1, min(m.Height-3, m.viewport.TotalLineCount())))
 		return
 	}
 	m.viewport.SoftWrap = true

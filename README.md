@@ -46,7 +46,9 @@ ln -s ~/.local/share/dots/bin/dots ~/.local/bin/dots
 `dots --version` prints the version and how it was installed (`mise`, `homebrew`, `checkout` or `archive`); `dots internal home` prints the directory it runs from, and `DOTS_HOME` overrides it.
 
 The `dots-up` renderer adds the interactive menu, live progress and saved reports; without it every command still works with plain output.
-`dots` uses the first renderer that reports the capability `dots-shared-cli/2` from `DOTS_UP_BIN`, its own `bin/dots-up`, `mise which dots-up` or `PATH`.
+`dots` checks its own `bin/dots-up`, `mise which dots-up` and `PATH` for a renderer that reports `dots-shared-cli/3`.
+`DOTS_UP_BIN` overrides that search.
+Update or unset it if it points to an older renderer.
 
 ## Updating
 
@@ -144,6 +146,7 @@ Read-only:
 | `dots plan` | Preview mise's bootstrap plan for the declared setup |
 | `dots help` | List the commands, including the configuration's own |
 | `dots reports [COMMAND]` | Browse saved command reports (needs the renderer) |
+| `dots sync --last` | Inspect the files and eligible text diffs from the latest sync in this checkout |
 | `dots internal home` | Print the manager directory (`DOTS_HOME`) |
 | `dots --version` | Print the manager version and how it was installed |
 
@@ -152,7 +155,7 @@ Everyday:
 | Command | What it does |
 | --- | --- |
 | `dots up [--mas]` | Sync the configuration, then install and update packages, tools, installer exceptions and hooks, and update mise last; `--mas` includes Mac App Store updates; `--last` reopens the last report |
-| `dots sync` | Share local configuration edits through `dev` and apply the merged result, without software updates |
+| `dots sync` | Share configuration edits through `dev`, apply the merged result and show the changed files |
 | `dots apply [TARGET...]` | Apply dotfiles and render templates |
 | `dots add [--base \| --profile P \| --path FILE] TOOL...` | Install tools or packages and record them in the configuration |
 | `dots remove [--dry-run] [--keep-installed] TOOL...` | Uninstall software and delete its declaration (`dots uninstall` is the same) |

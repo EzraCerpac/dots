@@ -152,14 +152,21 @@ func Run(opts Options) int {
 		detail := string(cleanTerminalOutput([]byte(err.Error())))
 		writeLog(nil, globalLog, []byte(detail+"\n"))
 		start, issue := startupFailure(opts.Command, code, detail, globalLog)
+		end := ui.Event{V: 1, Kind: "run_end", Status: "failed", ExitCode: code, DurationMS: time.Since(started).Milliseconds()}
+		startupEvents := []ui.Event{{V: 1, Kind: "run_start", Command: opts.Command}, start, issue, end}
+		dir, saved := "", false
 		if files != nil {
-			_ = files.record(ui.Event{V: 1, Kind: "run_start", Command: opts.Command})
-			_ = files.record(start)
-			_ = files.record(issue)
-			_ = files.record(ui.Event{V: 1, Kind: "run_end", Status: "failed", ExitCode: code, DurationMS: time.Since(started).Milliseconds()})
-			_ = files.finish(code, "", "", time.Now())
+			dir = files.runDir
+			for _, event := range startupEvents {
+				_ = files.record(event)
+			}
+			saved = files.finish(code, "", "", time.Now()) == nil
 		}
-		printFailedStage(os.Stderr, issue)
+		if opts.Command == "up" {
+			printUpReport(os.Stderr, Report{ExitCode: code, Events: startupEvents}, dir, saved)
+		} else {
+			printFailedStage(os.Stderr, issue)
+		}
 		return code
 	}
 	if dashboard && !backend.pty {
@@ -186,6 +193,7 @@ func Run(opts Options) int {
 		}()
 		go readControls(controlReader, controls)
 	}
+	terminalSync := opts.Command == "sync" && interactive && files != nil && !opts.Verbose && !backend.directTerminal
 	dashboardStarted := dashboard
 	defer func() {
 		if originalTerminalState != nil && backend.tty != nil {
@@ -223,6 +231,7 @@ func Run(opts Options) int {
 	var stageID, profile, host string
 	var runStarted, workReported, childFinished, outputFinished bool
 	var diagnosticOutput []byte
+	var syncOutput bytes.Buffer
 	var consoleFailure *ui.Event
 	runEnd := ui.Event{V: 1, Kind: "run_end"}
 	eventFinished := backend.streamNonce != ""
@@ -301,10 +310,17 @@ func Run(opts Options) int {
 		if opts.Command == "status" && printStatusEvent(e) {
 			return
 		}
-		if !opts.Verbose && e.ID != startupStage {
-			printProgress(e)
+		if !opts.Verbose && opts.Command != "sync" && e.ID != startupStage {
+			if opts.Command == "up" {
+				if e.Kind == "stage_start" || e.Kind == "app_store_start" {
+					fmt.Printf("→ %s · %s\n", e.Label, time.Since(started).Truncate(time.Second))
+				}
+			} else {
+				printProgress(e)
+			}
 		}
 	}
+	var unsavedUpEvents []ui.Event
 	emit := func(e ui.Event) {
 		if e.V == 0 {
 			e.V = 1
@@ -319,6 +335,8 @@ func Run(opts Options) int {
 			if err := files.record(e); err != nil {
 				fmt.Fprintf(os.Stderr, "dots up: report log: %v\n", err)
 			}
+		} else if opts.Command == "up" && !opts.Verbose {
+			unsavedUpEvents = append(unsavedUpEvents, e)
 		}
 		if restorePending && e.Kind != "handoff_end" && e.Kind != "terminal_end" {
 			deferredUIEvents = append(deferredUIEvents, e)
@@ -656,8 +674,11 @@ func Run(opts Options) int {
 					}
 				}
 				writeLog(stageLog, globalLog, clean)
+				if terminalSync && !relaying {
+					syncOutput.Write(clean)
+				}
 			}
-			if !relaying && opts.Verbose && len(b) > 0 {
+			if !relaying && (opts.Verbose || (opts.Command == "sync" && !terminalSync)) && len(b) > 0 {
 				_, _ = os.Stdout.Write(b)
 			}
 		case err := <-eventErr:
@@ -769,8 +790,9 @@ func Run(opts Options) int {
 		runEnd.DurationMS = time.Since(started).Milliseconds()
 	}
 	emit(runEnd)
+	reportSaved := false
 	if files != nil {
-		_ = files.finish(exitCode, profile, host, time.Now())
+		reportSaved = files.finish(exitCode, profile, host, time.Now()) == nil
 	}
 	if events != nil {
 		close(events)
@@ -784,21 +806,27 @@ func Run(opts Options) int {
 		plain = true
 		flushDashboardStatus()
 	}
-	if (plain && !opts.Verbose) || dashboardStarted {
+	if opts.Command != "sync" && ((plain && !opts.Verbose) || dashboardStarted) {
+		report := Report{Command: opts.Command, ExitCode: exitCode, Events: unsavedUpEvents}
+		dir := ""
 		if files != nil {
-			report := files.report
-			if consoleFailure != nil && consoleFailure.ID == updateConfigStage {
-				report.Events = slices.Clone(report.Events)
-				for i, event := range report.Events {
-					if event.Kind == "stage_end" && event.ID == consoleFailure.ID {
-						report.Events[i] = *consoleFailure
-						consoleFailure = nil
-						break
-					}
+			report, dir = files.report, files.runDir
+		}
+		if consoleFailure != nil && (consoleFailure.ID == updateConfigStage || opts.Command == "up") {
+			report.Events = slices.Clone(report.Events)
+			for i, event := range report.Events {
+				if event.Kind == "stage_end" && event.ID == consoleFailure.ID {
+					report.Events[i] = *consoleFailure
+					consoleFailure = nil
+					break
 				}
 			}
-			fmt.Println(summary(report, files.runDir))
-			printReportHighlights(os.Stdout, report, files.runDir, plain)
+		}
+		if opts.Command == "up" {
+			printUpReport(os.Stdout, report, dir, reportSaved)
+		} else if files != nil {
+			fmt.Println(summary(report, dir))
+			printReportHighlights(os.Stdout, report, plain)
 		} else {
 			fmt.Printf("Update completed with exit code %d.\n", exitCode)
 		}
@@ -808,6 +836,17 @@ func Run(opts Options) int {
 	}
 	if backendError != nil {
 		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)
+	}
+	// The captured output includes startup diagnostics and stage output in order.
+	// Only the original terminal receives patch text, after that stream drains.
+	if terminalSync {
+		receipt := filepath.Join(files.runDir, "sync.json")
+		preview := exec.Command("bash", filepath.Join(opts.Home, "bin", "dots"), "internal", "sync-present", receipt)
+		preview.Env = append(os.Environ(), "DOTS_ROOT="+opts.Root, "DOTS_HOME="+opts.Home)
+		preview.Stdin, preview.Stdout, preview.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := preview.Run(); err != nil {
+			_, _ = syncOutput.WriteTo(os.Stdout)
+		}
 	}
 	return exitCode
 }

@@ -22,6 +22,7 @@ Read-only, run freely:
 
 ```sh
 dots help                 # commands, including the configuration's own
+dots sync --last          # inspect the previous sync and its diff
 dots status               # profile, source repo, packages, tools, dotfiles, history
 dots plan                 # mise's bootstrap plan
 dots remove --dry-run X   # what removing X would do

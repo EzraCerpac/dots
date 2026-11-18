@@ -10,7 +10,7 @@ var specs = []Spec{
 	{"status", "Machine status", "Inspect", "Browse files, tools, source and backup health", "inspect", false, false},
 	{"reports", "Saved reports", "Inspect", "Browse completed command reports", "concise", false, false},
 	{"up", "Update machine", "Maintain", "Sync configuration and update tools and plugins", "dashboard", false, false},
-	{"sync", "Sync configuration", "Maintain", "Fetch main and apply configuration", "dashboard", false, false},
+	{"sync", "Sync configuration", "Maintain", "Share configuration and show changed files", "concise", false, false},
 	{"apply", "Apply dotfiles", "Maintain", "Apply declared dotfiles and templates", "dashboard", false, false},
 	{"add", "Add software", "Software", "Install and record tools or native packages", "dashboard", false, true},
 	{"remove", "Remove software", "Software", "Uninstall software and remove declarations", "dashboard", false, true},

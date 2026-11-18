@@ -148,7 +148,7 @@ jobs:
           export HOME="$RUNNER_TEMP/home"
           test "$("$dots" --version)" = "dots 0.0.0-ci (archive)"
           "$dots" --help | grep -q 'Your machine setup'
-          "$("$dots" internal home)/bin/dots-up" --capabilities | grep -qx 'dots-shared-cli/2'
+          "$("$dots" internal home)/bin/dots-up" --capabilities | grep -qx 'dots-shared-cli/3'
           test -f "$HOME/.claude/skills/dots/SKILL.md"
 
       - name: Keep the archives for review

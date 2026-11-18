@@ -35,10 +35,14 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    Both parents stay in history, so the losing version remains recoverable.
 6. Validates the merged configuration with this machine's local files; an invalid result is neither pushed nor applied.
    Local `[dotfiles.NAME]` tables that the merged `dots/retired-declarations` retires are validated as already removed (see [the `dots/` reference](../init/README.md#retired-dotfiles-and-retired-declarations)).
-7. Pushes without force, merging and retrying up to three times when `origin/dev` moved meanwhile.
+7. Only fast-forwards `origin/dev`.
+   Git checks that the remote tip still matches the one used to validate the update.
+   Sync merges and retries up to three times if another machine advanced the branch.
+   If published history disappears during a retry, sync keeps local work,
+   skips the withdrawn checkout and dotfile changes, and asks you to inspect the remote.
    A push that fails for any other reason is not retried, and one that takes longer than 60 seconds is stopped; Git never prompts for credentials here.
    Stopping it stops Git, not a hook or credential helper Git started, so a push may still land later; the next sync reconciles it.
-   Output from failed commands is shown as they printed it, except that credentials in URLs (`https://user:secret@host`) are replaced with `***`.
+   Diagnostics include the failed operation and recovery action. URLs have credentials removed.
 8. Checks incoming tracked paths for local obstructions, including ignored files, directories and symlinks.
    If a path is blocked, unrelated edits can still be shared.
    The two-tree checkout also refuses to overwrite a file edited during the run.
@@ -70,22 +74,44 @@ A `dev` moved with plumbing in another worktree of the live checkout is merged t
 
 ## The outcome block
 
-Every run prints one block.
-Its first line has three parts:
+A clean run fits on one line.
+When files change, the receipt leads with any issue and its next action,
+then lists up to five paths per group.
 
-```text
-dots sync: shared 2 files · pulled dev +1, main +0 · pushed 3f2a9c1
-```
+- **Shared on dev** covers the change accepted by the remote,
+  including work saved on an earlier offline run.
+- **Saved locally** covers edits recorded on this machine's `dev`.
+- **Updated in this checkout** covers files that reached the configuration checkout.
+  A later failure to deploy a dotfile is reported separately.
+- **Finished pending checkout** covers an update completed after an interruption.
+
+In a terminal, standalone sync can show a complete small text diff
+for up to two paths and twelve displayed lines across the run.
+Use `dots sync --last` to inspect the latest finished sync for this checkout,
+including the sync at the beginning of `dots up`.
+Search with `/` in the pager and press `q` to return.
+Replay reads the recorded Git revisions locally.
+It spends up to three seconds screening patches and retains up to 1 MiB for the pager.
+The pager lists every recorded file and counts omitted patches.
+Piped output and saved reports contain metadata only.
+Binary, encrypted and unverified changes remain visible as file entries.
+Showing a patch requires Gitleaks to return a clean JSON report.
+Versions that omit the report on a clean scan show the file list only.
+
+### Verbose diagnostics
+
+`dots --verbose sync` includes the Git summary and the underlying diagnostics.
 
 | Part | Values |
 | --- | --- |
-| Local work | `shared N files` (pushed), `saved N files locally` (committed, not pushed), `kept N files on disk` (not committed; the files are untouched), `no local changes` |
+| Local work | `shared N files` (pushed), `already shared N files` (another push included them), `saved N files locally` (committed, not pushed), `kept N files on disk` (not committed; the files are untouched), `no local changes` |
 | Incoming | `pulled dev +N, main +M` (applied), `fetched dev +N, main +M (not applied)`, `offline` |
 | Push | `pushed COMMIT`, `nothing to push`, `not pushed` |
 
 Indented lines follow.
-Upper-case lines need attention; `dots up` repeats them in its final summary and reports the sync stage as one issue, whose details show the whole block and the path of its log.
-When a command failed, the last lines it printed follow its attention line, indented further; they are the error to fix.
+The updater records each issue with its diagnostic and recovery action.
+Git and mise diagnostics appear under the relevant issue.
+Hook failures identify the failed step and keep patch contents out of the report.
 Lower-case lines are information.
 
 | Line | Meaning and what to do |
@@ -130,8 +156,8 @@ A run can also end with a single line instead:
 | `dots sync: skipped · GIT cannot merge-tree -X; install Git 2.43 or newer` | See [requirements](#requirements). |
 | `dots sync: failed · ERROR` | An unexpected error. Read it, fix the cause and sync again. |
 
-Every run exits 0; the printed outcome, not the exit status, says how it ended.
-`dots sync` and `dots up` report `stopped`, `skipped` and `failed` lines and upper-case lines as needing attention; `dots up` continues with its other stages whatever the sync outcome.
+A normal sync exits zero and reports its outcome in the receipt.
+The updater continues with its remaining stages after a sync issue.
 
 ## Requirements
 

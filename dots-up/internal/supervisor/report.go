@@ -105,13 +105,14 @@ func (r *runFiles) record(e ui.Event) error {
 	if e.LogPath != "" && !inside(r.runDir, e.LogPath) {
 		return errors.New("event log path escapes the update report directory")
 	}
-	if err := json.NewEncoder(r.eventLog).Encode(e); err != nil {
-		return fmt.Errorf("write update event log: %w", err)
-	}
+	// Keep the live outcome even if the event log cannot accept this event.
 	if e.Kind == "run_start" {
 		r.report.Command = e.Command
 	}
 	r.report.Events = append(r.report.Events, e)
+	if err := json.NewEncoder(r.eventLog).Encode(e); err != nil {
+		return fmt.Errorf("write update event log: %w", err)
+	}
 	return nil
 }
 
@@ -270,46 +271,34 @@ func replayEvents(report Report) <-chan ui.Event {
 }
 
 func summary(report Report, dir string) string {
-	changes, attention, failures := 0, 0, 0
-	for _, e := range report.Events {
-		switch e.Kind {
-		case "change":
-			changes++
-		case "notice":
-			if e.Severity == "attention" || e.Severity == "error" {
-				attention++
-			}
-		case "stage_end":
-			if e.Status == "failed" {
-				failures++
-			} else if e.Status == "attention" {
-				attention++
-			}
-		}
-	}
 	var result string
 	switch {
+	case report.ExitCode == 130:
+		result = "dots " + report.Command + " cancelled locally"
 	case report.ExitCode != 0:
-		result = fmt.Sprintf("Update failed (exit %d)", report.ExitCode)
-	case failures > 0 || attention > 0:
-		result = fmt.Sprintf("Update completed with %d failure(s) and %d item(s) needing attention", failures, attention)
-	case changes > 0:
-		result = fmt.Sprintf("Update completed; %d verified change(s)", changes)
+		result = fmt.Sprintf("dots %s failed (exit %d)", report.Command, report.ExitCode)
 	default:
-		result = "Update completed; no verified changes were reported"
-	}
-	if report.Command != "" && report.Command != "up" {
-		if report.ExitCode == 130 {
-			result = "dots " + report.Command + " cancelled locally"
-		} else if report.ExitCode != 0 {
-			result = fmt.Sprintf("dots %s failed (exit %d)", report.Command, report.ExitCode)
-		} else if failures > 0 || attention > 0 {
-			result = "dots " + report.Command + " needs attention"
-		} else {
-			result = "dots " + report.Command + " completed"
+		result = "dots " + report.Command + " completed"
+		for _, e := range report.Events {
+			if (e.Kind == "notice" && (e.Severity == "attention" || e.Severity == "error")) ||
+				(e.Kind == "stage_end" && (e.Status == "failed" || e.Status == "attention")) {
+				result = "dots " + report.Command + " needs attention"
+				break
+			}
 		}
 	}
 	return fmt.Sprintf("%s\nReport: %s", result, dir)
+}
+
+func printUpReport(w io.Writer, report Report, dir string, lastHint bool) {
+	events := make([]ui.Event, 0, len(report.Events)+1)
+	for event := range replayEvents(report) {
+		events = append(events, event)
+	}
+	fmt.Fprintln(w, ui.OutcomeReport(events, dir))
+	if lastHint {
+		fmt.Fprintln(w, "Details and logs · dots up --last")
+	}
 }
 
 func ShowLast(opts Options) int {
@@ -332,6 +321,10 @@ func ShowLast(opts Options) int {
 			fmt.Fprintf(os.Stderr, "dots up: dashboard unavailable: %v\n", err)
 		}
 	}
+	if report.Command == "" || report.Command == "up" {
+		printUpReport(os.Stdout, report, dir, false)
+		return report.ExitCode
+	}
 	fmt.Println(summary(report, dir))
 	if opts.Plain || opts.Verbose || !interactiveTerminal() {
 		if report.Command == "status" {
@@ -339,18 +332,12 @@ func ShowLast(opts Options) int {
 				printStatusEvent(event)
 			}
 		}
-		printReportHighlights(os.Stdout, report, dir, report.Command == "status")
+		printReportHighlights(os.Stdout, report, report.Command == "status")
 	}
 	return report.ExitCode
 }
 
-func printReportHighlights(w io.Writer, report Report, dir string, statusInventoryShown bool) {
-	up := report.Command == "" || report.Command == "up"
-	if up {
-		// The outcomes list each issue with its error, next command and log.
-		fmt.Fprintln(w, ui.OutcomeReport(report.Events, dir))
-		return
-	}
+func printReportHighlights(w io.Writer, report Report, statusInventoryShown bool) {
 	labels := map[string]string{}
 	for _, e := range report.Events {
 		if e.Kind == "stage_start" {

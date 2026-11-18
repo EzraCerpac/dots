@@ -180,7 +180,7 @@ jobs:
             echo 'No unchanged black-box scenarios found' >&2
             exit 1
           fi
-          mise run test -- --test '*' -- --include-ignored --exact "${scenarios[@]}"
+          DOTS_TEST_TOOL_PATH="$PATH" mise run test -- --no-fail-fast --test '*' -- --include-ignored --exact "${scenarios[@]}"
 
   rust-distros:
     name: Rust scenarios (${{ matrix.distro }})

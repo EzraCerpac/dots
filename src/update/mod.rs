@@ -9,11 +9,12 @@ use std::thread;
 
 use crate::config::{Exceptions, Vars, selection};
 use crate::history::{self, Checkpoint};
+use crate::hooks::exceptions;
 use crate::process::Mise;
 use crate::receipt::{self, Receipt};
 use crate::report;
 use crate::run::{Change, Issue, Outcome, Policy, Run, Sink, StageId, exit_code};
-use crate::{Args, Ctx, Fail, exceptions, hooks, sync};
+use crate::{Args, Ctx, Fail, hooks, sync};
 
 const NEXT: &str = "Fix the problem above, then rerun dots up.";
 const NOT_INSTALLED: &str = "not installed";

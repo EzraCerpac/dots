@@ -424,7 +424,7 @@ fn new_pre_checkpoint_failure_stops_before_sync_and_updates() {
 }
 
 #[test]
-#[ignore = "P-08"]
+#[ignore = "P-06, P-08"]
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
     let output = fixture
@@ -496,7 +496,7 @@ fi
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-11"]
+#[ignore = "P-06"]
 fn new_app_store_overlaps_tools_and_joins_before_standalone_mise() {
     let fixture = store_fixture();
     fixture.write("expect-store-overlap", "");
@@ -517,7 +517,7 @@ fn new_app_store_overlaps_tools_and_joins_before_standalone_mise() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-11"]
+#[ignore = "P-06"]
 fn new_app_store_defers_expired_authorization_without_reprompting() {
     let fixture = store_fixture();
     fixture.write("expire-authorization", "");
@@ -619,7 +619,7 @@ fn new_unresolved_bare_blocks_filtering_but_keeps_unfiltered_managers() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-11"]
+#[ignore = "P-06"]
 fn unchanged_app_store_tool_preparation_replaces_a_stale_shim_in_scope() {
     let fixture = store_fixture();
     let shim = fixture.bin.join("mas");

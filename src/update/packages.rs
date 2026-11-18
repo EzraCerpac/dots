@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
 use std::process::Command;
 
-use serde::Deserialize;
-
 use crate::Ctx;
 use crate::config::Exceptions;
+use crate::inspect::packages::{Manager, Package, Scope};
 use crate::process::{Cwd, Mise};
 use crate::run::{Issue, Outcome, Policy, Run, StageId};
 
@@ -15,175 +14,39 @@ use super::{Config, Step, Versions, child, issue, json, mise_command, record_cha
 type Status = BTreeMap<String, Manager>;
 type PackageNames = BTreeSet<String>;
 
-#[derive(Deserialize)]
-struct Manager {
-    available: bool,
-    #[serde(default)]
-    packages: Vec<Package>,
+fn read_scope(run: &Run<'_>, mise: &Mise<'_>) -> Result<Scope, Issue> {
+    Scope::read_with(run, |args| mise_command(run, mise, args)).map_err(issue)
 }
 
-#[derive(Deserialize)]
-struct Package {
-    package: String,
-    requested_version: String,
-    desired_state: String,
-    state: String,
-    #[serde(default)]
-    installed_version: String,
-    #[serde(default)]
-    auto_updates: bool,
-}
-
-#[derive(Deserialize)]
-struct Settings {
-    system_packages: Managers,
-}
-
-#[derive(Deserialize)]
-struct Managers {
-    managers: Option<Vec<String>>,
-    prefer: Option<Vec<String>>,
-}
-
-// P-02 owns the effective package scope. This keeps the status and command
-// adapter local until inspect::packages::Scope is published.
-struct Scope {
-    managers: BTreeSet<String>,
-    inventory: Status,
-}
-
-impl Scope {
-    fn read(run: &Run<'_>, mise: &Mise<'_>) -> Result<Self, Issue> {
-        let inventory: Status = json(run, command(run, mise, "", ["status", "--json"]))?;
-        if inventory.is_empty() {
-            return Ok(Self {
-                managers: BTreeSet::new(),
-                inventory,
-            });
-        }
-        let settings: Settings = json(
-            run,
-            mise_command(
-                run,
-                mise,
-                ["settings", "ls", "--all", "--json", "system_packages"],
-            ),
-        )?;
-        let mut names: BTreeSet<_> = inventory
-            .keys()
-            .filter(|name| *name != "unprefixed")
-            .cloned()
-            .collect();
-        if inventory.contains_key("unprefixed") {
-            names.extend(settings.system_packages.prefer.unwrap_or_else(|| {
-                [
-                    "apt", "dnf", "pacman", "zypper", "apk", "brew", "winget", "scoop", "choco",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-            }));
-        }
-        if let Some(allowed) = settings.system_packages.managers {
-            names.retain(|name| allowed.contains(name));
-        }
-        if !cfg!(target_os = "macos") {
-            names.remove("mas");
-        }
-        Ok(Self {
-            managers: names,
-            inventory,
-        })
-    }
-
-    fn includes(&self, manager: &str) -> bool {
-        self.managers.contains(manager)
-    }
-
-    fn managers(&self) -> impl Iterator<Item = &str> {
-        self.managers.iter().map(String::as_str)
-    }
-
-    fn has_bare(&self) -> bool {
-        self.inventory.contains_key("unprefixed")
-    }
-
-    fn declares(&self, manager: &str, package: &str) -> bool {
-        self.inventory
-            .get(manager)
-            .is_some_and(|entry| entry.packages.iter().any(|row| row.package == package))
-    }
-
-    fn status(&self, run: &Run<'_>, mise: &Mise<'_>, mas: Option<&Tool>) -> Result<Status, Issue> {
-        let command = self
-            .command_in_run(run, mise, mas.is_some(), ["status", "--json"])
-            .map_err(issue)?;
-        json(run, expose_mas(command, mas))
-    }
-
-    fn status_for(
-        &self,
-        run: &Run<'_>,
-        mise: &Mise<'_>,
-        manager: &str,
-    ) -> Result<Option<Manager>, Issue> {
-        let mut status: Status = json(run, self.status_command_for(run, mise, manager))?;
-        Ok(status.remove(manager))
-    }
-
-    fn status_command_for(
-        &self,
-        run: &Run<'_>,
-        mise: &Mise<'_>,
-        manager: &str,
-    ) -> Result<Command, crate::Fail> {
-        let mut cmd = command(run, mise, manager, ["status", "--json"])?;
-        cmd.env("MISE_SYSTEM_PACKAGES_PREFER", manager);
-        Ok(cmd)
-    }
-
-    fn command_in_run<I, S>(
-        &self,
-        run: &Run<'_>,
-        mise: &Mise<'_>,
-        include_mas: bool,
-        args: I,
-    ) -> Result<Command, crate::Fail>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<std::ffi::OsStr>,
-    {
-        let managers = self
-            .managers()
-            .filter(|name| include_mas || *name != "mas")
-            .collect::<Vec<_>>()
-            .join(",");
-        command(run, mise, &managers, args)
-    }
-}
-
-fn command<I, S>(
+fn scoped_status_command(
     run: &Run<'_>,
     mise: &Mise<'_>,
-    managers: &str,
-    args: I,
-) -> Result<Command, crate::Fail>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let prefix = [
-        std::ffi::OsStr::new("bootstrap"),
-        std::ffi::OsStr::new("packages"),
-    ];
-    let args: Vec<_> = args.into_iter().collect();
-    let mut cmd = mise_command(
-        run,
-        mise,
-        prefix.into_iter().chain(args.iter().map(AsRef::as_ref)),
-    )?;
-    cmd.env("MISE_SYSTEM_PACKAGES_MANAGERS", managers);
-    Ok(cmd)
+    scope: &Scope,
+    manager: &str,
+) -> Result<Command, crate::Fail> {
+    let command = mise_command(run, mise, ["bootstrap", "packages", "status", "--json"])?;
+    Ok(scope.scoped_for(command, manager))
+}
+
+fn scoped_status(
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    scope: &Scope,
+    manager: &str,
+) -> Result<Option<Manager>, Issue> {
+    let mut status: Status = json(run, scoped_status_command(run, mise, scope, manager))?;
+    Ok(status.remove(manager))
+}
+
+fn grouped_status(
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    scope: &Scope,
+    mas: Option<&Tool>,
+) -> Result<Status, Issue> {
+    let command =
+        mise_command(run, mise, ["bootstrap", "packages", "status", "--json"]).map_err(issue)?;
+    json(run, expose_mas(scope.scoped(command, mas.is_some()), mas))
 }
 
 pub(super) struct Update<'a, 'ctx> {
@@ -216,7 +79,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             ctx,
             run,
             mise,
-            scope: Scope::read(run, mise)?,
+            scope: read_scope(run, mise)?,
             config,
             mas,
         })
@@ -232,7 +95,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         let resolved = self
             .scope
             .has_bare()
-            .then(|| self.scope.status(self.run, self.mise, mas.as_ref()).ok())
+            .then(|| grouped_status(self.run, self.mise, &self.scope, mas.as_ref()).ok())
             .flatten();
 
         for name in self.scope.managers().filter(|name| *name != "mas") {
@@ -282,9 +145,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 upgrade: self
                     .package_command("mas", "upgrade", &specs, Some(mas))
                     .map_err(issue)?,
-                status: self
-                    .scope
-                    .status_command_for(self.run, self.mise, "mas")
+                status: scoped_status_command(self.run, self.mise, &self.scope, "mas")
                     .and_then(|command| mas.expose(command))
                     .map_err(issue)?,
                 before: versions("mas", &manager, tracked.as_ref()),
@@ -310,14 +171,12 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         mas: Option<&Tool>,
     ) -> Result<Option<Manager>, Issue> {
         let mut status = if let Some(mas) = mas {
-            let command = self
-                .scope
-                .status_command_for(self.run, self.mise, name)
+            let command = scoped_status_command(self.run, self.mise, &self.scope, name)
                 .and_then(|command| mas.expose(command));
             let mut status: Status = json(self.run, command)?;
             status.remove(name)
         } else {
-            self.scope.status_for(self.run, self.mise, name)?
+            scoped_status(self.run, self.mise, &self.scope, name)?
         };
         if let Some(resolved) = resolved {
             let Some(known) = resolved.get(name) else {
@@ -428,7 +287,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             return Ok(false);
         }
         if self.scope.includes("brew")
-            && let Some(manager) = self.scope.status_for(self.run, self.mise, "brew")?
+            && let Some(manager) = scoped_status(self.run, self.mise, &self.scope, "brew")?
             && manager.packages.iter().any(|pkg| {
                 pkg.package.rsplit('/').next() == Some("mas")
                     && (pkg.desired_state != "present" || pkg.requested_version != "latest")
@@ -566,10 +425,12 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         let args = [action, "--manager", name, "--yes"]
             .into_iter()
             .chain(specs.0.iter().map(String::as_str));
-        let cmd = self
-            .scope
-            .command_in_run(self.run, self.mise, mas.is_some(), args)?;
-        expose_mas(cmd, mas)
+        let cmd = mise_command(
+            self.run,
+            self.mise,
+            ["bootstrap", "packages"].into_iter().chain(args),
+        )?;
+        expose_mas(self.scope.scoped(cmd, mas.is_some()), mas)
     }
 
     pub(super) fn update_store(&self, id: StageId, store: Store) -> Step {
@@ -649,7 +510,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
 
     fn record(&self, id: StageId, name: &str, before: Versions, tracked: Option<&PackageNames>) {
         if !self.run.cancelled()
-            && let Ok(Some(manager)) = self.scope.status_for(self.run, self.mise, name)
+            && let Ok(Some(manager)) = scoped_status(self.run, self.mise, &self.scope, name)
             && manager.available
         {
             record_changes(self.run, id, before, versions(name, &manager, tracked));
@@ -743,12 +604,11 @@ fn versions(name: &str, manager: &Manager, tracked: Option<&PackageNames>) -> Ve
 }
 
 pub(super) fn declared_dots_formula(run: &Run<'_>, mise: &Mise<'_>) -> Option<String> {
-    let scope = Scope::read(run, mise).ok()?;
+    let scope = read_scope(run, mise).ok()?;
     if !scope.includes("brew") {
         return None;
     }
-    let manager = scope
-        .status_for(run, mise, "brew")
+    let manager = scoped_status(run, mise, &scope, "brew")
         .ok()
         .flatten()
         .filter(|manager| manager.available)?;
@@ -791,6 +651,7 @@ mod tests {
             state: "installed".to_owned(),
             installed_version: "1".to_owned(),
             auto_updates: false,
+            reason: None,
         }
     }
 

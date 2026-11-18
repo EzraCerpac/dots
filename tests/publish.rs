@@ -9,7 +9,9 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
+
+use support::FixtureCommand;
 
 use isolation::{IsolatedWorld, executable_on_path, fixture_file};
 use pty::Pty;
@@ -369,7 +371,7 @@ exit "$status"
         self.jj(&["describe", "-m", &format!("Publish fixture change {index}")]);
     }
 
-    fn dots(&self, args: &[&str]) -> Command {
+    fn dots(&self, args: &[&str]) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         command
             .current_dir(&self.workspace)
@@ -400,7 +402,7 @@ exit "$status"
         command
     }
 
-    fn real_scan(&self, command: &mut Command) {
+    fn real_scan(&self, command: &mut FixtureCommand<'_>) {
         assert!(
             self.real_gitleaks.is_some(),
             "real-scanner scenario requires gitleaks"
@@ -487,7 +489,12 @@ exit "$status"
         );
     }
 
-    fn approve(&self, command: Command, revision: &str, expected_paths: &[&str]) -> String {
+    fn approve(
+        &self,
+        command: FixtureCommand<'_>,
+        revision: &str,
+        expected_paths: &[&str],
+    ) -> String {
         let approved = self.jj(&["log", "--no-graph", "-r", revision, "-T", "commit_id"]);
         let approved = approved.trim();
         let mut terminal = Pty::spawn(command);
@@ -580,9 +587,9 @@ exit "$status"
     }
 }
 
-fn success(command: &mut Command) -> String {
+fn success(command: &mut FixtureCommand<'_>) -> String {
     let result = command.output().unwrap();
-    assert!(result.status.success(), "{command:?}\n{result:?}");
+    assert!(result.status.success(), "{:?}\n{result:?}", &**command);
     String::from_utf8(result.stdout).unwrap()
 }
 

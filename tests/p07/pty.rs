@@ -3,11 +3,12 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd as _};
-use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::libc;
+
+use crate::support::FixtureCommand;
 
 const TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -20,7 +21,7 @@ pub struct Pty {
 }
 
 impl Pty {
-    pub fn spawn(mut command: Command) -> Self {
+    pub fn spawn(mut command: FixtureCommand<'_>) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {

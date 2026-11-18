@@ -1,6 +1,6 @@
 //! Additional private paths for P-07's real mise, Git and JJ subprocesses.
 
-use crate::support::World;
+use crate::support::{FixtureCommand, World};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -66,27 +66,19 @@ impl IsolatedWorld {
         self.world.home()
     }
 
-    pub fn dots(&self) -> Command {
+    pub fn dots(&self) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         self.apply_private_paths(&mut command);
         command
     }
 
-    pub fn git(&self) -> Command {
+    pub fn git(&self) -> FixtureCommand<'_> {
         self.tool(&self.git)
     }
 
-    pub fn tool(&self, program: impl AsRef<OsStr>) -> Command {
-        let isolated = self.dots();
-        let mut command = Command::new(program);
-        command
-            .env_clear()
-            .envs(
-                isolated
-                    .get_envs()
-                    .filter_map(|(name, value)| value.map(|v| (name, v))),
-            )
-            .current_dir(self.root());
+    pub fn tool(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
+        let mut command = self.world.command(program);
+        self.apply_private_paths(&mut command);
         command
     }
 
@@ -108,7 +100,7 @@ impl IsolatedWorld {
         remote
     }
 
-    fn apply_private_paths(&self, command: &mut Command) {
+    fn apply_private_paths(&self, command: &mut FixtureCommand<'_>) {
         let home = self.home();
         let private = &self.private;
         command

@@ -7,8 +7,9 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::{env, str};
+use support::FixtureCommand;
 
 const SOURCE: &str = "templates/herdr.tera";
 const ROW: &str = "dotfiles.herdr\ttemplates/herdr.tera\n";
@@ -145,7 +146,7 @@ impl Retirement {
         str::from_utf8(&output.stdout).unwrap().trim().to_owned()
     }
 
-    fn isolate_tools(&self, cmd: &mut Command) {
+    fn isolate_tools(&self, cmd: &mut FixtureCommand<'_>) {
         let base = self.root.parent().unwrap();
         cmd.env("PATH", &self.path)
             .env("GIT_ALLOW_PROTOCOL", "file")
@@ -176,7 +177,7 @@ impl Retirement {
         .unwrap();
     }
 
-    fn sync_command(&self) -> Command {
+    fn sync_command(&self) -> FixtureCommand<'_> {
         let mut cmd = self.world.dots();
         cmd.current_dir(&self.root)
             .env("DOTS_ROOT", &self.root)
@@ -215,11 +216,12 @@ impl Retirement {
     }
 }
 
-fn success(cmd: &mut Command) -> Output {
+fn success(cmd: &mut FixtureCommand<'_>) -> Output {
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
-        "{cmd:?}:\n{}\n{}",
+        "{:?}:\n{}\n{}",
+        &**cmd,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

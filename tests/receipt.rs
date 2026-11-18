@@ -10,8 +10,9 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Instant;
+use support::FixtureCommand;
 
 const ORIGIN: &str = "https://github.com/dots-tests/receipt.git";
 const MISE: &str = r#"#!/bin/sh
@@ -251,7 +252,7 @@ impl ReceiptWorld {
         f
     }
 
-    fn isolate(&self, command: &mut Command) {
+    fn isolate(&self, command: &mut FixtureCommand<'_>) {
         command
             .env("PATH", &self.tools)
             .env("TMPDIR", self.fixture.join("tmp"))
@@ -262,7 +263,7 @@ impl ReceiptWorld {
             .env("TERM", "xterm");
     }
 
-    fn git_command(&self, at: &Path, args: &[&str]) -> Command {
+    fn git_command(&self, at: &Path, args: &[&str]) -> FixtureCommand<'_> {
         let mut command = self.world.git();
         command.current_dir(at).args(args);
         self.isolate(&mut command);
@@ -293,7 +294,7 @@ impl ReceiptWorld {
         head
     }
 
-    fn dots(&self, at: &Path, args: &[&str]) -> Command {
+    fn dots(&self, at: &Path, args: &[&str]) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         command.args(args);
         command
@@ -321,7 +322,7 @@ impl ReceiptWorld {
         capture
     }
 
-    fn terminal(&self, command: Command) -> String {
+    fn terminal(&self, command: FixtureCommand<'_>) -> String {
         let (status, text) = pty::Pty::spawn(command).finish();
         assert!(status.success(), "{status}: {text}");
         text

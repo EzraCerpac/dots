@@ -6,28 +6,29 @@ use std::fs;
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use isolation::{IsolatedWorld, executable_on_path, fixture_file};
 use nix::libc;
+use support::FixtureCommand;
 
 const FIXTURE_GITHUB: &str = "https://github.com/dots-fixture/source";
 const TEXT: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
 const PRIVATE_MARKER: &str = "FIXTURE_PRIVATE_LINE";
 
-fn finish(command: &mut Command) -> Output {
+fn finish(command: &mut FixtureCommand<'_>) -> Output {
     command
         .output()
-        .unwrap_or_else(|error| panic!("{command:?}: {error}"))
+        .unwrap_or_else(|error| panic!("{:?}: {error}", &**command))
 }
 
 fn stdout(output: &Output) -> &str {
     std::str::from_utf8(&output.stdout).unwrap()
 }
 
-fn success(command: &mut Command) -> String {
+fn success(command: &mut FixtureCommand<'_>) -> String {
     let output = finish(command);
-    assert!(output.status.success(), "{command:?}: {output:?}");
+    assert!(output.status.success(), "{:?}: {output:?}", &**command);
     stdout(&output).trim().to_owned()
 }
 
@@ -188,7 +189,7 @@ impl Repo {
         .unwrap()
     }
 
-    fn git_command(&self, root: &Path) -> Command {
+    fn git_command(&self, root: &Path) -> FixtureCommand<'_> {
         let mut command = self.world.git();
         command
             .current_dir(root)
@@ -289,7 +290,7 @@ impl Repo {
         hook
     }
 
-    fn dots(&self, root: &Path, args: &[&str]) -> Command {
+    fn dots(&self, root: &Path, args: &[&str]) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         command.args(args);
         command
@@ -329,9 +330,14 @@ impl Repo {
     }
 }
 
-fn dots_zero(command: &mut Command) -> String {
+fn dots_zero(command: &mut FixtureCommand<'_>) -> String {
     let output = finish(command);
-    assert_eq!(output.status.code(), Some(0), "{command:?}: {output:?}");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{:?}: {output:?}",
+        &**command
+    );
     format!(
         "{}{}",
         stdout(&output),
@@ -1743,12 +1749,27 @@ struct RunningSync {
 }
 
 impl RunningSync {
-    fn start(command: &mut Command, log: &Path) -> Self {
-        use std::os::unix::process::CommandExt as _;
+    fn start(repo: &Repo, command: &FixtureCommand<'_>, log: &Path) -> Self {
         let stdout = log.with_extension("stdout");
         let stderr = log.with_extension("stderr");
-        let child = command
-            .process_group(0)
+        // The fixture Python process makes a private group before replacing
+        // itself with dots. Both inherit the checked world environment.
+        let mut launcher = repo.world.tool(repo.tools.join("python3"));
+        let child = launcher
+            .env_clear()
+            .current_dir(command.get_current_dir().unwrap())
+            .envs(
+                command
+                    .get_envs()
+                    .filter_map(|(name, value)| value.map(|value| (name, value))),
+            )
+            .args([
+                "-I",
+                "-c",
+                "import os, sys; os.setpgid(0, 0); os.execv(sys.argv[1], sys.argv[1:])",
+            ])
+            .arg(command.get_program())
+            .args(command.get_args())
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
@@ -1850,6 +1871,7 @@ sync_case!(
         let parent = f.scratch.join("lock-holder-pid");
         f.write(&f.a, "local", "waiting\n");
         let mut holder = RunningSync::start(
+            &f,
             f.dots(&f.a, &["--plain", "sync"])
                 .env("FIXTURE_VALIDATE", &hook)
                 .env("FIXTURE_VALIDATION_PARENT", &parent),
@@ -1880,6 +1902,7 @@ fn new_standalone_sync_cancellation_records_replayable_stopped_receipt() {
         entered = sh(&entered),
     ));
     let mut run = RunningSync::start(
+        &f,
         f.dots(&f.a, &["--plain", "sync"])
             .env("FIXTURE_CLEANED", &cleaned),
         &f.scratch.join("cancelled"),
@@ -2121,7 +2144,7 @@ impl<'a> Machine<'a> {
         })
     }
 
-    fn isolate(&self, command: &mut Command) {
+    fn isolate(&self, command: &mut FixtureCommand<'_>) {
         command
             .env("PATH", self.repo.path())
             .env("TMPDIR", self.repo.scratch.join("tmp"))
@@ -2145,7 +2168,7 @@ impl<'a> Machine<'a> {
             .env("MISE_NO_HOOKS", if self.hooks { "0" } else { "1" });
     }
 
-    fn dots(&self, args: &[&str]) -> Command {
+    fn dots(&self, args: &[&str]) -> FixtureCommand<'_> {
         let mut command = self.repo.dots(self.root, args);
         self.isolate(&mut command);
         command.env("DOTS_MISE_BIN", &self.mise);
@@ -3571,7 +3594,7 @@ sync_case!(
             if name == "dead" {
                 command.env("FIXTURE_VALIDATION_PARENT", &parent);
             }
-            RunningSync::start(&mut command, &f.scratch.join(format!("run-{name}")))
+            RunningSync::start(&f, &command, &f.scratch.join(format!("run-{name}")))
         };
         let mut dead = start("dead");
         dead.wait_until_started(&marker.with_extension("dead"));

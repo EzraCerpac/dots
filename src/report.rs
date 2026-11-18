@@ -167,7 +167,7 @@ fn dir(env: &Env) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn ensure_directory(path: &Path, forbidden_mode: u32) -> io::Result<()> {
+pub(crate) fn ensure_directory(path: &Path, forbidden_mode: u32) -> io::Result<()> {
     check_directory(path, forbidden_mode).or_else(|error| {
         if error.kind() != io::ErrorKind::NotFound {
             return Err(error);
@@ -177,7 +177,7 @@ fn ensure_directory(path: &Path, forbidden_mode: u32) -> io::Result<()> {
     })
 }
 
-fn check_directory(path: &Path, forbidden_mode: u32) -> io::Result<()> {
+pub(crate) fn check_directory(path: &Path, forbidden_mode: u32) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir()
         || metadata.mode() & forbidden_mode != 0
@@ -212,10 +212,18 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
-pub(crate) fn save(env: &Env, report: &Report) -> io::Result<()> {
+pub(crate) fn save(env: &Env, report: &Report, log_id: Option<&str>) -> io::Result<()> {
+    #[derive(Serialize)]
+    struct Stored<'a> {
+        #[serde(flatten)]
+        report: &'a Report,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        log_id: Option<&'a str>,
+    }
+
     let dir = dir(env)?;
     let mut pending = Builder::new().prefix(".pending-").tempfile_in(&dir)?;
-    serde_json::to_writer(pending.as_file_mut(), report)?;
+    serde_json::to_writer(pending.as_file_mut(), &Stored { report, log_id })?;
     let token = pending
         .path()
         .file_name()
@@ -278,6 +286,35 @@ pub fn load(env: &Env, id: &Id) -> io::Result<Report> {
 /// The saved file identified by an entry returned from `list`.
 pub(crate) fn path(env: &Env, id: &Id) -> io::Result<PathBuf> {
     Ok(env.state_dir()?.join("reports").join(&id.0))
+}
+
+/// Keep recent reports per command. Only published reports reference log runs,
+/// so runs still writing their logs never participate in retention.
+pub(crate) fn prune(env: &Env, command: Command) -> io::Result<()> {
+    #[derive(Deserialize)]
+    struct StoredLogs {
+        log_id: Option<String>,
+    }
+
+    const KEEP: usize = 10;
+    let directory = dir(env)?;
+    for entry in list(env, Some(command))?.into_iter().skip(KEEP) {
+        let path = directory.join(&entry.id.0);
+        let old: StoredLogs = match read_json(&path) {
+            Ok(old) => old,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(log_id) = old.log_id {
+            crate::supervisor::remove_run_logs(env, &log_id)?;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn fragment_dir(path: &Path) -> io::Result<&Path> {

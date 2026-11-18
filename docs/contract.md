@@ -345,7 +345,8 @@ Configuration commands, `dots test` and `dots mise` exit with their child's stat
 `dots sync` with invalid arguments exits 2.
 Ctrl-C cancels the current stage's entire process group, and no later stage starts.
 A cancellation is not a stage failure, so the rule above for `dots up` and `dots bootstrap` does not apply to it.
-A cancelled run exits with the cancelled child's own status, unchanged, when the child exits with one; otherwise it exits 130, the shell's status for an interrupt.
+A cancelled run exits with the cancelled child's own status, unchanged, when the child exits with one.
+Otherwise it exits with a nonzero status, and no particular value is promised.
 `dots sync` still exits 0, and its receipt records the stopped run.
 **Changed from 0.3.5:** `dots bundle` usage errors exit 2, not 1.
 

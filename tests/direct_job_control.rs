@@ -11,12 +11,11 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
-use support::World;
+use support::{FixtureCommand, World};
 use unix::*;
 
 // Keep this suite's PTY sessions sequential under the default Rust runner.
@@ -48,7 +47,7 @@ impl Fixture {
         }
     }
 
-    fn dots(&self) -> Command {
+    fn dots(&self) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         let home = self.world.home();
         command
@@ -200,7 +199,12 @@ impl<'a> Terminal<'a> {
         Self::shell(fixture, dots, tostop, "\r\n")
     }
 
-    fn shell(fixture: &'a Fixture, dots: Command, tostop: bool, newline: &'static str) -> Self {
+    fn shell(
+        fixture: &'a Fixture,
+        dots: FixtureCommand<'_>,
+        tostop: bool,
+        newline: &'static str,
+    ) -> Self {
         let case = dots
             .get_envs()
             .find(|(key, _)| *key == "DIRECT_CASE")
@@ -225,10 +229,9 @@ impl<'a> Terminal<'a> {
         set_termios(slave.as_raw_fd(), &modes);
         nonblocking(&master);
         let path = tty_name(slave.as_raw_fd()).unwrap();
-        let mut shell = Command::new("/bin/bash");
+        let mut shell = fixture.world.command("/bin/bash");
         shell
             .args(["--noprofile", "--norc", "--noediting", "-i"])
-            .env_clear()
             .envs(
                 dots.get_envs()
                     .filter_map(|(key, value)| Some((key, value?))),

@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 
 const TOKEN: &str = "fixture/tools/widget";
 const CASK: &str = "widget";
@@ -93,7 +93,7 @@ impl Fixture {
         Self { world, directory }
     }
 
-    fn command(&self) -> std::process::Command {
+    fn command(&self) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         command
             .arg("brew")

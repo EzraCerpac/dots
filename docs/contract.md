@@ -1123,13 +1123,14 @@ Then it saves a checkpoint, publishes it to the state repository, and says so.
   The checkpoints are encrypted to the configured recipients.
   A later explicit `dots backup` publishes them in the history branch's ancestry.
 - On an overlapping conflict, restore keeps the live file and exits 1 with a diagnostic saying that both sides changed the same lines.
-- A new store is staged and validated before it is installed.
+- A new store is staged and validated as a bare clone before it is installed.
+  On first restore, mise applies the fetched remote state as the initial checkpoint, using its native conflict checks.
 - An interrupted first restore resumes on the next run instead of treating the new store as established.
 - A completed restore leaves no staging clone or pending marker.
 - An existing unconnected store is replaced only with `--initialize-history`.
   The old store moves to a private sibling directory and is kept.
   If preparing the replacement fails, the old store stays in place.
-- It refreshes this machine's identity and recipients, sets exactly the tracked files active for this machine to mode 0600, and sets history sync to `manual`.
+- It refreshes this machine's identity and recipients, sets the active encrypted tracked files for this machine to mode 0600, and sets history sync to `manual`.
 - It needs Git, Git authentication for the state repository, and the age identity to be present, and installs nothing.
 
 ## Environment variables

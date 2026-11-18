@@ -13,7 +13,7 @@ const TRACKED: &str = "~/.config/app/state";
 const TRACKED_RELATIVE: &str = ".config/app/state";
 const DECLARATIONS: &str = "config.host-fx.toml";
 const HOST: &str = "host-fx";
-const EMPTY: &str = r#"{"entries":[]}"#;
+const EMPTY: &str = r#"{"entries":[],"invalid":[]}"#;
 const REPO: &str = "dots-test-fixture/fixture-state";
 const HTTPS: &str = "https://github.com/dots-test-fixture/fixture-state.git";
 const MACHINE_KEY: &str = "age1tcfkaaftjeax8f0c3hsxcwrhl6nefap2df9v9qvmxy6zjnft8pvqt89uap";
@@ -46,6 +46,20 @@ impl History {
         // The native history module uses age to validate recipients. The
         // enrollment scenarios check which public recipients were persisted.
         write(&bin.join("age"), "#!/bin/sh\nexit 0\n", 0o755);
+        write(
+            &bin.join("git"),
+            r#"#!/bin/sh
+PATH="$CONTRACT_HISTORY_REAL_PATH"
+export PATH
+if [ "$#" -eq 8 ] && [ "$1" = "--git-dir" ] && [ "$3" = "ls-remote" ] &&
+   [ "$4" = "--exit-code" ] && [ "$5" = "--refs" ] && [ "$6" = "--" ] &&
+   [ "$7" = "$CONTRACT_HISTORY_ORIGIN" ] && [ "$8" = "refs/heads/$CONTRACT_HISTORY_BRANCH" ]; then
+    exec git ls-remote --exit-code --refs -- "file://$CONTRACT_HISTORY_ACK_REMOTE" "$8"
+fi
+exec git "$@"
+"#,
+            0o755,
+        );
         fs::write(world.root().join("config.laptop.toml"), "").unwrap();
         fs::write(world.root().join("dots/exceptions.tsv"), "").unwrap();
         let mut fixture = Self {
@@ -96,6 +110,10 @@ impl History {
             .env("CONTRACT_HISTORY_STATUS", "{}")
             .env("CONTRACT_HISTORY_ORIGIN", "")
             .env("CONTRACT_HISTORY_BRANCH", "")
+            .env(
+                "CONTRACT_HISTORY_ACK_REMOTE",
+                base.join("remotes/history-acknowledged"),
+            )
             .env("CONTRACT_HISTORY_MACHINE_KEY", MACHINE_KEY);
         command
     }
@@ -131,7 +149,7 @@ impl History {
             }
             entry
         });
-        json!({ "entries": entries.collect::<Vec<_>>() }).to_string()
+        json!({ "entries": entries.collect::<Vec<_>>(), "invalid": [] }).to_string()
     }
 
     fn enroll(&self, inventory: Option<&str>) -> Output {
@@ -220,9 +238,56 @@ impl History {
 
     fn create_store(&self) -> PathBuf {
         let bare = self.world.bare_remote("history-store");
+        let acknowledged = self.world.bare_remote("history-acknowledged");
         let store = self.history_store();
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(bare, &store).unwrap();
+        // The recorder reports an already acknowledged checkpoint without
+        // contacting the fixture's synthetic GitHub endpoint.
+        let seed = self.world.root().join("history-seed");
+        fs::create_dir(&seed).unwrap();
+        for args in [
+            &["init", "--initial-branch=main"][..],
+            &["commit", "--allow-empty", "-m", "fixture checkpoint"],
+        ] {
+            expect(
+                &self
+                    .world
+                    .git()
+                    .current_dir(&seed)
+                    .args(args)
+                    .output()
+                    .unwrap(),
+                0,
+                &[],
+            );
+        }
+        expect(
+            &self
+                .world
+                .git()
+                .current_dir(&seed)
+                .args(["push", "--"])
+                .arg(&store)
+                .args(["HEAD:refs/heads/main", "HEAD:refs/remotes/origin/setup"])
+                .output()
+                .unwrap(),
+            0,
+            &[],
+        );
+        expect(
+            &self
+                .world
+                .git()
+                .current_dir(&seed)
+                .args(["push", "--"])
+                .arg(&acknowledged)
+                .arg(format!("HEAD:refs/heads/{HOST}"))
+                .output()
+                .unwrap(),
+            0,
+            &[],
+        );
         store
     }
 

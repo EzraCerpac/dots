@@ -122,27 +122,48 @@ impl LocalSettings {
         recipients: &BTreeSet<String>,
     ) -> Result<(), Fail> {
         let identity = path_text(identity)?;
-        let origin = origin.transport_url();
+        self.set_origin(branch, origin)?;
         let root = self.document.as_table_mut();
         let env = table(root, "env")?;
-        env.insert("SETUP_HISTORY_ORIGIN", value(origin.as_ref()));
         if !env.contains_key("SETUP_AGE_IDENTITY") {
             env.insert("SETUP_AGE_IDENTITY", value(identity));
         }
         let settings = table(root, "settings")?;
         table(settings, "history")?.insert("sync", value("manual"));
-        let mut identities = Array::new();
-        identities.push(identity);
-        table(settings, "age")?.insert("identity_files", value(identities));
-        let history = table(root, "history")?;
-        let remote = table(history, "origin")?;
-        remote.insert("url", value(origin.as_ref()));
-        remote.insert("branch", value(branch));
+        let age = table(settings, "age")?;
+        if !age.contains_key("identity_files") {
+            age.insert("identity_files", value(Array::new()));
+        }
+        let identities = age
+            .get_mut("identity_files")
+            .and_then(Item::as_array_mut)
+            .filter(|files| files.iter().all(|file| file.as_str().is_some()))
+            .ok_or_else(|| {
+                invalid("config.local.toml age identity files must be an array of paths")
+            })?;
+        if !identities
+            .iter()
+            .any(|file| file.as_str() == Some(identity))
+        {
+            identities.push(identity);
+        }
         let mut keys = Array::new();
         for recipient in recipients {
             keys.push(recipient.as_str());
         }
-        table(history, "encryption")?.insert("recipients", value(keys));
+        table(table(root, "history")?, "encryption")?.insert("recipients", value(keys));
+        Ok(())
+    }
+
+    pub fn set_origin(&mut self, branch: &str, origin: &RepoSetting) -> Result<(), Fail> {
+        let origin = origin.transport_url();
+        let root = self.document.as_table_mut();
+        let env = table(root, "env")?;
+        env.insert("SETUP_HISTORY_ORIGIN", value(origin.as_ref()));
+        let history = table(root, "history")?;
+        let remote = table(history, "origin")?;
+        remote.insert("url", value(origin.as_ref()));
+        remote.insert("branch", value(branch));
         Ok(())
     }
 

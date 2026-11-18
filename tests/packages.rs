@@ -125,7 +125,7 @@ fn dots(world: &World) -> FixtureCommand<'_> {
     cmd
 }
 
-fn fixture_child(world: &World, program: &Path) -> FixtureCommand<'_> {
+fn fixture_child<'a>(world: &'a World, program: &Path) -> FixtureCommand<'a> {
     let environment = dots(world);
     let mut child = world.command(program);
     child

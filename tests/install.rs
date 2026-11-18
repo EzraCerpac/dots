@@ -241,11 +241,11 @@ printf '%s\n' "${COMPREPLY[@]}"
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     for candidate in ["remove", "reports"] {
         assert!(stdout.lines().any(|line| line == candidate), "{stdout}");
     }
-    assert!(output.stderr.is_empty(), "{output:?}");
     assert_absent(&world.home().join(".local/state/dots"));
     for link in links {
         assert_absent(link.parent().unwrap());

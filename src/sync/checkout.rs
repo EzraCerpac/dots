@@ -2,13 +2,9 @@ use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirEntry, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Stdio};
-use std::time::Duration;
 
 use nix::libc;
 use serde::{Deserialize, Serialize};
@@ -453,117 +449,6 @@ fn replace_index(staged: &Path, directory: &Path) -> io::Result<()> {
     fs::rename(next, directory.join("index"))
 }
 
-/// Git locks both the symbolic HEAD and its referent during a prepared
-/// transaction. EOF releases both without updating them if sync stops.
-struct RefTransaction {
-    child: Child,
-    input: Option<ChildStdin>,
-    output: ChildStdout,
-}
-
-impl RefTransaction {
-    fn prepare(
-        git: &Git<'_>,
-        head: &str,
-        desired: &str,
-        cancelled: &impl Fn() -> bool,
-    ) -> io::Result<Self> {
-        let mut child = git
-            .command(["update-ref", "-m", "dots sync", "--stdin"])?
-            .env("LC_ALL", "C")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
-        let input = child.stdin.take();
-        let output = child.stdout.take().expect("requested Git transaction pipe");
-        let mut transaction = Self {
-            child,
-            input,
-            output,
-        };
-        transaction.request("start\n", b"start: ok\n", cancelled)?;
-        let update = if head == desired {
-            format!("verify HEAD {head}^{{commit}}\nprepare\n")
-        } else {
-            format!("update HEAD {desired}^{{commit}} {head}^{{commit}}\nprepare\n")
-        };
-        transaction.request(&update, b"prepare: ok\n", cancelled)?;
-        if git.text(["symbolic-ref", "HEAD"])? != "refs/heads/dev" {
-            return Err(invalid("the checked out branch changed"));
-        }
-        Ok(transaction)
-    }
-
-    fn request(
-        &mut self,
-        request: &str,
-        response: &[u8],
-        cancelled: &impl Fn() -> bool,
-    ) -> io::Result<()> {
-        self.input
-            .as_mut()
-            .expect("Git transaction input remains open")
-            .write_all(request.as_bytes())?;
-        for expected in response {
-            loop {
-                if cancelled() {
-                    return Err(io::ErrorKind::Interrupted.into());
-                }
-                let mut poll = libc::pollfd {
-                    fd: self.output.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: poll describes one live pipe for this call.
-                match unsafe { libc::poll(&mut poll, 1, 100) } {
-                    0 => continue,
-                    -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {
-                        continue;
-                    }
-                    -1 => return Err(io::Error::last_os_error()),
-                    _ => break,
-                }
-            }
-            let mut byte = [0];
-            self.output.read_exact(&mut byte)?;
-            if byte[0] != *expected {
-                return Err(invalid("unexpected Git transaction response"));
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RefTransaction {
-    fn drop(&mut self) {
-        drop(self.input.take());
-        let wait = |child: &mut Child| {
-            for _ in 0..20 {
-                if !matches!(child.try_wait(), Ok(None)) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            false
-        };
-        if wait(&mut self.child) {
-            return;
-        }
-        // Only this invocation's process group is targeted. Give Git time
-        // to clean its own ref locks before bounding a stuck hook.
-        let group = -(self.child.id() as libc::pid_t);
-        // SAFETY: group is the private group created for the child.
-        unsafe { libc::kill(group, libc::SIGTERM) };
-        if !wait(&mut self.child) {
-            // SAFETY: the child is still alive in the same private group.
-            unsafe { libc::kill(group, libc::SIGKILL) };
-            let _ = self.child.wait();
-        }
-    }
-}
-
 fn apply(
     git: &Git<'_>,
     directory: &Path,
@@ -616,15 +501,7 @@ fn apply(
         }
         return Err(invalid("Git index changed while sync was running"));
     }
-    let mut reference = match RefTransaction::prepare(git, &head, &plan.after, &cancelled) {
-        Ok(reference) => reference,
-        Err(error) => {
-            if !pending.join("started").exists() {
-                release_index(directory, pending)?;
-            }
-            return Err(error);
-        }
-    };
+    super::verify_dev(git, &head)?;
     if !pending.join("started").exists() {
         write_synced(pending.join("started"), b"verified index\n")?;
         File::open(pending)?.sync_all()?;
@@ -698,7 +575,29 @@ fn apply(
         }
         File::open(directory)?.sync_all()?;
     }
-    reference.request("commit\n", b"commit: ok\n", &cancelled)?;
+    let update = (|| {
+        super::verify_dev(git, &head)?;
+        if head != plan.after {
+            git.get([
+                "update-ref",
+                "-m",
+                "dots sync",
+                "refs/heads/dev",
+                &plan.after,
+                &head,
+            ])?;
+        }
+        Ok::<(), io::Error>(())
+    })();
+    if let Err(error) = update {
+        if !plan.checkout {
+            replace_index(&pending.join("index.before"), directory)?;
+            File::open(directory)?.sync_all()?;
+            release_index(directory, pending)?;
+            retire_pending(directory, pending, progress)?;
+        }
+        return Err(error);
+    }
     write_synced(pending.join("finished"), b"installed index and dev\n")?;
     File::open(pending)?.sync_all()?;
     release_index(directory, pending)?;
@@ -1200,19 +1099,25 @@ mod tests {
         let after = fixture_commit(&git, "desired");
         let other = fixture_commit(&git, "competing commit");
         git.get(["reset", "--hard", &before]).unwrap();
-        let mut transaction = RefTransaction::prepare(&git, &before, &after, &|| false).unwrap();
-        assert!(
-            git.get(["update-ref", "refs/heads/dev", &other, &before])
-                .is_err()
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, false).unwrap();
+        let installed = apply(
+            &git,
+            &dir,
+            &dir.join(PENDING),
+            &mut Interrupted::default(),
+            || false,
+            |staged, path| {
+                replace_index(staged, path)?;
+                git.get(["update-ref", "refs/heads/dev", &other, &before])?;
+                Ok(())
+            },
         );
-        assert!(
-            git.get(["symbolic-ref", "HEAD", "refs/heads/elsewhere"])
-                .is_err()
-        );
-        transaction
-            .request("commit\n", b"commit: ok\n", &|| false)
-            .unwrap();
-        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+        assert!(installed.is_err());
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), other);
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
+        assert!(!has_pending(&dir));
     }
 
     #[test]

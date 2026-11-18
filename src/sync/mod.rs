@@ -380,7 +380,6 @@ fn synchronize(
         "Could not verify the index against the current dev ref",
         GIT,
     )? {
-        verify_dev(&git, &before).or_note("The dev checkout changed during preflight", GIT)?;
         let old = git
             .tree(&previous)
             .or_note("Could not verify the preceding dev tree", GIT)?;
@@ -416,7 +415,6 @@ fn synchronize(
             installed.paths,
         ));
     }
-    verify_dev(&git, &before).or_note("The dev checkout changed before copy capture", GIT)?;
     copies
         .capture(run, &git, &shared.dir, &before, &base, receipt)
         .or_note(
@@ -425,8 +423,6 @@ fn synchronize(
         )?;
 
     active(run)?;
-    verify_dev(&git, &before)
-        .or_note("The dev checkout changed before taking the snapshot", GIT)?;
     let unscanned = scratch.capture(&before).or_note(
         "Could not snapshot local edits",
         "Check Git identity, repository state and free space; your edits remain on disk.",
@@ -480,8 +476,6 @@ fn synchronize(
     receipt.kept = local_paths.len().saturating_sub(saved_paths.len());
     if approved != before {
         active(run)?;
-        verify_dev(&git, &before)
-            .or_note("The dev checkout changed before saving local edits", GIT)?;
         dense_index(&git)?;
         checkout::begin(&git, &shared.dir, &index, &before, &approved, false).or_note(
             "Could not prepare the local index update; edits remain on disk",
@@ -677,7 +671,6 @@ fn synchronize(
 
             active(run)?;
             if merged != approved {
-                dense_index(&git)?;
                 checkout::begin(&git, &shared.dir, &index, &approved, &merged, true)
                     .or_note("Could not prepare guarded checkout", GIT)?;
                 let installed = finish_pending(run, &git, &shared.dir, receipt)?

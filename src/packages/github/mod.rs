@@ -3,10 +3,12 @@ mod archive;
 mod release;
 
 use glob::Pattern;
-use std::fmt::Write;
+use std::{fmt::Write, path::Path};
 use toml_edit::{Array, InlineTable, Item, Value};
 
-use crate::{Ctx, Fail, run::Run, targets::github_repo as repo_name};
+use crate::{
+    Ctx, Env, Fail, config_commands::installer, run::Run, targets::github_repo as repo_name,
+};
 
 pub use app::{install_release_app, validate_owned_app};
 
@@ -47,9 +49,10 @@ pub fn resolve(
                 "this release contains a macOS app; install it on a Mac",
             ));
         }
-        let exe =
-            std::env::current_exe().map_err(|err| failure(format!("cannot locate dots: {err}")))?;
-        Some(app_hook(&exe, &repo)?)
+        let exe = std::env::current_exe()
+            .and_then(|path| path.canonicalize())
+            .map_err(|err| failure(format!("cannot locate dots: {err}")))?;
+        Some(app_hook(&exe, &ctx.env, &repo)?)
     } else {
         None
     };
@@ -121,24 +124,24 @@ fn tool_options(
     Item::Value(Value::InlineTable(tool))
 }
 
-fn app_hook(exe: &std::path::Path, repo: &str) -> Result<String, Fail> {
-    let command = if let Some(cellar) = exe.ancestors().find(|path| path.ends_with("Cellar/dots")) {
-        let prefix = cellar
-            .parent()
-            .and_then(std::path::Path::parent)
-            .ok_or_else(|| failure("cannot locate the Homebrew prefix for dots"))?;
-        shell_path(&prefix.join("bin/dots"))?
-    } else if exe.ancestors().any(|path| {
-        path.ends_with("installs/github-ezra-cerpac-dots") || path.ends_with("installs/dots")
-    }) {
-        r#""${DOTS_MISE_BIN:-$(command -v mise || printf '%s\n' "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots"#.to_owned()
-    } else {
-        shell_path(exe)?
+fn app_hook(exe: &Path, env: &Env, repo: &str) -> Result<String, Fail> {
+    let command = match installer(exe, env) {
+        "homebrew" => {
+            let prefix = exe
+                .ancestors()
+                .find(|path| path.ends_with("Cellar/dots"))
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .ok_or_else(|| failure("cannot locate the Homebrew prefix for dots"))?;
+            shell_path(&prefix.join("bin/dots"))?
+        }
+        "mise" => r#""${DOTS_MISE_BIN:-$(command -v mise || printf '%s\n' "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots"#.to_owned(),
+        _ => shell_path(exe)?,
     };
     Ok(format!("{command} install-release-app {repo}"))
 }
 
-fn shell_path(path: &std::path::Path) -> Result<String, Fail> {
+fn shell_path(path: &Path) -> Result<String, Fail> {
     let path = path.to_str().ok_or_else(|| {
         failure("the dots executable path must be UTF-8 to record a release app hook")
     })?;
@@ -157,7 +160,6 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
-        path::Path,
         process::Command,
     };
 
@@ -181,17 +183,21 @@ mod tests {
     #[test]
     fn generates_stable_paths_for_each_installation_kind() {
         let repo = "owner/tool";
+        let env = Env {
+            vars: Default::default(),
+            cwd: "/".into(),
+        };
         for (exe, command) in [
             ("/work/dots/bin/dots", "'/work/dots/bin/dots'"),
             ("/opt/a'b c/dots", "'/opt/a'\\''b c/dots'"),
             ("/brew/Cellar/dots/1.0/bin/dots", "'/brew/bin/dots'"),
             (
-                "/mise/installs/github-ezra-cerpac-dots/1.0/dots",
+                "/mise/installs/github-ezracerpac-dots/1.0/bin/dots",
                 r#""${DOTS_MISE_BIN:-$(command -v mise || printf '%s\n' "$HOME/.local/bin/mise")}" x github:EzraCerpac/dots -- dots"#,
             ),
         ] {
             assert_eq!(
-                app_hook(Path::new(exe), repo).unwrap(),
+                app_hook(Path::new(exe), &env, repo).unwrap(),
                 format!("{command} install-release-app {repo}")
             );
         }
@@ -207,8 +213,12 @@ mod tests {
         fs::write(&exe, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&exe, fixture.path().join("bin/dots")).unwrap();
+        let env = Env {
+            vars: Default::default(),
+            cwd: fixture.path().to_owned(),
+        };
         let result = Command::new("/bin/sh")
-            .args(["-c", &app_hook(&exe, "owner/tool").unwrap()])
+            .args(["-c", &app_hook(&exe, &env, "owner/tool").unwrap()])
             .env_clear()
             .env("PATH", "")
             .output()

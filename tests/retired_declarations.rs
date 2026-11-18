@@ -62,6 +62,11 @@ impl Retirement {
             let executable = executable_on_path(&world.dots(), program).unwrap_or_else(|| {
                 panic!("{program} must be installed on PATH for the retirement fixture")
             });
+            let executable = if *program == "mise" {
+                world.native_mise_adapter(&executable)
+            } else {
+                executable
+            };
             symlink(executable, bin.join(program)).unwrap();
         }
         fs::write(bin.join("gitleaks"), CLEAN_SCAN).unwrap();
@@ -245,17 +250,17 @@ fn assert_retired(local: &str, expected: &str, rows: &str) {
     fixture.assert_deployed();
     assert!(!fixture.root.join(SOURCE).exists());
     // The backup path is printed; its naming and location are internal.
-    let backup = output
+    let saved = output
         .split_whitespace()
         .map(|word| word.trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')')))
         .map(|word| fixture.root.join(word))
         .filter(|path| path != &fixture.root.join("config.local.toml"))
         .filter_map(|path| fixture_file(fixture.root.parent().unwrap(), &path))
-        .find(|path| fs::read_to_string(path).is_ok_and(|bytes| bytes == local))
-        .unwrap_or_else(|| panic!("missing printed backup of the original local file: {output}"));
-    assert_eq!(
-        fs::metadata(backup).unwrap().permissions().mode() & 0o777,
-        0o600
+        .filter(|entry| entry.file.metadata().unwrap().permissions().mode() & 0o777 == 0o600)
+        .any(|entry| std::io::read_to_string(entry.file).is_ok_and(|bytes| bytes == local));
+    assert!(
+        saved,
+        "missing printed private backup of the original local file: {output}"
     );
 }
 

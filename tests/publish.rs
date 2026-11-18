@@ -48,6 +48,11 @@ impl Publication {
             "bash", "cat", "dirname", "mise", "node", "python3", "readlink",
         ] {
             if let Some(tool) = executable_on_path(&world.dots(), name) {
+                let tool = if name == "mise" {
+                    world.native_mise_adapter(&tool)
+                } else {
+                    tool
+                };
                 symlink(tool, tools.join(name)).unwrap();
             }
         }
@@ -297,22 +302,45 @@ esac
     printf '%s\n' '8.30.1'
     exit 0
 fi
+cwd=$(pwd -P)
+for operand do :; done
+case "$operand" in
+    /*) source=$operand ;;
+    *) source="$cwd/$operand" ;;
+esac
+case "$source" in "$PUBLISH_AREA"/*) ;; *) exit 88 ;; esac
+case "$source/" in */../*) exit 88 ;; esac
+[ ! -L "$source" ]
+printf '%s\t%s\t%s\n' "$1" "$cwd" "$operand" >> "$PUBLISH_LOG/scan-location"
 case "$1" in
     git)
+        [ "$cwd" = "$PUBLISH_WORKSPACE" ]
+        source=$(cd "$source" && pwd -P)
+        [ "$source" = "$cwd" ]
         range=
         for arg do
             case "$arg" in --log-opts=*) range=${arg##* } ;; esac
         done
         case "$range" in *[!a-f0-9.]*|'') exit 88 ;; esac
-        "$PUBLISH_GIT" -C "$PUBLISH_WORKSPACE" log --format= --name-only "$range" -- >> "$PUBLISH_LOG/scan-input"
+        "$PUBLISH_GIT" -C "$source" log --format= --name-only "$range" -- >> "$PUBLISH_LOG/scan-input"
         ;;
     dir)
-        case "$(pwd -P)" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
-        for path in public-*.txt synthetic-token.txt payload.zip opaque.bin binary.dat; do
-            if [ -f "$path" ] && [ ! -L "$path" ]; then
-                printf '%s\n' "$path" >> "$PUBLISH_LOG/scan-input"
-            fi
-        done
+        case "$cwd" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
+        if [ -d "$source" ]; then
+            source=$(cd "$source" && pwd -P)
+            case "$source" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
+            for path in "$source"/public-*.txt "$source"/synthetic-token.txt "$source"/payload.zip "$source"/opaque.bin "$source"/binary.dat "$source"/*.pdf "$source"/collision.txt; do
+                if [ -f "$path" ] && [ ! -L "$path" ]; then
+                    printf '%s\n' "${path##*/}" >> "$PUBLISH_LOG/scan-input"
+                fi
+            done
+        elif [ -f "$source" ]; then
+            parent=$(cd "${source%/*}" && pwd -P)
+            case "$parent" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
+            printf '%s\n' "${source##*/}" >> "$PUBLISH_LOG/scan-input"
+        else
+            exit 88
+        fi
         ;;
     *) exit 88 ;;
 esac
@@ -524,6 +552,10 @@ exit "$status"
                     .nth(1)
             })
             .expect("PR creation must name its published head");
+        assert!(
+            head.starts_with("wip/"),
+            "not a private publication bookmark: {head}"
+        );
         if revision != "@" {
             assert_eq!(head, revision);
         }
@@ -823,8 +855,17 @@ fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
         .into_iter()
         .filter(|path| !before.contains(path))
     {
-        let path = fixture_file(&state, &path).expect("private regular fixture report");
-        let report: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let report_file = fixture_file(fixture.world.root().parent().unwrap(), &path)
+            .expect("regular fixture report");
+        assert_eq!(
+            report_file.parent.metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(
+            report_file.file.metadata().unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let report: serde_json::Value = serde_json::from_reader(report_file.file).unwrap();
         if report["command"] == "publish" {
             publish_reports.push(report);
         }
@@ -880,12 +921,17 @@ fn token_history() -> Publication {
 #[ignore = "P-10"]
 fn new_publish_never_previews_the_rejected_secret() {
     let token = synthetic_token();
-    for (fixture, bookmark) in [
-        (token_history(), "wip/token"),
-        (merge_resolution(), "wip/merge"),
-    ] {
-        let transcript = fixture.reject_secret(bookmark, true);
-        assert!(!transcript.contains(&token));
+    for terminal in [false, true] {
+        for (fixture, bookmark) in [
+            (token_history(), "wip/token"),
+            (merge_resolution(), "wip/merge"),
+        ] {
+            let transcript = fixture.reject_secret(bookmark, terminal);
+            assert!(!transcript.contains(&token));
+            assert!(!transcript.contains("Proposed changes"));
+            assert!(!transcript.contains("Final pull request diff"));
+            assert!(!transcript.contains("[y/N]"));
+        }
     }
 }
 

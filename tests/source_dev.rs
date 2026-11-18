@@ -8,7 +8,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use isolation::{IsolatedWorld, executable_on_path, fixture_file};
+use isolation::{FixtureFile, IsolatedWorld, executable_on_path, fixture_editor, fixture_file};
 use nix::libc;
 use support::FixtureCommand;
 
@@ -70,6 +70,81 @@ fn absent(text: &str, unwanted: &str) {
     assert!(!text.contains(unwanted), "found {unwanted:?} in {text}");
 }
 
+#[test]
+fn native_mise_adapter_is_private_after_nested_environment_reset() {
+    let world = IsolatedWorld::new();
+    let fixture = world.root().parent().unwrap();
+    let nested = fixture.join("native-call");
+    fs::create_dir(&nested).unwrap();
+    let native = fixture.join("observe-native-env");
+    script(&native, "exec /usr/bin/env");
+    let adapter = world.native_mise_adapter(&native);
+    let reset = fixture.join("reset-native-env");
+    let command = world.tool(&reset);
+    let mise_keys = command
+        .get_envs()
+        .filter_map(|(key, _)| key.to_str())
+        .filter(|key| key.starts_with("MISE_") || key.starts_with("__MISE_"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    script(
+        &reset,
+        &format!(
+            r#"unset {mise_keys}
+export HOME={home}
+export MISE_CONFIG_DIR="$HOME" MISE_SYSTEM_CONFIG_DIR="$HOME/system"
+export MISE_DATA_DIR="$HOME/data" MISE_STATE_DIR="$HOME/state" MISE_CACHE_DIR="$HOME/cache"
+if [ "$1" = override ]; then
+    export MISE_SYSTEM_DATA_DIR="$HOME/override-system-data"
+    export MISE_SYSTEM_PLUGINS_DIRS="$HOME/override-plugins"
+fi
+exec {adapter}"#,
+            home = sh(&nested),
+            adapter = sh(&adapter),
+        ),
+    );
+    for variant in ["fallback", "override"] {
+        let output = finish(world.tool(&reset).arg(variant));
+        assert!(output.status.success(), "{output:?}");
+        let values: std::collections::BTreeMap<_, _> = stdout(&output)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        let system_data = if variant == "fallback" {
+            fixture.join("mise-system/data")
+        } else {
+            nested.join("override-system-data")
+        };
+        let plugins = if variant == "fallback" {
+            system_data.join("plugins")
+        } else {
+            nested.join("override-plugins")
+        };
+        for (key, expected) in [
+            ("HOME", nested.clone()),
+            ("MISE_CONFIG_DIR", nested.clone()),
+            ("MISE_SYSTEM_CONFIG_DIR", nested.join("system")),
+            ("MISE_SYSTEM_CONFIG_FILE", nested.join("system/config.toml")),
+            ("MISE_DATA_DIR", nested.join("data")),
+            ("MISE_STATE_DIR", nested.join("state")),
+            ("MISE_CACHE_DIR", nested.join("cache")),
+            ("MISE_INSTALLS_DIR", nested.join("data/installs")),
+            ("MISE_SYSTEM_DATA_DIR", system_data.clone()),
+            ("MISE_SYSTEM_INSTALLS_DIR", system_data.join("installs")),
+            ("MISE_SYSTEM_SHIMS_DIR", system_data.join("shims")),
+            ("MISE_SYSTEM_PLUGINS_DIRS", plugins),
+        ] {
+            assert_eq!(
+                values.get(key).copied(),
+                expected.to_str(),
+                "{key} ({variant})"
+            );
+        }
+        assert_eq!(values.get("MISE_OFFLINE"), Some(&"1"));
+        assert_eq!(values.get("MISE_AUTO_INSTALL"), Some(&"0"));
+    }
+}
+
 struct Repo {
     world: IsolatedWorld,
     scratch: PathBuf,
@@ -100,7 +175,8 @@ impl Repo {
                 symlink(binary, tools.join(tool)).unwrap();
             }
         }
-        let mise_real = executable_on_path(&world.git(), "mise");
+        let mise_real = executable_on_path(&world.git(), "mise")
+            .map(|native| world.native_mise_adapter(&native));
         let gitleaks_real = executable_on_path(&world.git(), "gitleaks");
         let dots = world.dots();
         let mut prefix = [0; 2];
@@ -1076,12 +1152,14 @@ fn failed_history_save(f: &Repo, output: Option<&Path>, diagnostic: &str) -> [St
     assert_eq!(f.tip(&f.a), before);
     let reports = [receipt, f.replay(&f.a)];
     for text in &reports {
-        has(text, "history");
-        has(text, "save");
         let lower = text.to_ascii_lowercase();
         assert!(
-            lower.contains("failed") || lower.contains("could not"),
-            "{text}"
+            lower.lines().any(|line| {
+                (line.contains("history") || line.contains("encrypted settings checkpoint"))
+                    && line.contains("save")
+                    && (line.contains("failed") || line.contains("could not"))
+            }),
+            "missing a clear save failure reason: {text}"
         );
         absent(&lower, "dots backup");
         assert!(
@@ -1673,15 +1751,9 @@ fn wrong_checkout(shape: &str, diagnostic: &str) {
         "jj" => fs::create_dir(f.a.join(".jj")).unwrap(),
         "legacy" => f.write(&f.a, ".git/dots-dev.json", "{}"),
         "wrong origin" => {
-            f.git(
-                &f.a,
-                &[
-                    "remote",
-                    "set-url",
-                    "origin",
-                    "file:///unavailable/fixture-origin",
-                ],
-            );
+            let mismatched = f.world.bare_remote("mismatched-origin.git");
+            let url = format!("file://{}", mismatched.display());
+            f.git(&f.a, &["remote", "set-url", "origin", &url]);
         }
         _ => unreachable!(),
     }
@@ -1957,7 +2029,7 @@ fn setup_retirement(f: &Repo, listed: bool, local_file: &str, local: &str) -> St
 fn retirement_backup(root: &Path, receipt: &str, local_path: &str, expected: &str) {
     // The filename and storage scheme are internal. Resolve candidates from
     // the receipt text and accept the existing path with the saved bytes.
-    let backup = receipt
+    let saved = receipt
         .split_whitespace()
         .filter(|part| part.contains(local_path))
         .map(|part| {
@@ -1965,13 +2037,14 @@ fn retirement_backup(root: &Path, receipt: &str, local_path: &str, expected: &st
                 .trim_end_matches('.')
         })
         .map(|part| root.join(part))
+        .filter(|path| path != &root.join(local_path))
         .filter_map(|path| fixture_file(root.parent().unwrap(), &path))
-        .find(|path| {
-            path != &root.join(local_path)
-                && fs::read_to_string(path).is_ok_and(|data| data == expected)
-        })
-        .unwrap_or_else(|| panic!("receipt did not name the retirement backup: {receipt}"));
-    assert_eq!(mode(&backup), 0o600);
+        .filter(|entry| entry.file.metadata().unwrap().mode() & 0o777 == 0o600)
+        .any(|entry| std::io::read_to_string(entry.file).is_ok_and(|data| data == expected));
+    assert!(
+        saved,
+        "receipt did not name the private retirement backup: {receipt}"
+    );
 }
 
 sync_case!(
@@ -2378,7 +2451,10 @@ copies_case!(
     }
 );
 
-fn recovery_paths<'a>(base: &'a Path, receipt: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
+fn recovery_files<'a>(
+    base: &'a Path,
+    receipt: &'a str,
+) -> impl Iterator<Item = (PathBuf, FixtureFile)> + 'a {
     receipt
         .lines()
         .flat_map(str::split_whitespace)
@@ -2387,15 +2463,17 @@ fn recovery_paths<'a>(base: &'a Path, receipt: &'a str) -> impl Iterator<Item = 
                 .trim_end_matches('.')
         })
         .map(PathBuf::from)
-        .filter_map(|path| fixture_file(base, &path))
+        .filter_map(|path| fixture_file(base, &path).map(|entry| (path, entry)))
 }
 
-fn recovery_path(base: &Path, receipt: &str, expected: &str) -> PathBuf {
-    recovery_paths(base, receipt)
-        .find(|path| fs::read_to_string(path).is_ok_and(|data| data == expected))
-        .unwrap_or_else(|| {
-            panic!("sync did not print a recovery path containing expected bytes: {receipt}")
-        })
+fn assert_recovery_copy(base: &Path, receipt: &str, expected: &str) {
+    let saved = recovery_files(base, receipt)
+        .filter(|(_, entry)| entry.parent.metadata().unwrap().mode() & 0o777 == 0o700)
+        .any(|(_, entry)| std::io::read_to_string(entry.file).is_ok_and(|data| data == expected));
+    assert!(
+        saved,
+        "sync did not print a private recovery copy with the expected bytes: {receipt}"
+    );
 }
 
 copies_case!(
@@ -2407,12 +2485,14 @@ copies_case!(
         b.sync();
         let target = a.home.join(".copied");
         let identity = |metadata: fs::Metadata| (metadata.dev(), metadata.ino());
-        let original = identity(fs::symlink_metadata(&target).unwrap());
-        let mut previous = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&target)
-            .unwrap();
+        let original = identity(
+            fixture_file(&f.scratch, &target)
+                .unwrap()
+                .file
+                .metadata()
+                .unwrap(),
+        );
+        let mut previous = fixture_editor(&f.scratch, &target).unwrap().file;
         let opened = identity(previous.metadata().unwrap());
         assert_eq!(
             opened, original,
@@ -2421,14 +2501,21 @@ copies_case!(
         let receipt = a.sync();
         let replay = a.replay();
         let after_sync = identity(previous.metadata().unwrap());
-        let new_target = identity(fs::symlink_metadata(&target).unwrap());
+        let new_file = fixture_file(&f.scratch, &target).unwrap().file;
+        let new_target = identity(new_file.metadata().unwrap());
         // Checkout backups can have the same bytes as the deployed file.
         // The path for an editor's old descriptor must name the same inode.
         let candidates: Vec<_> = [("live", &receipt), ("replay", &replay)]
             .into_iter()
             .flat_map(|(source, text)| {
-                recovery_paths(&f.scratch, text)
-                    .map(move |path| (source, identity(fs::symlink_metadata(&path).unwrap()), path))
+                recovery_files(&f.scratch, text).map(move |(path, entry)| {
+                    (
+                        source,
+                        identity(entry.file.metadata().unwrap()),
+                        path,
+                        entry,
+                    )
+                })
             })
             .collect();
         let evidence = format!(
@@ -2438,12 +2525,16 @@ copies_case!(
         );
         assert_eq!(after_sync, opened, "{evidence}");
         assert_ne!(new_target, opened, "{evidence}");
-        let (_, _, recovered) = candidates
-            .iter()
-            .find(|(_, file, _)| *file == opened)
+        let (_, _, _, mut recovered) = candidates
+            .into_iter()
+            .find(|(_, file, _, _)| *file == opened)
             .unwrap_or_else(|| panic!("no printed recovery path names the open inode: {evidence}"));
-        assert_eq!(mode(recovered.parent().unwrap()), 0o700);
-        assert_eq!(read(recovered), "initial\n", "{evidence}");
+        assert_eq!(recovered.parent.metadata().unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::io::read_to_string(&mut recovered.file).unwrap(),
+            "initial\n",
+            "{evidence}"
+        );
         previous.set_len(0).unwrap();
         previous.seek(SeekFrom::Start(0)).unwrap();
         previous
@@ -2451,16 +2542,21 @@ copies_case!(
             .unwrap();
         assert_eq!(identity(previous.metadata().unwrap()), opened, "{evidence}");
         assert_eq!(
-            identity(fs::symlink_metadata(recovered).unwrap()),
+            identity(recovered.file.metadata().unwrap()),
             opened,
             "{evidence}"
         );
+        recovered.file.rewind().unwrap();
         assert_eq!(
-            read(recovered),
+            std::io::read_to_string(recovered.file).unwrap(),
             "save through old descriptor\n",
             "{evidence}"
         );
-        assert_eq!(read(&target), "incoming version\n", "{evidence}");
+        assert_eq!(
+            std::io::read_to_string(new_file).unwrap(),
+            "incoming version\n",
+            "{evidence}"
+        );
     }
 );
 
@@ -2558,12 +2654,24 @@ copies_case!(
         a.source("pending.txt", "initial\n");
         a.source("kept.txt", "initial\n");
         a.sync();
-        let pre = "for file in copy.txt pending.txt kept.txt; do echo 'generated by pre-hook' > \"$file\"; done; sed 's/permissions = \"0644\"/permissions = \"0600\"/' config.toml > new.toml && mv new.toml config.toml";
+        let pre = r#"pwd -P > "$HOME/hook-cwd"
+printf '%s\n' "$DOTS_ROOT" > "$HOME/hook-root"
+git rev-parse --git-path index > "$HOME/hook-index"
+git ls-files --error-unmatch -- copy.txt > "$HOME/hook-tracked" || exit 1
+for file in copy.txt pending.txt kept.txt; do echo 'generated by pre-hook' > "$file"; done
+sed 's/permissions = "0644"/permissions = "0600"/' config.toml > new.toml && mv new.toml config.toml"#;
         let post =
             "cat \"$HOME/.copied\" \"$HOME/.pending-copy\" \"$HOME/.kept-copy\" > \"$HOME/post\"";
         a.source("config.toml", hooks(&config, pre, post));
         a.source("pending.txt", "planned before hook\n");
         a.sync();
+        assert_eq!(Path::new(read(&a.home.join("hook-cwd")).trim()), a.root);
+        assert_eq!(Path::new(read(&a.home.join("hook-root")).trim()), a.root);
+        assert_eq!(
+            a.root.join(read(&a.home.join("hook-index")).trim()),
+            f.git_dir(a.root).join("index")
+        );
+        assert_eq!(read(&a.home.join("hook-tracked")), "copy.txt\n");
         assert_eq!(
             read(&a.home.join("post")),
             "generated by pre-hook\ngenerated by pre-hook\ninitial\n"
@@ -2612,8 +2720,17 @@ copies_case!(
         );
         a.deploy();
         a.source("template.tera", "{{ 'sync update' }}\n");
-        a.sync();
-        assert_eq!(read(&a.home.join("post")), "sync update\nsync update\n");
+        let receipt = a.sync();
+        let handoffs = [
+            read(&a.home.join(".rendered")),
+            read(&a.home.join(".dependent")),
+            read(&a.home.join(".consumer")),
+        ];
+        assert_eq!(
+            read(&a.home.join("post")),
+            "sync update\nsync update\n",
+            "rendered, dependent, consumer: {handoffs:?}\n{receipt}"
+        );
         a.target(".dependent", "local edit\n");
         a.source("template.tera", "{{ 'next template' }}\n");
         let receipt = a.sync();
@@ -2912,7 +3029,7 @@ copies_case!(
         a.source("template.tera", "{{ 'sync template' }}\n");
         a.target("events", "");
         let receipt = a.sync();
-        recovery_path(
+        assert_recovery_copy(
             &f.scratch,
             &format!("{receipt}{}", a.replay()),
             "native copy\n",
@@ -2961,24 +3078,86 @@ copies_case!(
     unchanged_dirty_copy_survives_incoming_source_and_retry,
     false,
     |f, a, b, _config| {
-        a.target(".copied", "my dirty copy\n");
-        b.source("copy.txt", "incoming edit\n");
+        const DIRTY: &str = "my dirty copy\n";
+        const INCOMING: &str = "incoming edit\n";
+        let bare_copy = |revision: &str| {
+            let object = format!("{revision}:copy.txt");
+            let output = finish(f.git_command(&f.origin).args(["cat-file", "blob", &object]));
+            assert!(output.status.success(), "{object}: {output:?}");
+            output.stdout
+        };
+        a.target(".copied", DIRTY);
+        b.source("copy.txt", INCOMING);
         b.source("template.tera", "{{ 'incoming template' }}\n");
         b.sync();
+        let published = f.remote();
+        assert_eq!(bare_copy(&published), INCOMING.as_bytes());
+
         let receipt = a.sync();
         has(&receipt, ".copied");
         has(&receipt, "conflict");
-        let history = f.git(&f.origin, &["log", "--format=%H", "dev", "--", "copy.txt"]);
+        let message = receipt.to_ascii_lowercase();
         assert!(
-            history
-                .lines()
-                .any(|commit| f.blob(commit, "copy.txt") == "my dirty copy")
+            message.contains("compare")
+                || message.contains("review")
+                || message.contains("recover"),
+            "missing next action in {receipt}"
         );
+
+        let merged = f.remote();
+        let parents = f.git(&f.origin, &["show", "-s", "--format=%P", &merged]);
+        let parents: Vec<_> = parents.split_whitespace().collect();
+        assert_eq!(
+            parents.len(),
+            2,
+            "{merged} has parents {parents:?}\n{receipt}"
+        );
+        assert!(
+            parents.contains(&published.as_str()),
+            "missing incoming parent: {parents:?}"
+        );
+        let losing = parents.into_iter().find(|oid| *oid != published).unwrap();
+        assert_eq!(bare_copy(losing), DIRTY.as_bytes());
+        assert_eq!(bare_copy(&merged), INCOMING.as_bytes());
+        // Path-limited Git history can omit the losing side of a merge.
+        let ancestry = f.git(&f.origin, &["rev-list", "dev"]);
+        assert!(ancestry.lines().any(|oid| oid == losing), "{receipt}");
+        assert!(ancestry.lines().any(|oid| oid == published), "{receipt}");
+
+        for line in receipt
+            .lines()
+            .filter(|line| line.contains("git show") && line.contains("copy.txt"))
+        {
+            let reported = line
+                .split_whitespace()
+                .filter_map(|word| {
+                    word.trim_matches(['(', ')', '\'', '"', '`', ',', ';'])
+                        .strip_suffix(":copy.txt")
+                })
+                .find(|oid| {
+                    (7..=64).contains(&oid.len())
+                        && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .unwrap_or_else(|| panic!("missing recovery revision in {line}"));
+            let resolved = f.git(
+                &f.origin,
+                &["rev-parse", "--verify", &format!("{reported}^{{commit}}")],
+            );
+            assert_eq!(resolved, losing, "{line}");
+            assert_eq!(bare_copy(&resolved), DIRTY.as_bytes());
+        }
+
+        assert_eq!(read(&f.a.join("copy.txt")), INCOMING);
+        assert_eq!(read(&a.home.join(".copied")), DIRTY);
         f.clean(&f.a);
-        a.sync();
-        assert_eq!(read(&f.a.join("copy.txt")), "incoming edit\n");
-        assert_eq!(read(&a.home.join(".copied")), "my dirty copy\n");
+        let retry = a.sync();
+        absent(&retry.to_ascii_lowercase(), "conflict");
+        assert_eq!(f.remote(), merged, "{retry}");
+        assert_eq!(f.tip(&f.a), merged, "{retry}");
+        assert_eq!(read(&f.a.join("copy.txt")), INCOMING);
+        assert_eq!(read(&a.home.join(".copied")), DIRTY);
         assert_eq!(read(&a.home.join(".rendered")), "incoming template\n");
+        f.clean(&f.a);
     }
 );
 
@@ -3540,7 +3719,27 @@ copies_case!(
         script(
             &wrapper,
             &format!(
-                "case \" $* \" in\n  *' --dry-run '*) ;;\n  *' bootstrap dotfiles apply '*)\n    if [ ! -e {marker} ]; then\n      for argument do\n        case \"$argument\" in '~/.tree/leaf'|{target}|*/copy-handoff-*/output)\n          printf 'competing edit\\n' > {target}; touch {marker}; break ;;\n        esac\n      done\n    fi ;;\nesac\nexec {mise} \"$@\"",
+                r#"case " $* " in
+  *' --dry-run '*) ;;
+  *' bootstrap dotfiles apply '*)
+    if [ ! -e {marker} ]; then
+      for argument do
+        case "$argument" in
+          */dots-dotfile-*/rendered)
+            # The guarded renderer uses this staged destination for every
+            # template. Select only the configuration for the takeover.
+            [ "$PWD" = "${{argument%/rendered}}/config" ] || continue
+            grep -Fq 'takeover.tera' config.toml || continue ;;
+          '~/.tree/leaf'|{target}|*/copy-handoff-*/output) ;;
+          *) continue ;;
+        esac
+        printf 'competing edit\n' > {target}
+        touch {marker}
+        break
+      done
+    fi ;;
+esac
+exec {mise} "$@""#,
                 marker = sh(&marker),
                 target = sh(&target),
                 mise = sh(&a.mise)
@@ -3552,7 +3751,7 @@ copies_case!(
         );
         assert!(
             marker.exists(),
-            "native apply did not reach the competing-writer seam"
+            "native apply did not reach the competing-writer seam: {receipt}"
         );
         has(&receipt, ".tree/leaf");
         has(&receipt, "dependency");

@@ -390,15 +390,19 @@ fn unchanged_replay_lists_renamed_deleted_added_and_binary_paths() {
     // executable sync can't check them out on all platforms (notably macOS);
     // the metadata contract permits a path entry without exact Git quoting.
     let output = f.sync();
-    present(
-        &output,
-        &["binary-path", "deleted-path", "added-path", "new name"],
-    );
     let replay = f.last();
-    present(
-        &replay,
-        &["binary-path", "deleted-path", "added-path", "new name"],
-    );
+    for metadata in [&output, &replay] {
+        present(metadata, &["binary-path", "deleted-path", "added-path"]);
+        assert!(
+            metadata.lines().any(|line| {
+                line.contains("new name")
+                    && (line.contains(r"odd\tfile\nname")
+                        || line.contains(r"odd\u0009file\u000aname"))
+            }),
+            "missing escaped old and new names on the rename line: {metadata}"
+        );
+        excluded(metadata, &[old_name]);
+    }
     assert_eq!(f.git(&f.root, &["rev-parse", "HEAD"]), incoming);
     excluded(&replay, &[old_name, "remove me", "rename me", "diff --git"]);
 }
@@ -769,12 +773,17 @@ fn unchanged_replay_omits_unsafe_patch_bodies() {
     f.write(&f.publisher, "escape-byte", b"escape \x1b[31m payload\n");
     f.write(&f.publisher, "bidi-byte", "bidi \u{202e} payload\n");
     f.write(&f.publisher, "invalid-utf8", [0xff, b'\n']);
-    f.write(&f.publisher, "odd\nname", "unsafe filename fixture\n");
+    let unsafe_name = "00-odd\nname";
+    f.write(&f.publisher, unsafe_name, "unsafe filename fixture\n");
     f.publish();
     f.sync();
 
     let capture = f.prepare_pager();
     let replay = f.replay_to_pager(&capture);
+    assert!(
+        replay.contains(r"00-odd\nname") || replay.contains(r"00-odd\u000aname"),
+        "{replay}"
+    );
     present(
         &replay,
         &[
@@ -796,6 +805,7 @@ fn unchanged_replay_omits_unsafe_patch_bodies() {
             "age-encryption.org/v1",
             "payload",
             "unsafe filename fixture",
+            unsafe_name,
             "encrypted fixture placeholder",
         ],
     );

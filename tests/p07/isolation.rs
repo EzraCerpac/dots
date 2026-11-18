@@ -1,26 +1,69 @@
 //! Additional private paths for P-07's real mise, Git and JJ subprocesses.
 
 use crate::support::{FixtureCommand, World};
+use nix::libc;
 use std::env;
-use std::ffi::OsStr;
-use std::fs;
+use std::ffi::{CString, OsStr};
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[allow(dead_code)] // Only suites reading reported recovery paths need this.
-pub fn fixture_file(base: &Path, candidate: &Path) -> Option<PathBuf> {
+#[derive(Debug)]
+pub struct FixtureFile {
+    pub file: File,
+    pub parent: File,
+}
+
+#[allow(dead_code)]
+pub fn fixture_file(base: &Path, candidate: &Path) -> Option<FixtureFile> {
+    open_fixture_file(base, candidate, libc::O_RDONLY)
+}
+
+#[allow(dead_code)]
+pub fn fixture_editor(base: &Path, candidate: &Path) -> Option<FixtureFile> {
+    open_fixture_file(base, candidate, libc::O_RDWR)
+}
+
+fn open_fixture_file(base: &Path, candidate: &Path, access: libc::c_int) -> Option<FixtureFile> {
+    const DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
+    const NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let relative = candidate.strip_prefix(base).ok()?;
-    let mut path = base.to_path_buf();
+    let mut dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(DIRECTORY | NO_FOLLOW)
+        .open(base)
+        .ok()?;
+    let owner = dir.metadata().ok()?.uid();
     let mut entries = relative.components().peekable();
     while let Some(Component::Normal(name)) = entries.next() {
-        path.push(name);
-        let kind = fs::symlink_metadata(&path).ok()?.file_type();
-        if entries.peek().is_none() {
-            return kind.is_file().then_some(path);
-        }
-        if !kind.is_dir() {
+        let final_component = entries.peek().is_none();
+        let flags = if final_component {
+            access | libc::O_NONBLOCK
+        } else {
+            DIRECTORY
+        };
+        let name = CString::new(name.as_bytes()).ok()?;
+        // Each component is opened beneath its already-open directory, so a
+        // symlink replacement cannot redirect a subsequent open or read.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | NO_FOLLOW) };
+        if fd < 0 {
             return None;
         }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata().ok()?;
+        if metadata.uid() != owner {
+            return None;
+        }
+        if final_component {
+            return metadata
+                .is_file()
+                .then_some(FixtureFile { file, parent: dir });
+        }
+        dir = file;
     }
     None
 }
@@ -80,6 +123,52 @@ impl IsolatedWorld {
         let mut command = self.world.command(program);
         self.apply_private_paths(&mut command);
         command
+    }
+
+    #[allow(dead_code)] // The receipt suite supplies a mise double.
+    pub fn native_mise_adapter(&self, executable: &Path) -> PathBuf {
+        let adapter = self.private.join("native-mise");
+        let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        let base = quote(self.root().parent().unwrap());
+        let executable = quote(executable);
+        fs::write(
+            &adapter,
+            format!(
+                r#"#!/bin/sh
+set -eu
+fixture={base}
+case "$HOME" in "$fixture"/*) ;; *) exit 88 ;; esac
+
+# The packaged oracle clears MISE_* for nested materialization. Retain its
+# private per-call config, data and state, and fill only absent paths.
+export MISE_CONFIG_DIR="${{MISE_CONFIG_DIR:-$HOME/.config/mise}}"
+export MISE_DATA_DIR="${{MISE_DATA_DIR:-$HOME/.local/share/mise}}"
+export MISE_STATE_DIR="${{MISE_STATE_DIR:-$HOME/.local/state/mise}}"
+export MISE_CACHE_DIR="${{MISE_CACHE_DIR:-$HOME/.cache/mise}}"
+export MISE_TMP_DIR="${{MISE_TMP_DIR:-$fixture/tmp}}"
+export MISE_INSTALLS_DIR="${{MISE_INSTALLS_DIR:-$MISE_DATA_DIR/installs}}"
+export MISE_INSTALL_STORE_DIR="${{MISE_INSTALL_STORE_DIR:-$MISE_DATA_DIR/store}}"
+export MISE_DOWNLOADS_DIR="${{MISE_DOWNLOADS_DIR:-$MISE_DATA_DIR/downloads}}"
+export MISE_PLUGINS_DIR="${{MISE_PLUGINS_DIR:-$MISE_DATA_DIR/plugins}}"
+export MISE_SHIMS_DIR="${{MISE_SHIMS_DIR:-$MISE_DATA_DIR/shims}}"
+export MISE_SHARED_INSTALL_DIRS="${{MISE_SHARED_INSTALL_DIRS:-$fixture/mise-shared-installs}}"
+export MISE_SYSTEM_DIR="${{MISE_SYSTEM_DIR:-$fixture/mise-system}}"
+export MISE_SYSTEM_CONFIG_DIR="${{MISE_SYSTEM_CONFIG_DIR:-$MISE_SYSTEM_DIR/config}}"
+export MISE_SYSTEM_CONFIG_FILE="${{MISE_SYSTEM_CONFIG_FILE:-$MISE_SYSTEM_CONFIG_DIR/config.toml}}"
+export MISE_SYSTEM_DATA_DIR="${{MISE_SYSTEM_DATA_DIR:-$MISE_SYSTEM_DIR/data}}"
+export MISE_SYSTEM_INSTALLS_DIR="${{MISE_SYSTEM_INSTALLS_DIR:-$MISE_SYSTEM_DATA_DIR/installs}}"
+export MISE_SYSTEM_SHIMS_DIR="${{MISE_SYSTEM_SHIMS_DIR:-$MISE_SYSTEM_DATA_DIR/shims}}"
+export MISE_SYSTEM_PLUGINS_DIRS="${{MISE_SYSTEM_PLUGINS_DIRS:-$MISE_SYSTEM_DATA_DIR/plugins}}"
+export MISE_CEILING_PATHS="${{MISE_CEILING_PATHS:-$fixture}}"
+export MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0
+export MISE_NOT_FOUND_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0
+exec {executable} "$@"
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        adapter
     }
 
     pub fn bare_remote(&self, name: &str) -> PathBuf {

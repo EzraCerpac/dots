@@ -11,7 +11,7 @@ use nix::libc;
 /// inode while another participant still holds the original one.
 #[derive(Debug)]
 pub struct RepoLock {
-    _file: File,
+    file: File,
 }
 
 const NAME: &str = "dots-source-rust.lock";
@@ -31,7 +31,7 @@ impl RepoLock {
         validate(&file)?;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Some(Self { _file: file })),
+                Ok(()) => return Ok(Some(Self { file })),
                 Err(TryLockError::WouldBlock) => return Ok(None),
                 Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(TryLockError::Error(error)) => return Err(error),
@@ -53,11 +53,29 @@ impl RepoLock {
         validate(&file)?;
         loop {
             match file.try_lock_shared() {
-                Ok(()) => return Ok(false),
+                Ok(()) => return unlock(&file).map(|()| false),
                 Err(TryLockError::WouldBlock) => return Ok(true),
                 Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(TryLockError::Error(error)) => return Err(error),
             }
+        }
+    }
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        // A child created by another thread can briefly inherit this open
+        // file description before exec closes its duplicate descriptor.
+        // Explicit unlock releases it without waiting for that child.
+        let _ = unlock(&self.file);
+    }
+}
+
+fn unlock(file: &File) -> io::Result<()> {
+    loop {
+        match file.unlock() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
         }
     }
 }
@@ -96,9 +114,11 @@ mod tests {
         assert!(RepoLock::try_acquire(dir.path()).unwrap().is_none());
         assert!(RepoLock::is_held(dir.path()).unwrap());
 
+        let inherited = guard.file.try_clone().unwrap();
         drop(guard);
         assert!(!RepoLock::is_held(dir.path()).unwrap());
         let _guard = RepoLock::try_acquire(dir.path()).unwrap().unwrap();
+        drop(inherited);
         assert_eq!(fs::metadata(path).unwrap().ino(), original.ino());
     }
 

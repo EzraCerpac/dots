@@ -34,11 +34,31 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.command_for(args, false)
+    }
+
+    pub(crate) fn command_active<I, S>(&self, args: I) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command_for(args, true)
+    }
+
+    fn command_for<I, S>(&self, args: I, active: bool) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<S> = args.into_iter().collect();
         let mut command = self.raw_command()?;
+        if active {
+            command.env("MISE_ENV", self.selected.active_environments());
+        }
         #[cfg(target_os = "macos")]
         if matches!(args.as_slice(), [command, sub, ..] if command.as_ref() == "bootstrap"
-            && matches!(sub.as_ref().to_str(), Some("status" | "packages")))
+            && (matches!(sub.as_ref().to_str(), Some("status" | "packages"))
+                || active && sub.as_ref() == "plan"))
         {
             self.expose_ruby(&mut command)?;
         }
@@ -52,8 +72,7 @@ impl<'a> Mise<'a> {
         S: AsRef<OsStr>,
     {
         let output = self
-            .command(args)?
-            .env("MISE_ENV", self.selected.active_environments())
+            .command_active(args)?
             .output()
             .map_err(|error| Fail::new(1, format!("could not run mise: {error}")))?;
         if !output.status.success() {
@@ -134,7 +153,11 @@ impl<'a> Mise<'a> {
     fn expose_ruby(&self, command: &mut Command) -> Result<(), Fail> {
         use std::os::unix::ffi::OsStrExt;
 
-        let Ok(output) = self.raw_command()?.args(["which", "ruby"]).output() else {
+        let mut probe = self.raw_command()?;
+        if let Some((_, Some(selected))) = command.get_envs().find(|(key, _)| *key == "MISE_ENV") {
+            probe.env("MISE_ENV", selected);
+        }
+        let Ok(output) = probe.args(["which", "ruby"]).output() else {
             return Ok(());
         };
         let ruby = PathBuf::from(OsStr::from_bytes(

@@ -56,6 +56,7 @@ impl Fixture {
             .env("TERM", "dumb")
             .env("LC_ALL", "C")
             .env("CODEX_HOME", home.join(".codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("MISE_CONFIG_DIR", self.world.root())
             .env("MISE_DATA_DIR", home.join(".local/share/mise"))
             .env("MISE_STATE_DIR", home.join(".local/state/mise"))
@@ -365,6 +366,32 @@ impl<'a> Terminal<'a> {
         self.assert_observer_gone();
     }
 
+    fn resume_job(&mut self, dots: Pid, stage: Pid) {
+        self.line(&format!("fg; {RESULT}"));
+        wait_for_with(
+            "Bash fg to resume the original dots job and stage",
+            || {
+                [dots, stage]
+                    .into_iter()
+                    .all(|pid| session(pid) == self.session.pid() && !stopped(pid))
+                    .then_some(())
+            },
+            || self.session.launch_details(),
+        );
+    }
+
+    fn complete_resumed_read(&mut self, stage: &Identity, code: i32) {
+        self.line("ordinary input");
+        self.expect("ordinary input accepted");
+        let resumed = self.session.identity("resumed");
+        self.verify_original_tty(&resumed, false);
+        assert_eq!(resumed.pid, stage.pid, "fg replaced the original reader");
+        assert_eq!(resumed.foreground, resumed.group, "{resumed:?}");
+        self.result(code);
+        assert!(!self.session.fixture.live("stage"));
+        assert_eq!(self.session.members(), vec![self.session.pid()]);
+    }
+
     fn assert_observer_gone(&self) {
         if let Some(pid) = self.observer {
             assert_eq!(
@@ -666,6 +693,80 @@ fn new_background_dots_never_takes_shell_terminal_or_starts_observer() {
     terminal.result(130);
     assert!(!fixture.live("stage"));
     assert_eq!(terminal.session.members(), vec![terminal.session.pid()]);
+}
+
+#[test]
+fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
+    let fixture = Fixture::new();
+    let mut terminal = Terminal::start(&fixture, "background-reader", false);
+    terminal.line(&format!("{JOB} &"));
+    terminal.expect(SHELL_PROMPT);
+    let stage = terminal.session.identity("stage");
+    let dots = terminal.dots_pid();
+    terminal.verify_original_tty(&stage, false);
+    assert_eq!(stage.foreground, terminal.session.pid(), "{stage:?}");
+    assert_ne!(stage.group, stage.foreground, "{stage:?}");
+    let mut known = vec![terminal.session.pid(), dots, stage.pid];
+    known.sort_unstable();
+    assert_eq!(terminal.session.members(), known, "background observer");
+    terminal.line("printf '\\nshell-owns-tty\\n'");
+    terminal.expect("\r\nshell-owns-tty\r\n");
+    terminal.expect(SHELL_PROMPT);
+
+    fs::write(fixture.control.join("read-tty"), b"").unwrap();
+    terminal.expect(PROMPT);
+    wait_for_with(
+        "background native /dev/tty read to stop the stage",
+        || stopped(stage.pid).then_some(()),
+        || terminal.session.launch_details(),
+    );
+    wait_for_with(
+        "Bash's dots job to stop with its background reader",
+        || stopped(dots).then_some(()),
+        || terminal.session.launch_details(),
+    );
+
+    terminal.resume_job(dots, stage.pid);
+    terminal.complete_resumed_read(&stage, 0);
+}
+
+#[test]
+fn new_ignored_ctrl_c_survives_ctrl_z_and_bash_fg_with_cancelled_status() {
+    for (case, code) in [("cancel-suspend-zero", 130), ("cancel-suspend-23", 23)] {
+        let fixture = Fixture::new();
+        let mut terminal = Terminal::start(&fixture, case, true);
+        terminal.line(JOB);
+        terminal.expect(PROMPT);
+        let stage = terminal.session.identity("stage");
+        let dots = terminal.dots_pid();
+        terminal.observe_foreground_group(&stage, None);
+
+        terminal.send(b"\x03");
+        terminal.expect("native SIGINT ignored");
+        terminal.line("still reading");
+        terminal.expect("native input survived SIGINT");
+        assert!(fixture.live("stage"));
+        terminal.send(b"\x1a");
+        wait_for_with(
+            "foreground stage to stop on terminal Ctrl-Z",
+            || stopped(stage.pid).then_some(()),
+            || terminal.session.launch_details(),
+        );
+        wait_for_with(
+            "Bash's dots job to stop after its interrupted stage stopped",
+            || stopped(dots).then_some(()),
+            || terminal.session.launch_details(),
+        );
+        terminal.expect("Stopped");
+        terminal.expect(SHELL_PROMPT);
+
+        terminal.resume_job(dots, stage.pid);
+        terminal.complete_resumed_read(&stage, code);
+        let report = fixture.report().expect("saved cancellation report");
+        assert_eq!(report["status"], code);
+        assert_eq!(report["cancelled"], true);
+        assert_eq!(report["stages"][0]["outcome"], "cancelled");
+    }
 }
 
 #[test]

@@ -143,6 +143,11 @@ extern "C" fn exit_on_interrupt(_: libc::c_int) {
     }
 }
 
+extern "C" fn continue_after_interrupt(_: libc::c_int) {
+    let marker = b"native SIGINT ignored\n";
+    unsafe { libc::write(1, marker.as_ptr().cast(), marker.len()) };
+}
+
 fn set_handler(signal: libc::c_int, handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
@@ -202,6 +207,14 @@ fn stage(dir: &Path, case: &str) -> ! {
         }
         "ignore-alone" | "ignoring" | "leader-exits" | "detached" => ignore_cancellation(),
         "suspend" => set_handler(libc::SIGTSTP, libc::SIG_DFL),
+        "cancel-suspend-zero" | "cancel-suspend-23" => {
+            set_handler(
+                libc::SIGINT,
+                continue_after_interrupt as *const () as libc::sighandler_t,
+            );
+            set_handler(libc::SIGTSTP, libc::SIG_DFL);
+        }
+        "background-reader" => set_handler(libc::SIGTTIN, libc::SIG_DFL),
         "line" | "background" | "sudo" => {}
         _ => panic!("unknown fixture case {case}"),
     }
@@ -215,6 +228,26 @@ fn stage(dir: &Path, case: &str) -> ! {
     }
     match case {
         "detached" | "background" => wait_forever(),
+        "background-reader" | "cancel-suspend-zero" | "cancel-suspend-23" => {
+            let tty = File::open("/dev/tty").unwrap();
+            let mut reader = io::BufReader::new(&tty);
+            if case == "background-reader" {
+                wait_for("permission to start the background tty read", || {
+                    dir.join("read-tty").exists().then_some(())
+                });
+            }
+            print!("{PROMPT}");
+            io::stdout().flush().unwrap();
+            if case != "background-reader" {
+                read_reply(&mut reader, "still reading");
+                println!("native input survived SIGINT");
+            }
+            read_reply(&mut reader, "ordinary input");
+            assert_eq!(foreground(tty.as_raw_fd()), group(0));
+            let _resumed = register(dir, "resumed");
+            println!("ordinary input accepted");
+            process::exit(if case == "cancel-suspend-23" { 23 } else { 0 });
+        }
         "sudo" => {
             let mut tty = OpenOptions::new()
                 .read(true)
@@ -250,6 +283,12 @@ fn stage(dir: &Path, case: &str) -> ! {
         child.wait().unwrap();
     }
     process::exit(0)
+}
+
+fn read_reply(reader: &mut impl BufRead, reply: &str) {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line.strip_suffix('\n'), Some(reply));
 }
 
 fn observe(dir: &Path) -> ! {

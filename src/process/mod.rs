@@ -153,6 +153,9 @@ pub fn exec_pinned(args: &[OsString]) -> Result<u8, Fail> {
             Some((b'+', value)) => {
                 environment.insert(key.into(), OsStr::from_bytes(value).to_owned());
             }
+            // Up stamps this value for its own stages. Ordinary commands
+            // otherwise keep the effective config's Homebrew setting.
+            None if key == "HOMEBREW_NO_INSTALL_CLEANUP" => {}
             None => {
                 environment.remove(OsStr::new(key));
             }

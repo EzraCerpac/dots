@@ -34,7 +34,9 @@ pub fn test(ctx: &Ctx, args: &[OsString]) -> Result<u8, Fail> {
     }
     run.finish(
         stage,
-        if status == 0 {
+        if run.cancelled() {
+            Outcome::Cancelled
+        } else if status == 0 {
             Outcome::Completed
         } else {
             Outcome::Failed

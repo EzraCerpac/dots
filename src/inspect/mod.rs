@@ -16,6 +16,6 @@ pub fn retire_dotfiles(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     Err(Fail::unported("P-02", "dots retire-dotfiles"))
 }
 
-pub fn test(_ctx: &Ctx, _args: &[std::ffi::OsString]) -> Result<u8, Fail> {
-    Err(Fail::unported("P-02", "dots test"))
-}
+mod test_command;
+
+pub use test_command::test;

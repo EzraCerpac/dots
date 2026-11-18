@@ -318,9 +318,14 @@ mod tests {
                         .diagnostic
                         .contains("is running")
                 );
+                // A parallel child can inherit the lock descriptor until exec.
+                // Keep a duplicate open so the test exercises that lifetime.
+                let inherited = holder.try_clone().unwrap();
+                holder.unlock().unwrap();
                 drop(holder);
                 script(home, "pgrep", "exit 1");
                 require_stopped(native).unwrap();
+                drop(inherited);
                 assert!(path.is_file());
 
                 fs::remove_file(&path).unwrap();

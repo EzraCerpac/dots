@@ -215,7 +215,7 @@ if [[ "${DOTS_SOURCE_SYNC_DONE:-0}" != 1 ]]; then
                                        else . + [{summary: ($line | ltrimstr("  ")), detail: []}] end)
             | to_entries[] | .key as $first | .value
             | {v:1, summary, detail: (.detail | join("\n")),
-               action: (if (.summary | startswith("APPLY FAILED")) then "dots apply" else "dots sync" end)}
+               action: (if (.summary | startswith("APPLY FAILED") and endswith("then run dots apply")) then "dots apply" else "dots sync" end)}
             | if $first == 0 then . + {kind:"stage_end", id:"source-sync", label:"Sync configuration", status:"attention", exit_code:0}
               else . + {kind:"notice", severity:"attention", stage:"source-sync"} end')
     else

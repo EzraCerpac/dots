@@ -24,6 +24,10 @@ case "$*" in
         fi
         ;;
     'bootstrap dotfiles status --json') printf '%s\n' "$CONTRACT_HISTORY_STATUS" ;;
+    'bootstrap dotfiles origin')
+        printf '%s (branch %s) declared in config.local.toml; mode manual\n' \
+            "$CONTRACT_HISTORY_ORIGIN" "$CONTRACT_HISTORY_BRANCH"
+        ;;
     'bootstrap dotfiles save'|'bootstrap dotfiles sync') ;;
     'bootstrap packages status --json'|ls|ls\ *) printf '{}\n' ;;
     'settings get history.sync') printf 'manual\n' ;;

@@ -3,6 +3,7 @@
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
 Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation, the 1.0 guarantee for the running `dots` on children's `PATH`, file adoption and removal, software version syntax, status program versions, history enrollment and restore, retired declarations, and publish validation.
 Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
+Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, and pull request bases.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -181,16 +182,19 @@ The seed commit:
 - Every other file stays out of it and on disk as it is, including a `config.toml` that differs from its template because it existed before `init` or was edited since.
 - Without a configured Git identity, `init` supplies a synthetic author for that one commit only, on the command line; it never writes Git configuration.
 - `main` and `dev` both point at it, and `HEAD` is on `dev`.
+- Its commit message is exactly `Initialize dots configuration` followed by a single LF.
 
 The seed is **pristine** while all of these hold:
 
 - `main` and `dev` exist and point at the same commit, which has no parents, so no unrelated commit is part of it.
 - Its tree contains only zero or more embedded template files, each at its template path with the template's bytes and file mode; any subset of the templates, including none, qualifies.
 - `HEAD` is on `dev`, there is no `origin`, and nothing has been committed since.
+- **New in 1.0:** the root commit message must match the seed message byte for byte for a scan-free seed push, automatic or printed.
+  A different message makes the seed ineligible, and `init` never prints the rejected message.
 
 The remote step:
 
-1. `init` offers to create a remote only in the run that created the seed, and only when stdin and stdout are terminals, `gh` is on `PATH`, and `gh` reports a signed-in account.
+1. `init` offers to create a remote only in the run that created the seed, and only when the seed is pristine, stdin and stdout are terminals, `gh` is on `PATH`, and `gh` reports a signed-in account.
 2. The offer is a private GitHub repository named `dotfiles`; the default answer is no.
 3. On yes, `init` creates the repository, adds it as `origin`, and pushes the verified seed without force, as below.
 4. When any part fails, `init` keeps the local configuration, reports what did and did not happen, and prints only the remaining commands; when `origin` was already added, that is only the push of the verified seed.
@@ -293,7 +297,7 @@ Read-only commands never install tools.
 | `dots` | R/O | **Changed from 0.4.0:** the help text and exit 0, in a terminal too |
 | `dots help`, `-h`, `--help` | R/O | Built-in commands, the helpers, then the configuration's commands |
 | `dots --version` | R/O | Version and install method |
-| `dots reports [COMMAND]` | R/O | **Changed from 0.4.0:** lists recent reports; without a terminal, exit 2 |
+| `dots reports [COMMAND]` | R/O | **Changed from 0.4.0:** prints the same newest-first listing to a terminal, a pipe or a redirected file. Exits 0 for a valid listing and 2 for an invalid filter or usage |
 | `dots completions bash\|zsh\|fish` | R/O | **New in 0.4.0.** Prints a completion script |
 | `dots status` | R/O, report | Programs, profile, source, packages, tools, dotfiles, history, exceptions |
 | `dots plan` | R/O, report | mise's bootstrap plan for this profile and machine; **New in 1.0:** the report |
@@ -629,7 +633,7 @@ A software target is named by its exact declaration (`brew-cask:firefox`), by a 
 When another active file still declares the software, only the selected declaration goes and the software stays.
 mise tools are removed with `mise unuse` and then pruned only for that tool, which keeps versions other projects use.
 Native packages are removed with one targeted uninstall after checking dependents, never with zap, purge or force.
-GitHub apps are moved to the Trash and their release installation is removed.
+GitHub apps that pass the [ownership checks](#dots-install-release-app-ownerrepo) are moved to the Trash and their release installation is removed.
 When a removal cannot be confirmed safe, the command stops; when a step fails, it restores the declarations and any staged app.
 Settings and app data stay where they are.
 `--keep-installed` deletes only the declaration.
@@ -778,6 +782,9 @@ By default it publishes exactly one unpublished working change directly above `m
 `--all` publishes the current stack, offering to merge `main@origin` into it first.
 It fails with exit status 1 before any push or pull request when `main` does not exist on the remote.
 It scans the outgoing commits with gitleaks, asks for confirmation, pushes a bookmark without force, and opens or updates the pull request.
+As in 0.4.0, new pull requests target `main`.
+When exactly one open pull request matches the head branch from the same repository, `dots publish` edits its title and body and keeps its existing base, including a base other than `main`.
+The scan still uses `main@origin` as its base.
 When `dots_publish_on_behalf_of` names a person, the pull request text notes that a model, named by `DOTS_PUBLISH_MODEL` when set, wrote it on that person's behalf.
 It exits 3 when conflicts stop it, and 1 on other failures.
 
@@ -785,7 +792,8 @@ It exits 3 when conflicts stop it, and 1 on other failures.
 
 **Changed from 0.4.0:** it prints recent completed reports, newest first, optionally only one command's.
 Each line gives the command, time, outcome, exit status and the report's location.
-As in 0.4.0, without a terminal it exits 2.
+It prints the same listing to a terminal, a pipe or a redirected file.
+A valid listing exits 0, and an invalid command filter or usage exits 2.
 
 ### `dots completions bash|zsh|fish`
 
@@ -952,6 +960,10 @@ See [Enrollment](#enrollment).
 
 mise runs it as the post-install hook of a GitHub release that `dots add` recorded as a macOS app.
 It needs exactly one app bundle in the installed release, and replaces the app in `/Applications` only when `dots` installed that app from this repository before.
+As in 0.4.0, a valid `{repo, path, bundle_id}` ownership record and a matching app are enough to establish ownership for an upgrade or removal to the Trash, subject to the existing permission, path, marker and bundle checks.
+`dots` refuses mismatches and ambiguous rename candidates.
+The user can leave the matching app in place for either operation.
+**New in 1.0:** `dots` records stronger app identity only after it installs or replaces the app itself.
 It fails on systems other than macOS.
 The hook that `dots add` writes runs `dots` by a path that survives upgrades: a Homebrew install runs the prefix's `bin/dots`; a mise install runs `dots` through `mise x github:EzraCerpac/dots`, finding mise through `DOTS_MISE_BIN`, `PATH` or `~/.local/bin/mise`; any other install runs the executable's absolute path.
 

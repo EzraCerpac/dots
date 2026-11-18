@@ -1,3 +1,4 @@
+mod child;
 mod patch;
 mod store;
 
@@ -22,6 +23,7 @@ pub enum Display {
 pub struct Receipt {
     #[serde(with = "store::optional_path")]
     pub checkout: Option<PathBuf>,
+    /// Summary of the verified push and local-save result.
     pub outcome: String,
     pub issues: Vec<Issue>,
     pub shared: Vec<ChangeGroup>,
@@ -33,6 +35,7 @@ pub struct Receipt {
     pub pulled_main: usize,
     pub local_only: bool,
     pub stage_outcome: Outcome,
+    /// Private destinations where moved originals remain, including after a successful write.
     #[serde(with = "store::paths")]
     pub recovery_files: Vec<PathBuf>,
     pub adopted_revision: Option<(String, String)>,
@@ -107,16 +110,22 @@ pub fn emit(ctx: &Ctx, receipt: &Receipt, display: Display) -> Result<(), Fail> 
     let root = ctx.root.path();
     let saved = store::save(&ctx.env, root, receipt);
     let mut output = metadata(receipt, false);
-    if patch_eligible(ctx, display) && matches!(receipt.stage_outcome, Outcome::Completed) {
-        output.push_str(&patch::render(
-            &ctx.env,
-            root,
-            receipt,
-            false,
-            patch::MAX_BYTES - output.len().min(patch::MAX_BYTES),
-        ));
-    }
+    let screened =
+        if patch_eligible(ctx, display) && matches!(receipt.stage_outcome, Outcome::Completed) {
+            let screened = patch::render(
+                &ctx.env,
+                root,
+                receipt,
+                false,
+                patch::MAX_BYTES - output.len().min(patch::MAX_BYTES),
+            );
+            output.push_str(&screened.text);
+            Some(screened)
+        } else {
+            None
+        };
     write_stdout(&output);
+    drop(screened);
     saved.map_err(|error| {
         Fail::new(
             1,
@@ -143,6 +152,7 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
         }
     };
     let metadata = metadata(&receipt, true);
+    let mut screened = None;
     if patch_eligible(ctx, Display::Standalone) {
         let mut output = metadata.clone();
         if output.len() > patch::MAX_BYTES - 128 {
@@ -151,13 +161,16 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
             output.push_str("Additional receipt metadata omitted.\n");
         } else {
             let remaining = patch::MAX_BYTES - output.len();
-            output.push_str(&patch::render(&ctx.env, root, &receipt, true, remaining));
+            let patches = patch::render(&ctx.env, root, &receipt, true, remaining);
+            output.push_str(&patches.text);
+            screened = Some(patches);
         }
         if page(&ctx.env, &output) {
             return Ok(0);
         }
     }
     write_stdout(&metadata);
+    drop(screened);
     Ok(0)
 }
 
@@ -169,7 +182,9 @@ fn patch_eligible(ctx: &Ctx, display: Display) -> bool {
 }
 
 fn write_stdout(text: &str) {
-    let _ = io::stdout().lock().write_all(text.as_bytes());
+    let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes());
+    let _ = stdout.flush();
 }
 
 fn page(env: &crate::Env, text: &str) -> bool {
@@ -219,6 +234,21 @@ impl Tools {
         command.envs(self.0.iter().map(|(key, value)| (*key, value)));
         command
     }
+
+    fn with_scratch_home(&self, directory: &Path) -> Self {
+        let mut vars = self.0.clone();
+        vars.extend(
+            [
+                ("HOME", "home"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_CACHE_HOME", "cache"),
+            ]
+            .map(|(key, path)| (key, directory.join(path).into_os_string())),
+        );
+        Self(vars)
+    }
 }
 
 fn printable(text: &str) -> String {
@@ -240,7 +270,7 @@ fn terminal_control(c: char) -> bool {
 
 fn path_label(path: &Path) -> String {
     match path.to_str() {
-        Some(path) => printable(path),
+        Some(path) => printable(&path.replace('\\', "\\\\")),
         None => path
             .as_os_str()
             .as_encoded_bytes()

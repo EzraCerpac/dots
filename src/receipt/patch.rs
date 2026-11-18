@@ -1,17 +1,16 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::Command;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 use nix::libc;
-use tempfile::TempDir;
 use toml_edit::{DocumentMut, value};
 
+use super::child::{self, Budget};
 use super::{ChangeGroup, Receipt, Tools, path_label, terminal_control};
 use crate::Env;
 
@@ -25,7 +24,7 @@ pub(super) fn render(
     receipt: &Receipt,
     replay: bool,
     bytes: usize,
-) -> String {
+) -> Screened {
     render_until(
         env,
         root,
@@ -43,7 +42,7 @@ pub(super) fn render_until(
     replay: bool,
     bytes: usize,
     deadline: Instant,
-) -> String {
+) -> Screened {
     let groups: Vec<_> = receipt
         .groups()
         .into_iter()
@@ -51,51 +50,68 @@ pub(super) fn render_until(
         .filter(|group| !group.paths.is_empty())
         .cloned()
         .collect();
-    let mut omitted = groups.iter().map(|group| group.paths.len()).sum::<usize>();
-    if omitted == 0 || bytes < OMISSION_BYTES || (!replay && omitted > 2) {
-        return String::new();
+    let candidates = groups.iter().map(|group| group.paths.len()).sum::<usize>();
+    if candidates == 0 || bytes < OMISSION_BYTES || (!replay && candidates > 2) {
+        return Screened::default();
     }
 
-    let mut output = String::new();
+    let mut screened = Screened::default();
     if receipt.checkout.as_deref() == Some(root) {
         let root = root.to_owned();
         let tools = Tools::new(env);
-        let budget = Arc::new(Budget {
-            deadline,
-            groups: Mutex::new(Vec::new()),
+        screened = collect_until(deadline, move |budget, send| {
+            screen(&tools, &root, &groups, replay, bytes, budget, send);
         });
-        let (send, receive) = mpsc::channel();
-        let worker_budget = Arc::clone(&budget);
-        let worker = thread::Builder::new().spawn(move || {
-            screen(&tools, &root, &groups, replay, bytes, &worker_budget, send);
-        });
-        if worker.is_ok() {
-            let mut scratch = None;
-            while let Ok(event) =
-                receive.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            {
-                match event {
-                    Event::Scratch(dir) => scratch = Some(dir),
-                    Event::Patch(patch) => {
-                        output.push_str(&patch);
-                        omitted -= 1;
-                    }
-                }
-            }
-            budget.stop_groups();
-            drop(scratch);
-        }
     }
+    let omitted = candidates - screened.patches;
     if replay && omitted != 0 {
         let files = if omitted == 1 { "file" } else { "files" };
-        let _ = writeln!(output, "\nPatch omitted for {omitted} {files}.");
+        let _ = writeln!(screened.text, "\nPatch omitted for {omitted} {files}.");
     }
-    output
+    screened
 }
 
-enum Event {
-    Scratch(TempDir),
-    Patch(String),
+#[derive(Default)]
+pub(super) struct Screened {
+    pub(super) text: String,
+    patches: usize,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for Screened {
+    fn drop(&mut self) {
+        // Callers retain this guard until after publishing the receipt. The
+        // worker alone owns scratch and cannot race cleanup with staging.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn collect_until(
+    deadline: Instant,
+    work: impl FnOnce(&Budget, mpsc::Sender<String>) + Send + 'static,
+) -> Screened {
+    let budget = Arc::new(Budget::new(deadline));
+    let (send, receive) = mpsc::channel();
+    let worker_budget = Arc::clone(&budget);
+    let worker = thread::Builder::new()
+        .spawn(move || work(&worker_budget, send))
+        .ok();
+    let mut text = String::new();
+    let mut patches = 0;
+    if worker.is_some() {
+        while let Ok(patch) = receive.recv_timeout(budget.remaining()) {
+            patches += 1;
+            text.push_str(&patch);
+        }
+        budget.cancel();
+    }
+    Screened {
+        text,
+        patches,
+        worker,
+    }
 }
 
 fn screen(
@@ -105,26 +121,23 @@ fn screen(
     replay: bool,
     bytes: usize,
     budget: &Budget,
-    send: mpsc::Sender<Event>,
+    send: mpsc::Sender<String>,
 ) {
+    let Ok(dir) = private_directory().tempdir() else {
+        return;
+    };
+    let tools = tools.with_scratch_home(dir.path());
     if run(
-        git(tools, root).args(["rev-parse", "--is-inside-work-tree", "--show-prefix"]),
+        git(&tools, root).args(["rev-parse", "--is-inside-work-tree", "--show-prefix"]),
         budget,
     )
     .as_deref()
         != Some(b"true\n\n")
+        || budget.expired()
     {
         return;
     }
-    let Ok(dir) = private_directory().tempdir() else {
-        return;
-    };
-    let scratch = dir.path().to_owned();
-    // Transfer ownership before staging any data, so the caller can clean up on cutoff.
-    if send.send(Event::Scratch(dir)).is_err() {
-        return;
-    }
-    let Some(scanner) = Scanner::new(tools, root, &scratch, budget) else {
+    let Some(scanner) = Scanner::new(&tools, root, dir.path(), budget) else {
         return;
     };
     let mut lines = 0;
@@ -134,7 +147,7 @@ fn screen(
             if budget.expired() {
                 return;
             }
-            let Some(patch) = prepare(tools, root, group, path, budget) else {
+            let Some(patch) = prepare(&tools, root, group, path, budget) else {
                 continue;
             };
             let patch_lines = patch.text.lines().count();
@@ -145,7 +158,7 @@ fn screen(
             if scanner.clean(path, &patch, budget) && !budget.expired() {
                 lines += patch_lines;
                 used += patch.text.len();
-                if send.send(Event::Patch(patch.text)).is_err() {
+                if send.send(patch.text).is_err() {
                     return;
                 }
             }
@@ -389,10 +402,15 @@ impl<'a> Scanner<'a> {
             let mut parent = input.path().to_owned();
             for component in path.parent()?.components() {
                 parent.push(component);
-                // Never recreate the scratch tree if the caller removed it at cutoff.
+                if budget.expired() {
+                    return None;
+                }
                 fs::DirBuilder::new().mode(0o700).create(&parent).ok()?;
             }
             let file = input.path().join(path);
+            if budget.expired() {
+                return None;
+            }
             private_file(&file, body).ok()?;
             for config in std::iter::once(&self.floor).chain(&self.project) {
                 let stdin = displayed && config == &self.floor;
@@ -485,97 +503,48 @@ fn snapshot(
     Some(copy)
 }
 
-struct Budget {
-    deadline: Instant,
-    groups: Mutex<Vec<u32>>,
-}
-
-impl Budget {
-    fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
-    fn register(&self, pid: u32) -> bool {
-        let mut groups = self.groups.lock().unwrap();
-        if self.expired() {
-            return false;
-        }
-        groups.push(pid);
-        true
-    }
-
-    fn unregister(&self, pid: u32) {
-        self.groups.lock().unwrap().retain(|id| *id != pid);
-    }
-
-    fn stop_groups(&self) {
-        for &pid in &*self.groups.lock().unwrap() {
-            kill_group(pid);
-        }
-    }
-}
-
-fn kill_group(pid: u32) {
-    // SAFETY: process_group(0) isolated this child and its descendants.
-    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
-}
-
 fn run(command: &mut Command, budget: &Budget) -> Option<Vec<u8>> {
-    if budget.expired() {
-        return None;
-    }
-    let mut child = command
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let pid = child.id();
-    if !budget.register(pid) {
-        kill_group(pid);
-        let _ = child.wait();
-        return None;
-    }
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (send, receive) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let read = stdout.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes);
-        let _ = send.send(
-            read.ok()
-                .filter(|_| bytes.len() <= MAX_BYTES)
-                .map(|_| bytes),
+    child::run(command, budget, MAX_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cutoff_returns_screened_text_without_racing_a_staging_write() {
+        let (started, staged) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (finish, finished) = mpsc::channel();
+        let screened = collect_until(
+            Instant::now() + Duration::from_secs(2),
+            move |budget, send| {
+                let directory = private_directory().tempdir().unwrap();
+                let path = directory.path().join("input");
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .unwrap();
+                send.send("already screened\n".into()).unwrap();
+                started.send(path).unwrap();
+                // Keep an in-flight staging operation blocked across the cutoff.
+                blocked.recv().unwrap();
+                file.write_all(b"staging completed").unwrap();
+                finish.send(budget.expired()).unwrap();
+            },
         );
-    });
-    let mut status = None;
-    let mut output = None;
-    while !budget.expired() {
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(value) => status = value,
-                Err(_) => break,
-            }
-        }
-        if output.is_none() {
-            match receive.try_recv() {
-                Ok(Some(bytes)) => output = Some(bytes),
-                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => break,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        if let (Some(status), Some(_)) = (status, &output) {
-            budget.unregister(pid);
-            return if status.success() && !budget.expired() {
-                output
-            } else {
-                None
-            };
-        }
-        let remaining = budget.deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(4)));
+
+        let staged = staged.try_recv();
+        let scratch_owned_by_worker = staged.as_ref().is_ok_and(|path| path.is_file());
+        let already_screened = screened.text == "already screened\n";
+        let _ = release.send(());
+        drop(screened);
+
+        assert!(scratch_owned_by_worker);
+        assert!(already_screened);
+        assert!(finished.try_recv().unwrap());
+        assert!(!staged.unwrap().exists());
     }
-    kill_group(pid);
-    budget.unregister(pid);
-    let _ = child.wait();
-    None
 }

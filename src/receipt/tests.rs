@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -27,33 +27,7 @@ impl Fixture {
         for path in [&root, &bin, &home] {
             fs::create_dir(path).unwrap();
         }
-        let path = std::env::join_paths(
-            std::iter::once(bin.clone())
-                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-        )
-        .unwrap();
-        let mut env = Env {
-            vars: Default::default(),
-            cwd: root.clone(),
-        };
-        for (key, value) in [
-            ("HOME", home.into_os_string()),
-            ("PATH", path),
-            (
-                "XDG_CONFIG_HOME",
-                dir.path().join("config").into_os_string(),
-            ),
-            ("XDG_STATE_HOME", dir.path().join("state").into_os_string()),
-            ("XDG_CACHE_HOME", dir.path().join("cache").into_os_string()),
-            ("XDG_DATA_HOME", dir.path().join("data").into_os_string()),
-            ("JJ_CONFIG", dir.path().join("jj.toml").into_os_string()),
-            (
-                "MISE_CONFIG_DIR",
-                dir.path().join("config/mise").into_os_string(),
-            ),
-        ] {
-            env.vars.insert(key.into(), value);
-        }
+        let env = isolated_env(dir.path());
         let fixture = Self {
             dir,
             env,
@@ -72,7 +46,6 @@ impl Fixture {
             .env_clear()
             .envs(&self.env.vars)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(&self.root)
             .args(args)
             .output()
@@ -104,13 +77,16 @@ impl Fixture {
     }
 
     fn render(&self, receipt: &Receipt, replay: bool) -> String {
-        patch::render_until(
-            &self.env,
-            &self.root,
-            receipt,
-            replay,
-            patch::MAX_BYTES,
-            Instant::now() + Duration::from_secs(15),
+        std::mem::take(
+            &mut patch::render_until(
+                &self.env,
+                &self.root,
+                receipt,
+                replay,
+                patch::MAX_BYTES,
+                Instant::now() + Duration::from_secs(15),
+            )
+            .text,
         )
     }
 
@@ -122,6 +98,43 @@ impl Fixture {
             .unwrap()
             .path()
     }
+}
+
+pub(super) fn isolated_env(dir: &Path) -> Env {
+    let path = std::env::join_paths(
+        std::iter::once(dir.join("bin"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut env = Env {
+        vars: Default::default(),
+        cwd: dir.to_owned(),
+    };
+    env.vars.insert("PATH".into(), path);
+    for (key, relative) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_STATE_HOME", "state"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("CODEX_HOME", "config/codex"),
+        ("CLAUDE_CONFIG_DIR", "config/claude"),
+        ("JJ_CONFIG", "config/jj/config.toml"),
+        ("GIT_CONFIG_GLOBAL", "config/git/config"),
+        ("GIT_CONFIG_SYSTEM", "config/git/system"),
+        ("DOTS_ROOT", "checkout"),
+        ("MISE_CONFIG_DIR", "config/mise"),
+        ("MISE_GLOBAL_CONFIG_FILE", "config/mise/config.toml"),
+        ("MISE_SYSTEM_CONFIG_DIR", "config/mise-system"),
+        ("MISE_DATA_DIR", "data/mise"),
+        ("MISE_STATE_DIR", "state/mise"),
+        ("MISE_CACHE_DIR", "cache/mise"),
+        ("TMPDIR", ""),
+    ] {
+        env.vars
+            .insert(key.into(), dir.join(relative).into_os_string());
+    }
+    env
 }
 
 #[test]
@@ -209,6 +222,49 @@ fn metadata_leads_with_recovery_and_preserves_paths_in_replay() {
         metadata(&local, false),
         "dots sync: add an origin remote to share changes\n"
     );
+}
+
+#[test]
+fn recovery_and_push_outcomes_are_visible_in_saved_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("checkout");
+    let env = Env {
+        vars: [(
+            "XDG_STATE_HOME".into(),
+            directory.path().join("state").into_os_string(),
+        )]
+        .into(),
+        cwd: directory.path().to_owned(),
+    };
+    let recovery = directory.path().join("private/recovery\x1b\n\\u{1b}");
+    let mut pushed = Receipt::new(Some(root.clone()), "pushed dev");
+    pushed.recovery_files.push(recovery.clone());
+    let recovery_line = format!(
+        "Recovery copy at {}/private/recovery\\u{{1b}}\\n\\\\u{{1b}}\n",
+        directory.path().display()
+    );
+    assert!(metadata(&pushed, false).ends_with(&recovery_line));
+    store::save(&env, &root, &pushed).unwrap();
+    let loaded = store::load(&env, &root).unwrap().unwrap();
+    assert!(loaded.issues.is_empty());
+    assert_eq!(loaded.recovery_files, [recovery]);
+    let replay = metadata(&loaded, true);
+    assert!(replay.contains(" · pushed dev\n"));
+    assert!(replay.ends_with(&recovery_line));
+
+    let mut saved = Receipt::new(Some(root.clone()), "not pushed");
+    saved.saved.push(ChangeGroup::new(
+        Some("1".repeat(40)),
+        Some("2".repeat(40)),
+        vec!["changed-file".into()],
+    ));
+    let summary = metadata(&saved, false);
+    assert!(summary.contains("saved 1 locally"));
+    assert!(summary.contains(" · not pushed\n"));
+    let untouched = Receipt::new(Some(root), "nothing to push");
+    let summary = metadata(&untouched, false);
+    assert!(summary.contains("saved 0 locally"));
+    assert!(summary.ends_with(" · nothing to push\n"));
 }
 
 #[test]
@@ -335,7 +391,8 @@ fn replay_times_out_a_scanner_and_rejects_nonlocal_configuration() {
             &receipt,
             true,
             patch::MAX_BYTES
-        ),
+        )
+        .text,
         "\nPatch omitted for 1 file.\n"
     );
     assert!(start.elapsed() < Duration::from_secs(5));
@@ -500,11 +557,11 @@ fn replay_byte_budget_keeps_later_small_patches_across_groups() {
         budget,
         Instant::now() + Duration::from_secs(15),
     );
-    assert!(rendered.contains("+first small body"));
-    assert!(rendered.contains("+second small body"));
-    assert!(!rendered.contains(&"x".repeat(10)));
-    assert!(rendered.contains("Patch omitted for 1 file."));
-    assert!(rendered.len() <= budget);
+    assert!(rendered.text.contains("+first small body"));
+    assert!(rendered.text.contains("+second small body"));
+    assert!(!rendered.text.contains(&"x".repeat(10)));
+    assert!(rendered.text.contains("Patch omitted for 1 file."));
+    assert!(rendered.text.len() <= budget);
 }
 
 #[test]
@@ -653,9 +710,10 @@ fn deadline_keeps_completed_patches_and_removes_stalled_scan_inputs() {
         start + Duration::from_secs(12),
     );
     assert!(start.elapsed() < Duration::from_secs(15));
-    assert!(output.contains("+safe retained patch"));
-    assert!(output.contains("Patch omitted for 1 file."));
-    assert!(!output.contains("STALL_THIS_SCAN"));
+    assert!(output.text.contains("+safe retained patch"));
+    assert!(output.text.contains("Patch omitted for 1 file."));
+    assert!(!output.text.contains("STALL_THIS_SCAN"));
+    drop(output);
     let input = fs::read_to_string(marker).unwrap();
     assert!(!std::path::Path::new(input.trim()).exists());
 }

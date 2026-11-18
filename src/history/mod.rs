@@ -1,7 +1,6 @@
 mod checkpoint;
 mod keys;
 mod native;
-mod publication;
 mod recovery;
 mod tracked;
 mod watcher;
@@ -106,10 +105,12 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
             &saved,
         )?;
     }
-    let cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
-    native.output(
+    let mut cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    // A native exit status does not prove whether its push reached the host ref.
+    native.probe(
         cmd,
-        "could not publish private settings history; the local checkpoint was kept",
+        "native history sync failed; the checkpoint was kept locally and publication could not be verified",
     )?;
     let pending = || {
         blocked(
@@ -118,7 +119,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     };
     let unconfirmed = || {
         blocked(
-            "settings checkpoint saved locally; publication could not be confirmed. Check the private history remote before retrying dots backup",
+            "settings checkpoint saved locally; publication could not be verified. Check the private history remote",
         )
     };
     native
@@ -128,11 +129,6 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     let remote = remote_checkpoint(native, &store, &origin, &reference)
         .map_err(|_| unconfirmed())?
         .ok_or_else(pending)?;
-    let tracked =
-        recovery::revision(native, &store, recovery::TRACKING_REF).map_err(|_| unconfirmed())?;
-    if remote != tracked {
-        return Err(unconfirmed());
-    }
     if !recovery::ancestor(native, &store, &saved, &remote).map_err(|_| unconfirmed())? {
         return Err(pending());
     }
@@ -155,6 +151,7 @@ fn remote_checkpoint(
         origin,
         reference,
     ]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     let output = native.probe(cmd, diagnostic)?;
     if output.status.code() == Some(2) && output.stdout.is_empty() && output.stderr.is_empty() {
         return Ok(None);
@@ -340,6 +337,11 @@ fn prepare_enrollment(
         local = LocalSettings::read(&native)?;
     }
     local.set_history(&branch, origin, &identity, &all)?;
+    if persist_selection {
+        // Standalone --identity also selects the key for a later standalone
+        // restore. Bootstrap supplies a machine key separately from recovery.
+        local.set_recovery_identity(&identity)?;
+    }
     local.install(&native)
 }
 

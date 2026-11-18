@@ -167,6 +167,12 @@ impl LocalSettings {
         Ok(())
     }
 
+    pub fn set_recovery_identity(&mut self, identity: &Path) -> Result<(), Fail> {
+        table(self.document.as_table_mut(), "env")?
+            .insert("SETUP_AGE_IDENTITY", value(path_text(identity)?));
+        Ok(())
+    }
+
     pub fn install(self, native: &Native<'_, '_>) -> Result<(), Fail> {
         // Prepare the replacement in the same filesystem and keep it private.
         let root = self

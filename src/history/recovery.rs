@@ -262,7 +262,8 @@ impl Recovery<'_, '_, '_> {
         let mut command = self.native.mise(args)?;
         command
             .env("MISE_HISTORY_SYNC", "fetch-only")
-            .env("MISE_AGE_IDENTITY_FILES", self.identity);
+            .env("MISE_AGE_IDENTITY_FILES", self.identity)
+            .env("GIT_TERMINAL_PROMPT", "0");
         if offline {
             command.env("GIT_ALLOW_PROTOCOL", "");
         }
@@ -631,6 +632,7 @@ fn prepare(
         raw,
         &refspec,
     ]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     native.output(
         cmd,
         "could not stage the selected remote history branch; the existing store was left unchanged",
@@ -860,7 +862,7 @@ pub(super) fn revision(
     store: &Path,
     reference: &str,
 ) -> Result<String, Fail> {
-    let mut cmd = native.git(Some(store))?;
+    let mut cmd = local_git(native, store)?;
     let commit = format!("{reference}^{{commit}}");
     cmd.args(["rev-parse", "--verify", &commit]);
     let id = native.text(
@@ -887,7 +889,7 @@ pub(super) fn ancestor(
     if !valid_oid(from) || !valid_oid(to) {
         return Err(blocked("invalid history checkpoint ID"));
     }
-    let mut cmd = native.git(Some(store))?;
+    let mut cmd = local_git(native, store)?;
     cmd.args(["merge-base", "--is-ancestor", from, to]);
     match native
         .probe(cmd, "could not check history checkpoint ancestry")?
@@ -898,6 +900,15 @@ pub(super) fn ancestor(
         Some(1) => Ok(false),
         _ => Err(blocked("could not check history checkpoint ancestry")),
     }
+}
+
+fn local_git(native: &Native<'_, '_>, store: &Path) -> Result<Command, Fail> {
+    let mut command = native.git(Some(store))?;
+    // Even a nominally local Git read can fetch missing partial-clone objects.
+    command
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    Ok(command)
 }
 
 #[derive(Deserialize)]
@@ -934,7 +945,7 @@ fn verify_tree(
     if !valid_oid(commit) {
         return Err(invalid("invalid private history checkpoint ID"));
     }
-    let mut cmd = native.git(Some(store))?;
+    let mut cmd = local_git(native, store)?;
     cmd.args(["show", &format!("{commit}:.mise-history/manifest.json")]);
     let data = native.output(cmd, "could not read the native history checkpoint manifest")?;
     let manifest: Manifest = serde_json::from_slice(&data)
@@ -973,7 +984,7 @@ fn verify_tree(
         }
     }
 
-    let mut cmd = native.git(Some(store))?;
+    let mut cmd = local_git(native, store)?;
     cmd.args(["ls-tree", "-r", "-t", "-z", commit]);
     let tree = native.output(cmd, "could not inspect private checkpoint objects")?;
     for row in tree.split(|&byte| byte == 0).filter(|row| !row.is_empty()) {
@@ -1017,7 +1028,7 @@ fn verify_tree(
         {
             return Err(unsafe_tree());
         }
-        let mut cmd = native.git(Some(store))?;
+        let mut cmd = local_git(native, store)?;
         cmd.args(["cat-file", "blob", oid]);
         let blob = native.output(cmd, "could not inspect the encrypted checkpoint envelope")?;
         if !blob.starts_with(b"mise-encrypted-file-v1\n") {

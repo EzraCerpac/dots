@@ -233,7 +233,12 @@ exec git "$@"
     }
 
     fn history_store(&self) -> PathBuf {
-        self.world.home().join(".local/state/mise/history/repo.git")
+        let command = self.dots();
+        let state = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "MISE_STATE_DIR").then_some(value).flatten())
+            .expect("guarded history fixture must set MISE_STATE_DIR");
+        Path::new(state).join("history/repo.git")
     }
 
     fn create_store(&self) -> PathBuf {

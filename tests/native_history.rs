@@ -5,9 +5,9 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
-use support::World;
+use support::{FixtureCommand, World};
 
 const BRANCH: &str = "host-fixture";
 const REF: &str = "refs/heads/host-fixture";
@@ -76,7 +76,7 @@ impl Fixture {
         }
     }
 
-    fn base(&self, command: &mut Command) {
+    fn base(&self, command: &mut FixtureCommand<'_>) {
         let home = self.world.home();
         command
             .env("PATH", &self.path)
@@ -103,20 +103,13 @@ impl Fixture {
             .env("GIT_ALLOW_PROTOCOL", "file:ssh");
     }
 
-    fn command(&self, program: &Path) -> Command {
-        let world = self.world.dots();
-        let mut command = Command::new(program);
-        command.env_clear().current_dir(self.world.root());
-        for (key, value) in world.get_envs() {
-            if let Some(value) = value {
-                command.env(key, value);
-            }
-        }
+    fn command(&self, program: &Path) -> FixtureCommand<'_> {
+        let mut command = self.world.command(program);
         self.base(&mut command);
         command
     }
 
-    fn dots(&self, args: &[&str], remote: &Path) -> Command {
+    fn dots(&self, args: &[&str], remote: &Path) -> FixtureCommand<'_> {
         let mut cmd = self.world.dots();
         self.base(&mut cmd);
         let transport = self.script(
@@ -135,13 +128,37 @@ esac
         cmd.env("GIT_SSH_COMMAND", transport)
             .env("GIT_SSH_VARIANT", "ssh")
             .env("FIXTURE_GIT", &self.git)
+            .env("FIXTURE_AGE_KEYGEN", &self.keygen)
+            .env(
+                "FIXTURE_GENERATION_MARKER",
+                self.world.home().join("attempted-key-generation"),
+            )
             .env("FIXTURE_REMOTE", remote)
             .env("FIXTURE_TRANSPORT", self.world.home().join("transport"))
             .args(args);
         cmd
     }
 
-    fn git(&self, store: Option<&Path>) -> Command {
+    fn enroll(&self, remote: &Path, identity: &Path, recipient: &str) -> Output {
+        let version = text(ok(&mut self.dots(&["--version"], remote)));
+        let mut command = self.dots(&[], remote);
+        if version.starts_with("dots 0.4.0 (") || version == "dots dev (archive)" {
+            command.arg("internal");
+        }
+        ok(command
+            .args([
+                "enroll-history",
+                "--profile",
+                "laptop",
+                "--machine-id",
+                "fixture",
+                "--identity",
+            ])
+            .arg(identity)
+            .args(["--origin", URL, "--recipient", recipient]))
+    }
+
+    fn git(&self, store: Option<&Path>) -> FixtureCommand<'_> {
         let mut cmd = self.world.git();
         self.base(&mut cmd);
         if let Some(store) = store {
@@ -150,7 +167,7 @@ esac
         cmd
     }
 
-    fn mise(&self, args: &[&str]) -> Command {
+    fn mise(&self, args: &[&str]) -> FixtureCommand<'_> {
         let mut cmd = self.command(&self.mise);
         cmd.args(["-E", "laptop,host-fixture"]).args(args);
         cmd
@@ -330,11 +347,12 @@ fn tool(name: &str) -> PathBuf {
     find_tool(name).unwrap_or_else(|| panic!("native history scenarios require {name} on PATH"))
 }
 
-fn ok(command: &mut Command) -> Output {
+fn ok(command: &mut FixtureCommand<'_>) -> Output {
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
-        "{command:?}\n{}",
+        "{:?}\n{}",
+        command.get_program(),
         messages(&output)
     );
     output
@@ -595,10 +613,111 @@ fn new_native_sync_can_succeed_without_publishing_a_conflicting_checkpoint() {
     assert_eq!(fs::read(local.active()).unwrap(), LOCAL_EDIT);
     let backup = local.dots(&["backup"], &remote).output().unwrap();
     assert_eq!(backup.status.code(), Some(1), "{}", messages(&backup));
-    assert!(messages(&backup).contains("checkpoint saved locally; publication is pending"));
+    let pending = messages(&backup);
+    let diagnostic = pending
+        .lines()
+        .find(|line| line.contains("checkpoint saved locally; publication is pending"))
+        .unwrap_or_else(|| panic!("{pending}"));
+    assert!(diagnostic.contains("Run mise dot status"));
     assert!(!messages(&backup).contains("Settings backup published"));
+    let native_status = ok(local.mise(&["dot", "status"]).env("GIT_ALLOW_PROTOCOL", ""));
+    let status = messages(&native_status);
+    assert!(
+        status.contains("both sides changed the same lines"),
+        "{status}"
+    );
+    eprintln!(
+        "dots backup exit 1: {diagnostic}\nmise dot status exit 0: both sides changed the same lines"
+    );
     assert_eq!(local.tip(&remote, REF), remote_edit);
     assert_eq!(local.tip(&local.store(), "refs/heads/main"), saved);
+}
+
+#[test]
+fn unchanged_standalone_reenrollment_selects_the_explicit_key_for_restore() {
+    let fixture = Fixture::new();
+    let remote = fixture.world.bare_remote("private.git");
+    let (old, old_recipient) = fixture.key("old-key");
+    let (replacement, new_recipient) = fixture.key("new-key");
+    let seed = Fixture::new();
+    seed.configure(
+        "p06-fixture/state",
+        URL,
+        &replacement,
+        std::slice::from_ref(&new_recipient),
+    );
+    seed.seed(&remote, FIRST);
+    let original_tip = seed.tip(&remote, REF);
+    fixture.configure("p06-fixture/state", URL, &old, &[old_recipient.clone()]);
+    fixture.write(DEFAULT, 0o600);
+    fixture.script(
+        "age-keygen",
+        r#"#!/bin/sh
+if [ "${1-}" = "-y" ]; then exec "$FIXTURE_AGE_KEYGEN" "$@"; fi
+touch "$FIXTURE_GENERATION_MARKER"
+exit 97
+"#,
+    );
+    fixture.enroll(&remote, &replacement, &old_recipient);
+    fs::rename(&old, old.with_extension("moved")).unwrap();
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    assert_eq!(fixture.tip(&remote, REF), original_tip);
+    assert!(
+        !fixture
+            .world
+            .home()
+            .join("attempted-key-generation")
+            .exists()
+    );
+    assert!(!fixture.world.home().join(".config/age/keys.txt").exists());
+}
+
+#[test]
+fn new_standalone_reenrollment_retains_old_identity_paths_and_recipients() {
+    let fixture = Fixture::new();
+    let remote = fixture.world.bare_remote("private.git");
+    let (old, old_recipient) = fixture.key("old-key");
+    let (replacement, new_recipient) = fixture.key("new-key");
+    let (_, archive_recipient) = fixture.key("archive-key");
+    fixture.configure(
+        "p06-fixture/state",
+        URL,
+        &old,
+        &[old_recipient.clone(), archive_recipient.clone()],
+    );
+    fixture.write(DEFAULT, 0o600);
+    fixture.enroll(&remote, &replacement, &old_recipient);
+    let local: toml_edit::DocumentMut =
+        fs::read_to_string(fixture.world.root().join("config.local.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        local["env"]["SETUP_AGE_IDENTITY"].as_str(),
+        replacement.to_str()
+    );
+    let identities = local["settings"]["age"]["identity_files"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        identities
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>(),
+        [old.to_str(), replacement.to_str()]
+    );
+    let recipients = local["history"]["encryption"]["recipients"]
+        .as_array()
+        .unwrap();
+    for expected in [&old_recipient, &new_recipient, &archive_recipient] {
+        assert!(
+            recipients
+                .iter()
+                .any(|value| value.as_str() == Some(expected))
+        );
+    }
+    assert!(!fixture.store().exists());
 }
 
 #[test]
@@ -627,7 +746,7 @@ exec "$FIXTURE_GIT" "$@"
     assert_eq!(output.status.code(), Some(1), "{}", messages(&output));
     let report = messages(&output);
     assert!(
-        report.contains("publication could not be confirmed"),
+        report.contains("publication could not be verified"),
         "{report}"
     );
     assert!(!report.contains("Settings backup published"));
@@ -972,6 +1091,114 @@ fn new_restore_uses_the_native_connection_when_the_bare_store_has_no_git_origin(
     assert_eq!(fs::read(fixture.active()).unwrap(), SECOND);
     assert_eq!(fixture.tip(&remote, REF), incoming);
     assert!(!fixture.store().join("dots-restore-pending").exists());
+}
+
+#[test]
+fn new_restore_local_inspection_never_follows_an_alternate_promisor() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    ok(seed
+        .git(Some(&remote))
+        .args(["config", "uploadpack.allowFilter", "true"]));
+
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(DEFAULT, 0o600);
+    let store = fixture.store();
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    ok(fixture
+        .git(None)
+        .args([
+            "clone",
+            "--bare",
+            "--no-local",
+            "--filter=blob:none",
+            "--single-branch",
+            "--branch",
+            BRANCH,
+            "--origin",
+            "promisor",
+            &url,
+        ])
+        .arg(&store));
+    ok(fixture.git(Some(&store)).args(["branch", "-m", "main"]));
+    for metadata in [
+        "HEAD:.mise-history/manifest.json",
+        "HEAD:.mise-history/format.toml",
+    ] {
+        ok(fixture.git(Some(&store)).args(["show", metadata]));
+    }
+    ok(fixture.git(Some(&store)).args([
+        "config",
+        "remote.promisor.url",
+        "ssh://git@fixture-promisor.invalid/alternate",
+    ]));
+
+    let result = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(result.status.code(), Some(1), "{}", messages(&result));
+    let diagnostic = messages(&result);
+    assert!(
+        diagnostic.contains("could not inspect the encrypted checkpoint envelope"),
+        "{diagnostic}"
+    );
+    assert!(fixture.trace().is_empty());
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+
+    // Positive control on the same missing object. With SSH allowed, Git
+    // invokes our fixture stub, which records the call and never dials out.
+    let control = fixture
+        .git(Some(&store))
+        .args(["show", "HEAD:home@host-fixture/app/selected"])
+        .env("GIT_ALLOW_PROTOCOL", "ssh")
+        .env("GIT_SSH_COMMAND", fixture.world.home().join("bin/ssh"))
+        .env("GIT_SSH_VARIANT", "ssh")
+        .env("FIXTURE_TRANSPORT", fixture.world.home().join("transport"))
+        .output()
+        .unwrap();
+    assert!(!control.status.success());
+    assert!(
+        fixture
+            .trace()
+            .iter()
+            .any(|line| line.contains("/alternate"))
+    );
+}
+
+#[test]
+fn new_restore_ignores_an_inherited_global_config_for_another_origin() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+
+    let alternate = Fixture::new();
+    let wrong = alternate.world.bare_remote("wrong.git");
+    let wrong_url = format!("file://{}", wrong.display());
+    alternate.configure(&wrong_url, &wrong_url, &key, std::slice::from_ref(&public));
+    alternate.seed(&wrong, REMOTE_EDIT);
+    let other_tip = alternate.tip(&wrong, REF);
+
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(DEFAULT, 0o600);
+    let override_dir = fixture.world.home().join("override");
+    fs::create_dir(&override_dir).unwrap();
+    let override_file = override_dir.join("config.toml");
+    let wrong_config = format!("[history.origin]\nurl = {wrong_url:?}\nbranch = {BRANCH:?}\n");
+    fs::write(&override_file, &wrong_config).unwrap();
+    ok(fixture
+        .dots(&["restore"], &remote)
+        .env("MISE_GLOBAL_CONFIG_FILE", &override_file));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    assert_eq!(fs::read_to_string(&override_file).unwrap(), wrong_config);
+    assert!(!override_dir.join("config.local.toml").exists());
+    assert_eq!(alternate.tip(&wrong, REF), other_tip);
 }
 
 #[test]

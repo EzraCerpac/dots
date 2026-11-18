@@ -106,19 +106,21 @@ impl Drop for Session<'_> {
     fn drop(&mut self) {
         // This session was created solely for the fixture. Also account for
         // explicitly registered fixture children if the binary relocated them.
-        let mut pids = self.members();
-        pids.reverse();
+        let session_id = self.pid();
         for role in ["grandchild", "stage"] {
             if let Some(child) = Identity::read(&self.fixture.control.join(role))
+                && child.session != session_id
                 && self.fixture.live(role)
                 && session(child.pid) == child.session
                 && group(child.pid) == child.group
             {
-                pids.insert(0, child.pid);
+                let _ = signal(child.pid, libc::SIGKILL);
             }
         }
-        for pid in pids {
-            let _ = signal(pid, libc::SIGKILL);
+        for pid in self.members().into_iter().rev() {
+            if session(pid) == session_id {
+                let _ = signal(pid, libc::SIGKILL);
+            }
         }
         let end = Instant::now() + Duration::from_secs(2);
         while self.child.try_wait().ok().flatten().is_none() && Instant::now() < end {
@@ -584,6 +586,10 @@ fn new_terminal_ctrl_z_and_shell_fg_stop_and_resume_dots_and_stage_group() {
                 .all(|pid| session(pid) == terminal.session.pid() && !stopped(pid))
                 .then_some(())
         },
+    );
+    assert!(
+        fixture.live("grandchild"),
+        "fg dropped the original grandchild"
     );
     terminal.line("ordinary input");
     terminal.expect("ordinary input accepted");

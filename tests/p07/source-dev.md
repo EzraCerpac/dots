@@ -8,7 +8,7 @@ The [P-07 fixture adapter](isolation.rs) gets the executable from Q-01's `World:
 It sets private XDG, agent, Git and mise paths before starting either fixture setup or a command under test.
 JJ uses Q-01's fixture config and Git transports allow only local files.
 
-The integration suite contains 109 unchanged and 12 new tests. Each of the 99 original cases has an executable counterpart or a documented gap. Split rows preserve all externally observable portions listed below. Unchanged counts include parameterized branches split into independent tests.
+The integration suite contains 109 unchanged and 13 new tests. Each of the 99 original cases has an executable counterpart or a documented gap. Split rows preserve all externally observable portions listed below. Unchanged counts include parameterized branches split into independent tests.
 
 The Q-01 owner accounts separately for `test_dots_contract.py`.
 That suite owns the legacy public sync and replay test, the updater forwarding and stage tests,
@@ -28,7 +28,7 @@ P-07's counts cover its four JavaScript suites and the new standalone sync cance
 | 293 a clean checkout syncs as a no-op | Unchanged | `unchanged_clean_checkout_has_one_receipt_and_no_changes`. Clean CLI sync leaves dev and origin equal to the previous tip; receipt summarizes no local, incoming or push. | Can share executable with row 149. |
 | 301 sync stops before snapshotting Git metadata stored inside the worktree | Unchanged | `unchanged_git_metadata_is_never_snapshotted`. Move fixture git metadata into its worktree, seed private marker, verify sync stops before publishing marker. | No metadata filename assertions. |
 | 314 a local edit is shared and private files stay local | Unchanged | `unchanged_public_edit_push_excludes_private_files`. Publish public edit while ignored private config and machine state stay local; inspect remote tree and clean index. | Drop commit subject. |
-| 330 sync saves nothing while a tracked file is not declared encrypted | Unchanged | `unchanged_sync_refuses_unencrypted_history`. Mise inventory includes unencrypted track entry; save marker stays absent and refusal names declaration. | Mise script. |
+| 330 sync saves nothing while a tracked file is not declared encrypted | Unchanged | `unchanged_sync_refuses_unencrypted_history`. An active encrypted entry reaches save. Turning off encryption on that entry requires a declaration correction, and neither save nor push runs. | Stub native save marker and real Git pre-push sentinel. The empty-inventory save call is internal. |
 | 344 a remote change arrives on disk | Unchanged | `unchanged_remote_change_arrives_on_disk`. Push peer edit directly; run sync and check local bytes, ref, receipt and clean status. | Local Git. |
 | 353 dots up receives the changed path once and finishes each sync stage | Unchanged | `unchanged_up_receives_changed_path_once_and_finishes_source_sync`. Run real dots up twice with fixture subprocesses; first receipt contains incoming path once, second has no changes and both sync stages complete. | Drop DOTS_UP_EVENT_FD and event record schema. |
 | 368 non-conflicting edits on both sides merge | Unchanged | `unchanged_independent_hunks_merge_on_both_machines`. Edit opposite ends of same file locally and on peer; verify combined bytes on both machines and bare origin. | Local Git. |
@@ -50,8 +50,8 @@ P-07's counts cover its four JavaScript suites and the new standalone sync cance
 | 622 a hanging push times out and points at the credential helper | Unchanged | `unchanged_hanging_push_times_out`. Bounded client fixture makes actual local push exceed 60-second contract and records no prompts; explain timed out push and preserve remote. | Oracle timeout option was injected directly; full deadline scenario slower. A short shell sleep does not cover this. |
 | 634 only pushes that keep losing the race say dev kept moving | Unchanged | `unchanged_only_repeated_races_report_a_moving_branch`. Pre-push hook advances peer on every attempted push; only repeated race receives moving-dev diagnostic. | Use sequential file increments portable to macOS/Linux. |
 | 643 a failed apply carries the output that explains it | Unchanged | `unchanged_failed_native_apply_names_diagnostic_and_recovery`. Fail actual apply via mise script and preserve diagnostic plus rerun action. | Native command wrapper; drop exact mise footer format. |
-| 653 a failed save carries the output that explains it | Unchanged | `unchanged_failed_native_save_names_diagnostic_and_recovery`. Fail history save via mise script; show actionable diagnostic and prove save did not happen. | Native command wrapper. |
-| 660 a long native diagnostic keeps the sync attention event readable | Split | `unchanged_long_native_failure_keeps_receipt_readable`. Emit huge output then a meaningful final diagnostic; receipt and up attention preserve final diagnostic and remain bounded. | Drop retired 4096-byte event protocol and receipt size fingerprint. |
+| 653 a failed save carries the output that explains it | Unchanged | `unchanged_failed_native_save_names_diagnostic_and_recovery`. A valid active encrypted declaration reaches a failing save. The live receipt and replay name the save failure and advise retrying sync. The checkout and bare ref stay put. | Native command wrapper. The exact child stderr tail is internal. |
+| 660 a long native diagnostic keeps the sync attention event readable | Split | `unchanged_long_native_failure_keeps_receipt_readable`. Flood stderr during a verified save attempt. The live receipt and replay keep a bounded failure explanation and a sync retry action. | The retired 4096-byte stage-event protocol is omitted. |
 | 683 a push retry merges main again over a racing dev change to the same hunk | Unchanged | `unchanged_retry_reapplies_main_priority_after_racing_dev`. Main and racing dev edit same hunk; final tip keeps reviewed main hunk and both histories. | Git pre-push race. |
 | 703 a flagged new file stays local while other edits are shared | Unchanged | `unchanged_flagged_candidate_stays_unreferenced_and_safe_file_is_shared`. Scanner flags staged new file, then permits clean remainder; the push hook requires a blocked scan followed by a clean scan covering the accepted file. Verify the flagged file stays on disk and unreachable from refs. | Gitleaks stub via fixture PATH. |
 | 717 a missing scanner shares and pushes nothing | Unchanged | `unchanged_no_working_scanner_shares_nothing`, `unchanged_missing_scanner_blocks_candidate_before_local_snapshot`. Omit gitleaks from fixture PATH and attempt public change; live history and origin stay unchanged, then successful rerun. | Ensure fallback cannot see installed scanner. |
@@ -155,6 +155,9 @@ The rejected-origin cases record transport attempts through a fixture Git wrappe
   source push. Native rollback restores the exact bytes. The source bare
   repository contains the approved public update and excludes the private payload,
   and the separate private history remote remains empty.
+- `new_native_history_failure_keeps_backend_secret_out_of_live_and_replay`
+  injects a synthetic password into native mise stderr during a verified save attempt
+  and checks combined stdout and stderr from live sync and replay for redaction.
 - `new_local_only_sync_skips_all_stages`
 - `new_empty_reachable_origin_creates_only_dev`
 - `new_credential_bearing_origin_is_refused_before_transport`

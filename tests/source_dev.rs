@@ -353,6 +353,12 @@ fi
 if [ "${1:-}" = -E ]; then shift 2; fi
 case "${1:-} ${2:-} ${3:-}" in
   'config get --file')
+    case "$5" in
+      'dotfiles."~/.fixture-history"')
+        exec grep '^"~/.fixture-history" = ' "$4" ;;
+      'dotfiles."~/.fixture-history".encrypt')
+        exec sed -nE '/^"~\/.fixture-history" = /s/.*encrypt = (true|false).*/\1/p' "$4" ;;
+    esac
     name=${5#vars.}
     value=$(sed -n 's/^'"$name"' = "\(.*\)"$/\1/p' "$4")
     [ -n "$value" ] && printf '%s\n' "$value"
@@ -384,6 +390,7 @@ case "${1:-} ${2:-} ${3:-}" in
     printf '{"files": [], "edits": []}\n'
     ;;
   'bootstrap dotfiles save')
+    if [ -n "${FIXTURE_SAVE_ATTEMPTED:-}" ]; then touch "$FIXTURE_SAVE_ATTEMPTED"; fi
     if [ -n "${FIXTURE_SAVE_OUTPUT:-}" ]; then "$FIXTURE_SAVE_OUTPUT"; fi
     if [ -n "${FIXTURE_SAVE_FAILURE:-}" ]; then printf '%s\n' "$FIXTURE_SAVE_FAILURE" >&2; exit 1; fi
     if [ -n "${FIXTURE_SAVED:-}" ]; then touch "$FIXTURE_SAVED"; fi
@@ -630,25 +637,64 @@ sync_case!(unchanged_public_edit_push_excludes_private_files, || {
     f.clean(&f.a);
 });
 
+fn tracked_fixture(f: &Repo, encrypted: bool) -> String {
+    let declaration = "config.local.toml";
+    f.write(
+        &f.a,
+        declaration,
+        format!(
+            "[dotfiles]\n\"~/.fixture-history\" = {{ mode = \"track\", encrypt = {encrypted} }}\n"
+        ),
+    );
+    let target = f.world.home().join(".fixture-history");
+    put(&target, "fixture native history\n");
+    chmod(&target, 0o600);
+    serde_json::json!({
+        "entries": [{
+            "path": "~/.fixture-history",
+            "mode": "track",
+            "declared_in": f.a.join(declaration)
+        }]
+    })
+    .to_string()
+}
+
 sync_case!(unchanged_sync_refuses_unencrypted_history, || {
     let f = Repo::new();
+    let before = f.remote();
     let saved = f.scratch.join("saved");
     let marker = saved.to_str().unwrap();
-    f.sync_env(&f.a, &[("FIXTURE_SAVED", marker)]);
-    assert!(saved.exists());
-    fs::remove_file(&saved).unwrap();
-    let inventory =
-        r#"{"entries": [{"path":"~/.app", "mode":"track", "declared_in":"config.toml"}]}"#;
-    let receipt = f.sync_env(
+    let encrypted = tracked_fixture(&f, true);
+    let allowed = f.sync_env(
         &f.a,
         &[
             ("FIXTURE_SAVED", marker),
-            ("FIXTURE_DOTFILE_PATHS", inventory),
+            ("FIXTURE_DOTFILE_PATHS", &encrypted),
         ],
     );
-    has(&receipt, "~/.app");
-    has(&receipt, "encrypt");
+    assert!(saved.exists(), "{allowed}");
+    fs::remove_file(&saved).unwrap();
+    let attempted = f.scratch.join("plaintext-save-attempted");
+    let pushed = f.scratch.join("plaintext-push-attempted");
+    f.hook(&f.a, "pre-push", &format!("touch {}", sh(&pushed)));
+    let plaintext = tracked_fixture(&f, false);
+    let receipt = dots_zero(
+        f.dots(&f.a, &["--verbose", "sync"])
+            .env("FIXTURE_SAVED", marker)
+            .env("FIXTURE_DOTFILE_PATHS", plaintext)
+            .env("FIXTURE_SAVE_ATTEMPTED", &attempted),
+    );
+    has(&receipt, "history");
+    has(&receipt, "encrypt = true");
     assert!(!saved.exists());
+    assert!(!attempted.exists());
+    assert!(!pushed.exists());
+    assert_eq!(f.remote(), before);
+    assert_eq!(f.tip(&f.a), before);
+    assert_eq!(
+        read(&f.world.home().join(".fixture-history")),
+        "fixture native history\n"
+    );
 });
 
 sync_case!(unchanged_remote_change_arrives_on_disk, || {
@@ -1001,22 +1047,51 @@ sync_case!(
     unchanged_failed_native_save_names_diagnostic_and_recovery,
     || {
         let f = Repo::new();
-        let saved = f.scratch.join("saved");
-        let receipt = f.sync_env(
-            &f.a,
-            &[
-                (
-                    "FIXTURE_SAVE_FAILURE",
-                    "mise ERROR cannot read ~/.fixture-state",
-                ),
-                ("FIXTURE_SAVED", saved.to_str().unwrap()),
-            ],
-        );
-        has(&receipt, "cannot read ~/.fixture-state");
-        has(&receipt, "save");
-        assert!(!saved.exists());
+        failed_history_save(&f, None, "mise ERROR cannot read fixture history");
     }
 );
+
+fn failed_history_save(f: &Repo, output: Option<&Path>, diagnostic: &str) -> [String; 2] {
+    let inventory = tracked_fixture(f, true);
+    let before = f.remote();
+    let attempted = f.scratch.join("save-attempted");
+    let saved = f.scratch.join("saved");
+    let receipt = dots_zero(
+        f.dots(&f.a, &["sync"])
+            .env("FIXTURE_DOTFILE_PATHS", inventory)
+            .env("FIXTURE_SAVE_ATTEMPTED", &attempted)
+            .env("FIXTURE_SAVED", &saved)
+            .env("FIXTURE_SAVE_OUTPUT", output.unwrap_or(Path::new("")))
+            .env("FIXTURE_SAVE_FAILURE", diagnostic),
+    );
+    assert!(attempted.exists(), "{receipt}");
+    assert!(!saved.exists(), "{receipt}");
+    assert_eq!(f.remote(), before);
+    assert_eq!(f.tip(&f.a), before);
+    let reports = [receipt, f.replay(&f.a)];
+    for text in &reports {
+        has(text, "history");
+        has(text, "save");
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("failed") || lower.contains("could not"),
+            "{text}"
+        );
+        absent(&lower, "dots backup");
+        assert!(
+            lower.lines().any(|line| {
+                line.contains("sync") && (line.contains("retry") || line.contains("rerun"))
+            }),
+            "checkpoint failure needs an actionable sync retry: {text}"
+        );
+        assert!(
+            text.len() < 64 * 1024,
+            "sync receipt rendered {} bytes",
+            text.len()
+        );
+    }
+    reports
+}
 
 sync_case!(unchanged_long_native_failure_keeps_receipt_readable, || {
     let f = Repo::new();
@@ -1025,25 +1100,19 @@ sync_case!(unchanged_long_native_failure_keeps_receipt_readable, || {
         &failure,
         "awk 'BEGIN { for (i=0; i<20; i++) printf \"fixture diagnostic %d %070000d\\n\", i, 0 }' >&2",
     );
-    let receipt = f.sync_env(
-        &f.a,
-        &[
-            ("FIXTURE_SAVE_OUTPUT", failure.to_str().unwrap()),
-            (
-                "FIXTURE_SAVE_FAILURE",
-                "mise ERROR cannot read ~/.fixture-state",
-            ),
-        ],
-    );
-    for text in [receipt, f.replay(&f.a)] {
-        has(&text, "cannot read ~/.fixture-state");
-        assert!(
-            text.len() < 64 * 1024,
-            "sync receipt rendered {} bytes",
-            text.len()
-        );
-    }
+    failed_history_save(&f, Some(&failure), "mise ERROR cannot read fixture history");
 });
+
+sync_case!(
+    new_native_history_failure_keeps_backend_secret_out_of_live_and_replay,
+    || {
+        let f = Repo::new();
+        let marker = "SYNTHETIC_HISTORY_PASSWORD_7E341A";
+        for report in failed_history_save(&f, None, &format!("mise ERROR {marker}")) {
+            absent(&report, marker);
+        }
+    }
+);
 
 const FLAG_SCANNER: &str = r#"
 report=''

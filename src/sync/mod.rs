@@ -11,6 +11,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -83,21 +84,21 @@ fn shape(git: &Git<'_>) -> Result<CheckoutShape, Fail> {
 
 fn shape_problem(shape: &CheckoutShape) -> Option<Note> {
     if shape.git_too_old {
-        Some(Note(
+        Some(Note::new(
             "Sync needs Git 2.43 or newer",
             "Upgrade Git and rerun dots sync.",
         ))
     } else if shape.jj_workspace {
-        Some(Note("Sync stopped in a JJ workspace", GUIDE))
+        Some(Note::new("Sync stopped in a JJ workspace", GUIDE))
     } else if shape.legacy_sync {
-        Some(Note("Sync found pre-1.0 source state", GUIDE))
+        Some(Note::new("Sync found pre-1.0 source state", GUIDE))
     } else if shape.head.as_deref() != Some(OsStr::new("refs/heads/dev")) || !shape.has_commit {
-        Some(Note(
+        Some(Note::new(
             "Sync needs Git HEAD on a dev branch with a commit",
             GUIDE,
         ))
     } else if !shape.operations.is_empty() {
-        Some(Note(
+        Some(Note::new(
             "Sync skipped while a Git operation is in progress",
             "Finish the Git operation and rerun dots sync.",
         ))
@@ -110,14 +111,16 @@ pub fn load(ctx: &Ctx) -> Loaded {
     match load_source(ctx) {
         Ok(Some(shared)) => Loaded::Ready(shared),
         Ok(None) => Loaded::LocalOnly,
-        Err(Note(diagnostic, action)) => Loaded::Problem(run::Issue::new(diagnostic, action)),
+        Err(Note(diagnostic, action)) => {
+            Loaded::Problem(run::Issue::new(diagnostic.as_ref(), action))
+        }
     }
 }
 
 fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
     let git = Git::new(ctx, ctx.root.path());
     let checkout = shape(&git).map_err(|_| {
-        Note(
+        Note::new(
             "Git is unavailable or the configuration is outside a Git checkout",
             GUIDE,
         )
@@ -128,7 +131,7 @@ fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
     let (dir, common) =
         repository_dirs(&git).or_note("Could not resolve Git checkout directories", GUIDE)?;
     if common != checkout.common_dir {
-        return Err(Note(
+        return Err(Note::new(
             "The Git common directory changed during preflight",
             GIT,
         ));
@@ -141,7 +144,7 @@ fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
 
 fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
     if !ctx.root.path().join("config.toml").is_file() {
-        return Err(Note(
+        return Err(Note::new(
             "config.toml is missing",
             "Run dots init or set DOTS_ROOT to the configuration checkout.",
         ));
@@ -172,7 +175,10 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
             if let Err(Note(reason, fix)) = synchronize(execution, stage, shared, &mut receipt)
                 && !execution.cancelled()
             {
-                issue(&mut receipt, reason, fix);
+                receipt.issues.push(Issue {
+                    diagnostic: reason.into_owned(),
+                    next_action: fix.into(),
+                });
             }
         }
     }
@@ -204,7 +210,13 @@ fn local_only(receipt: &mut Receipt) {
 }
 
 #[derive(Debug)]
-struct Note(&'static str, &'static str);
+struct Note(Cow<'static, str>, &'static str);
+
+impl Note {
+    fn new(diagnostic: &'static str, action: &'static str) -> Self {
+        Self(Cow::Borrowed(diagnostic), action)
+    }
+}
 
 trait Explanation<T> {
     fn or_note(self, reason: &'static str, fix: &'static str) -> Result<T, Note>;
@@ -212,7 +224,7 @@ trait Explanation<T> {
 
 impl<T, E> Explanation<T> for Result<T, E> {
     fn or_note(self, reason: &'static str, fix: &'static str) -> Result<T, Note> {
-        self.map_err(|_| Note(reason, fix))
+        self.map_err(|_| Note::new(reason, fix))
     }
 }
 
@@ -229,7 +241,7 @@ fn path_issue(receipt: &mut Receipt, diagnostic: &'static str, path: &Path, acti
 
 fn active(run: &Run<'_>) -> Result<(), Note> {
     if run.cancelled() {
-        Err(Note(
+        Err(Note::new(
             "Sync stopped before launching more work",
             "Rerun dots sync.",
         ))
@@ -288,7 +300,7 @@ fn synchronize(
     let git = Git::supervised(run);
     let _lock = RepoLock::try_acquire(&shared.common)
         .or_note("Could not open the source operation lock", GIT)?
-        .ok_or(Note(
+        .ok_or(Note::new(
             "Sync skipped while another sync or publish is running",
             "Wait for it to finish, then rerun dots sync.",
         ))?;
@@ -297,7 +309,7 @@ fn synchronize(
         return Err(problem);
     }
     if checked_shape.common_dir != shared.common {
-        return Err(Note(
+        return Err(Note::new(
             "The Git common directory changed during preflight",
             GIT,
         ));
@@ -308,7 +320,7 @@ fn synchronize(
         .or_note("Could not verify the source checkout directory", GIT)?;
     for metadata in [&shared.dir, &shared.common] {
         if metadata.starts_with(&root) && !metadata.starts_with(root.join(".git")) {
-            return Err(Note(
+            return Err(Note::new(
                 "Git metadata is inside a publishable checkout path",
                 "Move Git metadata outside the worktree or into .git, then rerun dots sync.",
             ));
@@ -399,14 +411,14 @@ fn synchronize(
         drop(snapshot);
         checkout::begin(&git, &shared.dir, &index_before, &previous, &before, true)
             .or_note("Could not prepare the checkout after dev moved", GIT)?;
-        let installed = finish_pending(run, &git, &shared.dir, receipt)?.ok_or(Note(
+        let installed = finish_pending(run, &git, &shared.dir, receipt)?.ok_or(Note::new(
             "The checkout could not be reconciled after dev moved",
             GIT,
         ))?;
         snapshot = acquire_index()?;
         verify_dev(&git, &before).or_note("The dev checkout changed after reconciliation", GIT)?;
         if snapshot.bytes() != installed.index_after.as_slice() {
-            return Err(Note("The Git index changed after reconciliation", GIT));
+            return Err(Note::new("The Git index changed after reconciliation", GIT));
         }
         receipt.recovered.push(ChangeGroup::new(
             Some(previous),
@@ -441,7 +453,7 @@ fn synchronize(
     )
     .or_note("Could not verify the staged local edits", GIT)?
     {
-        return Err(Note(
+        return Err(Note::new(
             "A path has different staged and unstaged edits",
             "Save or reconcile the two versions with Git, then rerun dots sync.",
         ));
@@ -475,7 +487,7 @@ fn synchronize(
             GIT,
         )?;
         let installed = finish_pending(run, &git, &shared.dir, receipt)?
-            .ok_or(Note("The local checkout update was not recorded", GIT))?;
+            .ok_or(Note::new("The local checkout update was not recorded", GIT))?;
         adoption(receipt, &installed);
         index = installed.index_after;
         receipt.saved.push(ChangeGroup::new(
@@ -491,7 +503,7 @@ fn synchronize(
         .or_note("Could not record the saved copy baseline", RERUN)?;
 
     let Ok(mut heads) = remote::fetch(&git, run, &origin) else {
-        return Err(Note(
+        return Err(Note::new(
             "origin is offline or its refs could not be fetched",
             "Check the repository and your Git credentials, then rerun dots sync.",
         ));
@@ -504,7 +516,7 @@ fn synchronize(
         if machine_local_in_history(&git, &approved, &published)
             .or_note("Could not verify unpublished Git history", GIT)?
         {
-            return Err(Note(
+            return Err(Note::new(
                 "NOT SHARED: unpublished history tracked a machine-local file",
                 "Review local history without publishing it, then rerun dots sync.",
             ));
@@ -514,7 +526,7 @@ fn synchronize(
             .map_err(scan_note)?
             .is_empty()
         {
-            return Err(Note(
+            return Err(Note::new(
                 "NOT SHARED: gitleaks flagged unpublished history",
                 "Review the unpublished commits and remove or rotate any secret before sharing.",
             ));
@@ -535,7 +547,7 @@ fn synchronize(
             if machine_local_in_history(&scratch.git, &merged, &excluded)
                 .or_note("Could not verify intermediate merged trees", GIT)?
             {
-                return Err(Note(
+                return Err(Note::new(
                     "NOT SHARED: merged history touched a machine-local file",
                     "Review the incoming revisions without sharing the merge, then rerun dots sync.",
                 ));
@@ -545,7 +557,7 @@ fn synchronize(
                 .map_err(scan_note)?
                 .is_empty()
             {
-                return Err(Note(
+                return Err(Note::new(
                     "NOT SHARED: gitleaks flagged the merged configuration",
                     "Review the merged revisions before sharing.",
                 ));
@@ -575,7 +587,7 @@ fn synchronize(
                     receipt.issues.push(issue);
                     return Ok(());
                 }
-                return Err(Note(
+                return Err(Note::new(
                     "Merged configuration failed validation; nothing pushed or applied",
                     fix,
                 ));
@@ -586,7 +598,10 @@ fn synchronize(
             .still_current(git.root())
             .or_note("Could not recheck machine-local files", RERUN)?
         {
-            return Err(Note("Machine-local files changed during validation", RERUN));
+            return Err(Note::new(
+                "Machine-local files changed during validation",
+                RERUN,
+            ));
         }
 
         let blocked = checkout::preflight(&scratch.git, &approved, &local_tree, &merged_tree)
@@ -613,7 +628,7 @@ fn synchronize(
             Ok(()) => true,
             Err(PushError::Rejected) => false,
             Err(PushError::NotAttempted) => {
-                return Err(Note(
+                return Err(Note::new(
                     "NOT SHARED: the conditional dev push could not be started",
                     "Check the verified revision and origin settings, then rerun dots sync.",
                 ));
@@ -648,8 +663,9 @@ fn synchronize(
             if merged != approved {
                 checkout::begin(&git, &shared.dir, &index, &approved, &merged, true)
                     .or_note("Could not prepare guarded checkout", GIT)?;
-                let installed = finish_pending(run, &git, &shared.dir, receipt)?
-                    .ok_or(Note("The merged checkout update was not recorded", GIT))?;
+                let installed = finish_pending(run, &git, &shared.dir, receipt)?.ok_or(
+                    Note::new("The merged checkout update was not recorded", GIT),
+                )?;
                 adoption(receipt, &installed);
                 if !installed.paths.is_empty() {
                     receipt.updated.push(ChangeGroup::new(
@@ -666,7 +682,7 @@ fn synchronize(
                 .still_current(git.root())
                 .or_note("Could not recheck machine-local files before apply", RERUN)?
             {
-                return Err(Note(
+                return Err(Note::new(
                     "Machine-local files changed after validation; dotfiles were kept",
                     RERUN,
                 ));
@@ -699,7 +715,7 @@ fn synchronize(
             .withdraws(&git, &heads)
             .or_note("Could not verify refreshed published history", GIT)?
         {
-            return Err(Note(
+            return Err(Note::new(
                 "Published dev or main was removed or rewound during sync",
                 "Review origin's branch history and rerun dots sync.",
             ));
@@ -712,7 +728,7 @@ fn synchronize(
         }
         heads = refreshed;
     }
-    Err(Note(
+    Err(Note::new(
         "NOT SHARED: the conditional dev push was rejected",
         "Check origin, credentials and remote branch policies, then rerun dots sync.",
     ))
@@ -806,11 +822,11 @@ fn scan_candidate(
 
 fn scan_note(error: ScanError) -> Note {
     match error {
-        ScanError::Missing => Note(
+        ScanError::Missing => Note::new(
             "NOT SHARED: gitleaks not found; local edits kept on disk, nothing pushed",
             "Install gitleaks and rerun dots sync.",
         ),
-        ScanError::Failed => Note(
+        ScanError::Failed => Note::new(
             "NOT SHARED: the gitleaks scan failed; nothing pushed",
             "Check gitleaks and its rules, then rerun dots sync.",
         ),
@@ -850,6 +866,13 @@ fn finish_pending(
         Ok(None) => Ok(None),
         Err(error) => {
             receipt.recovery_files.extend(error.backups);
+            if let Some((before, after)) = error.moved_dev {
+                return Err(Note(
+                    format!("dev moved during guarded checkout (expected {before} or {after})")
+                        .into(),
+                    "Preserve the competing dev tip, reconcile the checkout with the recorded revisions, then rerun dots sync.",
+                ));
+            }
             if let Some(path) = error.path {
                 path_issue(
                     receipt,
@@ -858,7 +881,7 @@ fn finish_pending(
                     RERUN,
                 );
             }
-            Err(Note(
+            Err(Note::new(
                 "A guarded checkout is pending; sync kept your files",
                 "Resolve the obstruction and rerun dots sync to finish the pending checkout.",
             ))

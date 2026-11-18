@@ -46,6 +46,7 @@ pub(super) struct Installed {
 pub(super) struct Interrupted {
     pub path: Option<PathBuf>,
     pub backups: Vec<PathBuf>,
+    pub moved_dev: Option<(String, String)>,
 }
 
 fn fingerprints_match(path: &Path, other: &Path) -> io::Result<bool> {
@@ -469,6 +470,7 @@ fn apply(
     }
     let head = git.id(["rev-parse", "--verify", "HEAD^{commit}"])?;
     if head != plan.before && head != plan.after {
+        progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
         if !pending.join("started").exists() && !pending.join("finished").exists() {
             release_index(directory, pending)?;
             retire_pending(directory, pending, progress)?;
@@ -487,6 +489,7 @@ fn apply(
     };
     if pending.join("finished").exists() {
         if head != plan.after {
+            progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
             return Err(invalid("branch no longer matches the finished checkout"));
         }
         release_index(directory, pending)?;
@@ -597,6 +600,13 @@ fn apply(
         Ok::<(), io::Error>(())
     })();
     if let Err(error) = update {
+        if !cancelled()
+            && git
+                .id(["rev-parse", "--verify", "refs/heads/dev^{commit}"])
+                .is_ok_and(|dev| dev != plan.before && dev != plan.after)
+        {
+            progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
+        }
         if !plan.checkout {
             replace_index(&pending.join("index.before"), directory)?;
             File::open(directory)?.sync_all()?;
@@ -777,10 +787,7 @@ pub(super) fn finish(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Ok(md) if md.is_dir() && md.permissions().mode() & 0o077 == 0 => (),
         _ => {
-            return Err(Interrupted {
-                path: None,
-                backups: Vec::new(),
-            });
+            return Err(Interrupted::default());
         }
     };
     let mut progress = Interrupted::default();
@@ -1159,7 +1166,9 @@ mod tests {
         begin(&git, &dir, &index, &before, &after, true).unwrap();
         git.get(["update-ref", "refs/heads/dev", &other, &before])
             .unwrap();
-        assert!(finish(&git, &dir, || false).is_err());
+        let problem = finish(&git, &dir, || false).err().expect("dev moved");
+        assert_eq!(problem.moved_dev, Some((before, after)));
+        assert!(problem.backups.is_empty());
         assert!(!has_pending(&dir));
         assert_eq!(fs::read(live).unwrap(), b"baseline");
         assert_eq!(index_snapshot(&dir).unwrap(), index);

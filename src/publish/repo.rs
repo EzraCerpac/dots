@@ -14,7 +14,7 @@ pub(super) struct Workspace<'a, 'ctx> {
     ctx: &'ctx Ctx,
     run: &'a Run<'ctx>,
     root: PathBuf,
-    live: Option<PathBuf>,
+    live: PathBuf,
     pub(super) slug: String,
 }
 
@@ -46,7 +46,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             .ok_or_else(workspace_required)?;
         let live = git_path(ctx, run, config, "--show-toplevel")?
             .filter(|path| path == config)
-            .map(|_| config.to_path_buf());
+            .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
         let workspace = Self {
             ctx,
             run,
@@ -75,7 +75,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
 
     pub(super) fn lock(&self) -> Result<Vec<RepoLock>, Fail> {
         let mut dirs = Vec::new();
-        for root in std::iter::once(self.root.as_path()).chain(self.live.as_deref()) {
+        for root in [&self.root, &self.live] {
             let common = git_path(self.ctx, self.run, root, "--git-common-dir")?
                 .ok_or_else(|| failure("could not locate the repository lock directory"))?;
             dirs.push(common);
@@ -100,10 +100,8 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         let raw = configured_urls(self.ctx, self.run, &self.root, "remote.origin.url")?
             .ok_or_else(|| failure("the JJ workspace has no origin remote"))?;
         self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
-        if let Some(live) = &self.live
-            && live != &self.root
-        {
-            let raw = configured_urls(self.ctx, self.run, live, "remote.origin.url")?
+        if self.live != self.root {
+            let raw = configured_urls(self.ctx, self.run, &self.live, "remote.origin.url")?
                 .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
             self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
         }
@@ -167,6 +165,33 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             "resolve the fetched main",
         )?;
         object_id(stdout(&out)?.trim()).map(str::to_owned)
+    }
+
+    pub(super) fn refuse_shared_dev(&self, base: &str, head: &str) -> Result<(), Fail> {
+        let mut cmd = git_command(self.ctx, &self.root)?;
+        cmd.args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/dev^{commit}",
+        ]);
+        let out = self.probe(cmd, "git")?;
+        match out.status.code() {
+            Some(0) => {
+                let dev = object_id(stdout(&out)?.trim())?;
+                if !self
+                    .revisions(&format!("({dev} & ::{head}) ~ ::{base}"))?
+                    .is_empty()
+                {
+                    return Err(failure(
+                        "shared dev cannot be published as a pull request; extract a focused change onto a main-based task branch",
+                    ));
+                }
+                Ok(())
+            }
+            Some(1) => Ok(()),
+            _ => Err(failure("git could not read the workspace's dev branch")),
+        }
     }
 
     pub(super) fn require_unchanged(

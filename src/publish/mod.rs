@@ -87,6 +87,7 @@ fn publish_source(
         Selection::All => workspace.stack_head(&working)?,
         Selection::Bookmark(name) => workspace.local_bookmark(name)?,
     };
+    workspace.refuse_shared_dev(&base, &revision)?;
     let mut outgoing = outgoing_commits(&workspace, &base, &revision)?;
     if matches!(selection, Selection::Working)
         && (outgoing.len() != 1
@@ -181,6 +182,7 @@ fn publish_source(
     if workspace.fetch_main()? != base {
         return Err(repo::stale());
     }
+    workspace.refuse_shared_dev(&base, &revision)?;
     workspace.validate_origin()?;
     if !matches!(selection, Selection::Bookmark(_)) {
         workspace.save_bookmark(&name, &revision)?;

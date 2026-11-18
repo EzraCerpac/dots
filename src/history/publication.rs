@@ -7,7 +7,7 @@ use std::str;
 
 use serde::Deserialize;
 
-use crate::Fail;
+use crate::{Fail, config::RepoSetting};
 
 const LOCAL: &str = "refs/heads/main";
 const MARKER: &str = ".mise-history/format.toml";
@@ -34,9 +34,10 @@ pub(super) fn preflight(
     probe: impl Fn(Command) -> Result<Output, Fail>,
     branch: &str,
     origin: &str,
+    local: &str,
 ) -> Result<(), Fail> {
     let blocked = || refusal("could not verify saved settings history", RECONCILE);
-    let probe = |args: &[&str]| {
+    let run_git = |args: &[&str], network: bool| {
         let mut command = git()?;
         command
             .env("LC_ALL", "C")
@@ -45,10 +46,17 @@ pub(super) fn preflight(
             .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args);
+        if network {
+            command.env("GIT_TERMINAL_PROMPT", "0");
+        } else {
+            // Git versions that lack GIT_NO_LAZY_FETCH must also stop at a
+            // missing promisor object without initiating an implicit fetch.
+            command.env("GIT_ALLOW_PROTOCOL", "");
+        }
         probe(command).map_err(|_| blocked())
     };
     let read = |args: &[&str]| {
-        let output = probe(args)?;
+        let output = run_git(args, false)?;
         output
             .status
             .success()
@@ -72,9 +80,39 @@ pub(super) fn preflight(
             .map(Some)
             .ok_or_else(blocked)
     };
+    let expected = RepoSetting::parse(origin).map_err(|_| blocked())?;
+    let routes = || -> Result<Vec<u8>, Fail> {
+        let routes = read(&["remote", "show", "-n", "--", origin])?;
+        let text = str::from_utf8(&routes).map_err(|_| blocked())?;
+        let mut fetch = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("  Fetch URL: "));
+        let mut push = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("  Push  URL: "))
+            .peekable();
+        let url = fetch
+            .next()
+            .filter(|url| !url.is_empty())
+            .ok_or_else(blocked)?;
+        if fetch.next().is_some() || !expected.matches(url) {
+            return Err(blocked());
+        }
+        if push.peek().is_none() || push.any(|route| route != url) {
+            return Err(refusal(
+                "cannot verify history publication through different fetch and push routes",
+                "Configure one verified route for fetching and pushing this private history, then retry backup",
+            ));
+        }
+        Ok(routes)
+    };
+    let route = routes()?;
     let dest = format!("refs/heads/{branch}");
     let remote_tip = || -> Result<Option<String>, Fail> {
-        let output = probe(&["ls-remote", "--refs", "--exit-code", "--", origin, &dest])?;
+        let output = run_git(
+            &["ls-remote", "--refs", "--exit-code", "--", origin, &dest],
+            true,
+        )?;
         match output.status.code() {
             Some(2) if output.stdout.is_empty() => Ok(None),
             Some(0) => {
@@ -90,23 +128,15 @@ pub(super) fn preflight(
             _ => Err(blocked()),
         }
     };
-    let local = local_tip()?;
-    if let Some(id) = local.as_deref()
-        && read(&["cat-file", "-t", id]).ok().as_deref() != Some(b"commit\n")
-    {
-        return Err(refusal(
-            format!("cannot verify history path \"<checkpoint>\" in checkpoint {id}"),
-            REVIEW,
-        ));
+    if parse_oid(local.as_bytes()).is_none() {
+        return Err(blocked());
     }
     let remote = remote_tip()?;
-    if let Some(local) = local.as_deref()
-        && Some(local) != remote.as_deref()
-    {
+    if Some(local) != remote.as_deref() {
         // If the remote commit is unfamiliar, avoid fetching into the store.
         // Auditing all local ancestors is a safe superset in that case.
         let known_remote = if let Some(remote) = remote.as_deref() {
-            let object = probe(&["cat-file", "-t", remote])?;
+            let object = run_git(&["cat-file", "-t", remote], false)?;
             if object.status.success() {
                 if object.stdout != b"commit\n" {
                     return Err(blocked());
@@ -123,7 +153,7 @@ pub(super) fn preflight(
         // tree. Neither makes any unchecked local ancestor reachable.
         audit(&read, local, known_remote)?;
     }
-    if remote_tip()? != remote || local_tip()? != local {
+    if routes()? != route || remote_tip()? != remote || local_tip()?.as_deref() != Some(local) {
         return Err(refusal(
             "the local or destination checkpoint changed during verification",
             "Retry backup",
@@ -169,6 +199,7 @@ fn audit(
         return Ok(());
     }
     let mut manifests = HashMap::new();
+    let mut saved_manifests = HashMap::new();
     let mut markers = HashSet::new();
     let mut checked = HashSet::new();
     for id in line(&commits).split(|&b| b == b'\n') {
@@ -217,22 +248,8 @@ fn audit(
             }
         }
         let manifest = metadata(MANIFEST)?;
-        if !manifests.contains_key(manifest.oid) {
-            let body =
-                blob(read, manifest.oid, 4 * 1024 * 1024).ok_or_else(|| unverified(MANIFEST))?;
-            let decoded: Manifest =
-                serde_json::from_slice(&body).map_err(|_| unverified(MANIFEST))?;
-            if decoded.format != 1
-                || decoded.enrollment.iter().any(|entry| {
-                    !safe_path(&entry.path)
-                        || !matches!(entry.path.split('/').next(), Some("config" | "home"))
-                })
-            {
-                return Err(unverified(MANIFEST));
-            }
-            manifests.insert(manifest.oid.to_owned(), decoded);
-        }
-        let manifest = &manifests[manifest.oid];
+        cache_manifest(read, &mut manifests, manifest.oid).ok_or_else(|| unverified(MANIFEST))?;
+        saved_manifests.insert(id.to_owned(), manifest.oid.to_owned());
         for entry in entries {
             let path = entry.path;
             let (root, _) = path.split_once('/').unwrap_or((path, ""));
@@ -241,11 +258,16 @@ fn audit(
                 .map_or((root, None), |(root, variant)| (root, Some(variant)));
             match (root, variant) {
                 _ if matches!(path, MARKER | MANIFEST) => continue,
-                ("config", None) if !manifest.tracks_config(path) => continue,
+                ("config", None) => {
+                    if !config_payload(read, id, path, &mut manifests, &mut saved_manifests)
+                        .ok_or_else(|| unverified(path))?
+                    {
+                        continue;
+                    }
+                }
                 ("home" | "config", Some(variant))
                     if !variant.is_empty() && !variant.contains('@') => {}
                 ("home", None) => {}
-                ("config", None) => {}
                 _ => return Err(unverified(path)),
             }
             if !checked.insert((path.to_owned(), entry.mode.to_owned(), entry.oid.to_owned())) {
@@ -263,6 +285,64 @@ fn audit(
         }
     }
     Ok(())
+}
+
+// Native puts unscoped configuration and unscoped tracked payloads in the
+// same namespace. Look through every parent, including ancestry excluded
+// from the push range. An earlier tracked leaf makes a reused path ambiguous
+// even when the outgoing manifest no longer declares that stream.
+fn config_payload(
+    read: &impl Fn(&[&str]) -> Result<Vec<u8>, Fail>,
+    id: &str,
+    path: &str,
+    manifests: &mut HashMap<String, Manifest>,
+    saved: &mut HashMap<String, String>,
+) -> Option<bool> {
+    let ancestry = read(&["rev-list", id, "--"]).ok()?;
+    for ancestor in line(&ancestry).split(|&b| b == b'\n') {
+        let ancestor = parse_oid(ancestor)?;
+        if !saved.contains_key(ancestor) {
+            let output = read(&["ls-tree", "-z", "--full-tree", ancestor, "--", MANIFEST]).ok()?;
+            let entry = Entry::parse(output.strip_suffix(b"\0")?)?;
+            if entry.path != MANIFEST || entry.mode != "100644" {
+                return None;
+            }
+            cache_manifest(read, manifests, entry.oid)?;
+            saved.insert(ancestor.to_owned(), entry.oid.to_owned());
+        }
+        if manifests.get(saved.get(ancestor)?)?.tracks_config(path) {
+            let output = read(&["ls-tree", "-z", "--full-tree", ancestor, "--", path]).ok()?;
+            if !output.is_empty() {
+                let entry = Entry::parse(output.strip_suffix(b"\0")?)?;
+                if entry.path != path {
+                    return None;
+                }
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+fn cache_manifest(
+    read: &impl Fn(&[&str]) -> Result<Vec<u8>, Fail>,
+    manifests: &mut HashMap<String, Manifest>,
+    oid: &str,
+) -> Option<()> {
+    if !manifests.contains_key(oid) {
+        let body = blob(read, oid, 4 * 1024 * 1024)?;
+        let decoded: Manifest = serde_json::from_slice(&body).ok()?;
+        if decoded.format != 1
+            || decoded.enrollment.iter().any(|entry| {
+                !safe_path(&entry.path)
+                    || !matches!(entry.path.split('/').next(), Some("config" | "home"))
+            })
+        {
+            return None;
+        }
+        manifests.insert(oid.to_owned(), decoded);
+    }
+    Some(())
 }
 
 fn blob(
@@ -401,24 +481,57 @@ fn age_file(bytes: &[u8]) -> bool {
     let Some(mut bytes) = bytes.strip_prefix(b"age-encryption.org/v1\n") else {
         return false;
     };
-    let base64 = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/');
-    let mut stanza = false;
+    let mut stanzas = 0;
     while let Some((line, rest)) = split_byte(bytes, b'\n') {
         if let Some(mac) = line.strip_prefix(b"--- ") {
-            return stanza
+            // The nonce occupies 16 bytes. Each full 64 KiB chunk and the
+            // final chunk have a 16-byte tag. Mise encrypts a nonempty body.
+            let payload = rest.len().saturating_sub(16);
+            let final_chunk = payload % (64 * 1024 + 16);
+            return stanzas > 0
                 && mac.len() == 43
-                && mac.iter().copied().all(base64)
-                && rest.len() >= 32;
+                && raw_base64(mac)
+                && payload > 16
+                && (final_chunk == 0 || final_chunk > 16);
         }
-        if let Some(args) = line.strip_prefix(b"-> ") {
-            if args.is_empty() || !args.iter().all(|b| (b' '..=b'~').contains(b)) {
-                return false;
-            }
-            stanza = true;
-        } else if !stanza || line.len() > 64 || !line.iter().copied().all(base64) {
+        let Some(args) = line.strip_prefix(b"-> ") else {
+            return false;
+        };
+        if args
+            .split(|&b| b == b' ')
+            .any(|arg| arg.is_empty() || !arg.iter().all(|b| (b'!'..=b'~').contains(b)))
+        {
             return false;
         }
+        stanzas += 1;
         bytes = rest;
+        loop {
+            let Some((body, rest)) = split_byte(bytes, b'\n') else {
+                return false;
+            };
+            if body.len() > 64 || !raw_base64(body) {
+                return false;
+            }
+            bytes = rest;
+            if body.len() < 64 {
+                break;
+            }
+        }
     }
     false
+}
+
+fn raw_base64(bytes: &[u8]) -> bool {
+    let digits = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if !bytes.iter().all(|byte| digits.contains(byte)) {
+        return false;
+    }
+    match bytes.len() % 4 {
+        0 => true,
+        2 => bytes.last().is_some_and(|byte| b"AQgw".contains(byte)),
+        3 => bytes
+            .last()
+            .is_some_and(|byte| b"AEIMQUYcgkosw048".contains(byte)),
+        _ => false,
+    }
 }

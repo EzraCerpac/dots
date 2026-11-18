@@ -23,6 +23,7 @@ case "$*" in
             real_mise "$@"
         fi
         ;;
+    'bootstrap dotfiles --local paths --json') printf '%s\n' '{"entries":[],"invalid":[]}' ;;
     'bootstrap dotfiles status --json') printf '%s\n' "$CONTRACT_HISTORY_STATUS" ;;
     'bootstrap dotfiles origin')
         printf '%s (branch %s) declared in config.local.toml; mode manual\n' \
@@ -31,6 +32,7 @@ case "$*" in
     'bootstrap dotfiles save'|'bootstrap dotfiles sync') ;;
     'bootstrap packages status --json'|ls|ls\ *) printf '{}\n' ;;
     'settings get history.sync') printf 'manual\n' ;;
+    'settings get history.allow_plaintext_history') printf 'true\n' ;;
     'config get --file '*|'config set '*|'config ls --json'|'--no-config config '*) real_mise "$@" ;;
     'config ls'|install|upgrade\ *|'self-update --yes') ;;
     exec\ *) shift; [ "$1" != "--" ] || shift; exec "$@" ;;

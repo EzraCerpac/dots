@@ -1,13 +1,15 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use crate::Fail;
-use crate::config::Vars;
+use crate::config::{RepoSetting, Vars, selection};
 
 use super::checkpoint::{MARKER, STAGING, legacy_marker};
 use super::keys::{self, LocalSettings};
@@ -15,13 +17,47 @@ use super::native::{Native, exists, private_dir};
 use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origin};
 
 const PREVIOUS: &str = "repo.git.pre-restore.";
-const TRACKING_REF: &str = "refs/remotes/origin/setup";
+pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
+pub(super) const MAIN_REF: &str = "refs/heads/main";
 
 #[derive(Deserialize, Serialize)]
 struct Journal {
+    root: PathBuf,
+    root_device: u64,
+    root_inode: u64,
+    home: PathBuf,
     origin: String,
     branch: String,
+    device: u64,
+    inode: u64,
+    seed: String,
+    progress: Progress,
     previous: Option<Previous>,
+}
+
+#[derive(Deserialize, Serialize)]
+enum Progress {
+    Prepared,
+    Pulling(Attempt),
+    RollingBack(Attempt),
+    Applied,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Attempt {
+    target: String,
+    head: String,
+    live: BTreeMap<PathBuf, Option<FileVersion>>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct FileVersion {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+    mode: u32,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -40,35 +76,79 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
         initialize,
     } = settings;
     let branch = host(machine)?;
+    let selected = selection::read(&native.ctx.root, &native.ctx.env)?;
+    if selected.machine_id.as_deref() != Some(machine)
+        || selected
+            .active_environments()
+            .split(',')
+            .any(|name| host_stream(name) && name != branch)
+    {
+        return Err(invalid(
+            "active mise selection must name only the restore host profile",
+        ));
+    }
     let vars = Vars::read(&native.ctx.root)?;
     let expected = state_repo(&vars)?;
     validate_origin(native, &vars, origin)?;
     let (identity, recovered_keys) = keys::read_identity(native, identity)?;
-    let local = LocalSettings::read(native)?;
+    let mut local = LocalSettings::read(native)?;
     let mut recipients = local.recipients()?;
     recipients.extend(recovered_keys);
     keys::check_recipients(native, &recipients)?;
     let paths = tracked::paths(native, Some(&branch))?;
     let store = native.store()?;
-    let raw = origin.transport_url();
+    let raw = local
+        .origin()
+        .filter(|url| url.contains(':'))
+        .map_or_else(|| origin.transport_url().into_owned(), str::to_owned);
     let _lock = super::native::lock(&store)?;
-
     let staging = parent(&store).join(STAGING);
-    if exists(&staging)? {
-        if !fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
+    if exists(&staging)? && !fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
+        return Err(invalid(
+            "pending history install location is not a real directory",
+        ));
+    }
+    let staged = staging.join("repo.git");
+    let pending = if exists(&staged)? {
+        Some(staged.as_path())
+    } else if exists(&store.join(MARKER))? {
+        Some(store.as_path())
+    } else {
+        None
+    };
+    let journal = pending
+        .map(|pending| {
+            native.bare(pending)?;
+            let record = read_journal(pending)?;
+            match_request(native, pending, &record, &raw, &branch)?;
+            Ok::<_, Fail>(record)
+        })
+        .transpose()?;
+    let prior_origin = native.effective_origin().ok();
+    if local.origin() != Some(&raw) || local.branch() != Some(&branch) {
+        if exists(&store)? && journal.is_none() && !initialize {
             return Err(invalid(
-                "pending history install location is not a real directory",
+                "local history is connected elsewhere; inspect it before using dots restore --initialize-history",
             ));
         }
-        let staged = staging.join("repo.git");
-        if exists(&staged)? {
-            let record = read_journal(&staged)?;
-            match_request(&record, &raw, &branch)?;
-            native.bare(&staged)?;
+        local.set_origin(&branch, &RepoSetting::parse(&raw)?)?;
+        local.install(native)?;
+    }
+    // The explicit fetch below must use the same native config that apply sees.
+    native.require_origin(&raw, &branch)?;
+
+    if exists(&staging)? {
+        if pending == Some(staged.as_path()) {
+            let record = journal
+                .as_ref()
+                .ok_or_else(|| blocked("pending history journal vanished"))?;
             native.destinations(Some(&staged), &raw, expected, &vars)?;
-            verify_manifest(native, &staged, "HEAD", &branch, &paths)?;
-            install(&staging, &store, &record)?;
-        } else if exists(&store.join(MARKER))? {
+            if revision(native, &staged, MAIN_REF)? != record.seed {
+                return Err(blocked("the staged history seed checkpoint changed"));
+            }
+            verify_tree(native, &staged, &record.seed, &branch, &paths)?;
+            install(&staging, &store, record)?;
+        } else if journal.is_some() {
             fs::remove_dir(&staging)
                 .map_err(|_| blocked("could not finish pending history installation"))?;
         } else {
@@ -78,110 +158,441 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
         }
     }
 
-    let pending = if exists(&store.join(MARKER))? {
-        let record = read_journal(&store)?;
-        match_request(&record, &raw, &branch)?;
-        native.bare(&store)?;
-        true
+    let journal = if let Some(record) = journal {
+        Some(record)
     } else if exists(&legacy_marker(&store))? {
-        native.bare(&store)?;
-        let prior = read_marker(&legacy_marker(&store))?;
-        if prior.trim_end() != raw {
-            return Err(invalid(
-                "pending first restore names a different history origin",
-            ));
-        }
-        true
+        return Err(blocked(
+            "an older pending restore cannot be safely resumed by this build; finish it with the dots version that started it",
+        ));
     } else {
         let old = existing_directory(&store)?;
         let connected = old.is_some()
             && native.bare(&store).is_ok()
+            && revision(native, &store, MAIN_REF).is_ok()
+            && prior_origin.is_some_and(|(url, current_branch)| {
+                current_branch == branch && expected.matches(&url)
+            })
             && native
                 .local_origin(&store)?
-                .is_some_and(|url| expected.matches(&url));
+                .is_none_or(|url| expected.matches(&url))
+            && read_sync(&store)?.is_none_or(|status| {
+                status.origin_url.is_none_or(|url| expected.matches(&url))
+                    && status.origin_branch.is_none_or(|current| current == branch)
+            });
         if connected {
-            false
+            None
         } else {
             if old.is_some() && !initialize {
                 return Err(invalid(
                     "local history is connected elsewhere; inspect it before using dots restore --initialize-history",
                 ));
             }
-            prepare(native, &store, &raw, &branch, &vars, &paths, old)?;
-            true
+            Some(prepare(native, &store, &raw, &branch, &vars, &paths, old)?)
         }
     };
 
     native.destinations(Some(&store), &raw, expected, &vars)?;
-    verify_manifest(native, &store, "HEAD", &branch, &paths)?;
-
-    let make_command = |args: &[&str]| {
-        let mut cmd = native.mise(args)?;
-        cmd.env("MISE_HISTORY_SYNC", "fetch-only")
-            .env("MISE_AGE_IDENTITY_FILES", &identity);
-        Ok::<_, Fail>(cmd)
-    };
-    let cmd = make_command(&[
-        "--yes",
-        "bootstrap",
-        "dotfiles",
-        "origin",
-        "set",
-        &raw,
-        "--branch",
-        &branch,
-        "--sync",
-        "fetch-only",
-    ])?;
-    apply(
+    let recovery = Recovery {
         native,
-        cmd,
-        "mise could not connect and fetch encrypted history",
-    )?;
-    let fetched = revision(native, &store, TRACKING_REF)?;
-    verify_manifest(native, &store, &fetched, &branch, &paths)?;
-    let status = make_command(&["bootstrap", "dotfiles", "status"])?;
-    let status = native.text(status, "could not inspect the fetched private settings")?;
-    let cmd = make_command(&["--yes", "bootstrap", "dotfiles", "pull"])?;
-    let diagnostic = if status.contains("both sides changed the same lines") {
-        "mise could not restore private settings: both sides changed the same lines; resolve the native history conflict before retrying"
-    } else {
-        "mise could not apply incoming private settings"
+        store: &store,
+        origin: &raw,
+        branch: &branch,
+        identity: &identity,
+        paths: &paths,
     };
-    apply(native, cmd, diagnostic)?;
+    let pending = journal.is_some();
+    if let Some(record) = journal {
+        recovery.resume(record)?;
+    } else {
+        recovery.restore_established()?;
+    }
+
+    let mut local = LocalSettings::read(native)?;
+    local.set_history(&branch, &RepoSetting::parse(&raw)?, &identity, &recipients)?;
+    local.install(native)?;
     if pending {
-        // Native rollback keeps its encrypted undo history. Dots never
-        // copies plaintext targets or invokes save/sync during restore.
-        let target = format!("commit:{fetched}");
-        for mode in ["--dry-run", "--yes"] {
-            let cmd = make_command(&[
-                "bootstrap",
-                "dotfiles",
-                "rollback",
-                "--to",
-                &target,
-                "--all",
-                mode,
-            ])?;
-            apply(
-                native,
-                cmd,
-                "mise could not apply the first private history checkpoint",
-            )?;
+        fs::remove_file(store.join(MARKER))
+            .map_err(|_| blocked("could not finish the pending restore marker"))?;
+        fsync_dir(&store)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct SyncState {
+    origin_url: Option<String>,
+    origin_branch: Option<String>,
+    upstream_commit: Option<String>,
+    #[serde(default)]
+    conflicts: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pending_directories: usize,
+    #[serde(default)]
+    pending_applications: Vec<PendingApplication>,
+}
+
+#[derive(Deserialize)]
+struct PendingApplication {
+    branch_path: String,
+    configuration: bool,
+    object: Option<(String, String)>,
+}
+
+fn read_sync(store: &Path) -> Result<Option<SyncState>, Fail> {
+    let path = parent(store).join("sync.json");
+    if !exists(&path)? {
+        return Ok(None);
+    }
+    serde_json::from_reader(read_private(&path)?)
+        .map(Some)
+        .map_err(|_| invalid("could not verify native history synchronization state"))
+}
+
+struct Recovery<'a, 'run, 'ctx> {
+    native: &'a Native<'run, 'ctx>,
+    store: &'a Path,
+    origin: &'a str,
+    branch: &'a str,
+    identity: &'a Path,
+    paths: &'a [PathBuf],
+}
+
+impl Recovery<'_, '_, '_> {
+    fn command(&self, args: &[&str], offline: bool) -> Result<Command, Fail> {
+        let mut command = self.native.mise(args)?;
+        command
+            .env("MISE_HISTORY_SYNC", "fetch-only")
+            .env("MISE_AGE_IDENTITY_FILES", self.identity);
+        if offline {
+            command.env("GIT_ALLOW_PROTOCOL", "");
+        }
+        Ok(command)
+    }
+
+    fn fetch(&self) -> Result<String, Fail> {
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        self.verify(&head)?;
+        tracked::secure(self.native, self.paths)?;
+        self.native.require_origin(self.origin, self.branch)?;
+        let cmd = self.command(&["bootstrap", "dotfiles", "sync", "--fetch-only"], false)?;
+        apply(self.native, cmd, "mise could not fetch encrypted history")?;
+        revision(self.native, self.store, TRACKING_REF)
+    }
+
+    fn verify(&self, commit: &str) -> Result<BTreeSet<PathBuf>, Fail> {
+        verify_tree(self.native, self.store, commit, self.branch, self.paths)
+    }
+
+    fn verify_plan(&self, target: &str) -> Result<(), Fail> {
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        let mut allowed = self.verify(&head)?;
+        allowed.extend(self.verify(target)?);
+        if revision(self.native, self.store, TRACKING_REF)? != target {
+            return Err(blocked(
+                "fetched history changed while preparing restore; retry",
+            ));
+        }
+        let sync = read_sync(self.store)?
+            .ok_or_else(|| blocked("native fetch did not record a restore plan"))?;
+        if sync.upstream_commit.as_deref() != Some(target) || sync.pending_directories != 0 {
+            return Err(invalid(
+                "native restore plan has an unchecked checkpoint or directory mode change",
+            ));
+        }
+        if !sync.conflicts.is_empty() {
+            return Err(history_conflict());
+        }
+        let stem = format!("home@{}/", self.branch);
+        let home = physical_home(self.native)?;
+        for application in sync.pending_applications {
+            let path = application
+                .branch_path
+                .strip_prefix(&stem)
+                .and_then(|relative| home_path(&home, relative));
+            if application.configuration
+                || path.is_none_or(|path| !allowed.contains(&path))
+                || application
+                    .object
+                    .is_some_and(|(mode, oid)| mode != "100644" || !valid_oid(&oid))
+            {
+                return Err(unsafe_tree());
+            }
+        }
+        if tracked::paths(self.native, Some(self.branch))? != self.paths {
+            return Err(blocked(
+                "active encrypted history paths changed while preparing restore",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_established(&self) -> Result<(), Fail> {
+        let target = self.fetch()?;
+        self.verify_plan(&target)?;
+        self.pull()
+    }
+
+    fn pull(&self) -> Result<(), Fail> {
+        let cmd = self.command(&["--yes", "bootstrap", "dotfiles", "pull"], true)?;
+        apply(
+            self.native,
+            cmd,
+            "mise could not apply incoming private settings",
+        )
+    }
+
+    fn resume(&self, mut journal: Journal) -> Result<(), Fail> {
+        loop {
+            journal.progress = match &journal.progress {
+                Progress::Prepared => {
+                    let target = self.fetch()?;
+                    self.verify_plan(&target)?;
+                    Progress::Pulling(self.attempt(target, self.paths.iter())?)
+                }
+                Progress::Pulling(attempt) => {
+                    let completed = self.completion(attempt, "apply")?;
+                    if completed.is_none() {
+                        require_unchanged(&attempt.live, &BTreeSet::new())?;
+                        self.verify_plan(&attempt.target)?;
+                        self.pull()?;
+                    }
+                    let written = self.completion(attempt, "apply")?.unwrap_or_default();
+                    require_unchanged(&attempt.live, &written)?;
+                    let allowed = self.verify(&attempt.target)?;
+                    let remaining: BTreeMap<_, _> = attempt
+                        .live
+                        .iter()
+                        .filter(|(path, _)| allowed.contains(*path) && !written.contains(*path))
+                        .map(|(path, version)| (path.clone(), version.clone()))
+                        .collect();
+                    if remaining.is_empty() {
+                        Progress::Applied
+                    } else {
+                        Progress::RollingBack(Attempt {
+                            target: attempt.target.clone(),
+                            head: revision(self.native, self.store, MAIN_REF)?,
+                            live: remaining,
+                        })
+                    }
+                }
+                Progress::RollingBack(attempt) => {
+                    if self.completion(attempt, "rollback")?.is_none() {
+                        require_unchanged(&attempt.live, &BTreeSet::new())?;
+                        self.verify_rollback(&attempt.target, attempt.live.keys())?;
+                        // Native rollback records the encrypted undo of the live files.
+                        let target = format!("commit:{}", attempt.target);
+                        for mode in ["--dry-run", "--yes"] {
+                            let mut command = self.command(
+                                &[
+                                    "bootstrap",
+                                    "dotfiles",
+                                    "rollback",
+                                    "--to",
+                                    &target,
+                                    mode,
+                                    "--",
+                                ],
+                                true,
+                            )?;
+                            command.args(attempt.live.keys());
+                            apply(
+                                self.native,
+                                command,
+                                "mise could not apply the first private history checkpoint",
+                            )?;
+                        }
+                    }
+                    Progress::Applied
+                }
+                Progress::Applied => return Ok(()),
+            };
+            write_journal(self.store, &journal)?;
         }
     }
 
-    let current = tracked::paths(native, Some(&branch))?;
-    tracked::secure(&current)?;
-    let mut local = LocalSettings::read(native)?;
-    local.set_history(&branch, origin, &identity, &recipients)?;
-    local.install(native)?;
-    if pending {
-        for marker in [store.join(MARKER), legacy_marker(&store)] {
-            if exists(&marker)? {
-                fs::remove_file(&marker)
-                    .map_err(|_| blocked("could not finish the pending restore marker"))?;
+    fn attempt<'p>(
+        &self,
+        target: String,
+        paths: impl Iterator<Item = &'p PathBuf>,
+    ) -> Result<Attempt, Fail> {
+        let live = paths
+            .map(|path| Ok((path.clone(), file_version(path)?)))
+            .collect::<Result<_, Fail>>()?;
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        Ok(Attempt { target, head, live })
+    }
+
+    fn checkpoint(&self, commit: &str) -> Result<NativeCheckpoint, Fail> {
+        let reference = format!("commit:{commit}");
+        let cmd = self.command(
+            &[
+                "bootstrap",
+                "dotfiles",
+                "history",
+                "show",
+                &reference,
+                "--json",
+            ],
+            true,
+        )?;
+        let output = self
+            .native
+            .output(cmd, "could not inspect native checkpoint coverage")?;
+        serde_json::from_slice(&output)
+            .map_err(|_| invalid("could not read native checkpoint coverage"))
+    }
+
+    fn completion(&self, attempt: &Attempt, kind: &str) -> Result<Option<BTreeSet<PathBuf>>, Fail> {
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        if head == attempt.head {
+            return Ok(None);
+        }
+        if !ancestor(self.native, self.store, &attempt.head, &head)? {
+            return Err(blocked("local history changed outside the pending restore"));
+        }
+        let native = self.checkpoint(&head)?;
+        let Some(operation) = native.operation else {
+            return Ok(None);
+        };
+        if operation.kind != kind
+            || operation.status != "completed"
+            || operation.to.or(operation.applied).as_deref() != Some(&attempt.target)
+        {
+            return Ok(None);
+        }
+        let home = physical_home(self.native)?;
+        let written = operation
+            .affected
+            .iter()
+            .map(|path| {
+                covered_path(&home, path)
+                    .filter(|path| attempt.live.contains_key(path))
+                    .ok_or_else(unsafe_tree)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(written))
+    }
+
+    fn verify_rollback<'p>(
+        &self,
+        target: &str,
+        paths: impl Iterator<Item = &'p PathBuf>,
+    ) -> Result<(), Fail> {
+        let allowed = self.verify(target)?;
+        let checkpoint = self.checkpoint(target)?;
+        let home = physical_home(self.native)?;
+        let covered: BTreeSet<_> = checkpoint
+            .tree
+            .coverage
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry.mode == "track"
+                    && entry.encrypt
+                    && entry.variant.as_deref() == Some(self.branch)
+            })
+            .filter_map(|entry| covered_path(&home, &entry.path))
+            .collect();
+        let unverified = checkpoint
+            .tree
+            .coverage
+            .omitted
+            .into_iter()
+            .chain(checkpoint.tree.coverage.incomplete)
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>();
+        for path in paths {
+            if !allowed.contains(path)
+                || !covered.contains(path)
+                || unverified.iter().any(|entry| {
+                    covered_path(&home, entry).is_none_or(|entry| path.starts_with(entry))
+                })
+            {
+                return Err(invalid(
+                    "first restore includes a path without complete encrypted checkpoint coverage",
+                ));
             }
+        }
+        if tracked::paths(self.native, Some(self.branch))? != self.paths {
+            return Err(blocked(
+                "active encrypted history paths changed while preparing restore",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct NativeCheckpoint {
+    tree: NativeTree,
+    operation: Option<NativeOperation>,
+}
+
+#[derive(Deserialize)]
+struct NativeTree {
+    coverage: NativeCoverage,
+}
+
+#[derive(Deserialize)]
+struct NativeCoverage {
+    entries: Vec<NativeEntry>,
+    #[serde(default)]
+    omitted: Vec<NativePath>,
+    #[serde(default)]
+    incomplete: Vec<NativePath>,
+}
+
+#[derive(Deserialize)]
+struct NativeEntry {
+    path: String,
+    mode: String,
+    encrypt: bool,
+    variant: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NativePath {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct NativeOperation {
+    kind: String,
+    status: String,
+    to: Option<String>,
+    applied: Option<String>,
+    #[serde(default)]
+    affected: Vec<String>,
+}
+
+fn covered_path(home: &Path, path: &str) -> Option<PathBuf> {
+    home_path(home, path.strip_prefix("~/")?)
+}
+
+fn file_version(path: &Path) -> Result<Option<FileVersion>, Fail> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(FileVersion {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => Err(unsafe_tree()),
+    }
+}
+
+fn require_unchanged(
+    live: &BTreeMap<PathBuf, Option<FileVersion>>,
+    written: &BTreeSet<PathBuf>,
+) -> Result<(), Fail> {
+    for (path, previous) in live {
+        if !written.contains(path) && file_version(path)? != *previous {
+            return Err(blocked(
+                "a tracked file changed after restore started; inspect the native restore journal before retrying",
+            ));
         }
     }
     Ok(())
@@ -195,7 +606,7 @@ fn prepare(
     vars: &Vars,
     paths: &[PathBuf],
     old: Option<fs::Metadata>,
-) -> Result<(), Fail> {
+) -> Result<Journal, Fail> {
     let base = parent(store);
     let temp = tempfile::Builder::new()
         .prefix(".dots-restore-clone-")
@@ -225,7 +636,8 @@ fn prepare(
         "could not stage the selected remote history branch; the existing store was left unchanged",
     )?;
     native.bare(&staged)?;
-    verify_manifest(native, &staged, "HEAD", branch, paths)?;
+    let seed = revision(native, &staged, MAIN_REF)?;
+    verify_tree(native, &staged, &seed, branch, paths)?;
     fs::set_permissions(&staged, Permissions::from_mode(0o700))
         .map_err(|_| blocked("could not protect the staged history store"))?;
 
@@ -252,9 +664,22 @@ fn prepare(
         }),
         _ => None,
     };
+    let staged_metadata =
+        existing_directory(&staged)?.ok_or_else(|| blocked("staged history store vanished"))?;
+    let root = native.ctx.root.path();
+    let root_metadata =
+        existing_directory(root)?.ok_or_else(|| blocked("configuration root vanished"))?;
     let record = Journal {
+        root: native.ctx.root.path().to_owned(),
+        root_device: root_metadata.dev(),
+        root_inode: root_metadata.ino(),
+        home: physical_home(native)?,
         origin: raw.to_owned(),
         branch: branch.to_owned(),
+        device: staged_metadata.dev(),
+        inode: staged_metadata.ino(),
+        seed,
+        progress: Progress::Prepared,
         previous,
     };
     write_journal(&staged, &record)?;
@@ -265,7 +690,8 @@ fn prepare(
         let _ = backup.keep();
     }
     fsync_dir(base)?;
-    install(&staging, store, &record)
+    install(&staging, store, &record)?;
+    Ok(record)
 }
 
 fn install(staging: &Path, store: &Path, record: &Journal) -> Result<(), Fail> {
@@ -364,25 +790,22 @@ fn fsync_dir(path: &Path) -> Result<(), Fail> {
 fn write_journal(store: &Path, record: &Journal) -> Result<(), Fail> {
     let data = serde_json::to_vec(record)
         .map_err(|_| blocked("could not record pending history recovery"))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(store.join(MARKER))
+    let mut file = tempfile::NamedTempFile::new_in(store)
         .map_err(|_| blocked("could not record pending history recovery"))?;
     file.write_all(&data)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| file.as_file().sync_all())
         .map_err(|_| blocked("could not persist the pending history recovery"))?;
+    file.persist(store.join(MARKER))
+        .map_err(|_| blocked("could not install the pending history recovery marker"))?;
     fsync_dir(store)
 }
 
 fn read_journal(store: &Path) -> Result<Journal, Fail> {
-    serde_json::from_str(&read_marker(&store.join(MARKER))?)
+    serde_json::from_reader(read_private(&store.join(MARKER))?.take(4 * 1024 * 1024))
         .map_err(|_| invalid("could not validate the pending history recovery marker"))
 }
 
-fn read_marker(path: &Path) -> Result<String, Fail> {
-    let mut value = String::new();
+fn read_private(path: &Path) -> Result<File, Fail> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -391,22 +814,52 @@ fn read_marker(path: &Path) -> Result<String, Fail> {
             if !file.metadata()?.is_file() {
                 return Err(std::io::Error::other("not a regular marker"));
             }
-            file.take(8192).read_to_string(&mut value)
+            Ok(file)
         })
-        .map_err(|_| invalid("could not read the pending history marker"))?;
-    Ok(value)
+        .map_err(|_| invalid("could not read local history metadata"))
 }
 
-fn match_request(record: &Journal, origin: &str, branch: &str) -> Result<(), Fail> {
-    if record.origin != origin || record.branch != branch {
+fn match_request(
+    native: &Native<'_, '_>,
+    store: &Path,
+    record: &Journal,
+    origin: &str,
+    branch: &str,
+) -> Result<(), Fail> {
+    let root = native.ctx.root.path();
+    let root_metadata =
+        existing_directory(root)?.ok_or_else(|| blocked("configuration root vanished"))?;
+    if record.root != root
+        || record.home != physical_home(native)?
+        || (record.root_device, record.root_inode) != (root_metadata.dev(), root_metadata.ino())
+        || record.origin != origin
+        || record.branch != branch
+    {
         return Err(invalid(
-            "pending history install names another origin or branch",
+            "pending history restore belongs to another configuration root, origin or branch",
+        ));
+    }
+    let metadata =
+        existing_directory(store)?.ok_or_else(|| blocked("pending history store vanished"))?;
+    if (record.device, record.inode) != (metadata.dev(), metadata.ino()) {
+        return Err(invalid(
+            "pending history restore belongs to a different store",
+        ));
+    }
+    let head = revision(native, store, MAIN_REF)?;
+    if !ancestor(native, store, &record.seed, &head)? {
+        return Err(invalid(
+            "pending history store no longer contains its seed checkpoint",
         ));
     }
     Ok(())
 }
 
-fn revision(native: &Native<'_, '_>, store: &Path, reference: &str) -> Result<String, Fail> {
+pub(super) fn revision(
+    native: &Native<'_, '_>,
+    store: &Path,
+    reference: &str,
+) -> Result<String, Fail> {
     let mut cmd = native.git(Some(store))?;
     let commit = format!("{reference}^{{commit}}");
     cmd.args(["rev-parse", "--verify", &commit]);
@@ -415,15 +868,42 @@ fn revision(native: &Native<'_, '_>, store: &Path, reference: &str) -> Result<St
         "could not resolve the fetched private history checkpoint",
     )?;
     let id = id.trim_end();
-    if !matches!(id.len(), 40 | 64) || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+    if !valid_oid(id) {
         return Err(blocked("Git returned an invalid private history commit ID"));
     }
     Ok(id.to_owned())
 }
 
+pub(super) fn valid_oid(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+pub(super) fn ancestor(
+    native: &Native<'_, '_>,
+    store: &Path,
+    from: &str,
+    to: &str,
+) -> Result<bool, Fail> {
+    if !valid_oid(from) || !valid_oid(to) {
+        return Err(blocked("invalid history checkpoint ID"));
+    }
+    let mut cmd = native.git(Some(store))?;
+    cmd.args(["merge-base", "--is-ancestor", from, to]);
+    match native
+        .probe(cmd, "could not check history checkpoint ancestry")?
+        .status
+        .code()
+    {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(blocked("could not check history checkpoint ancestry")),
+    }
+}
+
 #[derive(Deserialize)]
 struct Manifest {
     enrollment: Vec<Enrollment>,
+    permissions: BTreeMap<String, u32>,
 }
 
 #[derive(Deserialize)]
@@ -436,53 +916,184 @@ struct Enrollment {
 #[derive(Deserialize)]
 struct Variant {
     profile: Option<String>,
+    #[serde(default)]
+    os: Vec<String>,
+    #[serde(default)]
+    default: bool,
+    #[serde(default)]
+    machine: bool,
 }
 
-fn verify_manifest(
+fn verify_tree(
     native: &Native<'_, '_>,
     store: &Path,
-    reference: &str,
+    commit: &str,
     branch: &str,
     paths: &[PathBuf],
-) -> Result<(), Fail> {
-    let commit = revision(native, store, reference)?;
+) -> Result<BTreeSet<PathBuf>, Fail> {
+    if !valid_oid(commit) {
+        return Err(invalid("invalid private history checkpoint ID"));
+    }
     let mut cmd = native.git(Some(store))?;
     cmd.args(["show", &format!("{commit}:.mise-history/manifest.json")]);
     let data = native.output(cmd, "could not read the native history checkpoint manifest")?;
     let manifest: Manifest = serde_json::from_slice(&data)
         .map_err(|_| invalid("invalid encrypted history checkpoint manifest"))?;
-    let home = native
-        .home()?
-        .canonicalize()
-        .map_err(|_| invalid("could not resolve HOME"))?;
+    let home = physical_home(native)?;
+    let mut enrolled = BTreeSet::new();
+    let mut streams = BTreeSet::new();
     for entry in manifest.enrollment {
-        let ours = entry
-            .variants
-            .iter()
-            .any(|variant| variant.profile.as_deref() == Some(branch));
-        if !ours
-            && !entry.variants.is_empty()
-            && entry.variants.iter().all(|variant| {
-                variant
-                    .profile
-                    .as_deref()
-                    .is_some_and(|profile| profile.starts_with("host-"))
-            })
+        let path = entry
+            .path
+            .to_str()
+            .and_then(|path| path.strip_prefix("home/"))
+            .and_then(|path| home_path(&home, path))
+            .ok_or_else(unsafe_tree)?;
+        if !streams.insert(path.clone()) || entry.variants.is_empty() {
+            return Err(unsafe_tree());
+        }
+        let mut names = BTreeSet::new();
+        for variant in entry.variants {
+            let profile = variant
+                .profile
+                .filter(|name| host_stream(name))
+                .ok_or_else(unsafe_tree)?;
+            if variant.default
+                || variant.machine
+                || !variant.os.is_empty()
+                || !names.insert(profile)
+            {
+                return Err(unsafe_tree());
+            }
+        }
+        if names.contains(branch)
+            && (!entry.encrypt || !paths.contains(&path) || !enrolled.insert(path))
+        {
+            return Err(unsafe_tree());
+        }
+    }
+
+    let mut cmd = native.git(Some(store))?;
+    cmd.args(["ls-tree", "-r", "-t", "-z", commit]);
+    let tree = native.output(cmd, "could not inspect private checkpoint objects")?;
+    for row in tree.split(|&byte| byte == 0).filter(|row| !row.is_empty()) {
+        let line = std::str::from_utf8(row).map_err(|_| unsafe_tree())?;
+        let (object, path) = line.split_once('\t').ok_or_else(unsafe_tree)?;
+        let mut object = object.split(' ');
+        let (Some(mode), Some(kind), Some(oid), None) =
+            (object.next(), object.next(), object.next(), object.next())
+        else {
+            return Err(unsafe_tree());
+        };
+        if path == ".mise-history" && kind == "tree"
+            || matches!(
+                path,
+                ".mise-history/manifest.json" | ".mise-history/format.toml"
+            ) && kind == "blob"
+                && mode == "100644"
         {
             continue;
         }
-        let safe_entry = entry
-            .path
-            .strip_prefix("home")
-            .ok()
-            .is_some_and(|path| paths.contains(&home.join(path)));
-        if !ours || !entry.encrypt || !safe_entry {
-            return Err(invalid(
-                "fetched history includes a path without an active encrypted host declaration",
-            ));
+        let (stem, suffix) = path.split_once('/').unwrap_or((path, ""));
+        let Some(profile) = stem.strip_prefix("home@").filter(|name| host_stream(name)) else {
+            return Err(unsafe_tree());
+        };
+        if profile != branch || suffix.is_empty() && kind == "tree" {
+            continue;
+        }
+        let live = home_path(&home, suffix).ok_or_else(unsafe_tree)?;
+        if kind == "tree"
+            && enrolled
+                .iter()
+                .any(|entry| entry.starts_with(&live) && *entry != live)
+        {
+            continue;
+        }
+        if !enrolled.contains(&live)
+            || kind != "blob"
+            || mode != "100644"
+            || !valid_oid(oid)
+            || manifest.permissions.get(path) != Some(&0o600)
+        {
+            return Err(unsafe_tree());
+        }
+        let mut cmd = native.git(Some(store))?;
+        cmd.args(["cat-file", "blob", oid]);
+        let blob = native.output(cmd, "could not inspect the encrypted checkpoint envelope")?;
+        if !blob.starts_with(b"mise-encrypted-file-v1\n") {
+            return Err(unsafe_tree());
         }
     }
-    Ok(())
+    for (path, mode) in &manifest.permissions {
+        let (stem, suffix) = path.split_once('/').ok_or_else(unsafe_tree)?;
+        let live = home_path(&home, suffix).ok_or_else(unsafe_tree)?;
+        if stem == "home" {
+            if !enrolled
+                .iter()
+                .any(|entry| entry.starts_with(&live) && *entry != live)
+            {
+                if streams
+                    .iter()
+                    .any(|entry| entry.starts_with(&live) && *entry != live)
+                {
+                    continue;
+                }
+                return Err(unsafe_tree());
+            }
+            match fs::symlink_metadata(&live) {
+                Ok(metadata) if metadata.is_dir() && metadata.mode() & 0o777 == *mode => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && *mode == 0o700 => {}
+                _ => {
+                    return Err(invalid(
+                        "history would change permissions of a containing directory",
+                    ));
+                }
+            }
+        } else {
+            let profile = stem
+                .strip_prefix("home@")
+                .filter(|name| host_stream(name))
+                .ok_or_else(unsafe_tree)?;
+            if profile == branch && (!enrolled.contains(&live) || *mode != 0o600) {
+                return Err(unsafe_tree());
+            }
+        }
+    }
+    Ok(enrolled)
+}
+
+fn host_stream(profile: &str) -> bool {
+    profile
+        .strip_prefix("host-")
+        .is_some_and(|machine| host(machine).is_ok())
+}
+
+fn unsafe_tree() -> Fail {
+    invalid("private history includes an unsafe path, stream, object or recorded mode")
+}
+
+fn physical_home(native: &Native<'_, '_>) -> Result<PathBuf, Fail> {
+    native
+        .home()?
+        .canonicalize()
+        .map_err(|_| invalid("could not resolve HOME"))
+}
+
+fn home_path(home: &Path, relative: &str) -> Option<PathBuf> {
+    let path = Path::new(relative);
+    (!relative.is_empty()
+        && relative.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.eq_ignore_ascii_case(".git")
+                && !part.contains(['\\', ':'])
+                && !part.chars().any(char::is_control)
+        })
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_))))
+    .then(|| home.join(path))
 }
 
 fn apply(
@@ -498,10 +1109,14 @@ fn apply(
         .iter()
         .any(|bytes| String::from_utf8_lossy(bytes).contains("both sides changed the same lines"));
     if conflict {
-        Err(blocked(
-            "mise could not restore private settings: both sides changed the same lines; resolve the native history conflict before retrying",
-        ))
+        Err(history_conflict())
     } else {
         Err(blocked(message))
     }
+}
+
+fn history_conflict() -> Fail {
+    blocked(
+        "mise could not restore private settings: both sides changed the same lines; resolve the native history conflict before retrying",
+    )
 }

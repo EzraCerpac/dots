@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use dots_cli::Fail;
+use dots_cli::{Fail, config};
 use support::World;
 
 const BRANCH: &str = "host-fixture";
@@ -59,8 +59,8 @@ impl History {
         let mut git = history.git(&history.remote);
         ok(git.args(["init", "--bare", "--initial-branch=main"]));
         let key = history.world.home().join("throwaway-age-key");
-        ok(&mut history.command("age-keygen").arg("-o").arg(&key));
-        history.recipient = text(ok(&mut history.command("age-keygen").arg("-y").arg(&key)));
+        ok(history.command("age-keygen").arg("-o").arg(&key));
+        history.recipient = text(ok(history.command("age-keygen").arg("-y").arg(&key)));
         let live = history.world.home().join("fixture/payload");
         fs::create_dir(live.parent().unwrap()).unwrap();
         fs::write(&live, PAYLOAD).unwrap();
@@ -149,6 +149,39 @@ impl History {
         cmd
     }
 
+    fn observed_backup(&self) -> (Command, PathBuf) {
+        let base = self.world.root().parent().unwrap();
+        let bin = base.join("observe-git");
+        fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            r#"#!/bin/sh
+case " $* " in
+    *" ls-remote "*" --get-url "*) ;;
+    *" ls-remote "*) printf 'ls-remote\n' >> "$FIXTURE_GIT_LOG" ;;
+    *" fetch "*) printf 'fetch\n' >> "$FIXTURE_GIT_LOG" ;;
+    *" push "*) printf 'push\n' >> "$FIXTURE_GIT_LOG" ;;
+esac
+exec "$FIXTURE_REAL_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+        let real_git = text(ok(self.command("sh").args(["-c", "command -v git"])));
+        let original_path = std::env::var_os("PATH").unwrap();
+        let path =
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&original_path)))
+                .unwrap();
+        let log = base.join("git-observations");
+        let mut cmd = self.dots();
+        cmd.arg("backup")
+            .env("PATH", path)
+            .env("FIXTURE_REAL_GIT", real_git)
+            .env("FIXTURE_GIT_LOG", &log);
+        (cmd, log)
+    }
+
     fn git(&self, repo: &Path) -> Command {
         let mut cmd = self.world.git();
         self.isolate(&mut cmd);
@@ -169,7 +202,7 @@ impl History {
     }
 
     fn save(&self) -> String {
-        ok(&mut self.mise("save").env("GIT_ALLOW_PROTOCOL", ""));
+        ok(self.mise("save").env("GIT_ALLOW_PROTOCOL", ""));
         self.tip(&self.store, "refs/heads/main")
     }
 
@@ -193,6 +226,7 @@ impl History {
             },
             BRANCH,
             &self.origin,
+            &self.tip(&self.store, "refs/heads/main"),
         )
     }
 
@@ -433,6 +467,7 @@ fn new_changed_destination_tip_refuses() {
         },
         BRANCH,
         &history.origin,
+        &tip,
     )
     .unwrap_err();
     assert!(err.diagnostic.contains("changed during verification"));
@@ -452,13 +487,8 @@ fn new_backup_default_false_refuses_before_native_sync() {
     fs::write(config, input).unwrap();
     let tip = history.save();
 
-    let trace = history.world.root().parent().unwrap().join("git-trace");
-    let refused = history
-        .dots()
-        .arg("backup")
-        .env("GIT_TRACE", &trace)
-        .output()
-        .unwrap();
+    let (mut backup, trace) = history.observed_backup();
+    let refused = backup.output().unwrap();
     assert!(!refused.status.success(), "{refused:?}");
     let diagnostic = format!(
         "{}{}",
@@ -473,7 +503,7 @@ fn new_backup_default_false_refuses_before_native_sync() {
     assert!(!diagnostic.contains(PAYLOAD.trim()));
     let git_trace = fs::read_to_string(trace).unwrap();
     assert!(git_trace.contains("ls-remote"));
-    assert!(!git_trace.contains("receive-pack") && !git_trace.contains(" fetch "));
+    assert!(!git_trace.contains("push") && !git_trace.contains("fetch"));
     assert_eq!(history.tip(&history.store, "refs/heads/main"), tip);
     history.empty_remote(&old);
 }
@@ -488,12 +518,10 @@ fn new_backup_explicit_effective_opt_in_leaves_publication_to_native_sync() {
     let refused = history.dots().arg("backup").output().unwrap();
     assert!(!refused.status.success(), "{refused:?}");
     history.empty_remote(&old);
-    let trace = history.world.root().parent().unwrap().join("git-trace");
     ok(history
         .dots()
         .arg("backup")
-        .env("MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY", "true")
-        .env("GIT_TRACE", &trace));
+        .env("MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY", "true"));
     let published = history.tip(&history.remote, REMOTE_REF);
     assert_eq!(
         history.object(&history.remote, &old, UNSCOPED),
@@ -625,13 +653,8 @@ fn new_current_unencrypted_declaration_stops_before_preflight() {
     let history = History::new();
     history.configure(Some(false), true);
     let old = history.save();
-    let trace = history.world.root().parent().unwrap().join("git-trace");
-    let refused = history
-        .dots()
-        .arg("backup")
-        .env("GIT_TRACE", &trace)
-        .output()
-        .unwrap();
+    let (mut backup, trace) = history.observed_backup();
+    let refused = backup.output().unwrap();
     assert_eq!(refused.status.code(), Some(2));
     let trace = fs::read_to_string(trace).unwrap_or_default();
     assert!(
@@ -641,4 +664,189 @@ fn new_current_unencrypted_declaration_stops_before_preflight() {
     );
     assert_eq!(history.tip(&history.store, "refs/heads/main"), old);
     history.empty_remote(&old);
+}
+
+#[test]
+fn new_split_routes_refuse_before_any_remote_contact() {
+    let history = History::new();
+    history.configure(Some(true), true);
+    let tip = history.save();
+    let origin = "https://github.com/example/fixture.git";
+    let other = "ssh://git@github.com/example/fixture.git";
+    let error = publication::preflight(
+        || {
+            let mut git = history.git(&history.store);
+            git.env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", format!("url.{other}.pushInsteadOf"))
+                .env("GIT_CONFIG_VALUE_0", origin);
+            Ok(git)
+        },
+        |mut cmd| {
+            assert!(!cmd.get_args().any(|arg| arg == "ls-remote"));
+            cmd.output()
+                .map_err(|_| Fail::new(1, "fixture Git did not run"))
+        },
+        BRANCH,
+        origin,
+        &tip,
+    )
+    .unwrap_err();
+    assert!(error.diagnostic.contains("different fetch and push routes"));
+}
+
+#[test]
+fn new_only_ref_queries_allow_git_transport_and_do_not_prompt() {
+    let history = History::new();
+    history.configure(Some(true), true);
+    let tip = history.save();
+    let ref_queries = std::cell::Cell::new(0);
+    publication::preflight(
+        || {
+            let mut git = history.git(&history.store);
+            git.env("GIT_TERMINAL_PROMPT", "1");
+            Ok(git)
+        },
+        |mut cmd| {
+            let env = |name| {
+                cmd.get_envs()
+                    .find_map(|(key, value)| (key == name).then_some(value))
+                    .flatten()
+            };
+            if cmd.get_args().any(|arg| arg == "ls-remote") {
+                assert_eq!(env("GIT_TERMINAL_PROMPT").unwrap(), "0");
+                assert_eq!(env("GIT_ALLOW_PROTOCOL").unwrap(), "file");
+                ref_queries.set(ref_queries.get() + 1);
+            } else {
+                assert_eq!(env("GIT_ALLOW_PROTOCOL").unwrap(), "");
+            }
+            cmd.output()
+                .map_err(|_| Fail::new(1, "fixture Git did not run"))
+        },
+        BRANCH,
+        &history.origin,
+        &tip,
+    )
+    .unwrap();
+    assert_eq!(ref_queries.get(), 2);
+    history.empty_remote(&tip);
+}
+
+fn with_unscoped_config(history: &History) {
+    let live = history.world.root().join("fixture/payload");
+    fs::create_dir(live.parent().unwrap()).unwrap();
+    fs::write(&live, PAYLOAD).unwrap();
+    history.configure(Some(false), false);
+    let config = history.world.root().join("config.toml");
+    let input = fs::read_to_string(&config)
+        .unwrap()
+        .replace("\"~/fixture/payload\"", &format!("{live:?}"));
+    fs::write(config, input).unwrap();
+}
+
+fn replace_manifest(history: &History, original: &str, donor: &str, parents: &[&str]) -> String {
+    let index = history
+        .world
+        .root()
+        .parent()
+        .unwrap()
+        .join("fixture-tree-index");
+    let git = || {
+        let mut cmd = history.git(&history.store);
+        cmd.env("GIT_INDEX_FILE", &index);
+        cmd
+    };
+    let manifest = ".mise-history/manifest.json";
+    let oid = history.tip(&history.store, &format!("{donor}:{manifest}"));
+    ok(git().args(["read-tree", original]));
+    ok(git().args(["update-index", "--cacheinfo", "100644", &oid, manifest]));
+    let tree = text(ok(git().arg("write-tree")));
+    let mut commit = git();
+    commit.args([
+        "commit-tree",
+        &tree,
+        "-m",
+        "synthetic carried unscoped config",
+    ]);
+    for parent in parents {
+        commit.args(["-p", parent]);
+    }
+    text(ok(&mut commit))
+}
+
+#[test]
+fn new_unscoped_config_retains_tracked_provenance_from_a_published_merge_parent() {
+    let history = History::new();
+    with_unscoped_config(&history);
+    let old = history.save();
+    let path = "config/fixture/payload";
+    assert_eq!(
+        history.object(&history.store, &old, path),
+        PAYLOAD.as_bytes()
+    );
+    ok(history
+        .git(&history.store)
+        .args(["push", &history.origin, &format!("{old}:{REMOTE_REF}")]));
+    history.configure(None, false);
+    let removed = history.save();
+    let independent = replace_manifest(&history, &removed, &removed, &[]);
+    let merge = replace_manifest(&history, &old, &removed, &[&independent, &old]);
+    ok(history
+        .git(&history.store)
+        .args(["update-ref", "refs/heads/main", &merge, &removed]));
+    let refusal = history.preflight().unwrap_err();
+    assert!(
+        refusal.diagnostic.contains(path) && refusal.diagnostic.contains(&merge),
+        "{refusal}"
+    );
+    assert_eq!(history.tip(&history.remote, REMOTE_REF), old);
+}
+
+#[test]
+fn new_plain_unscoped_config_without_tracked_provenance_is_allowed() {
+    let history = History::new();
+    with_unscoped_config(&history);
+    let old = history.save();
+    history.configure(None, false);
+    let plain = history.save();
+    // The same file content in a new history with an ordinary configuration
+    // tree and no enrollment ancestry is valid native plaintext.
+    let checkpoint = replace_manifest(&history, &old, &plain, &[]);
+    ok(history
+        .git(&history.store)
+        .args(["update-ref", "refs/heads/main", &checkpoint, &plain]));
+    history.preflight().unwrap();
+    history.empty_remote(&checkpoint);
+}
+
+#[test]
+fn new_unreadable_promisor_payload_refuses_without_fetching_it() {
+    let history = History::new();
+    history.configure(Some(true), true);
+    let tip = history.save();
+    let oid = history.tip(&history.store, &format!("{tip}:{HOST_SCOPED}"));
+    let promisor = history.world.root().parent().unwrap().join("promisor.git");
+    ok(history.git(&promisor).args(["init", "--bare"]));
+    let promised_url = format!("file://{}", promisor.display());
+    ok(history
+        .git(&history.store)
+        .args(["push", &promised_url, &format!("{tip}:{REMOTE_REF}")]));
+    ok(history
+        .git(&history.store)
+        .args(["config", "remote.promise.url", &promised_url]));
+    ok(history
+        .git(&history.store)
+        .args(["config", "remote.promise.promisor", "true"]));
+    let (directory, object) = oid.split_at(2);
+    fs::remove_file(history.store.join("objects").join(directory).join(object)).unwrap();
+    history.assert_refusal(&tip, HOST_SCOPED);
+    assert!(
+        !history
+            .git(&history.store)
+            .args(["cat-file", "-e", &oid])
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
 }

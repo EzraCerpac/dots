@@ -17,7 +17,7 @@ use crate::{Args, Ctx, Fail};
 use keys::LocalSettings;
 use native::{Native, exists};
 
-pub use checkpoint::{Checkpoint, checkpoint};
+pub use checkpoint::{Checkpoint, CheckpointFailure, checkpoint, checkpoint_classified};
 
 pub struct Restore<'a> {
     pub machine: &'a str,
@@ -70,7 +70,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     }
     let vars = Vars::read(&ctx.root)?;
     let expected = state_repo(&vars)?;
-    let paths = tracked::paths(native, Some(&branch))?;
+    let paths = tracked::capture_paths(native, Some(&branch))?;
     let (origin, effective_branch) = native.effective_origin()?;
     if effective_branch != branch {
         return Err(invalid(
@@ -85,9 +85,10 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         native.bare(store)?;
     }
     native.destinations(existing, &origin, expected, &vars)?;
-    tracked::secure(&paths)?;
-    checkpoint::save(native)?;
+    checkpoint::save(native, Some(&branch), &paths)?;
     native.bare(&store)?;
+    let saved = recovery::revision(native, &store, recovery::MAIN_REF)?;
+    native.require_origin(&origin, &branch)?;
     native.destinations(Some(&store), &origin, expected, &vars)?;
     let policy = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
     if !publication::allows_plaintext(native.probe(
@@ -99,6 +100,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
             |cmd| native.probe(cmd, "could not verify the history publication range"),
             &branch,
             &origin,
+            &saved,
         )?;
     }
     let cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
@@ -106,7 +108,62 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         cmd,
         "could not publish private settings history; the local checkpoint was kept",
     )?;
+    let pending = || {
+        blocked(
+            "settings checkpoint saved locally; publication is pending. Run mise dot status to inspect incoming changes or conflicts before retrying dots backup",
+        )
+    };
+    let unconfirmed = || {
+        blocked(
+            "settings checkpoint saved locally; publication could not be confirmed. Check the private history remote before retrying dots backup",
+        )
+    };
+    native
+        .destinations(Some(&store), &origin, expected, &vars)
+        .map_err(|_| unconfirmed())?;
+    let reference = format!("refs/heads/{branch}");
+    let remote = remote_checkpoint(native, &store, &origin, &reference)
+        .map_err(|_| unconfirmed())?
+        .ok_or_else(pending)?;
+    let tracked =
+        recovery::revision(native, &store, recovery::TRACKING_REF).map_err(|_| unconfirmed())?;
+    if remote != tracked {
+        return Err(unconfirmed());
+    }
+    if !recovery::ancestor(native, &store, &saved, &remote).map_err(|_| unconfirmed())? {
+        return Err(pending());
+    }
     Ok(())
+}
+
+fn remote_checkpoint(
+    native: &Native<'_, '_>,
+    store: &Path,
+    origin: &str,
+    reference: &str,
+) -> Result<Option<String>, Fail> {
+    let diagnostic = "could not independently verify the private history branch";
+    let mut cmd = native.git(Some(store))?;
+    cmd.args([
+        "ls-remote",
+        "--exit-code",
+        "--refs",
+        "--",
+        origin,
+        reference,
+    ]);
+    let output = native.probe(cmd, diagnostic)?;
+    if output.status.code() == Some(2) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    let (oid, actual) = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|text| text.trim_end_matches('\n').split_once('\t'))
+        .ok_or_else(|| blocked(diagnostic))?;
+    if !output.status.success() || actual != reference || !recovery::valid_oid(oid) {
+        return Err(blocked(diagnostic));
+    }
+    Ok(Some(oid.to_owned()))
 }
 
 pub fn restore_command(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
@@ -266,7 +323,7 @@ fn prepare_enrollment(
             ),
         ));
     }
-    tracked::secure(&paths)?;
+    tracked::secure(&native, &paths)?;
     if persist_selection {
         selection::persist(
             &ctx.root,

@@ -817,9 +817,9 @@ Every part is optional.
 **New in 1.0:** `dots` puts its running executable first on `PATH` in the environment it hands each child it starts directly, even when the user started `dots` by an absolute path.
 Every hook, recipe, configuration command and `dots test` child, and every other launch that `dots` itself makes for `dots bootstrap`, starts with that executable first on `PATH`, after any configuration environment is applied, so `dots` there is the same executable at the same version.
 `dots` arranges this without a setting.
-In 0.4.0 a configuration command inherited the caller's `PATH`, and `dots test` launched the test script through `mise exec`.
+In 0.4.0, a configuration command and the shell fallback for `dots test` could both run another `dots` from the caller's `PATH`.
 For programs started by an explicit `dots mise exec` or `dots mise run`, see [`dots mise`](#dots-mise-args).
-mise's native bootstrap likewise runs the `dots` that the configuration pins, as [`dots bootstrap`](#dots-bootstrap) describes.
+As in 0.4.0, mise's native bootstrap uses the configuration's pinned `dots` for its callbacks, as [`dots bootstrap`](#dots-bootstrap) describes.
 Every hook, recipe, configuration command, `dots test` child and `dots mise` child gets `DOTS_ROOT` and `DOTS_PROFILE`.
 **Changed from 0.3.5:** `DOTS_HOME` is not set.
 
@@ -892,6 +892,7 @@ Without options it prints the selected profile; with none selected it exits 2 wi
 
 It runs mise rooted in the configuration with this machine's `PROFILE,host-ID` environment, without the caller's `MISE_ENV`, and with auto-install off.
 `ARGS` are passed as an argument array and never evaluated by a shell.
+**New in 1.0:** `dots mise` is a public command; 0.4.0 had no such built-in.
 For an explicit `exec` or `run`, mise receives those arguments and the active configuration unchanged and applies its own `PATH` rules inside the resulting command or task.
 Configured tool directories and `[env] _.path` can precede the inherited `PATH`, so a bare `dots` there resolves according to the configuration.
 On macOS, for mise's package bootstrap and status, it exposes the configuration's already-installed Ruby so Homebrew tap evaluation does not go through a shim; it never installs Ruby.

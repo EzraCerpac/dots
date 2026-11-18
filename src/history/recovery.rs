@@ -41,6 +41,7 @@ struct Journal {
 #[derive(Deserialize, Serialize)]
 enum Progress {
     Prepared,
+    Fetching(LiveVersions),
     Pulling(Attempt),
     RollingBack(Attempt),
     Applied,
@@ -50,7 +51,7 @@ enum Progress {
 struct Attempt {
     target: String,
     head: String,
-    live: BTreeMap<PathBuf, Option<FileVersion>>,
+    live: LiveVersions,
     created: BTreeSet<PathBuf>,
     scope: String,
 }
@@ -64,6 +65,8 @@ struct FileVersion {
     changed: (i64, i64),
     mode: u32,
 }
+
+type LiveVersions = BTreeMap<PathBuf, Option<FileVersion>>;
 
 #[derive(Deserialize, Serialize)]
 struct Previous {
@@ -95,10 +98,11 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     let vars = Vars::read(&native.ctx.root)?;
     let expected = state_repo(&vars)?;
     validate_origin(native, &vars, origin)?;
-    verify_capture_policy(native)?;
+    let mut recipients = verify_capture_policy(native)?;
     let (identity, recovered_keys) = keys::read_identity(native, identity)?;
     let mut local = LocalSettings::read(native)?;
-    let mut recipients = local.recipients()?;
+    let refresh_recipients = recovered_keys.iter().any(|key| !recipients.contains(key));
+    recipients.extend(local.recipients()?);
     recipients.extend(recovered_keys);
     keys::check_recipients(native, &recipients)?;
     let paths = tracked::restore_paths(native, Some(&branch))?;
@@ -191,7 +195,11 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     native.destinations(Some(&store), &raw, expected, &vars)?;
     // Classify and persist any store replacement before changing native origin
     // settings. Failed staging must leave the old connection authoritative.
-    if local.origin() != Some(&raw) || local.branch() != Some(&branch) {
+    if refresh_recipients {
+        // Native capture can use the current configuration for its undo.
+        local.set_history(&branch, &RepoSetting::parse(&raw)?, &identity, &recipients)?;
+        local.install(native)?;
+    } else if local.origin() != Some(&raw) || local.branch() != Some(&branch) {
         local.set_origin(&branch, &RepoSetting::parse(&raw)?)?;
         local.install(native)?;
     }
@@ -249,7 +257,7 @@ fn read_sync(store: &Path) -> Result<Option<SyncState>, Fail> {
         .map_err(|_| invalid("could not verify native history synchronization state"))
 }
 
-fn verify_capture_policy(native: &Native<'_, '_>) -> Result<(), Fail> {
+fn verify_capture_policy(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fail> {
     #[derive(Deserialize)]
     struct ConfigFile {
         path: PathBuf,
@@ -302,7 +310,11 @@ fn verify_capture_policy(native: &Native<'_, '_>) -> Result<(), Fail> {
                 .as_array()
                 .ok_or_else(|| invalid(diagnostic))?
                 .iter()
-                .map(|key| key.as_str().ok_or_else(|| invalid(diagnostic)))
+                .map(|key| {
+                    key.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| invalid(diagnostic))
+                })
                 .collect::<Result<BTreeSet<_>, _>>()?;
             if observed.is_empty()
                 || observed
@@ -311,7 +323,7 @@ fn verify_capture_policy(native: &Native<'_, '_>) -> Result<(), Fail> {
             {
                 return Err(invalid(diagnostic));
             }
-            return Ok(());
+            return Ok(observed);
         }
     }
     Err(invalid(diagnostic))
@@ -340,18 +352,27 @@ impl Recovery<'_, '_, '_> {
         Ok(command)
     }
 
-    fn fetch(&self) -> Result<String, Fail> {
+    fn fetch(&self, live: &LiveVersions) -> Result<String, Fail> {
         self.native.require_no_pending_operations()?;
         let head = revision(self.native, self.store, MAIN_REF)?;
         self.verify(&head)?;
         verify_capture_policy(self.native)?;
-        self.paths.secure(self.native)?;
         self.native.require_origin(self.origin, self.branch)?;
         self.paths.recheck(self.native)?;
         self.native.require_no_pending_operations()?;
         let cmd = self.command(&["bootstrap", "dotfiles", "sync", "--fetch-only"], false)?;
+        require_unchanged(live, &BTreeSet::new())?;
         apply(self.native, cmd, "mise could not fetch encrypted history")?;
+        require_unchanged(live, &BTreeSet::new())?;
         revision(self.native, self.store, TRACKING_REF)
+    }
+
+    fn pin_fetch_paths(&self) -> Result<LiveVersions, Fail> {
+        self.verify(&revision(self.native, self.store, MAIN_REF)?)?;
+        verify_capture_policy(self.native)?;
+        self.native.require_no_pending_operations()?;
+        self.paths.secure(self.native)?;
+        live_versions(&self.paths)
     }
 
     fn verify(&self, commit: &str) -> Result<VerifiedTree, Fail> {
@@ -445,9 +466,10 @@ impl Recovery<'_, '_, '_> {
     }
 
     fn restore_established(&mut self) -> Result<(), Fail> {
-        let target = self.fetch()?;
+        let live = self.pin_fetch_paths()?;
+        let target = self.fetch(&live)?;
         let created = self.verify_plan(&target)?;
-        let attempt = self.attempt(target, self.paths.iter(), created)?;
+        let attempt = self.attempt(target, live, created)?;
         let record = new_journal(
             self.native,
             self.store,
@@ -510,9 +532,13 @@ impl Recovery<'_, '_, '_> {
             journal.progress = match &journal.progress {
                 Progress::Prepared => {
                     self.paths.check_binding(&journal.paths, false)?;
-                    let target = self.fetch()?;
+                    Progress::Fetching(self.pin_fetch_paths()?)
+                }
+                Progress::Fetching(live) => {
+                    self.paths.check_binding(&journal.paths, false)?;
+                    let target = self.fetch(live)?;
                     let created = self.verify_plan(&target)?;
-                    Progress::Pulling(self.attempt(target, self.paths.iter(), created)?)
+                    Progress::Pulling(self.attempt(target, live.clone(), created)?)
                 }
                 Progress::Pulling(attempt) => {
                     let completed = self.completion(attempt, false)?;
@@ -533,7 +559,7 @@ impl Recovery<'_, '_, '_> {
                     let written = completed.unwrap_or_default();
                     require_unchanged(&attempt.live, &written)?;
                     let allowed = self.verify(&attempt.target)?;
-                    let remaining: BTreeMap<_, _> = attempt
+                    let remaining: LiveVersions = attempt
                         .live
                         .iter()
                         .filter(|(path, _)| {
@@ -547,7 +573,7 @@ impl Recovery<'_, '_, '_> {
                         let created = self.verify_rollback(&attempt.target, remaining.keys())?;
                         Progress::RollingBack(self.attempt(
                             attempt.target.clone(),
-                            remaining.keys(),
+                            remaining,
                             created,
                         )?)
                     }
@@ -602,15 +628,12 @@ impl Recovery<'_, '_, '_> {
         }
     }
 
-    fn attempt<'p>(
+    fn attempt(
         &self,
         target: String,
-        paths: impl Iterator<Item = &'p PathBuf>,
+        live: LiveVersions,
         created: BTreeSet<PathBuf>,
     ) -> Result<Attempt, Fail> {
-        let live = paths
-            .map(|path| Ok((path.clone(), file_version(path)?)))
-            .collect::<Result<_, Fail>>()?;
         let head = revision(self.native, self.store, MAIN_REF)?;
         let directory = tempfile::Builder::new()
             .prefix(ATTEMPT)
@@ -789,9 +812,7 @@ impl Recovery<'_, '_, '_> {
                     .argv
                     .iter()
                     .map(String::as_str)
-                    .eq(command.get_args())
-                && operation.to.as_deref().or(operation.applied.as_deref())
-                    == Some(&attempt.target),
+                    .eq(command.get_args()),
         )
     }
 
@@ -825,7 +846,26 @@ impl Recovery<'_, '_, '_> {
         {
             return Err(unresolved_restore());
         }
-        self.paths.check_binding(binding, true)?;
+        let target = native.to.as_deref().or(native.applied.as_deref());
+        if let Some(target) = target {
+            if target != attempt.target {
+                return Err(unresolved_restore());
+            }
+        } else {
+            // Mise persists the invocation before recording its target.
+            if record.recovery != NativeRecovery::Pending
+                || native.status != "pending"
+                || !native.journal.is_empty()
+                || !native.affected.is_empty()
+                || revision(self.native, self.store, MAIN_REF)? != attempt.head
+                || revision(self.native, self.store, TRACKING_REF)? != attempt.target
+                || require_unchanged(&attempt.live, &BTreeSet::new()).is_err()
+            {
+                return Err(unresolved_restore());
+            }
+            self.verify(&attempt.target)?;
+        }
+        self.paths.check_binding(binding, target.is_some())?;
         let affected = native.written_paths(attempt)?;
         for path in self.paths.created_directories(binding) {
             if !attempt.created.contains(path)
@@ -1133,14 +1173,18 @@ fn file_version(path: &Path) -> Result<Option<FileVersion>, Fail> {
     }
 }
 
-fn require_unchanged(
-    live: &BTreeMap<PathBuf, Option<FileVersion>>,
-    written: &BTreeSet<PathBuf>,
-) -> Result<(), Fail> {
+fn live_versions(paths: &[PathBuf]) -> Result<LiveVersions, Fail> {
+    paths
+        .iter()
+        .map(|path| Ok((path.clone(), file_version(path)?)))
+        .collect()
+}
+
+fn require_unchanged(live: &LiveVersions, written: &BTreeSet<PathBuf>) -> Result<(), Fail> {
     for (path, previous) in live {
         if !written.contains(path) && file_version(path)? != *previous {
             return Err(blocked(
-                "a tracked file changed after restore started; inspect the native restore journal before retrying",
+                "a tracked file changed after restore started; inspect the live file and any pending restore before retrying",
             ));
         }
     }
@@ -1181,10 +1225,12 @@ fn prepare(
         &refspec,
     ]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    let live = live_versions(paths)?;
     native.output(
         cmd,
         "could not stage the selected remote history branch; the existing store was left unchanged",
     )?;
+    require_unchanged(&live, &BTreeSet::new())?;
     native.bare(&staged)?;
     let seed = revision(native, &staged, MAIN_REF)?;
     verify_tree(native, &staged, &seed, branch, paths)?;

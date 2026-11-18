@@ -854,6 +854,188 @@ exec "$FIXTURE_GIT" "$@"
 }
 
 #[test]
+fn new_backup_reports_native_sync_failure_without_readback() {
+    let fixture = Fixture::new();
+    let remote = fixture.world.bare_remote("private.git");
+    let (key, public) = fixture.key("recovery");
+    let url = format!("file://{}", remote.display());
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(FIRST, 0o600);
+
+    let rejection = remote.join("hooks/pre-receive");
+    fs::write(
+        &rejection,
+        "#!/bin/sh\n: > pre-receive-ran\nprintf '%s\\n' 'synthetic-native-sync-rejection' >&2\nexit 91\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rejection, fs::Permissions::from_mode(0o700)).unwrap();
+    let readback = fixture.world.home().join("direct-readback");
+    fixture.script(
+        "git",
+        r#"#!/bin/sh
+if [ "${1-}" = "--git-dir" ] && [ "${3-}" = "ls-remote" ] && [ "${4-}" = "--exit-code" ]; then
+    printf 'readback\n' > "$FIXTURE_READBACK"
+fi
+exec "$FIXTURE_GIT" "$@"
+"#,
+    );
+    let output = fixture
+        .dots(&["backup"], &remote)
+        .env("FIXTURE_READBACK", &readback)
+        .output()
+        .unwrap();
+    let report = messages(&output);
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    assert!(report.contains("native history sync failed"), "{report}");
+    assert!(report.contains("checkpoint was kept locally"), "{report}");
+    assert!(
+        report.contains("publication could not be verified"),
+        "{report}"
+    );
+    assert!(!report.contains("publication is pending"));
+    assert!(!report.contains("Settings backup published"));
+    assert!(!report.contains("synthetic-native-sync-rejection"));
+    assert!(remote.join("pre-receive-ran").is_file());
+    assert!(!readback.exists());
+    assert_eq!(
+        fixture
+            .git(Some(&remote))
+            .args(["show-ref", "--verify", "--quiet", REF])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    let stored = ok(fixture
+        .git(Some(&fixture.store()))
+        .args(["show", "refs/heads/main:home@host-fixture/app/selected"]))
+    .stdout;
+    assert!(fixture.can_decrypt(&stored, &key));
+}
+
+#[test]
+fn new_established_restore_can_undo_after_the_configured_recipient_changes() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (selected, public) = seed.key("selected");
+    let (_, other_public) = seed.key("other");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &selected, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &selected, std::slice::from_ref(&public));
+    fixture.write(DEFAULT, 0o600);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+
+    let config = fixture.world.root().join("config.local.toml");
+    let mut contents: toml_edit::DocumentMut =
+        fs::read_to_string(&config).unwrap().parse().unwrap();
+    contents["history"]["encryption"]["recipients"] = toml_edit::value(
+        [other_public.as_str()]
+            .into_iter()
+            .collect::<toml_edit::Array>(),
+    );
+    fs::write(&config, contents.to_string()).unwrap();
+    seed.seed(&remote, SECOND);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), SECOND);
+
+    let store = fixture.store();
+    let head = fixture.tip(&store, "refs/heads/main");
+    let checkpoint: serde_json::Value = serde_json::from_slice(
+        &ok(&mut fixture.mise(&[
+            "bootstrap",
+            "dotfiles",
+            "history",
+            "show",
+            &format!("commit:{head}"),
+            "--json",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    let undo = checkpoint["operation"]["before"]
+        .as_str()
+        .expect("native undo checkpoint");
+    let envelope = ok(fixture
+        .git(Some(&store))
+        .args(["show", &format!("{undo}:home@host-fixture/app/selected")]))
+    .stdout;
+    assert!(envelope.starts_with(b"mise-encrypted-file-v1\n"));
+    assert!(
+        fixture.can_decrypt(&envelope, &selected),
+        "selected identity cannot decrypt native undo"
+    );
+    ok(fixture
+        .mise(&["bootstrap", "dotfiles", "undo", "--yes"])
+        .env("MISE_AGE_IDENTITY_FILES", &selected)
+        .env("GIT_ALLOW_PROTOCOL", ""));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+}
+
+#[test]
+fn new_first_restore_keeps_an_edit_made_during_native_fetch() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(DEFAULT, 0o600);
+    let marker = fixture.world.home().join("edited-during-fetch");
+    let mise = fixture.script(
+        "edit-at-native-fetch",
+        r#"#!/bin/sh
+case " $* " in
+    *" bootstrap dotfiles sync --fetch-only "*) export FIXTURE_EDIT_DURING_FETCH=1 ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+    );
+    fixture.script(
+        "git",
+        r#"#!/bin/sh
+set -eu
+if [ "${FIXTURE_EDIT_DURING_FETCH-}" = 1 ] && [ ! -e "$FIXTURE_EDIT_MARKER" ]; then
+    for arg do
+        if [ "$arg" = fetch ]; then
+            printf '%s' "$FIXTURE_EDIT_CONTENTS" > "$FIXTURE_EDIT_TARGET"
+            printf 'edited\n' > "$FIXTURE_EDIT_MARKER"
+            break
+        fi
+    done
+fi
+exec "$FIXTURE_GIT" "$@"
+"#,
+    );
+    let output = fixture
+        .dots(&["restore"], &remote)
+        .env("DOTS_MISE_BIN", mise)
+        .env("FIXTURE_MISE", &fixture.mise)
+        .env("FIXTURE_EDIT_TARGET", fixture.active())
+        .env("FIXTURE_EDIT_MARKER", &marker)
+        .env(
+            "FIXTURE_EDIT_CONTENTS",
+            std::str::from_utf8(LOCAL_EDIT).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(marker.is_file(), "native fetch injection was never reached");
+    assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
+    assert_eq!(output.status.code(), Some(1), "{}", messages(&output));
+    assert!(messages(&output).contains("changed after restore started"));
+    let retry = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(retry.status.code(), Some(1), "{}", messages(&retry));
+    assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
 fn new_restore_reports_the_watcher_before_an_invalid_store() {
     let fixture = Fixture::new();
     let remote = fixture.world.bare_remote("private.git");
@@ -1030,6 +1212,15 @@ exec "$FIXTURE_MISE" "$@"
 
 #[test]
 fn new_restore_recovers_its_interrupted_native_write_when_there_is_no_later_edit() {
+    assert_interrupted_native_rollback("finished");
+}
+
+#[test]
+fn new_restore_resumes_an_owned_native_rollback_before_the_target_is_recorded() {
+    assert_interrupted_native_rollback("pending");
+}
+
+fn assert_interrupted_native_rollback(phase: &str) {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");
     let (key, public) = seed.key("recovery");
@@ -1042,11 +1233,16 @@ fn new_restore_recovers_its_interrupted_native_write_when_there_is_no_later_edit
         let fixture = Fixture::new();
         fixture.configure(&url, &url, &key, std::slice::from_ref(&public));
         fixture.write(DEFAULT, 0o600);
+        let interrupt_trace = fixture.world.home().join("native-interrupt");
         let interrupted = fixture.script(
             "interrupt-native-rollback",
             r#"#!/bin/sh
+set -eu
 case " $* " in
-  *" bootstrap dotfiles rollback "*" --yes "*) export FIXTURE_STOP_NATIVE=1 ;;
+  *" bootstrap dotfiles rollback "*" --yes "*)
+    printf 'armed\n' > "$FIXTURE_NATIVE_INTERRUPT"
+    export FIXTURE_STOP_NATIVE=1
+    ;;
 esac
 exec "$FIXTURE_MISE" "$@"
 "#,
@@ -1054,12 +1250,26 @@ exec "$FIXTURE_MISE" "$@"
         fixture.script(
             "git",
             r#"#!/bin/sh
+set -eu
 if [ "${FIXTURE_STOP_NATIVE-}" = 1 ]; then
     for record in "$MISE_STATE_DIR"/history/index/pending/*.json; do
-        if [ -f "$record" ] && /usr/bin/grep -q '"kind": *"committed"' "$record"; then
-            kill -KILL "$PPID"
-            exit 94
-        fi
+        [ -f "$record" ] || continue
+        committed=0
+        recovery=
+        while IFS= read -r line; do
+            case "$line" in
+                *'"kind": "committed"'*) committed=1 ;;
+                *'"recovery": "pending"'*) recovery=pending ;;
+                *'"recovery": "finished"'*) recovery=finished ;;
+            esac
+        done < "$record"
+        case "$FIXTURE_INTERRUPT_PHASE:$recovery:$committed" in
+            pending:pending:0|finished:finished:1)
+                printf 'hit\n' >> "$FIXTURE_NATIVE_INTERRUPT"
+                kill -KILL "$PPID"
+                exit 94
+                ;;
+        esac
     done
 fi
 exec "$FIXTURE_GIT" "$@"
@@ -1069,10 +1279,17 @@ exec "$FIXTURE_GIT" "$@"
             .dots(&["restore"], &remote)
             .env("DOTS_MISE_BIN", interrupted)
             .env("FIXTURE_MISE", &fixture.mise)
+            .env("FIXTURE_NATIVE_INTERRUPT", &interrupt_trace)
+            .env("FIXTURE_INTERRUPT_PHASE", phase)
             .output()
             .unwrap();
+        assert_eq!(
+            fs::read_to_string(&interrupt_trace).unwrap_or_default(),
+            "armed\nhit\n",
+            "native rollback never reached {phase} (later_edit={later_edit}): {}",
+            messages(&output)
+        );
         assert_eq!(output.status.code(), Some(1), "{}", messages(&output));
-        assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
         let store = fixture.store();
         let marker = store.join("dots-restore-pending");
         assert!(marker.is_file());
@@ -1085,15 +1302,26 @@ exec "$FIXTURE_GIT" "$@"
             .path();
         let snapshot = fs::read(&record).unwrap();
         let native: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
-        assert_eq!(native["checkpoint"]["operation"]["status"], "completed");
-        assert_eq!(native["recovery"], "finished");
-        assert!(
-            native["checkpoint"]["operation"]["journal"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["kind"] == "committed")
-        );
+        let operation = &native["checkpoint"]["operation"];
+        assert_eq!(native["recovery"], phase);
+        let journal = operation["journal"].as_array().unwrap();
+        if phase == "finished" {
+            assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+            assert_eq!(operation["status"], "completed");
+            assert!(journal.iter().any(|entry| entry["kind"] == "committed"));
+            assert_eq!(
+                fixture.tip(&store, "refs/heads/main"),
+                operation["before"]
+                    .as_str()
+                    .expect("native undo checkpoint"),
+                "the native outcome was already committed when the interruption fired"
+            );
+        } else {
+            assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+            assert_eq!(operation["status"], "pending");
+            assert!(operation["to"].is_null() && operation["applied"].is_null());
+            assert!(journal.is_empty());
+        }
         if later_edit {
             fixture.write(LOCAL_EDIT, 0o600);
             let retry = fixture.dots(&["restore"], &remote).output().unwrap();

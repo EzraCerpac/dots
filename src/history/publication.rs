@@ -92,20 +92,27 @@ pub(super) fn git_parameters<'a>(
             parameters.push(value);
         }
     }
-    parameters.push(" 'credential.interactive'='false'");
+    append_disabled_parameter(&mut parameters, "credential.interactive");
     if let GitAccess::Http(url) = access {
         parameters = without_redirects(Some(&parameters), url);
     }
     Ok(Some(parameters))
 }
 
-pub(super) fn without_redirects(prior: Option<&OsStr>, url: &str) -> OsString {
+fn without_redirects(prior: Option<&OsStr>, url: &str) -> OsString {
     let mut parameters = prior.unwrap_or_default().to_owned();
     // Match Git's quoted key/value representation for process-local -c
     // settings. A URL-specific setting wins over a generic Git config value.
-    let url = url.replace('\'', "'\\''");
-    parameters.push(format!(" 'http.{url}.followRedirects'='false'"));
+    append_disabled_parameter(&mut parameters, &format!("http.{url}.followRedirects"));
     parameters
+}
+
+fn append_disabled_parameter(parameters: &mut OsString, key: &str) {
+    if !parameters.is_empty() {
+        parameters.push(" ");
+    }
+    let key = key.replace('\'', "'\\''");
+    parameters.push(format!("'{key}'='false'"));
 }
 
 pub(super) fn constrain_http(command: &mut Command, url: Option<&str>) {

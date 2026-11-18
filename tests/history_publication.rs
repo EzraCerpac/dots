@@ -891,12 +891,20 @@ fn new_http_exact_scope_disables_redirects_without_changing_other_git_config() {
     let history = History::new();
     let url = "https://fixture.invalid/repo=fixture'with-quote.git";
     let prior =
-        std::ffi::OsStr::new(" 'http.followRedirects'='true' 'credential.helper'='fixture-helper'");
-    let parameters = publication::without_redirects(Some(prior), url);
+        std::ffi::OsStr::new("'http.followRedirects'='true' 'credential.helper'='fixture-helper'");
+    // Build the native command without starting it. Real Git in the
+    // guarded fixture reads the exact parameters that native sync inherits.
+    let mut native = std::process::Command::new("mise");
+    native.env_clear().env("GIT_CONFIG_PARAMETERS", prior);
+    publication::constrain_http(&mut native, Some(url));
+    let parameters = native
+        .get_envs()
+        .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten())
+        .unwrap();
     let value = |key: &str, target: &str| {
         text(ok(history
             .git(&history.remote)
-            .env("GIT_CONFIG_PARAMETERS", &parameters)
+            .env("GIT_CONFIG_PARAMETERS", parameters)
             .args(["config", "--get-urlmatch", key, target])))
     };
     assert_eq!(value("http.followRedirects", url), "false");

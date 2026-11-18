@@ -1,10 +1,8 @@
 use std::ffi::OsStr;
-use std::fs::{OpenOptions, TryLockError};
-use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use crate::Fail;
 use crate::config::checkout_shape;
+use crate::sync::lock::RepoLock;
 
 use super::command_line;
 use super::git::Git;
@@ -39,7 +37,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
             "Git operation in progress ({marker}). Finish or abort it before running dots sync."
         );
     }
-    match probe_lock(&shape.common_dir.join("dots-source-rust.lock")) {
+    match RepoLock::is_held(&shape.common_dir) {
         Ok(true) => println!(
             "Another sync or publish holds the repository lock. Wait for it to finish before running dots sync."
         ),
@@ -73,33 +71,4 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
         command_line("git -C ", git.root, " switch -c dev")?;
     }
     Ok(())
-}
-
-// P-03 read-only adapter until P-08 exposes its source-lock probe.
-fn probe_lock(path: &std::path::Path) -> io::Result<bool> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != nix::unistd::geteuid().as_raw()
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "lock must be a private regular file owned by this user",
-        ));
-    }
-    match file.try_lock_shared() {
-        Ok(()) => Ok(false),
-        Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(err)) => Err(err),
-    }
 }

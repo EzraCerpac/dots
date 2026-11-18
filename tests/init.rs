@@ -688,3 +688,32 @@ fn new_template_only_commit_with_private_message_requires_sync() {
         assert!(!stdout.contains(MEMO) && !stderr.contains(MEMO));
     }
 }
+
+#[test]
+fn new_existing_repository_reports_only_a_held_source_lock() {
+    use dots_cli::sync::lock::RepoLock;
+
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    let git_dir = root.join(".git");
+    let lock_path = git_dir.join("dots-source-rust.lock");
+    let unlocked = success(init(&world, &root));
+    assert!(
+        !unlocked.contains("holds the repository lock"),
+        "{unlocked}"
+    );
+    assert!(!lock_path.exists());
+
+    let lock = RepoLock::try_acquire(&git_dir).unwrap().unwrap();
+    let held = success(init(&world, &root));
+    assert!(held.contains("holds the repository lock"), "{held}");
+
+    drop(lock);
+    let unlocked = success(init(&world, &root));
+    assert!(
+        !unlocked.contains("holds the repository lock"),
+        "{unlocked}"
+    );
+    assert!(lock_path.is_file());
+}

@@ -7,7 +7,10 @@ use std::process::{Command, Output};
 
 use nix::libc;
 
-use crate::config::{RepoSetting, Vars, selection::Selection};
+use crate::config::{
+    RepoSetting, Vars,
+    selection::{self, Selection},
+};
 use crate::process::{Cwd, Mise};
 use crate::run::Run;
 use crate::{Ctx, Fail};
@@ -34,20 +37,24 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
     }
 
     pub fn mise(&self, args: &[&str]) -> Result<Command, Fail> {
-        let mise = match &self.selection {
-            Some(selected) => Mise::with_selection(
-                self.ctx,
-                Selection {
-                    profile: selected.profile.clone(),
-                    machine_id: selected.machine_id.clone(),
-                    selectors: selected.selectors.clone(),
-                },
-            )?,
-            None => Mise::new(self.ctx)?,
+        let selected = match &self.selection {
+            Some(selected) => Selection {
+                profile: selected.profile.clone(),
+                machine_id: selected.machine_id.clone(),
+                selectors: selected.selectors.clone(),
+            },
+            None => selection::read(&self.ctx.root, &self.ctx.env)?,
         };
+        let environments = selected.active_environments();
+        let mise = Mise::with_selection(self.ctx, selected)?;
         let mut cmd = mise.command(args)?;
-        cmd.env("MISE_AUTO_INSTALL", "0")
-            .env("MISE_EXEC_AUTO_INSTALL", "0");
+        // Use the managed global layers and the same store that dots checks.
+        // A single-file override hides the managed machine-local declaration.
+        cmd.env_remove("MISE_GLOBAL_CONFIG_FILE")
+            .env_remove("MISE_CD")
+            .env_remove("MISE_LOG_FILE")
+            .env("MISE_ENV", environments)
+            .env("MISE_STATE_DIR", self.state_dir()?);
         clean_git_env(&mut cmd);
         Ok(cmd)
     }
@@ -94,7 +101,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
             .ok_or_else(|| invalid("HOME must name an absolute directory"))
     }
 
-    pub fn store(&self) -> Result<PathBuf, Fail> {
+    fn state_dir(&self) -> Result<PathBuf, Fail> {
         let env = &self.ctx.env;
         let home = self.home()?;
         let state = match env.get("MISE_STATE_DIR").filter(|path| !path.is_empty()) {
@@ -108,12 +115,22 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         if !state.is_absolute() {
             return Err(invalid("the mise state directory must be absolute"));
         }
-        Ok(state.join("history/repo.git"))
+        Ok(state)
+    }
+
+    pub fn store(&self) -> Result<PathBuf, Fail> {
+        Ok(self.state_dir()?.join("history/repo.git"))
     }
 
     pub fn local_origin(&self, store: &Path) -> Result<Option<String>, Fail> {
         let mut cmd = self.git(Some(store))?;
-        cmd.args(["config", "--local", "--get-all", "remote.origin.url"]);
+        cmd.args([
+            "config",
+            "--null",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]);
         optional_config(self.probe(cmd, "could not read the history store origin")?)
     }
 
@@ -122,19 +139,18 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         let text = self
             .text(cmd, "could not read the effective mise history origin")
             .map_err(|_| invalid("could not read the effective mise history origin"))?;
-        let (url, tail) = text
-            .trim_end()
-            .split_once(" (branch ")
-            .ok_or_else(|| invalid("mise has no effective history origin"))?;
-        let (branch, _) = tail
-            .split_once(") declared in ")
-            .ok_or_else(|| invalid("could not read the effective mise history branch"))?;
-        if url.is_empty() || branch.is_empty() || text.lines().count() != 1 {
+        let (url, branch) = parse_origin(&text)?;
+        Ok((url.to_owned(), branch.to_owned()))
+    }
+
+    pub fn require_origin(&self, url: &str, branch: &str) -> Result<(), Fail> {
+        let (effective_url, effective_branch) = self.effective_origin()?;
+        if effective_url != url || effective_branch != branch {
             return Err(invalid(
-                "could not read the effective mise history origin and branch",
+                "mise history origin and branch must match the validated restore request",
             ));
         }
-        Ok((url.to_owned(), branch.to_owned()))
+        Ok(())
     }
 
     pub fn bare(&self, store: &Path) -> Result<(), Fail> {
@@ -169,11 +185,18 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
                 "effective history destinations must match private dots_state_repo and differ from the source repository",
             )
         };
-        let source = self.source(vars)?;
+        let source = self.source_urls()?;
+        let root = self.ctx.root.path();
         let check = |url: &str| {
-            if RepoSetting::parse(url).is_err()
+            if !concrete_url(url)
                 || !expected.matches(url)
-                || source.as_ref().is_some_and(|repo| repo.matches(url))
+                || vars
+                    .source_repo
+                    .as_ref()
+                    .is_some_and(|repo| repo.matches(url))
+                || source
+                    .iter()
+                    .any(|source| same_transport(root, source, url))
             {
                 return Err(invalid_destination());
             }
@@ -195,74 +218,185 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
             None
         };
         let resolver = store.or_else(|| temporary.as_ref().map(|temp| temp.path()));
+        self.check_url_config(resolver)?;
+        let mut fetch = self.git(resolver)?;
+        fetch.args(["ls-remote", "--get-url", "--", raw]);
+        let fetch = self
+            .text(fetch, "could not resolve the history fetch URL")
+            .map_err(|_| invalid_destination())?;
+        check(fetch.strip_suffix('\n').ok_or_else(invalid_destination)?)?;
+
         let mut cmd = self.git(resolver)?;
         cmd.args(["remote", "show", "-n", "--", raw]);
         let output = self
             .text(cmd, "could not resolve effective history URLs")
             .map_err(|_| invalid_destination())?;
-        let mut fetch = 0;
-        let mut push = 0;
-        for line in output.lines() {
-            if let Some(url) = line.strip_prefix("  Fetch URL: ") {
-                check(url)?;
-                fetch += 1;
-            }
-            if let Some(url) = line.strip_prefix("  Push  URL: ") {
-                check(url)?;
-                push += 1;
-            }
-        }
-        if fetch != 1 || push == 0 {
+        let mut pushes = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("  Push  URL: "))
+            .peekable();
+        if pushes.peek().is_none() {
             return Err(invalid_destination());
         }
-        if let Some(store) = store
-            && let Some(configured) = self.local_origin(store)?
-        {
-            check(&configured)?;
-            for arg in [None, Some("--push")] {
-                let mut cmd = self.git(Some(store))?;
-                cmd.args(["remote", "get-url", "--all"])
-                    .args(arg)
-                    .arg("origin");
-                let output = self
-                    .text(cmd, "could not resolve effective history URLs")
-                    .map_err(|_| invalid_destination())?;
-                if output.is_empty() {
-                    return Err(invalid_destination());
-                }
-                for url in output.lines() {
-                    check(url)?;
-                }
+        for url in pushes {
+            check(url)?;
+        }
+        if let Some(store) = store {
+            for url in self.origin_urls(Some(store))? {
+                check(&url)?;
             }
         }
         Ok(())
     }
 
-    fn source(&self, vars: &Vars) -> Result<Option<RepoSetting>, Fail> {
-        if let Some(source) = &vars.source_repo {
-            return RepoSetting::parse(&source.transport_url()).map(Some);
+    fn source_urls(&self) -> Result<Vec<String>, Fail> {
+        if !exists(&self.ctx.root.path().join(".git"))? {
+            return Ok(Vec::new());
         }
-        let mut cmd = self.git(None)?;
-        cmd.args(["config", "--get-all", "remote.origin.url"]);
-        let output = self.probe(cmd, "could not inspect the source origin")?;
-        optional_config(output)?
-            .map(|url| {
-                RepoSetting::parse(&url)
-                    .map_err(|_| invalid("could not validate the configured source origin"))
-            })
-            .transpose()
+        self.check_url_config(None)?;
+        let urls = self.origin_urls(None)?;
+        if urls
+            .iter()
+            .any(|url| !concrete_url(url) && local_transport(url).is_none())
+        {
+            return Err(invalid("could not validate the configured source origin"));
+        }
+        Ok(urls)
+    }
+
+    fn origin_urls(&self, store: Option<&Path>) -> Result<Vec<String>, Fail> {
+        let diagnostic = "could not resolve the repository origin URLs";
+        let mut cmd = self.git(store)?;
+        cmd.args([
+            "config",
+            "--null",
+            "--get-regexp",
+            "^remote\\.origin\\.(url|pushurl)$",
+        ]);
+        let mut urls = config_records(self.probe(cmd, diagnostic)?)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        if !urls.is_empty() {
+            for push in [None, Some("--push")] {
+                let mut cmd = self.git(store)?;
+                cmd.args(["remote", "get-url", "--all"])
+                    .args(push)
+                    .arg("origin");
+                let output = self
+                    .text(cmd, diagnostic)
+                    .map_err(|_| invalid(diagnostic))?;
+                if output.is_empty() {
+                    return Err(invalid(diagnostic));
+                }
+                urls.extend(output.lines().map(str::to_owned));
+            }
+        }
+        Ok(urls)
+    }
+
+    fn check_url_config(&self, store: Option<&Path>) -> Result<(), Fail> {
+        // Git's URL queries are line-oriented. A control character in a URL
+        // or rewrite can make one actual operand look like several safe ones.
+        let mut cmd = self.git(store)?;
+        cmd.args([
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof))$",
+        ]);
+        config_records(self.probe(cmd, "could not inspect Git history URL configuration")?)?;
+        Ok(())
     }
 }
 
+fn concrete_url(url: &str) -> bool {
+    // OWNER/NAME is accepted by RepoSetting only. Git treats a literal
+    // OWNER/NAME operand as a path in the command's working directory.
+    let http = url.starts_with("https://") || url.starts_with("http://");
+    url.contains(':')
+        && url.trim() == url
+        && (!http || !url.contains(['?', '#']))
+        && RepoSetting::parse(url).is_ok()
+}
+
+fn parse_origin(text: &str) -> Result<(&str, &str), Fail> {
+    let fail = || invalid("could not read the effective mise history origin and branch");
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let (url, tail) = text.split_once(" (branch ").ok_or_else(fail)?;
+    let (branch, _) = tail.split_once(") declared in ").ok_or_else(fail)?;
+    // A literal URL or declaration path can contain the origin report's
+    // delimiters. Refuse ambiguous reports rather than validating a prefix.
+    if !concrete_url(url)
+        || branch.is_empty()
+        || tail.contains(" (branch ")
+        || text.chars().any(char::is_control)
+    {
+        return Err(fail());
+    }
+    Ok((url, branch))
+}
+
+fn local_transport(url: &str) -> Option<&Path> {
+    let path = if url.starts_with("file://localhost/") {
+        &url["file://localhost".len()..]
+    } else if let Some(path) = url.strip_prefix("file://") {
+        if !path.starts_with('/') {
+            return None;
+        }
+        path
+    } else if !url.contains(':') {
+        url
+    } else {
+        return None;
+    };
+    (!path.is_empty() && !path.starts_with('-') && !path.chars().any(char::is_control))
+        .then(|| Path::new(path))
+}
+
+fn same_transport(cwd: &Path, source: &str, state: &str) -> bool {
+    if let (Some(source), Some(state)) = (local_transport(source), local_transport(state)) {
+        let source = cwd.join(source);
+        let state = cwd.join(state);
+        return source == state
+            || crate::config::physical(&source)
+                .ok()
+                .zip(crate::config::physical(&state).ok())
+                .is_some_and(|(source, state)| source == state);
+    }
+    concrete_url(source) && RepoSetting::parse(source).is_ok_and(|repo| repo.matches(state))
+}
+
+fn config_records(output: Output) -> Result<Vec<(String, String)>, Fail> {
+    let invalid_config = || invalid("could not validate Git repository URL configuration");
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| invalid_config())?;
+    let text = text
+        .strip_suffix('\0')
+        .filter(|_| output.status.success())
+        .ok_or_else(invalid_config)?;
+    text.split('\0')
+        .map(|entry| {
+            let (key, value) = entry.split_once('\n').ok_or_else(invalid_config)?;
+            if key.chars().any(char::is_control) || value.chars().any(char::is_control) {
+                return Err(invalid_config());
+            }
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 fn optional_config(output: Output) -> Result<Option<String>, Fail> {
-    if output.status.code() == Some(1) && output.stdout.is_empty() {
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
         return Ok(None);
     }
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| invalid("could not read the repository origin"))?;
-    let mut lines = text.lines();
-    match (output.status.success(), lines.next(), lines.next()) {
-        (true, Some(url), None) if !url.is_empty() => Ok(Some(url.to_owned())),
+    match (output.status.success(), text.strip_suffix('\0')) {
+        (true, Some(url)) if concrete_url(url) => Ok(Some(url.to_owned())),
+        (true, Some(url)) if local_transport(url).is_some() => Ok(None),
         _ => Err(invalid("could not identify a single repository origin")),
     }
 }
@@ -324,7 +458,223 @@ fn clean_git_env(cmd: &mut Command) {
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_NAMESPACE",
         "GIT_PREFIX",
+        "GIT_CONFIG",
+        "GIT_TRACE",
+        "GIT_TRACE_CURL",
+        "GIT_CURL_VERBOSE",
+        "GIT_TRACE_PACKET",
+        "GIT_TRACE2",
+        "GIT_TRACE2_EVENT",
+        "GIT_TRACE2_PERF",
     ] {
         cmd.env_remove(name);
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::{Env, Flags, config::Root, run::Sink};
+
+    pub fn in_world(test: impl FnOnce(&Native<'_, '_>, &Path)) {
+        let temp = tempfile::tempdir().unwrap();
+        let world = temp.path().canonicalize().unwrap();
+        let home = world.join("home");
+        let root = world.join("config");
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("config.toml"),
+            "[vars]\ndots_profiles = 'fixture'\n",
+        )
+        .unwrap();
+        let path = std::env::var_os("PATH").unwrap();
+        let path =
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
+        let vars = [
+            ("PATH", path),
+            ("HOME", home.clone().into()),
+            ("DOTS_ROOT", root.clone().into()),
+            ("CODEX_HOME", home.join("codex").into()),
+            ("XDG_CONFIG_HOME", home.join("xdg-config").into()),
+            ("XDG_DATA_HOME", home.join("xdg-data").into()),
+            ("XDG_STATE_HOME", home.join("xdg-state").into()),
+            ("XDG_CACHE_HOME", home.join("xdg-cache").into()),
+            ("GIT_CONFIG_GLOBAL", home.join("gitconfig").into()),
+            ("GIT_CONFIG_NOSYSTEM", "1".into()),
+            ("GIT_CEILING_DIRECTORIES", world.clone().into()),
+            ("GIT_ALLOW_PROTOCOL", "".into()),
+            ("JJ_CONFIG", home.join("jj.toml").into()),
+            ("RUSTUP_HOME", home.join("rustup").into()),
+            ("CARGO_HOME", home.join("cargo").into()),
+            ("MISE_SYSTEM_CONFIG_DIR", home.join("mise-system").into()),
+            ("MISE_CONFIG_DIR", world.join("alternate").into()),
+            (
+                "MISE_GLOBAL_CONFIG_FILE",
+                world.join("alternate/base.toml").into(),
+            ),
+            ("MISE_DATA_DIR", home.join("mise-data").into()),
+            ("MISE_CACHE_DIR", home.join("mise-cache").into()),
+            ("MISE_TMP_DIR", home.join("mise-tmp").into()),
+            ("MISE_INSTALLS_DIR", home.join("mise-installs").into()),
+            (
+                "MISE_INSTALL_STORE_DIR",
+                home.join("mise-install-store").into(),
+            ),
+            ("MISE_PLUGINS_DIR", home.join("mise-plugins").into()),
+            ("MISE_DOWNLOADS_DIR", home.join("mise-downloads").into()),
+            ("MISE_STATE_DIR", "~/mise-state".into()),
+            ("MISE_CD", world.join("alternate").into()),
+            ("MISE_ENV", "ambient".into()),
+            ("DOTS_MISE_BIN", std::env::current_exe().unwrap().into()),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect();
+        let env = Env { vars, cwd: root };
+        let ctx = Ctx {
+            root: Root::resolve(&env).unwrap(),
+            env,
+            flags: Flags::default(),
+        };
+        let run = Run::begin(&ctx, Sink::Unreported);
+        test(&Native::new(&run, &ctx), &world);
+    }
+
+    fn git(native: &Native<'_, '_>, store: Option<&Path>, args: &[&str]) {
+        let mut cmd = native.git(store).unwrap();
+        cmd.args(args);
+        native.output(cmd, "fixture Git failed").unwrap();
+    }
+
+    #[test]
+    fn refuses_every_effective_live_source_destination_even_with_a_configured_source() {
+        in_world(|native, world| {
+            git(native, None, &["init"]);
+            let state = format!("file://{}", world.join("state.git").display());
+            let source = format!("file://{}", world.join("source.git").display());
+            let declared = format!("file://{}", world.join("declared.git").display());
+            let other = format!("file://{}", world.join("other.git").display());
+            git(native, None, &["remote", "add", "origin", &source]);
+            let expected = RepoSetting::parse(&state).unwrap();
+            let mut vars = Vars::read(&native.ctx.root).unwrap();
+            vars.source_repo = Some(RepoSetting::parse(&declared).unwrap());
+            let check = || native.destinations(None, &state, &expected, &vars);
+            check().unwrap();
+
+            let rewrite = format!("url.{state}.insteadOf");
+            git(native, None, &["config", &rewrite, &source]);
+            assert_eq!(check().unwrap_err().status, 2);
+            git(native, None, &["config", "--unset", &rewrite]);
+
+            git(
+                native,
+                None,
+                &["config", "--add", "remote.origin.pushurl", &other],
+            );
+            check().unwrap();
+            git(
+                native,
+                None,
+                &["config", "--add", "remote.origin.pushurl", &state],
+            );
+            assert_eq!(check().unwrap_err().status, 2);
+        });
+    }
+
+    #[test]
+    fn checks_native_fetch_push_rewrites_and_concrete_operands() {
+        in_world(|native, world| {
+            let state = format!("file://{}", world.join("private.git").display());
+            let other = format!("file://{}", world.join("other.git").display());
+            let vars = Vars::read(&native.ctx.root).unwrap();
+            let expected = RepoSetting::parse(&state).unwrap();
+            let store = world.join("store.git");
+            fs::create_dir(&store).unwrap();
+            git(native, Some(&store), &["init", "--bare"]);
+            let check = || native.destinations(Some(&store), &state, &expected, &vars);
+            check().unwrap();
+            for rule in ["insteadOf", "pushInsteadOf"] {
+                let key = format!("url.{other}.{rule}");
+                git(native, Some(&store), &["config", &key, &state]);
+                assert_eq!(check().unwrap_err().status, 2);
+                git(native, Some(&store), &["config", "--unset", &key]);
+            }
+            let github = RepoSetting::parse("example/history").unwrap();
+            assert_eq!(
+                native
+                    .destinations(Some(&store), "example/history", &github, &vars)
+                    .unwrap_err()
+                    .status,
+                2
+            );
+            assert!(!same_transport(
+                native.ctx.root.path(),
+                "example/history",
+                "https://github.com/example/history"
+            ));
+            assert!(same_transport(
+                native.ctx.root.path(),
+                "../private.git",
+                &state
+            ));
+        });
+    }
+
+    #[test]
+    fn uses_managed_mise_root_selection_and_store() {
+        in_world(|native, _| {
+            let mut native = Native::new(native.run, native.ctx);
+            native.select(Selection {
+                profile: Some("fixture".to_owned()),
+                machine_id: Some("example".to_owned()),
+                selectors: vec!["extra".to_owned()],
+            });
+            let cmd = native.mise(&["bootstrap", "dotfiles", "origin"]).unwrap();
+            let env = cmd.get_envs().collect::<std::collections::BTreeMap<_, _>>();
+            use std::ffi::OsStr;
+            for name in ["MISE_GLOBAL_CONFIG_FILE", "MISE_CD"] {
+                assert_eq!(env.get(OsStr::new(name)).copied().flatten(), None);
+            }
+            assert_eq!(
+                env[OsStr::new("MISE_CONFIG_DIR")],
+                Some(native.ctx.root.path().as_os_str())
+            );
+            assert_eq!(
+                env[OsStr::new("MISE_STATE_DIR")],
+                Some(native.home().unwrap().join("mise-state").as_os_str())
+            );
+            assert_eq!(
+                env[OsStr::new("MISE_ENV")],
+                Some(OsStr::new("fixture,host-example,extra"))
+            );
+            assert_eq!(cmd.get_current_dir(), Some(native.ctx.root.path()));
+        });
+    }
+
+    #[test]
+    fn origin_report_cannot_disguise_the_native_url() {
+        let prefix = "file:///private.git (branch host-fixture) declared in ";
+        assert_eq!(
+            parse_origin(&format!("{prefix}config.local.toml; mode manual\n")).unwrap(),
+            ("file:///private.git", "host-fixture")
+        );
+        assert!(
+            parse_origin(&format!(
+                "{prefix}different (branch host-other) declared in config.local.toml; mode manual\n"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn dots_owned_failure_omits_transport_stderr() {
+        in_world(|native, _| {
+            let mut cmd = native.command("sh").unwrap();
+            cmd.args(["-c", "printf '%s' synthetic-transport-error >&2; exit 1"]);
+            let err = native.output(cmd, "history sync failed").unwrap_err();
+            assert_eq!(err.diagnostic, "history sync failed");
+        });
     }
 }

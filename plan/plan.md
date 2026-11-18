@@ -91,6 +91,8 @@ Every task is one pull request from its own worktree, into `main`. That is safe 
 | Implementer | Sol 6.2, high; xhigh on data paths and the supervisor | Modules, scenario translation, CI, packaging | |
 | Native subagents | Sonnet and Haiku under Opus; Codex subagents under Sol | Routine implementation, search, inventories, log triage | Fable is never spawned |
 
+**Leads are top-level T3 threads; workers are their delegated children.** A lead is woken by the checks and reviews of the pull requests it watches; a delegated child is not. Review findings go to the worker first, then to its lead, and reach the coordinator only as a gate, a contract change or a replan.
+
 **Review on every pull request.** The implementer runs a sol loop before asking its lead to merge: a fresh Sol 6.2 delegate at high effort with no history, three rounds by default and five on data-loss and state paths. `REVIEW.md` and CodeRabbit apply as they do today. The lead checks each finding the implementer set aside, then merges.
 
 **Council on larger things.** The owning lead runs one on the contract (S-01), the architecture note (S-02), history (P-06), sync (P-08) and the supervisor (P-11); the coordinator runs one on the whole repository at G-1. Members are Opus 5.5 and Sol 6.2. Grok 4.7 is disabled in this T3 setup; per the council skill it is reported as unavailable and not replaced.
@@ -112,15 +114,15 @@ Every task is one pull request from its own worktree, into `main`. That is safe 
 
 ## Brief for each lead
 
-The coordinator starts a lead with `delegate_task` and this brief; a child gets no history, so the brief carries everything.
+The coordinator launches each lead as its own top-level T3 thread in its own worktree, with this brief as the first message; the thread gets no history, so the brief carries everything.
 
 - **Read first**: this plan, `docs/contract.md` and `docs/rust-port.md` once they exist, `REVIEW.md` and `AGENTS.md`.
 - **You own**: the listed task IDs and the shared things the ownership table gives you.
 - **You may start**: Opus 5.5 at high effort for taste and Sol 6.2 at high effort for implementation (xhigh where the plan says so), each with `delegate_task` in worktree isolation, one task and one pull request per child. Tell each child it may use its own native subagents and must not start Fable.
-- **Each child must**: keep to its task's acceptance criteria, leave the current implementation untouched, run the tests, run a sol loop, open a pull request with the disclosure note, and end with the pull request URL, head SHA, and the state of checks and reviews.
-- **You must**: freeze a shared interface before two children depend on it, set the merge order, merge task pull requests once CI, the sol loop and `REVIEW.md` pass, run the councils the plan names, and push back on review findings that widen scope.
+- **Each child must**: keep to its task's acceptance criteria, leave the current implementation untouched, run the tests, run a sol loop, open a pull request with the disclosure note, answer the review findings on it, and end with the pull request URL, head SHA, and the state of checks and reviews.
+- **You must**: freeze a shared interface before two children depend on it, set the merge order, watch each worker's pull request, hand review findings that arrive after a worker has finished to a fresh worker, merge task pull requests once CI, the sol loop and `REVIEW.md` pass, run the councils the plan names, and push back on review findings that widen scope.
 - **You must not**: tag a release, change repository settings, create a repository or post outside this repository. Report that the gate is ready.
-- **Return**: per task the pull request, the sol-loop ledger and the council scores; then open questions and anything that needs a replan.
+- **Report** to the coordinator's thread by message when a task is merged, a gate is ready or a decision is needed: per task the pull request, the sol-loop ledger and the council scores; then open questions and anything that needs a replan.
 
 ## Decisions
 

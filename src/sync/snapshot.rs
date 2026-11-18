@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Seek, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -19,6 +19,12 @@ use super::git::{Git, Tree, bounded, checked, index_row, invalid, local, oid, re
 pub(super) enum ScanError {
     Missing,
     Failed,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct FindingLocation {
+    pub line: Option<usize>,
+    pub rule: Option<String>,
 }
 
 pub(super) struct Scratch<'a> {
@@ -200,7 +206,7 @@ impl<'a> Scratch<'a> {
         run: &Run<'_>,
         include: &str,
         excludes: &[&str],
-    ) -> Result<BTreeSet<PathBuf>, ScanError> {
+    ) -> Result<BTreeMap<PathBuf, FindingLocation>, ScanError> {
         let include = oid(include.as_bytes()).map_err(|_| ScanError::Failed)?;
         let mut revs = format!(
             "--root --full-history --diff-merges=first-parent --no-ext-diff --no-textconv --no-renames --text {include}^{{commit}}"
@@ -253,8 +259,19 @@ impl<'a> Scratch<'a> {
         // Match the native scanner: explicitly select the live policy files
         // when present, and otherwise let gitleaks select its defaults.
         let config = self.live.root().join(".gitleaks.toml");
+        let mut policy = RuleNames::Unknown;
         if config.exists() {
-            cmd.arg("--config").arg(config);
+            cmd.arg("--config").arg(&config);
+            if let Ok(text) = fs::read_to_string(config)
+                && let Ok(document) = text.parse()
+            {
+                policy = RuleNames::Project(document);
+            }
+        } else if ["GITLEAKS_CONFIG", "GITLEAKS_CONFIG_TOML"]
+            .iter()
+            .all(|name| run.ctx().env.get(name).is_none())
+        {
+            policy = RuleNames::Default;
         }
         let ignore = self.live.root().join(".gitleaksignore");
         if ignore.exists() {
@@ -271,28 +288,112 @@ impl<'a> Scratch<'a> {
         if !matches!(output.status.code(), Some(0 | 97)) || !output.stderr.is_empty() {
             return Err(ScanError::Failed);
         }
-        #[derive(Deserialize)]
-        struct Finding {
-            #[serde(rename = "File")]
-            file: String,
-        }
-        let findings = serde_json::from_reader::<_, Option<Vec<Finding>>>(
-            File::open(&report).map_err(|_| ScanError::Failed)?,
-        )
-        .map_err(|_| ScanError::Failed)?
-        .unwrap_or_default();
+        let findings = read_findings(File::open(&report).map_err(|_| ScanError::Failed)?, &policy)?;
         if output.status.success() != findings.is_empty() {
             return Err(ScanError::Failed);
         }
-        findings
-            .into_iter()
-            .map(|finding| relative(finding.file.as_bytes()).map_err(|_| ScanError::Failed))
-            .collect()
+        Ok(findings)
     }
 
     pub fn objects(&self) -> &Path {
         &self.objects
     }
+}
+
+enum RuleNames {
+    Unknown,
+    Default,
+    Project(toml_edit::DocumentMut),
+}
+
+impl RuleNames {
+    fn permits(&self, rule: &str) -> bool {
+        if rule.len() > 64
+            || !rule.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !rule.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            })
+        {
+            return false;
+        }
+        // These are documented IDs in the built-in config. An unknown
+        // detector name supplies no receipt text.
+        let built_in = matches!(
+            rule,
+            "github-pat" | "github-fine-grained-pat" | "generic-api-key" | "private-key"
+        );
+        match self {
+            Self::Unknown => false,
+            Self::Default => built_in,
+            Self::Project(doc) => {
+                if doc
+                    .get("rules")
+                    .and_then(toml_edit::Item::as_array_of_tables)
+                    .is_some_and(|rules| {
+                        rules.iter().any(|table| {
+                            table.get("id").and_then(toml_edit::Item::as_str) == Some(rule)
+                        })
+                    })
+                {
+                    return true;
+                }
+                let Some(extend) = doc.get("extend") else {
+                    return false;
+                };
+                built_in
+                    && extend.get("useDefault").and_then(toml_edit::Item::as_bool) == Some(true)
+                    && !extend
+                        .get("disabledRules")
+                        .and_then(toml_edit::Item::as_array)
+                        .is_some_and(|disabled| disabled.iter().any(|id| id.as_str() == Some(rule)))
+            }
+        }
+    }
+}
+
+fn read_findings(
+    report: impl std::io::Read,
+    rules: &RuleNames,
+) -> Result<BTreeMap<PathBuf, FindingLocation>, ScanError> {
+    #[derive(Deserialize)]
+    struct Finding {
+        #[serde(rename = "File")]
+        file: String,
+        #[serde(rename = "StartLine")]
+        line: Option<serde_json::Value>,
+        #[serde(rename = "RuleID")]
+        rule: Option<serde_json::Value>,
+    }
+    let findings = serde_json::from_reader::<_, Option<Vec<Finding>>>(report)
+        .map_err(|_| ScanError::Failed)?
+        .unwrap_or_default();
+    let mut paths = BTreeMap::new();
+    for finding in findings {
+        let path = relative(finding.file.as_bytes()).map_err(|_| ScanError::Failed)?;
+        if path
+            .components()
+            .collect::<PathBuf>()
+            .as_os_str()
+            .as_bytes()
+            != finding.file.as_bytes()
+        {
+            return Err(ScanError::Failed);
+        }
+        let line = finding
+            .line
+            .as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok())
+            .filter(|&line| line > 0);
+        let rule = finding
+            .rule
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|rule| rules.permits(rule))
+            .map(str::to_owned);
+        paths.entry(path).or_insert(FindingLocation { line, rule });
+    }
+    Ok(paths)
 }
 
 pub(super) fn changed(before: &Tree, after: &Tree) -> Vec<PathBuf> {
@@ -380,6 +481,75 @@ mod tests {
     }
 
     #[test]
+    fn finding_metadata_discards_unverified_rule_names_and_invalid_lines() {
+        let json = br#"[
+            {"File":"nested/token","RuleID":"github-pat","StartLine":2,"Secret":"unused secret text"},
+            {"File":"forged","RuleID":"not-a-built-in-rule","StartLine":"31337"},
+            {"File":"control","RuleID":"github-pat\nforged diagnostic","StartLine":0},
+            {"File":"negative","RuleID":42,"StartLine":-1},
+            {"File":"missing"}
+        ]"#;
+        let found = read_findings(&json[..], &RuleNames::Default).unwrap();
+        assert_eq!(
+            found[Path::new("nested/token")],
+            FindingLocation {
+                rule: Some("github-pat".into()),
+                line: Some(2)
+            },
+        );
+        for path in ["forged", "control", "negative", "missing"] {
+            assert_eq!(found[Path::new(path)], FindingLocation::default());
+        }
+        for path in [
+            "../outside",
+            "/absolute",
+            "nested/./token",
+            "nested//token",
+            ".git/index",
+        ] {
+            let report = serde_json::to_vec(&[serde_json::json!({ "File": path })]).unwrap();
+            assert!(matches!(
+                read_findings(&report[..], &RuleNames::Default),
+                Err(ScanError::Failed)
+            ));
+        }
+        assert!(matches!(
+            read_findings(
+                &br#"[{"RuleID":"github-pat","StartLine":2}]"#[..],
+                &RuleNames::Default
+            ),
+            Err(ScanError::Failed)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires actual gitleaks"]
+    fn native_scan_reports_a_verified_default_rule_and_positive_line() {
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let base = fixture_commit(&git, "seed");
+        fs::create_dir(git.root().join("nested")).unwrap();
+        let fixture_token = ["ghp_", "Ab3De6Gh9Jk2Mn5Pq8St1Uv4Wx7Yz0Bc3Ef6"].concat();
+        fs::write(
+            git.root().join("nested/token"),
+            format!("header\n{fixture_token}\n"),
+        )
+        .unwrap();
+        git.get(["add", "nested/token"]).unwrap();
+        let revision = fixture_commit(&git, "token fixture");
+        let scratch = scratch(&git);
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let found = scratch.scan(&run, &revision, &[&base]).unwrap();
+        assert_eq!(
+            found[Path::new("nested/token")],
+            FindingLocation {
+                rule: Some("github-pat".into()),
+                line: Some(2)
+            },
+        );
+    }
+
+    #[test]
     fn native_scan_checks_intermediate_and_merge_resolutions_with_live_policy() {
         let (_fixture, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());
@@ -435,9 +605,25 @@ path = '^(Side|Merge) marker\.txt$'
             Err(ScanError::Missing) => return,
             result => result.unwrap(),
         };
-        assert_eq!(found, BTreeSet::from([side_path.into(), merge_path.into()]));
         assert_eq!(
-            scratch.scan(&run, &merged, &[&side]).unwrap(),
+            found.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([side_path.into(), merge_path.into()])
+        );
+        for path in [side_path, merge_path] {
+            assert_eq!(
+                found[Path::new(path)],
+                FindingLocation {
+                    rule: Some("fixture-marker".into()),
+                    line: Some(1)
+                }
+            );
+        }
+        assert_eq!(
+            scratch
+                .scan(&run, &merged, &[&side])
+                .unwrap()
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([merge_path.into()])
         );
 
@@ -447,7 +633,11 @@ path = '^(Side|Merge) marker\.txt$'
         )
         .unwrap();
         assert_eq!(
-            scratch.scan(&run, &merged, &[&base]).unwrap(),
+            scratch
+                .scan(&run, &merged, &[&base])
+                .unwrap()
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([merge_path.into()])
         );
     }

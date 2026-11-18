@@ -682,18 +682,43 @@ fn scan_candidate(
         if found.is_empty() {
             return Ok(candidate);
         }
-        if found.iter().any(|path| !paths.contains(path)) {
+        if found.keys().any(|path| !paths.contains(path)) {
             return Err(ScanError::Failed);
         }
+        let tree = scratch
+            .git
+            .tree(&candidate)
+            .map_err(|_| ScanError::Failed)?;
         let count = rejected.len();
-        for path in found {
+        for (path, found) in found {
             if rejected.insert(path.clone()) {
-                path_issue(
-                    receipt,
-                    "NOT SHARED: gitleaks flagged a local file; it stays on disk",
-                    &path,
+                const DIAGNOSTIC: &str =
+                    "NOT SHARED: gitleaks flagged a local file; it stays on disk";
+                let mut location = path.into_os_string();
+                if let Some(line) = found.line
+                    && let Some(entry) = tree.get(Path::new(&location))
+                    && matches!(entry.mode.as_str(), "100644" | "100755")
+                    && scratch
+                        .git
+                        .get(["cat-file", "blob", &entry.oid])
+                        .is_ok_and(|blob| {
+                            blob.split_inclusive(|&byte| byte == b'\n')
+                                .nth(line - 1)
+                                .is_some()
+                        })
+                {
+                    location.push(format!(":{line}"));
+                }
+                let mut reported = Issue::new(
+                    DIAGNOSTIC,
                     "Remove or rotate the secret before sharing this path.",
                 );
+                reported.diagnostic = format!("{DIAGNOSTIC}: {location:?}");
+                if let Some(rule) = found.rule {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut reported.diagnostic, " ({rule})");
+                }
+                receipt.issues.push(reported);
             }
         }
         if rejected.len() == count {

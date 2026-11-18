@@ -266,6 +266,10 @@ pub(super) fn command(
                 "MISE_SYSTEM_CONFIG_DIR",
                 root.join(".dots-no-system-config"),
             )
+            .env(
+                "MISE_SYSTEM_CONFIG_FILE",
+                root.join(".dots-no-system-config/config.toml"),
+            )
             .env("MISE_CEILING_PATHS", root)
             .env("MISE_OFFLINE", "1")
             .env("MISE_AUTO_UPDATE", "0")

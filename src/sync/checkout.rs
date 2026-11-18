@@ -230,6 +230,7 @@ pub(super) fn begin(
         let from = git.tree(before)?;
         let to = git.tree(after)?;
         let live = Dir::open(git.root())?;
+        let stages = Dir::open(path)?;
         for (position, item) in mutations(&from, &to).iter().enumerate() {
             if from.contains_key(item) {
                 let expected = leaf_before(git, before, &from, item)?;
@@ -240,6 +241,15 @@ pub(super) fn begin(
                     ));
                 }
                 write_private(&path.join(format!("expected-{position}")), &observed)?;
+            } else if directory_in(&from, item) {
+                live.expect_directory(item, &stages, &CStrName::new(&format!("old-{position}"))?)?;
+                for (number, directory) in nested_ancestors(&from, item).into_iter().enumerate() {
+                    live.expect_directory(
+                        directory,
+                        &stages,
+                        &CStrName::new(&format!("old-dir-{position}-{number}"))?,
+                    )?;
+                }
             }
         }
     }
@@ -550,7 +560,7 @@ fn apply(
             {
                 // A shared ancestor can become empty only after every
                 // descendant is gone, regardless of lexical order.
-                prune_empty_ancestors(&root, &old, &item)?;
+                prune_empty_ancestors(&root, &stage, pending, &old, &item, position)?;
             }
             replace_exact(
                 &root,
@@ -597,7 +607,7 @@ fn apply(
     })
 }
 
-fn prune_empty_ancestors(root: &Dir, old: &Tree, target: &Path) -> io::Result<()> {
+fn nested_ancestors<'a>(old: &'a Tree, target: &Path) -> Vec<&'a Path> {
     let unique: BTreeSet<_> = old
         .keys()
         .filter(|leaf| leaf.starts_with(target))
@@ -608,9 +618,35 @@ fn prune_empty_ancestors(root: &Dir, old: &Tree, target: &Path) -> io::Result<()
         })
         .collect();
     let mut parents: Vec<_> = unique.into_iter().collect();
-    parents.sort_unstable_by_key(|path| Reverse(path.components().count()));
-    for parent in parents {
-        root.remove_dir_if_empty(parent)?;
+    parents.sort_unstable_by_key(|path| (Reverse(path.components().count()), *path));
+    parents
+}
+
+fn prune_empty_ancestors(
+    root: &Dir,
+    stage: &Dir,
+    pending: &Path,
+    old: &Tree,
+    target: &Path,
+    position: usize,
+) -> io::Result<()> {
+    let unused = CStrName::new("no-directory-replacement")?;
+    for (number, directory) in nested_ancestors(old, target).into_iter().enumerate() {
+        let done = pending.join(format!("pruned-{position}-{number}"));
+        if done.is_file() {
+            continue;
+        }
+        replace_exact(
+            root,
+            directory,
+            stage,
+            &CStrName::new(&format!("old-dir-{position}-{number}"))?,
+            &unused,
+            &Image::Directory,
+            &Image::Absent,
+        )?;
+        write_synced(done, b"displaced empty directory\n")?;
+        File::open(pending)?.sync_all()?;
     }
     Ok(())
 }
@@ -774,6 +810,48 @@ mod tests {
         );
         assert_eq!(fs::read(live).unwrap(), b"incoming file");
         assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    }
+
+    #[test]
+    fn a_competing_empty_nested_directory_survives_checkout() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        use std::cell::Cell;
+
+        let (fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let live = git.root().join("replace");
+        let nested = live.join("middle/deep");
+        let leaf = nested.join("leaf");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(&leaf, b"original").unwrap();
+        git.get(["add", "replace"]).unwrap();
+        let before = fixture_commit(&git, "nested directory");
+        fs::remove_dir_all(&live).unwrap();
+        fs::write(&live, b"incoming file").unwrap();
+        git.get(["add", "replace"]).unwrap();
+        let after = fixture_commit(&git, "file in place of directory");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, true).unwrap();
+
+        let claimed = Cell::new(None);
+        let saved = fixture.path().join("saved-empty-directory");
+        let result = finish(&git, &dir, || {
+            if !leaf.exists() && claimed.get().is_none() {
+                fs::rename(&nested, &saved).unwrap();
+                fs::create_dir(&nested).unwrap();
+                claimed.set(Some(fs::metadata(&nested).unwrap().ino()));
+            }
+            false
+        });
+        assert!(result.is_err());
+        assert_eq!(Some(fs::metadata(nested).unwrap().ino()), claimed.get());
+        assert!(saved.is_dir());
+        assert!(live.is_dir());
+        assert!(has_pending(&dir));
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
     }
 
     #[test]

@@ -186,7 +186,8 @@ impl Dir {
         // rename. An existing destination remains untouched.
         #[cfg(target_os = "linux")]
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 self.fd(),
                 name.as_ptr(),
                 saved.fd(),
@@ -204,7 +205,9 @@ impl Dir {
                 libc::RENAME_EXCL,
             )
         };
-        checked(result)?;
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
         saved.0.sync_all()?;
         self.0.sync_all()
     }
@@ -218,22 +221,12 @@ impl Dir {
         dir.0.sync_all()
     }
 
-    pub fn remove_dir_if_empty(&self, path: &Path) -> io::Result<()> {
-        match self.parent(path, false) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Ok((dir, name)) => match dir.read(&name)? {
-                Image::Absent => Ok(()),
-                Image::Directory => dir.remove_empty(&name),
-                _ => Err(invalid("directory changed during checkout")),
-            },
-            Err(error) => Err(error),
-        }
-    }
-
-    fn remove_empty(&self, name: &CString) -> io::Result<()> {
-        // SAFETY: the directory descriptor and name live through unlinkat.
-        checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
-        self.0.sync_all()
+    pub fn expect_directory(&self, path: &Path, stage: &Dir, slot: &CStrName) -> io::Result<()> {
+        let (parent, name) = self.parent(path, false)?;
+        let directory = parent.subdir(OsStr::from_bytes(name.as_bytes()), false)?;
+        verify_parent(self, path, &parent)?;
+        let identity = parent.identity()?.join(directory.identity()?);
+        stage.record_directory_removal(&slot.directory_marker()?, &identity)
     }
 
     fn identity(&self) -> io::Result<PathBuf> {
@@ -348,7 +341,6 @@ fn verify_parent(root: &Dir, path: &Path, held: &Dir) -> io::Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn displace_directory(
     root: &Dir,
     path: &Path,
@@ -360,9 +352,7 @@ fn displace_directory(
     replacement: &Image,
     before_move: impl Fn() -> io::Result<()>,
 ) -> io::Result<bool> {
-    let mut marker = b"removed-dir-".to_vec();
-    marker.extend_from_slice(old_slot.0.as_bytes());
-    let marker = c_name(OsStr::from_bytes(&marker))?;
+    let marker = old_slot.directory_marker()?;
     let mut proof = staging.read(&marker)?;
     let parent_id = parent.identity()?;
     if staging.read(&old_slot.0)? == Image::Absent {
@@ -390,7 +380,7 @@ fn displace_directory(
     if staging.read(&old_slot.0)? == Image::Directory {
         let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
         if proof == Image::Link(parent_id.join(moved.identity()?)) {
-            if &current == replacement {
+            if &current == replacement && *replacement != Image::Absent {
                 return Ok(true);
             }
             if current == Image::Absent && moved.is_empty()? {
@@ -491,6 +481,12 @@ fn replace_with(
 pub(super) struct CStrName(CString);
 
 impl CStrName {
+    fn directory_marker(&self) -> io::Result<CString> {
+        let mut marker = b"removed-dir-".to_vec();
+        marker.extend_from_slice(self.0.as_bytes());
+        c_name(OsStr::from_bytes(&marker))
+    }
+
     pub fn new(value: &str) -> io::Result<Self> {
         c_name(value.as_ref()).map(Self)
     }

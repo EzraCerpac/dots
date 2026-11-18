@@ -81,12 +81,11 @@ The exit status is the outcome:
 | 4 | skipped |
 | other | failed |
 
-A hook or recipe can prompt using the caller's stdin, stdout, stderr and controlling terminal from the start of its step.
-If stdin is redirected, the child receives that input.
-Answer prompts directly. Only the child reads the reply.
-`dots up` prints the step and its result in scrollback.
-If a step that had the terminal fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
-The step’s output stays in scrollback. Ordinary captured steps have private logs.
+During an interactive update in terminal scrollback, a hook or recipe owns the terminal from the start of its step.
+Answer its prompts directly. Only the child reads the reply.
+If the step fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
+In concise output, including headless and `--plain` updates, the child reads the caller's stdin and its output goes to a private log.
+A failure includes the last lines of that log. With `--verbose`, the output is also displayed as it arrives.
 
 ### Update hooks
 

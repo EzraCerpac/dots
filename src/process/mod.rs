@@ -2,17 +2,41 @@ mod mise;
 
 pub use mise::Mise;
 
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
+
+use nix::libc;
 
 use crate::{Ctx, Fail};
 
 pub(crate) use mise::{config_paths, mise_binary, quiet_probe, validate_selection};
+
+const HOOK_ENV: &[&str] = &[
+    "DOTS_CHANGES",
+    "DOTS_TOOLS_OK",
+    "DOTS_TOOLS_UPGRADED",
+    "DOTS_PRIVATE_READY",
+    "DOTS_RESTORED",
+    "DOTS_BUNDLE_FD",
+];
+
+fn staged_env() -> impl Iterator<Item = &'static str> {
+    [
+        "DOTS_ROOT",
+        "DOTS_PROFILE",
+        "DOTS_HOME",
+        "DOTS_STAGES",
+        "HOMEBREW_NO_INSTALL_CLEANUP",
+    ]
+    .into_iter()
+    .chain(HOOK_ENV.iter().copied())
+}
 
 pub enum Cwd<'a> {
     Root,
@@ -78,17 +102,10 @@ impl Ctx {
             .env("DOTS_ROOT", self.root.path())
             .env("DOTS_PROFILE", profile)
             .env("PATH", path);
-        for key in [
-            "MISE_ENV",
-            "DOTS_HOME",
-            "DOTS_STAGES",
-            "DOTS_CHANGES",
-            "DOTS_TOOLS_OK",
-            "DOTS_TOOLS_UPGRADED",
-            "DOTS_PRIVATE_READY",
-            "DOTS_RESTORED",
-            "DOTS_BUNDLE_FD",
-        ] {
+        for key in ["MISE_ENV", "DOTS_HOME", "DOTS_STAGES"]
+            .into_iter()
+            .chain(HOOK_ENV.iter().copied())
+        {
             command.env_remove(key);
         }
         Ok(command)
@@ -125,47 +142,156 @@ pub fn exec_pinned(args: &[OsString]) -> Result<u8, Fail> {
     }
     let encoded = fs::read(bin.join(name))
         .map_err(|error| Fail::new(1, format!("could not read dots child arguments: {error}")))?;
-    let mut argv = encoded
+    let invalid = || Fail::usage("invalid handoff for dots child");
+    let mut fields = encoded
         .strip_suffix(&[0])
-        .ok_or_else(|| Fail::usage("invalid arguments for dots child"))?
-        .split(|byte| *byte == 0)
-        .map(OsStr::from_bytes);
-    let program = argv
+        .ok_or_else(invalid)?
+        .split(|byte| *byte == 0);
+    let mut environment: BTreeMap<_, _> = std::env::vars_os().collect();
+    for key in staged_env() {
+        match fields.next().ok_or_else(invalid)?.split_first() {
+            Some((b'+', value)) => {
+                environment.insert(key.into(), OsStr::from_bytes(value).to_owned());
+            }
+            // Up stamps this value for its own stages. Ordinary commands
+            // otherwise keep the effective config's Homebrew setting.
+            None if key == "HOMEBREW_NO_INSTALL_CLEANUP" => {}
+            None => {
+                environment.remove(OsStr::new(key));
+            }
+            _ => return Err(invalid()),
+        }
+    }
+
+    let program = fields
         .next()
         .filter(|name| !name.is_empty())
-        .ok_or_else(|| Fail::usage("missing program for dots child"))?;
-    let existing = std::env::var_os("PATH");
-    let path = prepend_to_path(bin, existing.as_deref())?;
-    let error = Command::new(program).args(argv).env("PATH", path).exec();
+        .ok_or_else(invalid)?;
+    let path = prepend_to_path(
+        bin,
+        environment.get(OsStr::new("PATH")).map(OsString::as_os_str),
+    )?;
+    environment.insert("PATH".into(), path.clone());
+    let argv = std::iter::once(program)
+        .chain(fields)
+        .map(|arg| CString::new(arg).map_err(|_| invalid()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let environment = environment
+        .into_iter()
+        .map(|(key, value)| {
+            let mut entry = key.into_encoded_bytes();
+            entry.push(b'=');
+            entry.extend(value.into_encoded_bytes());
+            CString::new(entry).map_err(|_| invalid())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let pointers = |strings: &[CString]| {
+        strings
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain([std::ptr::null()])
+            .collect::<Vec<_>>()
+    };
+    let argv_pointers = pointers(&argv);
+    let env_pointers = pointers(&environment);
+    // Rust ignores SIGPIPE in the launcher. Give the executed program the
+    // native default, as Command does when starting a child.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let error = exec_search(OsStr::from_bytes(program), &path, |candidate| {
+        let Ok(candidate) = CString::new(candidate.as_os_str().as_bytes()) else {
+            return io::Error::from_raw_os_error(libc::EINVAL);
+        };
+        // The filename and both nul-terminated pointer arrays live across execve.
+        unsafe {
+            libc::execve(
+                candidate.as_ptr(),
+                argv_pointers.as_ptr(),
+                env_pointers.as_ptr(),
+            )
+        };
+        io::Error::last_os_error()
+    });
     Err(Fail::new(
         1,
-        format!("could not run {}: {error}", Path::new(program).display()),
+        format!(
+            "could not run {}: {error}",
+            Path::new(OsStr::from_bytes(program)).display()
+        ),
     ))
 }
 
-fn stage_argv<I, S>(bin: &Path, program: &OsStr, args: I) -> Result<OsString, Fail>
+fn exec_search(
+    program: &OsStr,
+    path: &OsStr,
+    mut exec: impl FnMut(&Path) -> io::Error,
+) -> io::Error {
+    if program.as_bytes().contains(&b'/') {
+        return exec(Path::new(program));
+    }
+    let mut denied = None;
+    for dir in std::env::split_paths(path) {
+        let error = exec(&dir.join(program));
+        match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => {}
+            Some(libc::EACCES) => denied = Some(error),
+            // A file that exists but has no executable format must fail here.
+            _ => return error,
+        }
+    }
+    denied.unwrap_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+}
+
+fn stage_argv<I, S>(
+    bin: &Path,
+    command: &Command,
+    program: &OsStr,
+    args: I,
+) -> Result<OsString, Fail>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    // mise's CLI converts non-UTF-8 arguments to text. Hand it only the
-    // UTF-8 private executable path and this filename.
+    // Pass mise only the UTF-8 launcher path and this filename. The private
+    // file holds raw argv and the designated environment, never bundle bytes.
     let stage = || -> io::Result<OsString> {
         let mut file = tempfile::Builder::new().prefix("argv-").tempfile_in(bin)?;
-        let mut append = |arg: &OsStr| -> io::Result<()> {
-            let bytes = arg.as_bytes();
+        let mut append = |bytes: &[u8], present: bool| -> io::Result<()> {
             if bytes.contains(&0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "argument contains NUL",
+                    "handoff contains NUL",
                 ));
+            }
+            if present {
+                file.write_all(b"+")?;
             }
             file.write_all(bytes)?;
             file.write_all(&[0])
         };
-        append(program)?;
+        for key in staged_env() {
+            let value = command
+                .get_envs()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value);
+            if key == "DOTS_BUNDLE_FD"
+                && value.is_some_and(|value| {
+                    value
+                        .to_str()
+                        .and_then(|fd| fd.parse::<u32>().ok())
+                        .is_none()
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid bundle descriptor",
+                ));
+            }
+            append(value.map_or(&[], OsStr::as_bytes), value.is_some())?;
+        }
+        append(program.as_bytes(), false)?;
         for arg in args {
-            append(arg.as_ref())?;
+            append(arg.as_ref().as_bytes(), false)?;
         }
         let filename = file
             .path()
@@ -215,5 +341,32 @@ impl BundlePipe {
             "P-05",
             "attaching the bootstrap hook's secret descriptor",
         ))
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    #[test]
+    fn path_search_skips_missing_and_denied_entries_and_stops_on_enoexec() {
+        let mut candidates = Vec::new();
+        let error = exec_search(
+            "example".as_ref(),
+            "/missing:/denied:/plain:/later".as_ref(),
+            |path| {
+                candidates.push(path.to_owned());
+                io::Error::from_raw_os_error(match path.parent().unwrap().to_str().unwrap() {
+                    "/missing" => libc::ENOENT,
+                    "/denied" => libc::EACCES,
+                    _ => libc::ENOEXEC,
+                })
+            },
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC));
+        assert_eq!(
+            candidates,
+            ["/missing/example", "/denied/example", "/plain/example"].map(std::path::PathBuf::from)
+        );
     }
 }

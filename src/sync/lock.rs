@@ -14,6 +14,9 @@ pub struct RepoLock {
     _file: File,
 }
 
+const NAME: &str = "dots-source-rust.lock";
+const FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+
 impl RepoLock {
     /// `common_git_dir` is the canonical, physical Git common directory.
     pub fn try_acquire(common_git_dir: &Path) -> io::Result<Option<Self>> {
@@ -23,20 +26,9 @@ impl RepoLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(common_git_dir.join("dots-source-rust.lock"))?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o077 != 0
-            || metadata.nlink() != 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "source operation lock must be a private regular file owned by this user",
-            ));
-        }
-
+            .custom_flags(FLAGS)
+            .open(common_git_dir.join(NAME))?;
+        validate(&file)?;
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Some(Self { _file: file })),
@@ -46,6 +38,43 @@ impl RepoLock {
             }
         }
     }
+
+    /// Observe contention without creating the lock file or taking ownership.
+    pub fn is_held(common_git_dir: &Path) -> io::Result<bool> {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(FLAGS)
+            .open(common_git_dir.join(NAME))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        validate(&file)?;
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => return Ok(false),
+                Err(TryLockError::WouldBlock) => return Ok(true),
+                Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+fn validate(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "source operation lock must be a private regular file owned by this user",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -57,13 +86,18 @@ mod tests {
     #[test]
     fn excludes_another_participant_and_reuses_the_inode() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(NAME);
+        assert!(!RepoLock::is_held(dir.path()).unwrap());
+        assert!(!path.exists());
+
         let guard = RepoLock::try_acquire(dir.path()).unwrap().unwrap();
-        let path = dir.path().join("dots-source-rust.lock");
         let original = fs::metadata(&path).unwrap();
         assert_eq!(original.permissions().mode() & 0o077, 0);
         assert!(RepoLock::try_acquire(dir.path()).unwrap().is_none());
+        assert!(RepoLock::is_held(dir.path()).unwrap());
 
         drop(guard);
+        assert!(!RepoLock::is_held(dir.path()).unwrap());
         let _guard = RepoLock::try_acquire(dir.path()).unwrap().unwrap();
         assert_eq!(fs::metadata(path).unwrap().ino(), original.ino());
     }
@@ -71,7 +105,7 @@ mod tests {
     #[test]
     fn refuses_symlink_and_shared_permissions() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dots-source-rust.lock");
+        let path = dir.path().join(NAME);
         let target = dir.path().join("unrelated");
         fs::write(&target, b"keep").unwrap();
         symlink(&target, &path).unwrap();

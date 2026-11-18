@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use serde::Deserialize;
 
@@ -661,21 +661,6 @@ fn expose_mas(command: Command, mas: Option<&Tool>) -> Result<Command, crate::Fa
     match mas {
         Some(tool) => tool.expose(command),
         None => Ok(command),
-    }
-}
-
-// P-11 owns detached stage sessions. Until its native probe_for lands,
-// withhold authorization rather than launch a worker with the caller's tty.
-trait PendingWorkerProbe {
-    fn probe_for(&self, id: StageId, command: Command) -> io::Result<Output>;
-}
-
-impl PendingWorkerProbe for Run<'_> {
-    fn probe_for(&self, _id: StageId, _command: Command) -> io::Result<Output> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "P-11 detached stage probe is pending",
-        ))
     }
 }
 

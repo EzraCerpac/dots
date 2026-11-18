@@ -80,12 +80,13 @@ fn update(run: &Run<'_>, mas: bool) {
         return;
     }
     let source = sync::load(ctx);
-    let label = if matches!(source, sync::Loaded::LocalOnly) {
-        "Sync configuration (no remote configured)"
+    if matches!(source, sync::Loaded::LocalOnly) {
+        run.skip("Sync configuration (no remote configured)");
     } else {
-        "Sync configuration"
-    };
-    step(run, label, |id| sync_configuration(run, id, source));
+        step(run, "Sync configuration", |id| {
+            sync_configuration(run, id, source)
+        });
+    }
 
     // Read selection and settings again: sync may have installed a different config.
     let mut loaded = None;

@@ -184,13 +184,13 @@ impl KnownCopy {
 pub(super) struct Copies {
     state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
+    written: BTreeSet<PathBuf>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
 struct CopyState {
     known: BTreeMap<PathBuf, KnownCopy>,
     captured: BTreeMap<PathBuf, Captured>,
-    changed: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -640,7 +640,7 @@ impl Copies {
             git.root(),
             selectors,
             &configs.reload,
-            &self.state.changed,
+            &self.written,
             receipt,
         )
         .is_err();
@@ -661,10 +661,6 @@ impl Copies {
             ) {
                 break;
             }
-        }
-        if !reload_failed {
-            self.state.changed.clear();
-            self.persist(git_dir)?;
         }
         Ok(())
     }
@@ -886,6 +882,7 @@ impl Copies {
                     continue;
                 }
                 self.state = Self::load(git_dir)?.state;
+                self.written.insert(path.clone());
             } else if let Some(baseline) = next_baseline {
                 self.state.known.insert(path.clone(), baseline);
             } else {
@@ -1143,7 +1140,6 @@ fn reconcile_write(
                 } else {
                     copies.state.known.remove(target);
                 }
-                copies.state.changed.insert(target.clone());
             }
         }
         copies.persist(git_dir)?;

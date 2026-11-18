@@ -221,25 +221,16 @@ impl Dir {
         dir.0.sync_all()
     }
 
-    pub fn expect_directory(&self, path: &Path, stage: &Dir, slot: &CStrName) -> io::Result<()> {
+    pub fn directory_identity(&self, path: &Path) -> io::Result<PathBuf> {
         let (parent, name) = self.parent(path, false)?;
-        let directory = parent.subdir(OsStr::from_bytes(name.as_bytes()), false)?;
-        verify_parent(self, path, &parent)?;
-        let identity = parent.identity()?.join(directory.identity()?);
-        stage.record_directory_removal(&slot.directory_marker()?, &identity)
+        parent
+            .subdir(OsStr::from_bytes(name.as_bytes()), false)?
+            .identity()
     }
 
     fn identity(&self) -> io::Result<PathBuf> {
         let metadata = self.0.metadata()?;
         Ok(format!("{}:{}", metadata.dev(), metadata.ino()).into())
-    }
-
-    fn record_directory_removal(&self, marker: &CString, identity: &Path) -> io::Result<()> {
-        let identity = c_string(identity.as_os_str())?;
-        // SAFETY: marker and identity are valid C strings and the staging
-        // descriptor is open. symlinkat records the entire identity at once.
-        checked(unsafe { libc::symlinkat(identity.as_ptr(), self.fd(), marker.as_ptr()) })?;
-        self.0.sync_all()
     }
 
     fn is_empty(&self) -> io::Result<bool> {
@@ -331,6 +322,13 @@ pub(super) fn write_private(path: &Path, image: &Image) -> io::Result<()> {
     }
 }
 
+fn same_inode(first: &Dir, one: &CString, second: &Dir, two: &CString) -> io::Result<bool> {
+    use nix::{fcntl::AtFlags, sys::stat::fstatat};
+    let one = fstatat(&first.0, one.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    let two = fstatat(&second.0, two.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    Ok((one.st_dev, one.st_ino) == (two.st_dev, two.st_ino))
+}
+
 fn verify_parent(root: &Dir, path: &Path, held: &Dir) -> io::Result<()> {
     let (current, _) = root.parent(path, false)?;
     if current.identity()? == held.identity()? {
@@ -352,9 +350,6 @@ fn displace_directory(
     replacement: &Image,
     before_move: impl Fn() -> io::Result<()>,
 ) -> io::Result<bool> {
-    let marker = old_slot.directory_marker()?;
-    let mut proof = staging.read(&marker)?;
-    let parent_id = parent.identity()?;
     if staging.read(&old_slot.0)? == Image::Absent {
         if *current != Image::Directory {
             return Err(invalid("no displaced directory for this replacement"));
@@ -363,33 +358,25 @@ fn displace_directory(
         if !child.is_empty()? {
             return Err(invalid("target directory has local files"));
         }
-        let identity = parent_id.join(child.identity()?);
-        if proof == Image::Absent {
-            staging.record_directory_removal(&marker, &identity)?;
-            proof = Image::Link(identity);
-        } else if proof != Image::Link(identity) {
-            return Err(invalid("another directory claimed the target"));
-        }
         before_move()?;
         verify_parent(root, path, parent)?;
         parent.move_to(name, staging, &old_slot.0)?;
-    }
-
-    let current = parent.read(name)?;
-    verify_parent(root, path, parent)?;
-    if staging.read(&old_slot.0)? == Image::Directory {
         let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
-        if proof == Image::Link(parent_id.join(moved.identity()?)) {
-            if &current == replacement && *replacement != Image::Absent {
-                return Ok(true);
-            }
-            if current == Image::Absent && moved.is_empty()? {
-                return Ok(false);
-            }
+        if moved.identity()? != child.identity()? || !moved.is_empty()? {
+            let _ = staging.move_to(&old_slot.0, parent, name);
+            return Err(invalid("directory changed during displacement"));
         }
     }
-    if current == Image::Absent {
-        let _ = staging.move_to(&old_slot.0, parent, name);
+    verify_parent(root, path, parent)?;
+    let current = parent.read(name)?;
+    if staging.read(&old_slot.0)? == Image::Directory {
+        let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
+        if &current == replacement && *replacement != Image::Absent {
+            return Ok(true);
+        }
+        if current == Image::Absent && moved.is_empty()? {
+            return Ok(false);
+        }
     }
     Err(invalid("directory or target changed during replacement"))
 }
@@ -426,7 +413,10 @@ fn replace_with(
             return Ok(());
         }
     } else if !matches!(displaced, Image::Absent) {
-        if !matches!(replacement, Image::Absent) && &current == replacement {
+        if !matches!(replacement, Image::Absent)
+            && &current == replacement
+            && same_inode(staging, &new_slot.0, &parent, &name)?
+        {
             return Ok(());
         }
         if &displaced != expected {
@@ -436,9 +426,6 @@ fn replace_with(
                     .and_then(|()| staging.link_to(&old_slot.0, &parent, &name));
             }
             return Err(invalid("displaced file changed"));
-        }
-        if &current == replacement {
-            return Ok(());
         }
         if !matches!(current, Image::Absent) {
             return Err(invalid("another writer claimed the target"));
@@ -461,7 +448,10 @@ fn replace_with(
                 }
             }
         }
-    } else if &current == replacement && *expected == Image::Absent {
+    } else if &current == replacement
+        && *expected == Image::Absent
+        && same_inode(staging, &new_slot.0, &parent, &name)?
+    {
         // A completed exclusive install survives interruption before the
         // caller's journal advances.
         return Ok(());
@@ -481,12 +471,6 @@ fn replace_with(
 pub(super) struct CStrName(CString);
 
 impl CStrName {
-    fn directory_marker(&self) -> io::Result<CString> {
-        let mut marker = b"removed-dir-".to_vec();
-        marker.extend_from_slice(self.0.as_bytes());
-        c_name(OsStr::from_bytes(&marker))
-    }
-
     pub fn new(value: &str) -> io::Result<Self> {
         c_name(value.as_ref()).map(Self)
     }

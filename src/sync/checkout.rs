@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirEntry, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -28,6 +28,8 @@ struct Plan {
     before: String,
     after: String,
     checkout: bool,
+    directories: BTreeMap<PathBuf, PathBuf>,
+    modes: BTreeMap<PathBuf, u32>,
 }
 
 #[derive(Debug)]
@@ -301,12 +303,13 @@ pub(super) fn begin(
     }
     let prepared = private_dir(git_dir, "dots-sync-prepare-")?;
     let path = prepared.path();
-    let plan = Plan {
+    let mut plan = Plan {
         before: before.into(),
         after: after.into(),
         checkout,
+        directories: BTreeMap::new(),
+        modes: BTreeMap::new(),
     };
-    write_synced(path.join("plan.json"), &serde_json::to_vec(&plan)?)?;
     write_synced(path.join("index.before"), original_index)?;
     git.indexed(&path.join("index.after")).get([
         "-c",
@@ -327,8 +330,7 @@ pub(super) fn begin(
         let from = git.tree(before)?;
         let to = git.tree(after)?;
         let live = Dir::open(git.root())?;
-        let stages = Dir::open(path)?;
-        for (position, item) in mutations(&from, &to).iter().enumerate() {
+        for item in &mutations(&from, &to) {
             if from.contains_key(item) {
                 let expected = leaf_before(git, before, &from, item)?;
                 let observed = live.read_path(item)?;
@@ -337,19 +339,20 @@ pub(super) fn begin(
                         "checkout path changed while preparing its replacement",
                     ));
                 }
-                write_private(&path.join(format!("expected-{position}")), &observed)?;
+                if let Image::Regular { mode, .. } = observed {
+                    plan.modes.insert(item.clone(), mode);
+                }
             } else if directory_in(&from, item) {
-                live.expect_directory(item, &stages, &CStrName::new(&format!("old-{position}"))?)?;
-                for (number, directory) in nested_ancestors(&from, item).into_iter().enumerate() {
-                    live.expect_directory(
-                        directory,
-                        &stages,
-                        &CStrName::new(&format!("old-dir-{position}-{number}"))?,
-                    )?;
+                for directory in
+                    std::iter::once(item.as_path()).chain(nested_ancestors(&from, item))
+                {
+                    plan.directories
+                        .insert(directory.to_owned(), live.directory_identity(directory)?);
                 }
             }
         }
     }
+    write_synced(path.join("plan.json"), &serde_json::to_vec(&plan)?)?;
     File::open(path)?.sync_all()?;
     fs::rename(path, &pending)?;
     File::open(git_dir)?.sync_all()
@@ -522,11 +525,12 @@ fn apply(
                 return Err(io::ErrorKind::Interrupted.into());
             }
             progress.path = Some(item.clone());
-            let expected = if directory_in(&old, &item) {
-                Image::Directory
-            } else {
-                stage.read_path(Path::new(&format!("expected-{position}")))?
-            };
+            let mut expected = leaf_before(git, &plan.before, &old, &item)?;
+            if let (Image::Regular { mode, .. }, Some(observed)) =
+                (&mut expected, plan.modes.get(&item))
+            {
+                *mode = *observed;
+            }
             let new_name = PathBuf::from(format!("new-{position}"));
             let mut replacement = stage.read_path(&new_name)?;
             if replacement == Image::Absent && new.contains_key(&item) {
@@ -541,7 +545,10 @@ fn apply(
             {
                 // A shared ancestor can become empty only after every
                 // descendant is gone, regardless of lexical order.
-                prune_empty_ancestors(&root, &stage, pending, &old, &item, position)?;
+                prune_empty_ancestors(&root, &stage, &plan, &old, &item, position)?;
+            }
+            if expected == Image::Directory {
+                verify_directory_slot(&root, &stage, &item, &old_name, &plan)?;
             }
             replace_exact(
                 &root,
@@ -628,38 +635,49 @@ fn nested_ancestors<'a>(old: &'a Tree, target: &Path) -> Vec<&'a Path> {
 fn prune_empty_ancestors(
     root: &Dir,
     stage: &Dir,
-    pending: &Path,
+    plan: &Plan,
     old: &Tree,
     target: &Path,
     position: usize,
 ) -> io::Result<()> {
     let unused = CStrName::new("no-directory-replacement")?;
     for (number, directory) in nested_ancestors(old, target).into_iter().enumerate() {
-        let done = pending.join(format!("pruned-{position}-{number}"));
-        if done.is_file() {
-            continue;
-        }
+        let slot = format!("old-dir-{position}-{number}");
+        verify_directory_slot(root, stage, directory, &slot, plan)?;
         replace_exact(
             root,
             directory,
             stage,
-            &CStrName::new(&format!("old-dir-{position}-{number}"))?,
+            &CStrName::new(&slot)?,
             &unused,
             &Image::Directory,
             &Image::Absent,
         )?;
-        write_synced(done, b"displaced empty directory\n")?;
-        File::open(pending)?.sync_all()?;
     }
     Ok(())
 }
 
-// Only these disposable leaves may be removed after retirement. A directory
-// or an unexpected entry may contain recovery data and must travel intact.
-fn numeric_pair(text: &str, separator: char) -> bool {
-    text.split_once(separator).is_some_and(|(first, second)| {
-        first.parse::<u64>().is_ok() && second.parse::<u64>().is_ok()
-    })
+fn verify_directory_slot(
+    root: &Dir,
+    stage: &Dir,
+    live: &Path,
+    slot: &str,
+    plan: &Plan,
+) -> io::Result<()> {
+    let expected = plan
+        .directories
+        .get(live)
+        .ok_or_else(|| invalid("missing directory identity"))?;
+    let slot = Path::new(slot);
+    let observed = if stage.read_path(slot)? == Image::Absent {
+        root.directory_identity(live)?
+    } else {
+        stage.directory_identity(slot)?
+    };
+    if &observed != expected {
+        return Err(invalid("another directory claimed the target"));
+    }
+    Ok(())
 }
 
 fn disposable(entry: &DirEntry) -> io::Result<bool> {
@@ -672,27 +690,12 @@ fn disposable(entry: &DirEntry) -> io::Result<bool> {
         name.strip_prefix(prefix)
             .is_some_and(|number| number.parse::<usize>().is_ok())
     };
-    let numbered_pair = |prefix| {
-        name.strip_prefix(prefix)
-            .is_some_and(|suffix| numeric_pair(suffix, '-'))
-    };
-    // Directory identity markers encode numbers as a symlink target. They
-    // are journal metadata even though the target is not a filesystem path.
-    if kind.is_symlink() && (numbered("removed-dir-old-") || numbered_pair("removed-dir-old-dir-"))
-    {
-        let target = fs::read_link(entry.path())?;
-        return Ok(target
-            .to_str()
-            .and_then(|target| target.split_once('/'))
-            .is_some_and(|(parent, moved)| numeric_pair(parent, ':') && numeric_pair(moved, ':')));
-    }
     Ok((kind.is_file()
         && (matches!(
             name,
             "plan.json" | "index.before" | "index.after" | "index.install" | "started" | "finished"
-        ) || numbered("done-")
-            || numbered_pair("pruned-")))
-        || ((kind.is_file() || kind.is_symlink()) && (numbered("expected-") || numbered("new-"))))
+        ) || numbered("done-")))
+        || ((kind.is_file() || kind.is_symlink()) && numbered("new-")))
 }
 
 fn recovery_paths(journal: &Path) -> Vec<PathBuf> {
@@ -1200,9 +1203,9 @@ mod tests {
     fn retired_journal_preserves_a_link_that_is_not_a_directory_identity() {
         let fixture = tempfile::tempdir().unwrap();
         let journal = fixture.path();
-        let metadata = journal.join("removed-dir-old-dir-2-0");
-        let foreign = journal.join("removed-dir-old-1");
-        std::os::unix::fs::symlink("12:34/56:78", &metadata).unwrap();
+        let metadata = journal.join("done-2");
+        let foreign = journal.join("unrelated-link");
+        fs::write(&metadata, b"done").unwrap();
         std::os::unix::fs::symlink("unrelated-file", &foreign).unwrap();
 
         assert_eq!(

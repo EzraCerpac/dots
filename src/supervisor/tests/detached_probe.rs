@@ -22,12 +22,11 @@ fn detached_result_deadline_preserves_admission() {
     }
 
     let id = run.start("Later work");
-    let output = run
-        .probe_detached(
-            shell("read line && exit 31; printf out; printf err >&2", &[]),
-            Duration::from_secs(3),
-        )
-        .unwrap();
+    let supplied = fixture.path().join("stdin");
+    fs::write(&supplied, b"this input must not reach the probe\n").unwrap();
+    let mut command = shell("read line && exit 31; printf out; printf err >&2", &[]);
+    command.stdin(File::open(supplied).unwrap());
+    let output = run.probe_detached(command, Duration::from_secs(3)).unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"out");
     assert_eq!(output.stderr, b"err");
@@ -86,7 +85,11 @@ fn detached_probe_never_signals_a_group_without_its_waitable_leader() {
     for route in ["poll", "cancel", "drop"] {
         let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
         let mut probe = supervisor
-            .spawn(shell("exit 0", &[]), Placement::DetachedProbe, false)
+            .spawn(
+                shell("exit 0", &[]),
+                Placement::DetachedProbe(Instant::now() + Duration::from_secs(3)),
+                false,
+            )
             .unwrap();
         assert!(probe.child.wait().unwrap().success());
         // Simulate a recycled group number with a live, test-owned sentinel.
@@ -111,4 +114,154 @@ fn detached_probe_never_signals_a_group_without_its_waitable_leader() {
             "{route}"
         );
     }
+}
+
+#[test]
+fn detached_capture_limit_covers_both_streams_and_retires_the_child() {
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut probe = supervisor
+        .spawn(
+            shell("printf 1234; printf 5678 >&2; exec sleep 10", &[]),
+            Placement::DetachedProbe(deadline),
+            false,
+        )
+        .unwrap();
+    probe.budget = Some(ProbeBudget::new(deadline));
+    let error = Pipes::take(&mut probe.child)
+        .unwrap()
+        .collect_limited(&mut probe, 6)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+    assert!(probe.reaped);
+    assert!(matches!(
+        probe.budget.unwrap().stop,
+        Some(ProbeStop::OutputLimit)
+    ));
+    drop(probe);
+    assert!(supervisor.state().children.is_empty());
+    assert!(!supervisor.cancelled());
+}
+
+#[test]
+fn detached_success_requires_confirmed_group_retirement() {
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut probe = supervisor
+        .spawn(
+            shell("exit 0", &[]),
+            Placement::DetachedProbe(deadline),
+            false,
+        )
+        .unwrap();
+    probe.budget = Some(ProbeBudget::new(deadline));
+    assert!(wait_until(|| matches!(
+        observe(probe.entry.pid, false),
+        Ok(Observed::Exited { .. })
+    )));
+    probe.membership = Some((Instant::now(), Ok(false)));
+    assert!(probe.poll(true, false).unwrap().is_none());
+    assert!(probe.group_cleanup.is_some());
+    assert!(
+        probe.membership.is_none(),
+        "pre-signal snapshot was retained"
+    );
+
+    probe.group_cleanup = Some(Instant::now() - GROUP_RETIRE_GRACE);
+    probe.membership = Some((Instant::now(), Err("ambiguous snapshot".into())));
+    let error = probe.poll(true, false).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("could not confirm probe group retirement")
+    );
+    assert!(probe.reaped);
+    assert!(
+        supervisor
+            .state()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ambiguous snapshot"))
+    );
+}
+
+#[test]
+fn detached_spawn_rechecks_deadline_after_waiting_for_admission() {
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let marker = fixture.path().join("spawned");
+    let guard = supervisor.state.lock().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(80);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            supervisor
+                .spawn(
+                    shell(": > \"$1\"", &[&marker]),
+                    Placement::DetachedProbe(deadline),
+                    false,
+                )
+                .err()
+        });
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + TICK);
+        drop(guard);
+        assert_eq!(
+            worker.join().unwrap().unwrap().kind(),
+            io::ErrorKind::TimedOut
+        );
+    });
+    assert!(!marker.exists());
+    assert!(supervisor.admit_stage(|| StageId(0)).is_some());
+}
+
+#[test]
+fn detached_exec_wait_does_not_hold_admission_and_rechecks_deadline() {
+    use std::os::fd::AsRawFd;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let ctx = fixture_context(fixture.path(), false);
+    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let marker = fixture.path().join("spawned");
+    let (ready, ready_write) = io::pipe().unwrap();
+    let (release, mut release_write) = io::pipe().unwrap();
+    let mut command = shell(": > \"$1\"", &[&marker]);
+    let ready_fd = ready_write.as_raw_fd();
+    let release_fd = release.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            let mut byte = b'R';
+            if libc::write(ready_fd, (&byte as *const u8).cast(), 1) != 1
+                || libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) != 1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let deadline = Instant::now() + Duration::from_millis(750);
+    std::thread::scope(|scope| {
+        let supervisor = &supervisor;
+        let worker = scope.spawn(move || {
+            supervisor
+                .spawn(command, Placement::DetachedProbe(deadline), false)
+                .err()
+        });
+        let child_waiting =
+            pipe::ready(ready.as_raw_fd(), libc::POLLIN, Duration::from_secs(2)).unwrap();
+        let lock_available = supervisor
+            .state
+            .try_lock()
+            .is_ok_and(|state| state.launching == 1);
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + TICK);
+        release_write.write_all(b"F").unwrap();
+        let error = worker.join().unwrap().unwrap();
+        assert!(child_waiting && lock_available);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    });
+    assert!(!marker.exists());
+    assert_eq!(supervisor.state().launching, 0);
 }

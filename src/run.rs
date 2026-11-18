@@ -168,6 +168,7 @@ impl<'a> Run<'a> {
     /// reaping disabled. This Run exclusively waits on the child until return.
     /// An in-process caller must not install a SIGCHLD handler or reap it from
     /// another thread, including through `waitpid(-1, ...)`.
+    /// A pending OS exec handshake and mandatory cleanup can delay the return.
     pub fn probe_detached(
         &self,
         cmd: ChildCommand,

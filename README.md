@@ -77,7 +77,7 @@ dots plan                                    # mise's bootstrap plan; installs n
 dots up                                      # checkpoint, sync and update eligible software
 dots apply                                   # apply declared dotfiles and templates locally
 dots up --last                               # print the saved report and return its exit status
-dots reports                                  # list recent completed reports in a terminal
+dots reports                                  # list recent completed reports, newest first
 dots sync                                    # share your edits and take the other machines'
 dots sync --last                             # replay the last sync receipt
 

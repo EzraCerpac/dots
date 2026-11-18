@@ -37,6 +37,7 @@ impl std::error::Error for ConfigLocation {}
 
 pub(super) struct Validated {
     _preview: tempfile::TempDir,
+    revision: String,
     pub apply: ApplyPlan,
     pub retired: Vec<Retirement>,
     local: BTreeMap<PathBuf, Image>,
@@ -48,7 +49,9 @@ impl Validated {
         Ok(self.local == local_files(root)?)
     }
 
-    pub fn ready_to_apply(&self, root: &Path) -> io::Result<()> {
+    pub fn ready_to_apply(&self, git: &Git<'_>) -> io::Result<()> {
+        super::verify_dev(git, &self.revision)?;
+        let root = git.root();
         let mut local = local_files(root)?;
         for (path, original) in &self.local {
             let expected = self
@@ -64,8 +67,10 @@ impl Validated {
             return Err(invalid("machine-local inputs changed after validation"));
         }
         let live = Dir::open(root)?;
+        let preview = Dir::open(self._preview.path())?;
         for (path, expected) in &self.configs {
-            if !live.read_path(path)?.git_eq(expected) {
+            if !live.read_path(path)?.git_eq(expected) || !preview.read_path(path)?.git_eq(expected)
+            {
                 return Err(invalid("configuration inputs changed after validation"));
             }
         }
@@ -77,12 +82,19 @@ pub(super) struct Retirement {
     pub path: PathBuf,
     pub before: Image,
     pub after: Image,
+    pub sources: BTreeSet<PathBuf>,
 }
 
-pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io::Result<Validated> {
+pub(super) fn validate(
+    run: &Run<'_>,
+    scratch: &Scratch<'_>,
+    revision: &str,
+    tree: &Tree,
+    current: &Tree,
+) -> io::Result<Validated> {
     let preview = private_dir(scratch.dir.path(), "validate-")?;
     let root = preview.path().canonicalize()?;
-    let mut documents = materialize(scratch, tree, &root)?;
+    let mut documents = materialize(scratch, revision, tree, &root)?;
     let local = local_files(scratch.live.root())?;
     let mut ignored = vec![
         PathBuf::from("config.local.toml"),
@@ -103,7 +115,9 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
     }
     protect_future_hosts(&root)?;
     check_ignored(&scratch.live, &root, &ignored)?;
-    let retired = retire(&root, &documents, &local)?;
+    let retired = retire(&root, &documents, &local, |source| {
+        Ok(!current.contains_key(source) && source_exists(scratch.live.root(), source)?)
+    })?;
     for row in &retired {
         let path = root.join(&row.path);
         fs::remove_file(&path)?;
@@ -121,7 +135,7 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
     };
     let selected_root = config::Root::resolve(&env).map_err(io::Error::other)?;
     config::Vars::read(&selected_root).map_err(io::Error::other)?;
-    config::selection::read(&selected_root, &env).map_err(io::Error::other)?;
+    let selection = config::selection::read(&selected_root, &env).map_err(io::Error::other)?;
     let config = probe(run, &root, ["config", "ls", "--json"], true)?;
     #[derive(Deserialize)]
     struct Entry {
@@ -140,6 +154,12 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
     {
         return Err(invalid("mise did not load the isolated configuration"));
     }
+    let apply = ApplyPlan::new(
+        run,
+        root.clone(),
+        scratch.live.root(),
+        selection.active_environments(),
+    )?;
     probe(
         run,
         &root,
@@ -161,9 +181,9 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
             configs.insert(path.to_owned(), private.read_path(path)?);
         }
     }
-    let apply = ApplyPlan::new(run, root, scratch.live.root())?;
     Ok(Validated {
         _preview: preview,
+        revision: revision.into(),
         apply,
         retired,
         local,
@@ -193,6 +213,7 @@ fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
 
 fn materialize(
     scratch: &Scratch<'_>,
+    revision: &str,
     tree: &Tree,
     root: &Path,
 ) -> io::Result<BTreeMap<PathBuf, DocumentMut>> {
@@ -201,7 +222,13 @@ fn materialize(
         if local(path) {
             return Err(invalid("configuration tracks a machine-local file"));
         }
-        let image = Image::from_git(&scratch.git, Some(entry))?;
+        let image = if is_mise_config(path)
+            || (path.starts_with("conf.d") && path.extension().is_some_and(|ext| ext == "toml"))
+        {
+            Image::checkout(&scratch.git, revision, path, Some(entry))?
+        } else {
+            Image::from_git(&scratch.git, Some(entry))?
+        };
         let destination = root.join(path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -220,11 +247,12 @@ fn materialize(
 pub(super) fn historical_status(
     run: &Run<'_>,
     scratch: &Scratch<'_>,
+    revision: &str,
     tree: &Tree,
 ) -> io::Result<(tempfile::TempDir, PathBuf, Vec<u8>)> {
     let preview = private_dir(scratch.dir.path(), "historical-")?;
     let root = preview.path().canonicalize()?;
-    materialize(scratch, tree, &root)?;
+    materialize(scratch, revision, tree, &root)?;
     for (path, image) in local_files(scratch.live.root())? {
         write_private(&root.join(path), &image)?;
     }
@@ -247,8 +275,19 @@ pub(super) fn command(
     let mut argv = vec![OsString::from("-C"), root.as_os_str().to_owned()];
     argv.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
     let mut cmd = mise.command(argv).map_err(io::Error::other)?;
-    let selected =
-        config::selection::read(&run.ctx().root, &run.ctx().env).map_err(io::Error::other)?;
+    let selected = if preview {
+        let mut vars = run.ctx().env.vars.clone();
+        vars.insert("DOTS_ROOT".into(), root.as_os_str().to_owned());
+        let env = Env {
+            vars,
+            cwd: root.to_owned(),
+        };
+        let private = config::Root::resolve(&env).map_err(io::Error::other)?;
+        config::selection::read(&private, &env)
+    } else {
+        config::selection::read(&run.ctx().root, &run.ctx().env)
+    }
+    .map_err(io::Error::other)?;
     cmd.current_dir(root)
         .env("MISE_ENV", selected.active_environments())
         .env("MISE_CONFIG_DIR", root)
@@ -423,6 +462,7 @@ fn retire(
     root: &Path,
     docs: &BTreeMap<PathBuf, DocumentMut>,
     machine: &BTreeMap<PathBuf, Image>,
+    survives_live: impl Fn(&Path) -> io::Result<bool>,
 ) -> io::Result<Vec<Retirement>> {
     let text = match Dir::open(root)?.read_path(Path::new("dots/retired-declarations"))? {
         Image::Absent => return Ok(Vec::new()),
@@ -434,14 +474,9 @@ fn retire(
         let Some((key, source)) = retired_row(row) else {
             continue;
         };
-        match fs::symlink_metadata(root.join(source)) {
-            Ok(_) => continue,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) => {}
-            Err(error) => return Err(error),
+        let source_path = Path::new(source);
+        if source_exists(root, source_path)? || survives_live(source_path)? {
+            continue;
         }
         let locations = docs
             .iter()
@@ -475,12 +510,16 @@ fn retire(
                 return Err(invalid("missing retired dotfile declarations"));
             };
             let mut ranges = Vec::new();
+            let mut sources = BTreeSet::new();
             for name in names {
                 let table = entries
                     .get(&name)
                     .and_then(Item::as_table)
                     .ok_or_else(|| invalid("retired declaration changed while editing"))?;
                 ranges.push(declaration_range(original, table)?);
+                if let Some(source) = table.get("source").and_then(Item::as_str) {
+                    sources.insert(PathBuf::from(source));
+                }
             }
             let mut after = original.to_owned();
 
@@ -507,9 +546,25 @@ fn retire(
                     bytes: after.into_bytes(),
                     mode: *mode,
                 },
+                sources,
             })
         })
         .collect()
+}
+
+pub(super) fn source_exists(root: &Path, path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(root.join(path)) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn retired_row(row: &str) -> Option<(String, &str)> {
@@ -636,7 +691,7 @@ source = "dotfiles/duplicate"
                 mode: 0o600,
             },
         )]);
-        let result = retire(root, &documents, &files).unwrap();
+        let result = retire(root, &documents, &files, |_| Ok(false)).unwrap();
         assert_eq!(result.len(), 1);
         let Image::Regular { bytes, mode } = &result[0].after else {
             panic!("retirement must produce a regular config")
@@ -684,6 +739,14 @@ source = "dotfiles/duplicate"
     }
 
     fn retirement_fixture(config: &str, rows: &str) -> io::Result<Vec<Retirement>> {
+        retirement_fixture_with_source(config, rows, |_| Ok(false))
+    }
+
+    fn retirement_fixture_with_source(
+        config: &str,
+        rows: &str,
+        surviving: impl Fn(&Path) -> io::Result<bool>,
+    ) -> io::Result<Vec<Retirement>> {
         let fixture = tempfile::tempdir()?;
         fs::create_dir(fixture.path().join("dots"))?;
         fs::write(fixture.path().join("dots/retired-declarations"), rows)?;
@@ -697,7 +760,22 @@ source = "dotfiles/duplicate"
                 mode: 0o600,
             },
         )]);
-        retire(fixture.path(), &docs, &machine)
+        retire(fixture.path(), &docs, &machine, surviving)
+    }
+
+    #[test]
+    fn retirement_keeps_a_source_that_still_exists_in_the_live_checkout() {
+        let live = tempfile::tempdir().unwrap();
+        fs::create_dir(live.path().join("templates")).unwrap();
+        fs::write(live.path().join("templates/file"), b"ignored live input").unwrap();
+        let config = "[dotfiles.name]\nmode = 'template'\nsource = 'templates/file'\n";
+        let rows = "dotfiles.name\ttemplates/file\n";
+        assert!(
+            retirement_fixture_with_source(config, rows, |path| source_exists(live.path(), path))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(retirement_fixture(config, rows).unwrap().len(), 1);
     }
 
     #[test]

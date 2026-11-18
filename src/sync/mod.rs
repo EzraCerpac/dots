@@ -12,11 +12,13 @@ mod validation;
 mod tests;
 
 use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{CheckoutShape, Vars, checkout_shape};
-use crate::history;
+use crate::history::{self, CheckpointFailure};
 use crate::receipt::{self, ChangeGroup, Display, Issue, Receipt};
 use crate::report::Command;
 use crate::run::{self, Outcome, Run, Sink, StageId};
@@ -236,6 +238,45 @@ fn active(run: &Run<'_>) -> Result<(), Note> {
     }
 }
 
+fn dev_tip(git: &Git<'_>) -> io::Result<String> {
+    if git.text(["symbolic-ref", "--no-recurse", "HEAD"])? != "refs/heads/dev" {
+        return Err(git::invalid("HEAD no longer names dev"));
+    }
+    let tip = git.id(["show-ref", "--hash", "--verify", "refs/heads/dev"])?;
+    if git.id(["rev-parse", "--verify", "HEAD^{commit}"])? != tip
+        || git.text(["symbolic-ref", "--no-recurse", "HEAD"])? != "refs/heads/dev"
+    {
+        return Err(git::invalid("dev changed while verifying the checkout"));
+    }
+    Ok(tip)
+}
+
+fn verify_dev(git: &Git<'_>, expected: &str) -> io::Result<()> {
+    if dev_tip(git)? != expected {
+        return Err(git::invalid("dev moved during sync"));
+    }
+    Ok(())
+}
+
+fn checkpoint(run: &Run<'_>, stage: StageId, receipt: &mut Receipt) -> bool {
+    let (problem, next) = match history::checkpoint_classified(run, stage, run.ctx()) {
+        Ok(_) => return true,
+        Err(CheckpointFailure::Preflight(problem)) => (
+            problem,
+            "Correct the history declaration or configuration, then rerun dots sync.",
+        ),
+        Err(CheckpointFailure::NativeSave(problem)) => (
+            problem,
+            "Resolve the local save failure, then rerun dots sync.",
+        ),
+    };
+    receipt.issues.push(Issue {
+        diagnostic: problem.diagnostic,
+        next_action: next.into(),
+    });
+    false
+}
+
 fn synchronize(
     run: &Run<'_>,
     stage: StageId,
@@ -310,23 +351,19 @@ fn synchronize(
         "mise is missing or this machine's profile could not be read",
         CONFIG,
     )?;
-    if let Err(problem) = history::checkpoint(run, stage, ctx) {
-        // Do not relay a history backend tail or command output.
-        let _ = problem;
-        return Err(Note(
-            "Could not save encrypted tracked history",
-            "Check the history configuration and run dots backup before retrying sync.",
-        ));
+    let acquire_index = || {
+        checkout::SnapshotIndex::acquire(&git, &shared.dir)
+            .or_note("Could not reserve the full Git index for capture", GIT)
+    };
+    let mut snapshot = acquire_index()?;
+    let before = dev_tip(&git).or_note("Could not verify the dev revision", GIT)?;
+    if !checkpoint(run, stage, receipt) {
+        return Ok(());
     }
-
-    let before = git
-        .id(["rev-parse", "--verify", "HEAD^{commit}"])
-        .or_note("Could not verify the dev revision", GIT)?;
+    verify_dev(&git, &before).or_note("The checkout changed during the history save", GIT)?;
     let base = git
         .tree(&before)
         .or_note("Could not read the dev tree", GIT)?;
-    let mut index =
-        checkout::index_snapshot(&shared.dir).or_note("Could not read the Git index", GIT)?;
     let scratch = Scratch::new(&git, &shared.dir, &shared.common).or_note(
         "Could not create a private sync workspace",
         "Check free space and permissions, then rerun dots sync.",
@@ -335,7 +372,7 @@ fn synchronize(
         dotfiles::Copies::load(&shared.dir).or_note("Could not read guarded copy state", RERUN)?;
     if let Some(previous) = checkout::previous_index_base(
         &git,
-        &index,
+        snapshot.bytes(),
         &scratch.dir.path().join("reflog.index"),
         &before,
     )
@@ -343,7 +380,7 @@ fn synchronize(
         "Could not verify the index against the current dev ref",
         GIT,
     )? {
-        dense_index(&git)?;
+        verify_dev(&git, &before).or_note("The dev checkout changed during preflight", GIT)?;
         let old = git
             .tree(&previous)
             .or_note("Could not verify the preceding dev tree", GIT)?;
@@ -361,18 +398,24 @@ fn synchronize(
             return Ok(());
         }
         copies
-            .seed(run, &scratch, &old)
+            .seed(run, &scratch, &previous, &old)
             .or_note("Could not preserve the previous copy declarations", RERUN)?;
         copies
             .persist(&shared.dir)
             .or_note("Could not save the previous copy baselines", RERUN)?;
-        checkout::begin(&git, &shared.dir, &index, &previous, &before, true)
+        let index_before = snapshot.bytes().to_vec();
+        drop(snapshot);
+        checkout::begin(&git, &shared.dir, &index_before, &previous, &before, true)
             .or_note("Could not prepare the checkout after dev moved", GIT)?;
         let installed = finish_pending(run, &git, &shared.dir, receipt)?.ok_or(Note(
             "The checkout could not be reconciled after dev moved",
             GIT,
         ))?;
-        index = installed.index_after;
+        snapshot = acquire_index()?;
+        verify_dev(&git, &before).or_note("The dev checkout changed after reconciliation", GIT)?;
+        if snapshot.bytes() != installed.index_after.as_slice() {
+            return Err(Note("The Git index changed after reconciliation", GIT));
+        }
         receipt.recovered.push(ChangeGroup::new(
             Some(previous),
             Some(before.clone()),
@@ -380,17 +423,19 @@ fn synchronize(
         ));
     }
     copies
-        .seed(run, &scratch, &base)
+        .seed(run, &scratch, &before, &base)
         .or_note("Could not verify the previous dotfile declarations", RERUN)?;
-    dense_index(&git)?;
+    verify_dev(&git, &before).or_note("The dev checkout changed before copy capture", GIT)?;
     copies
-        .capture(run, &git, &shared.dir, &base, receipt)
+        .capture(run, &git, &shared.dir, &before, &base, receipt)
         .or_note(
             "Could not inspect deployed copies or record their recovery state",
             RERUN,
         )?;
 
     active(run)?;
+    verify_dev(&git, &before)
+        .or_note("The dev checkout changed before taking the snapshot", GIT)?;
     let unscanned = scratch.capture(&before).or_note(
         "Could not snapshot local edits",
         "Check Git identity, repository state and free space; your edits remain on disk.",
@@ -404,7 +449,7 @@ fn synchronize(
     if !checkout::preserves_staged(
         &scratch.git,
         &scratch.dir.path().join("user.index"),
-        &index,
+        snapshot.bytes(),
         &before,
         &unscanned,
     )
@@ -415,6 +460,9 @@ fn synchronize(
             "Save or reconcile the two versions with Git, then rerun dots sync.",
         ));
     }
+    verify_dev(&git, &before).or_note("The dev checkout changed during capture", GIT)?;
+    let mut index = snapshot.bytes().to_vec();
+    drop(snapshot);
     let fetch = Fetch::new(
         &git,
         scratch
@@ -441,6 +489,8 @@ fn synchronize(
     receipt.kept = local_paths.len().saturating_sub(saved_paths.len());
     if approved != before {
         active(run)?;
+        verify_dev(&git, &before)
+            .or_note("The dev checkout changed before saving local edits", GIT)?;
         dense_index(&git)?;
         scratch
             .promote(&approved, &before)
@@ -507,6 +557,14 @@ fn synchronize(
         if merged != approved && !published.contains(&merged.as_str()) {
             let mut excluded = published.clone();
             excluded.push(&approved);
+            if machine_local_in_history(&scratch.git, &merged, &excluded)
+                .or_note("Could not verify intermediate merged trees", GIT)?
+            {
+                return Err(Note(
+                    "NOT SHARED: merged history touched a machine-local file",
+                    "Review the incoming revisions without sharing the merge, then rerun dots sync.",
+                ));
+            }
             if !scratch
                 .scan(run, &merged, &excluded)
                 .map_err(scan_note)?
@@ -522,7 +580,13 @@ fn synchronize(
             .git
             .tree(&merged)
             .or_note("Could not verify the merged tree", GIT)?;
-        let validated = match validation::validate(run, &scratch, &merged_tree) {
+        let validated = match validation::validate(
+            run,
+            &scratch,
+            &merged,
+            &merged_tree,
+            &local_tree,
+        ) {
             Ok(validated) => validated,
             Err(error) => {
                 let fix = "Check the merged mise configuration and machine-local ignore rules, then rerun dots sync.";
@@ -571,6 +635,11 @@ fn synchronize(
         scratch
             .promote(&merged, &approved)
             .or_note("Could not retain the validated merged revision", GIT)?;
+        let push_record = prepare_push_record(&shared.dir, heads.dev(), &merged)
+            .or_note("Could not record the planned dev push", GIT)?;
+        active(run)?;
+        dense_index(&git)?;
+        verify_dev(&git, &approved).or_note("The dev checkout changed before pushing", GIT)?;
         let pushed = match remote::push(&git, run, &origin, heads.dev(), &merged) {
             Ok(()) => true,
             Err(PushError::Rejected) => false,
@@ -581,15 +650,23 @@ fn synchronize(
                 ));
             }
             Err(PushError::Unconfirmed) => {
+                let record = push_record.keep().join("push.json");
                 receipt.outcome = if receipt.saved.is_empty() {
                     "dev push unconfirmed".into()
                 } else {
                     "local work saved · dev push unconfirmed".into()
                 };
-                return Err(Note(
+                let mut item = Issue::new(
                     "Could not verify whether origin accepted the dev push",
-                    "Check origin's dev revision before retrying dots sync.",
-                ));
+                    "Compare refs/heads/dev at origin's push URL before retrying dots sync.",
+                );
+                let expected = heads.dev().unwrap_or("(absent)");
+                item.diagnostic
+                    .push_str(&format!(" · candidate {merged} · expected {expected}"));
+                item.next_action
+                    .push_str(&format!(" Push record: {record:?}"));
+                receipt.issues.push(item);
+                return Ok(());
             }
         };
         if pushed {
@@ -599,6 +676,8 @@ fn synchronize(
             } else {
                 "dev up to date".into()
             };
+            active(run)?;
+            verify_dev(&git, &approved).or_note("The dev checkout changed during the push", GIT)?;
             if !blocked.is_empty() {
                 for checkout::Blocked(path) in blocked {
                     path_issue(
@@ -628,6 +707,8 @@ fn synchronize(
                 }
             }
             active(run)?;
+            verify_dev(&git, &merged)
+                .or_note("The dev checkout changed before dotfile apply", GIT)?;
             if !validated
                 .still_current(git.root())
                 .or_note("Could not recheck machine-local files before apply", RERUN)?
@@ -682,6 +763,27 @@ fn dense_index(git: &Git<'_>) -> Result<(), Note> {
         "Sync kept the checkout because the full Git index could not be verified",
         "Disable sparse checkout and clear skip-worktree entries, then rerun dots sync.",
     )
+}
+
+fn prepare_push_record(
+    git_dir: &Path,
+    expected: Option<&str>,
+    candidate: &str,
+) -> io::Result<tempfile::TempDir> {
+    let record = guard::private_dir(git_dir, "dots-sync-push-")?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(record.path().join("push.json"))?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({ "candidate": candidate, "expected_dev": expected }),
+    )?;
+    file.sync_all()?;
+    File::open(record.path())?.sync_all()?;
+    File::open(git_dir)?.sync_all()?;
+    Ok(record)
 }
 
 fn scan_candidate(

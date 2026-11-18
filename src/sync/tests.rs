@@ -333,6 +333,305 @@ fn capture_failure_still_shares(fault: super::dotfiles::CaptureFailure) {
     );
 }
 
+fn shared_mise_fixture(declarations: &str) -> (tempfile::TempDir, Ctx) {
+    let (fixture, mut ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let root = ctx.root.path();
+    for key in ["MISE_TRUSTED_CONFIG_PATHS", "MISE_CEILING_PATHS"] {
+        ctx.env.vars.insert(key.into(), root.as_os_str().to_owned());
+    }
+    ctx.env
+        .vars
+        .insert("SETUP_PROFILE".into(), "default".into());
+    fs::write(
+        root.join("config.toml"),
+        format!("[vars]\ndots_profiles = 'default'\n{declarations}"),
+    )
+    .unwrap();
+    fs::write(root.join(".gitignore"), "/config.local.toml\n/config.host-*.toml\n/miserc.toml\n/mise.lock\n/mise.*.lock\n/locks/\n/.setup-state/\n").unwrap();
+    let git = Git::new(&ctx, root);
+    git.get(["config", "user.name", "Fixture"]).unwrap();
+    git.get(["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    let remote = world.join("bare-origin");
+    git.get(["init", "--bare", "--quiet", remote.to_str().unwrap()])
+        .unwrap();
+    git.get([
+        "remote",
+        "add",
+        "origin",
+        &format!("file://{}", remote.display()),
+    ])
+    .unwrap();
+    (fixture, ctx)
+}
+
+fn shared_mise_sync(ctx: &Ctx) -> crate::receipt::Receipt {
+    use crate::{
+        receipt::Display,
+        run::{Run, Sink},
+    };
+    let run = Run::begin(ctx, Sink::Unreported);
+    let stage = run.start("Sync");
+    super::run(&run, stage, super::load(ctx), Display::Embedded)
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn validated_crlf_config_deploys_the_copy() {
+    let (fixture, ctx) =
+        shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");
+    let git = Git::new(&ctx, ctx.root.path());
+    fs::write(
+        git.root().join(".gitattributes"),
+        "config.toml text eol=crlf\n",
+    )
+    .unwrap();
+    fs::write(git.root().join("source"), "approved source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "checkout representation fixture");
+    git.get(["checkout-index", "--force", "--", "config.toml"])
+        .unwrap();
+    assert!(
+        fs::read(git.root().join("config.toml"))
+            .unwrap()
+            .windows(2)
+            .any(|bytes| bytes == b"\r\n")
+    );
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(
+        fs::read(fixture.path().join("home/deployed")).unwrap(),
+        b"approved source\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn rendered_variant_preserves_declaring_rules() {
+    let (fixture, ctx) = shared_mise_fixture(
+        r#"[dotfiles]
+'~/declaration-key' = { mode = "copy", source = "./tree", exclude = ["skip"], dot_prefix = true, manifest = "git", variants = [{ profile = "default", target = "{{ env.HOME }}/variant" }] }
+"#,
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    fs::create_dir(git.root().join("tree")).unwrap();
+    for name in ["dot-leaf", "skip"] {
+        fs::write(git.root().join("tree").join(name), name).unwrap();
+    }
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "variant declaration fixture");
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    let home = fixture.path().join("home");
+    assert_eq!(fs::read(home.join("variant/.leaf")).unwrap(), b"dot-leaf");
+    assert!(!home.join("variant/skip").exists());
+    assert!(!home.join("declaration-key").exists());
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn create_only_sources_and_existing_targets_are_preserved() {
+    let (fixture, ctx) = shared_mise_fixture(
+        "[dotfiles]\n'~/copy' = { mode = 'copy', source = 'source', create_if_missing = true }\n'~/template' = { mode = 'template', source = 'template.tera', create_if_missing = true }\n'~/missing' = { mode = 'copy', source = 'source', create_if_missing = true }\n",
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    let home = fixture.path().join("home");
+    fs::write(home.join("copy"), "existing copy\n").unwrap();
+    fs::write(home.join("template"), "existing template\n").unwrap();
+    fs::write(git.root().join("source"), "approved source\n").unwrap();
+    fs::write(
+        git.root().join("template.tera"),
+        "{{ 'incoming template' }}\n",
+    )
+    .unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "create-only fixture");
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(
+        fs::read(git.root().join("source")).unwrap(),
+        b"approved source\n"
+    );
+    assert_eq!(fs::read(home.join("copy")).unwrap(), b"existing copy\n");
+    assert_eq!(
+        fs::read(home.join("template")).unwrap(),
+        b"existing template\n"
+    );
+    assert_eq!(
+        fs::read(home.join("missing")).unwrap(),
+        b"approved source\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn a_flagged_live_source_is_never_deployed() {
+    let (fixture, ctx) =
+        shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");
+    let git = Git::new(&ctx, ctx.root.path());
+    let source = git.root().join("source");
+    fs::write(&source, "approved source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "approved source");
+    let flagged = ["ghp_", "Ab3De6Gh9Jk2Mn5Pq8St1Uv4Wx7Yz0Bc3Ef6"].concat();
+    fs::write(&source, format!("{flagged}\n")).unwrap();
+    let receipt = shared_mise_sync(&ctx);
+    assert!(
+        receipt
+            .issues
+            .iter()
+            .any(|issue| issue.diagnostic.contains("gitleaks flagged")),
+        "{:?}",
+        receipt.issues
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), format!("{flagged}\n"));
+    assert_eq!(
+        fs::read(fixture.path().join("home/deployed")).unwrap(),
+        b"approved source\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn generated_copy_contents_are_published_on_the_next_sync() {
+    let (fixture, ctx) = shared_mise_fixture(
+        r#"[dotfiles]
+'~/deployed' = { mode = 'copy', source = 'source' }
+[bootstrap.hooks]
+pre-dotfiles = "printf 'generated\\n' > source"
+"#,
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    let source = git.root().join("source");
+    fs::write(&source, "public source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    let expected = fixture_commit(&git, "generated copy baseline");
+    let first = shared_mise_sync(&ctx);
+    assert!(first.issues.is_empty(), "{:?}", first.issues);
+    assert_eq!(
+        fs::read(fixture.path().join("home/deployed")).unwrap(),
+        b"generated\n"
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"generated\n");
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), expected);
+    let second = shared_mise_sync(&ctx);
+    assert!(second.issues.is_empty(), "{:?}", second.issues);
+    let remote = Git::new(&ctx, &fixture.path().join("bare-origin"));
+    assert_eq!(
+        remote.get(["show", "refs/heads/dev:source"]).unwrap(),
+        b"generated\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn a_new_target_claimed_during_push_keeps_the_competing_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (fixture, ctx) = shared_mise_fixture(
+        "[dotfiles]\n'~/new-target' = { mode = 'template', source = 'source.tera' }\n",
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    fs::write(git.root().join("source.tera"), "validated contents\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "validated new target");
+    let hook = git.root().join(".git/hooks/pre-push");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'competing edit\\n' > \"$HOME/new-target\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let receipt = shared_mise_sync(&ctx);
+    assert_eq!(receipt.outcome, "pushed dev");
+    assert!(
+        receipt
+            .issues
+            .iter()
+            .any(|issue| issue.diagnostic.contains("new-target")),
+        "{:?}",
+        receipt.issues
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("home/new-target")).unwrap(),
+        b"competing edit\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn failed_reload_remains_pending_after_a_completed_copy_write() {
+    let (fixture, ctx) = shared_mise_fixture(
+        r#"[dotfiles]
+'~/deployed' = { mode = 'copy', source = 'source' }
+[history.reload]
+'~/deployed' = "test -e \"$HOME/reload-ready\" || exit 12; touch \"$HOME/reloaded\""
+"#,
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    fs::write(git.root().join("source"), "approved source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "reload fixture");
+    let home = fixture.path().join("home");
+    let first = shared_mise_sync(&ctx);
+    assert!(
+        first
+            .issues
+            .iter()
+            .any(|issue| issue.diagnostic.contains("reload failed (exit 12)")),
+        "{:?}",
+        first.issues
+    );
+    assert_eq!(
+        fs::read(home.join("deployed")).unwrap(),
+        b"approved source\n"
+    );
+    assert!(!home.join("reloaded").exists());
+    fs::write(home.join("reload-ready"), "").unwrap();
+    let second = shared_mise_sync(&ctx);
+    assert!(second.issues.is_empty(), "{:?}", second.issues);
+    assert!(home.join("reloaded").is_file());
+}
+
+#[test]
+fn dev_binding_rejects_a_clean_switch_to_the_same_commit() {
+    let (_fixture, ctx) = git_fixture();
+    let git = Git::new(&ctx, ctx.root.path());
+    let expected = fixture_commit(&git, "dev baseline");
+    super::verify_dev(&git, &expected).unwrap();
+    git.get(["checkout", "-qb", "other"]).unwrap();
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), expected);
+    assert!(super::verify_dev(&git, &expected).is_err());
+}
+
+#[test]
+fn unconfirmed_push_record_retains_both_exact_tips_and_expected_absence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let candidate = "a".repeat(40);
+    let previous = "b".repeat(40);
+    for expected in [None, Some(previous.as_str())] {
+        let record = super::prepare_push_record(tmp.path(), expected, &candidate).unwrap();
+        let record = record.keep();
+        assert_eq!(
+            fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let path = record.join("push.json");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({ "candidate": candidate, "expected_dev": expected })
+        );
+    }
+}
+
 #[test]
 fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_receipts() {
     use std::os::unix::fs::PermissionsExt;

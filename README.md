@@ -3,8 +3,7 @@
 `dots` keeps your tools, native packages and dotfiles in one ordinary [mise](https://mise.jdx.dev) configuration, and `dots up` brings a machine up to date with it in one command.
 An optional Git remote shares that configuration between your machines, and `dots sync` scans your changes for secrets before it pushes them.
 
-> **TODO (A-03):** Record the 1.0 binary running `dots init`, `dots add` and the `dots up` dashboard.
-> Once the interactive design is approved, verify the appearance and keys for the update dashboard, menu and report browser against the integrated binary.
+> **TODO (A-03):** Record the integrated 1.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal.
 
 ## Install
 
@@ -77,7 +76,8 @@ dots status                                  # what is declared, installed and m
 dots plan                                    # mise's bootstrap plan; installs nothing
 dots up                                      # checkpoint, sync and update eligible software
 dots apply                                   # apply declared dotfiles and templates locally
-dots up --last                               # reopen the last update report
+dots up --last                               # print the saved report and return its exit status
+dots reports                                  # list recent completed reports in a terminal
 dots sync                                    # share your edits and take the other machines'
 dots sync --last                             # replay the last sync receipt
 
@@ -92,7 +92,13 @@ For file adoption or removal, a selected file must resolve to the root’s base 
 An argument starting with `/`, `~/`, `./` or `../` is a file; anything else is software.
 Adopting an existing regular file under your home directory moves it into the configuration's `dotfiles/` and leaves a link in its place; `dots remove` with the same path puts back a regular file with its current contents and mode.
 
-`dots root` prints the configuration directory, `dots profile` the selected profile, and `dots help` every command, including your configuration's own.
+Run `dots` or `dots help` to list the built-in commands and your configuration's own commands.
+`dots root` prints the configuration directory and `dots profile` prints the selected profile.
+
+During an update, the current step and its result stay in ordinary terminal scrollback.
+Answer a hook’s or installer’s prompt directly in the terminal.
+At the end, “Needs attention” lists issues and what to do next.
+For a failed step that owned the terminal, its output is in your scrollback. Other failed steps include a private log path.
 
 ## Sharing between machines
 

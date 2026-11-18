@@ -19,7 +19,7 @@ Unported handlers exit 1 naming their task, and their seams below are typed stub
 `RepoSetting::parse`, `matches(url)`, `source_mode` and `checkout_shape` are read-only (URL checks, locks, Git writes: P-06, P-08); `Exceptions::read` fails with 2 on a bad row and answers `holds(request)`, `selected(profile)`.
 `Targets::read(&Root, Scope)`, shared by `completion` and P-01, and `resolve(request, keep_installed) -> One | Ambiguous | None(suggestion)` apply aliases and holds.
 `ctx.command(program, Cwd::{Root, Caller, Dir})` takes OS-string arguments, drops `MISE_ENV`, hook variables and `DOTS_STAGES`, and sets `DOTS_ROOT`, `DOTS_PROFILE` and `PATH` led by a `dots` link to `current_exe()`; `Mise::new(&Ctx)?.command(args)` adds `MISE_CONFIG_DIR`, `MISE_ENV`.
-`BundlePipe::new(json)?.attach(&mut cmd)` gives only that hook a close-on-exec pipe as `DOTS_BUNDLE_FD`, stdin intact.
+`BundlePipe::new(json)?.attach(&mut cmd)` lets only that hook inherit the pipe’s read end as `DOTS_BUNDLE_FD`, stdin intact.
 `complete(Request { words, cursor, quote, shell, cwd, root }) -> Path | Dir | Values` uses the clap tree, base profiles, configuration commands and `Targets` within [its limits](contract.md#dots-completions-bashzshfish); R-01 owns the Bash, Zsh and Fish adapters, loaders and executable tests, on fixture helpers Q-01 grows into `World`.
 `skill::refresh(&Ctx)` extracts to `${XDG_STATE_HOME:-~/.local/state}/dots/skills/dots/SKILL.md` and replaces only a link matching a `dots/skill-links` row whose parent stays inside the agent's directory, else warns once; `init::TEMPLATES` embeds `init/` and P-03's `src/init/{README.md,config.toml}`.
 

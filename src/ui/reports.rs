@@ -1,6 +1,8 @@
-use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 
 use nix::libc;
 
@@ -24,28 +26,43 @@ pub(super) fn list(env: &Env, command: Option<Command>, out: &mut impl Write) ->
         };
         let path = report::path(env, &entry.id)
             .map_err(|error| Fail::new(1, format!("could not locate saved report: {error}")))?;
-        let path = path.to_string_lossy();
-        let path = if path.contains(char::is_control) {
-            Cow::Owned(path.escape_debug().to_string())
-        } else {
-            path
-        };
         writeln!(
             out,
-            "dots {}  {}  {} (exit {})\n  {path}",
+            "dots {}  {}  {} (exit {})\n  {}",
             report.command.name(),
             finished_at(report.finished_at_ms),
             outcome(&report),
             report.status,
+            display_path(&path),
         )
         .map_err(|error| Fail::new(1, format!("could not write saved reports: {error}")))?;
     }
     Ok(0)
 }
 
+fn display_path(path: &Path) -> String {
+    let bytes = path.as_os_str().as_bytes();
+    let mut display = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch == '\\' || ch.is_control() {
+                display.extend(ch.escape_default());
+            } else {
+                display.push(ch);
+            }
+        }
+        for byte in chunk.invalid() {
+            write!(display, "\\x{byte:02x}").unwrap();
+        }
+    }
+    display
+}
+
 fn outcome(report: &Report) -> &'static str {
+    if report.cancelled {
+        return "cancelled";
+    }
     match report.status {
-        130 => "cancelled",
         0 if report.stages.iter().any(|stage| {
             !stage.issues.is_empty()
                 || matches!(stage.outcome, Some(Outcome::Failed | Outcome::Deferred))
@@ -59,11 +76,14 @@ fn outcome(report: &Report) -> &'static str {
 }
 
 fn finished_at(milliseconds: u64) -> String {
-    let seconds = (milliseconds / 1000) as libc::time_t;
+    let fallback = || format!("{milliseconds} ms since Unix epoch");
+    let Ok(seconds) = (milliseconds / 1000).try_into() else {
+        return fallback();
+    };
     let mut utc = MaybeUninit::<libc::tm>::uninit();
     // gmtime_r initializes the caller's buffer on success.
     let Some(utc) = (unsafe { libc::gmtime_r(&seconds, utc.as_mut_ptr()).as_ref() }) else {
-        return format!("{milliseconds} ms since Unix epoch");
+        return fallback();
     };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} UTC",
@@ -75,4 +95,31 @@ fn finished_at(milliseconds: u64) -> String {
         utc.tm_sec,
         milliseconds % 1000,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use super::display_path;
+
+    #[test]
+    fn report_paths_distinguish_raw_bytes_from_escapes() {
+        for (bytes, expected) in [
+            (
+                "/reports/café's file.json".as_bytes(),
+                "/reports/café's file.json",
+            ),
+            (b"/reports/line\nnext.json", r"/reports/line\nnext.json"),
+            (br"/reports/line\nnext.json", r"/reports/line\\nnext.json"),
+            (b"/reports/\xff.json", r"/reports/\xff.json"),
+            (br"/reports/\xff.json", r"/reports/\\xff.json"),
+            ("/reports/�.json".as_bytes(), "/reports/�.json"),
+            (b"/reports/\x1b.json", r"/reports/\u{1b}.json"),
+        ] {
+            assert_eq!(display_path(Path::new(OsStr::from_bytes(bytes))), expected);
+        }
+    }
 }

@@ -115,9 +115,11 @@ See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order o
 
 ## Optional, later
 
-- `dots publish [--all | --bookmark NAME]` opens or updates a pull request to `main`, from a separate colocated JJ workspace of a configuration hosted on GitHub.
+- `dots publish [--all | --bookmark NAME]` opens a pull request to `main` from a separate colocated JJ workspace of a configuration hosted on GitHub. Updating an existing pull request keeps its base.
 - `dots backup` publishes this machine's encrypted app settings to a separate private repository; `dots restore` fetches them back after safety checks.
-- `dots remote HOST --profile P` and `dots bootstrap` set up a new machine from the configuration; see [`dots bootstrap`](docs/contract.md#dots-bootstrap).
+- [`dots bootstrap`](docs/contract.md#dots-bootstrap) sets up the local machine. `dots remote HOST --profile P` sets up a machine over SSH and leaves its mise history settings alone.
+  With history enabled, the target stores unencrypted tracked files in plaintext in its local history. Set `encrypt = true` on those files or disable history on the target to avoid that.
+  Before publishing, `dots backup` checks the outgoing checkpoints for plaintext and respects mise's `allow_plaintext_history` opt-in.
 
 ## Why dots
 

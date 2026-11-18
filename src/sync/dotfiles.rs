@@ -82,6 +82,7 @@ impl ApplyPlan {
             }
         }
         Ok(Self {
+            root,
             selectors,
             targets,
             configs,

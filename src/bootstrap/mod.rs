@@ -187,8 +187,8 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
             args.get_one::<OsString>("from-dir"),
         )?;
     }
-    if let Some((key, url)) = source {
-        native.extend([format!("--{key}").into(), url.into()]);
+    if let Some((key, source)) = source {
+        native.extend([format!("--{key}").into(), source.argument().into()]);
     }
 
     // Only persist-selected reads the MISE_ENV supplied by its own caller.
@@ -216,6 +216,8 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     command
         .env_remove("MISE_AUTO_INSTALL")
         .env_remove("MISE_EXEC_AUTO_INSTALL")
+        // Keep mise and the Git preflight rooted in the same checkout context.
+        .env_remove("MISE_CD")
         // Native checkpoints do not enforce dots' encrypted-history contract.
         .env(HISTORY_ENABLED, "0")
         .env(PARENT_HISTORY_ENABLED, parent_history_enabled);

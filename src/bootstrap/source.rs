@@ -14,6 +14,9 @@ pub(super) fn clear_git_checkout_override(command: &mut Command) {
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
         "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
         "GIT_CONFIG",
     ] {
         command.env_remove(key);
@@ -156,17 +159,82 @@ fn push_url(url: &str, rules: &str) -> Result<Option<String>, Fail> {
     Ok(longest.map(|(_, base, suffix)| format!("{base}{suffix}")))
 }
 
+pub(super) struct NativeSource {
+    url: String,
+    reference: Option<String>,
+}
+
+impl NativeSource {
+    pub(super) fn argument(&self) -> String {
+        match &self.reference {
+            Some(reference) => {
+                let separator = if self.url.contains('?') { '&' } else { '?' };
+                format!("{}{separator}ref={reference}", self.url)
+            }
+            None => self.url.clone(),
+        }
+    }
+}
+
+fn credential_query_key(key: &str) -> bool {
+    let mut pieces = key.split('%');
+    let mut decoded = pieces.next().unwrap_or_default().to_owned();
+    for piece in pieces {
+        if let Some(hex) = piece.get(..2)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(char::from(byte));
+            decoded.push_str(&piece[2..]);
+        } else {
+            decoded.push('%');
+            decoded.push_str(piece);
+        }
+    }
+    decoded.make_ascii_lowercase();
+    decoded.contains("token") || decoded.contains("password") || decoded == "key"
+}
+
 pub(super) fn validate_native_source(
     ctx: &Ctx,
     run: &Run<'_>,
     value: &str,
     vars: &Vars,
-) -> Result<String, Fail> {
-    let (repo, reference) = value
-        .split_once("?ref=")
-        .map_or((value, None), |(repo, reference)| (repo, Some(reference)));
-    let setting = RepoSetting::parse(repo)?;
-    let url = transport_url(repo);
+) -> Result<NativeSource, Fail> {
+    let invalid = || Fail::usage("invalid bootstrap source repository or Git ref");
+    if value.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    // Mise keeps every query pair except ref=, and uses the last ref value.
+    let mut reference = None;
+    let mut repo = value.to_owned();
+    if let Some((base, query)) = value.split_once('?') {
+        let mut rest = Vec::new();
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("ref=") {
+                reference = Some(value);
+            } else {
+                let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+                if credential_query_key(key) {
+                    return Err(Fail::usage(
+                        "refusing a URL that carries a password or token",
+                    ));
+                }
+                rest.push(pair);
+            }
+        }
+        if reference.is_some_and(|value| {
+            value.is_empty() || value.starts_with('-') || value == "HEAD" || value.contains('?')
+        }) {
+            return Err(invalid());
+        }
+        repo.truncate(base.len());
+        if !rest.is_empty() {
+            repo.push('?');
+            repo.push_str(&rest.join("&"));
+        }
+    }
+    let setting = RepoSetting::parse(&repo)?;
+    let url = transport_url(&repo);
     let expected = vars.source_repo.as_ref().unwrap_or(&setting);
     if !expected.matches(&url) {
         return Err(Fail::usage(
@@ -174,9 +242,9 @@ pub(super) fn validate_native_source(
         ));
     }
     validate_destination(ctx, run, &url, expected, false)?;
-    Ok(match reference {
-        Some(reference) => format!("{url}?ref={reference}"),
-        None => url,
+    Ok(NativeSource {
+        url,
+        reference: reference.map(str::to_owned),
     })
 }
 
@@ -205,46 +273,94 @@ fn validate_remote(
     Ok(())
 }
 
-pub(super) fn validate_update(
-    ctx: &Ctx,
-    run: &Run<'_>,
-    vars: &Vars,
-    source: Option<&(&str, String)>,
-    from_dir: Option<&OsString>,
-) -> Result<(), Fail> {
+fn mise_path(ctx: &Ctx, name: &str) -> Result<Option<PathBuf>, Fail> {
+    let Some(value) = ctx.env.get(name).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = Path::new(value);
+    if let Ok(tail) = path.strip_prefix("~/") {
+        let home = ctx
+            .env
+            .home()
+            .ok_or_else(|| Fail::usage("set HOME to expand a mise bootstrap directory"))?;
+        return Ok(Some(home.join(tail)));
+    }
+    Ok(Some(path.to_owned()))
+}
+
+fn update_directory(ctx: &Ctx, from: bool, from_dir: Option<&OsString>) -> Result<PathBuf, Fail> {
     let root = ctx.root.path();
-    let checkout = match source {
-        Some(("from", _)) => {
-            let path = if let Some(path) = from_dir {
-                PathBuf::from(path)
-            } else if let Some(data) = ctx.env.get("MISE_DATA_DIR").filter(|dir| !dir.is_empty()) {
-                PathBuf::from(data).join("bootstrap-repo")
-            } else {
-                let data = ctx
-                    .env
-                    .get("XDG_DATA_HOME")
-                    .filter(|dir| !dir.is_empty())
-                    .map(PathBuf::from)
+    if from {
+        let checkout = if let Some(path) = from_dir {
+            PathBuf::from(path)
+        } else {
+            let data = match mise_path(ctx, "MISE_DATA_DIR")? {
+                Some(data) => data,
+                None => mise_path(ctx, "XDG_DATA_HOME")?
                     .or_else(|| ctx.env.home().map(|home| home.join(".local/share")))
                     .ok_or_else(|| {
                         Fail::usage(
                             "set HOME or MISE_DATA_DIR before updating a bootstrap checkout",
                         )
-                    })?;
-                data.join("mise/bootstrap-repo")
+                    })?
+                    .join("mise"),
             };
-            root.join(path)
-        }
-        _ => root.to_owned(),
+            data.join("bootstrap-repo")
+        };
+        return Ok(root.join(checkout));
+    }
+    // Mise uses the explicit global file's parent, including for --adopt.
+    let global_file = match mise_path(ctx, "MISE_GLOBAL_CONFIG_FILE")? {
+        Some(file) => Some(file),
+        None => mise_path(ctx, "MISE_CONFIG_FILE")?,
     };
-    if !checkout.join(".git").exists() {
+    Ok(global_file
+        .and_then(|path| path.parent().map(|parent| root.join(parent)))
+        .unwrap_or_else(|| root.to_owned()))
+}
+
+pub(super) fn validate_update(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    vars: &Vars,
+    source: Option<&(&str, NativeSource)>,
+    from_dir: Option<&OsString>,
+) -> Result<(), Fail> {
+    let dir = update_directory(
+        ctx,
+        source.is_some_and(|(flag, _)| *flag == "from"),
+        from_dir,
+    )?;
+    let Ok(resolved) = dir.canonicalize() else {
+        return Ok(());
+    };
+    if source.is_some()
+        && resolved.is_dir()
+        && resolved
+            .read_dir()
+            .map_err(|_| Fail::new(1, "could not inspect the bootstrap checkout"))?
+            .next()
+            .is_none()
+    {
         return Ok(());
     }
-    let query = |args: &[&str]| {
+    let query_in = |path: &Path, args: &[&str]| {
         let mut command = git(ctx)?;
-        command.arg("-C").arg(&checkout).args(args);
+        command.arg("-C").arg(path).args(args);
         probe(run, command)
     };
+    let top = query_in(&resolved, &["rev-parse", "--show-toplevel"])?;
+    if !top.status.success() {
+        return Ok(());
+    }
+    let checkout = PathBuf::from(text(top, "could not identify the bootstrap checkout")?.trim())
+        .canonicalize()
+        .map_err(|_| Fail::new(1, "could not resolve the bootstrap checkout"))?;
+    if source.is_none() && checkout != resolved && !dir.is_symlink() {
+        // A global directory nested in an unrelated repository is skipped.
+        return Ok(());
+    }
+    let query = |args: &[&str]| query_in(&checkout, args);
     if source.is_none()
         && !query(&["rev-parse", "--symbolic-full-name", "@{upstream}"])?
             .status
@@ -254,10 +370,8 @@ pub(super) fn validate_update(
         return Ok(());
     }
 
-    let selected = if let Some((_, url)) = source {
-        Some(RepoSetting::parse(
-            url.split_once("?ref=").map_or(url, |(repo, _)| repo),
-        )?)
+    let selected = if let Some((_, source)) = source {
+        Some(RepoSetting::parse(&source.url)?)
     } else if vars.source_repo.is_none() {
         Some(RepoSetting::parse(&origin(ctx, run)?.ok_or_else(
             || {
@@ -274,8 +388,13 @@ pub(super) fn validate_update(
         .as_ref()
         .or(selected.as_ref())
         .expect("configured source");
-    if source.is_some_and(|(_, url)| url.contains("?ref=")) {
-        return validate_remote(ctx, run, &checkout, "origin", expected);
+    if let Some((_, source)) = source {
+        let raw = query(&["config", "--get", "remote.origin.url"])?;
+        let raw = text(raw, "could not read the bootstrap checkout origin")?;
+        check_url(&raw, expected)?;
+        if source.reference.is_some() {
+            return validate_remote(ctx, run, &checkout, "origin", expected);
+        }
     }
 
     // A reused checkout without a requested ref uses git pull, just like

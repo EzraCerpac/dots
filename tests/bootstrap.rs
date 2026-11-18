@@ -1042,6 +1042,87 @@ fn unchanged_remote_delegates_native_adoption_and_connection_options() {
 }
 
 #[test]
+fn new_bootstrap_validates_the_url_mise_uses_after_extracting_the_ref() {
+    let world = World::new();
+    minimal(&world);
+    let remote = world.bare_remote("source");
+    let url = format!("file://{}", remote.display());
+    let config = world.root().join("config.toml");
+    write(
+        &config,
+        &format!("{MINIMAL}dots_source_repo = {url:?}\n"),
+        0o644,
+    );
+    let marker = "synthetic-query-value";
+    for (flag, suffix) in [
+        ("--from", format!("ref=main&access_token={marker}")),
+        ("--adopt", format!("password={marker}&ref=main")),
+        ("--from", format!("ref=main&to%6Ben={marker}")),
+        ("--adopt", format!("ref=bad?token={marker}")),
+        ("--from", "ref=HEAD".to_owned()),
+        ("--from", "ref=-option".to_owned()),
+        ("--from", "ref=".to_owned()),
+    ] {
+        let input = format!("{url}?{suffix}");
+        let output = run(fake(&world).env("NATIVE_FIXTURE_STATUS", "89").args([
+            "bootstrap",
+            flag,
+            &input,
+            "--dry-run",
+        ]));
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(&input) && !stderr.contains(marker),
+            "{stderr}"
+        );
+    }
+
+    let effective = format!("{url}?view=full&compression=off");
+    write(
+        &config,
+        &format!("{MINIMAL}dots_source_repo = {effective:?}\n"),
+        0o644,
+    );
+    let input = format!("{url}?view=full&ref=old&compression=off&ref=release/v1");
+    let output = run(fake(&world).args(["bootstrap", "--from", &input, "--dry-run"]));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(&format!("--from\n{effective}&ref=release/v1\n")),
+        "{output:?}"
+    );
+    let input = format!("{effective}&ref=release/v1~1");
+    let output = run(fake(&world).args(["bootstrap", "--from", &input, "--dry-run"]));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(&format!("--from\n{input}\n")),
+        "{output:?}"
+    );
+
+    write(
+        &config,
+        &format!("{MINIMAL}dots_source_repo = {url:?}\n"),
+        0o644,
+    );
+    let input = format!("{url}?ref=release/v1");
+    let output = run(dots(&world)
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args(["bootstrap", "--from", &input, "--from-dir"])
+        .arg(world.base().join("checkout"))
+        .arg("--dry-run"));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(&format!("git clone {url}")),
+        "{output:?}"
+    );
+    assert!(
+        stdout(&output).contains("checkout release/v1 --"),
+        "{output:?}"
+    );
+}
+
+#[test]
 fn new_bootstrap_update_checks_the_effective_upstream_before_running_mise() {
     let world = World::new();
     minimal(&world);
@@ -1081,6 +1162,73 @@ fn new_bootstrap_update_checks_the_effective_upstream_before_running_mise() {
     let output = run(fake(&world).args(["bootstrap", "--update"]));
     assert_success(&output);
     assert!(stdout(&output).contains("--update"), "{output:?}");
+}
+
+#[test]
+fn new_bootstrap_update_checks_and_uses_the_global_config_files_checkout() {
+    let world = World::new();
+    minimal(&world);
+    let expected = format!("file://{}", world.bare_remote("expected").display());
+    let foreign = format!("file://{}", world.bare_remote("foreign").display());
+    let alternate = world.base().join("alternate");
+    let global = alternate.join("alternate.toml");
+    let local = world.root().join("config.toml");
+    write(&global, MINIMAL, 0o644);
+    write(
+        &local,
+        &format!("{MINIMAL}dots_source_repo = {expected:?}\n"),
+        0o644,
+    );
+    let git = |checkout: &Path, args: &[&str]| {
+        assert_success(&run(world.git().current_dir(checkout).args(args)));
+    };
+    for (dir, upstream) in [
+        (world.root(), expected.as_str()),
+        (&alternate, foreign.as_str()),
+    ] {
+        git(dir, &["init", "--initial-branch=main"]);
+        git(dir, &["add", "--all"]);
+        git(dir, &["commit", "-m", "Seed fixture"]);
+        git(dir, &["remote", "add", "origin", &expected]);
+        git(dir, &["remote", "add", "upstream", upstream]);
+        git(dir, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git(dir, &["branch", "--set-upstream-to=upstream/main"]);
+    }
+
+    for setting in ["MISE_GLOBAL_CONFIG_FILE", "MISE_CONFIG_FILE"] {
+        let output = run(fake(&world)
+            .env(setting, &global)
+            .env("NATIVE_FIXTURE_STATUS", "89")
+            .args(["bootstrap", "--update", "--dry-run"]));
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("outside the expected bootstrap repository"),
+            "{output:?}"
+        );
+    }
+
+    let output = run(fake(&world)
+        .env("MISE_GLOBAL_CONFIG_FILE", &global)
+        .env("NATIVE_FIXTURE_STATUS", "89")
+        .args(["bootstrap", "--adopt", &expected, "--update", "--dry-run"]));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+
+    git(&alternate, &["remote", "set-url", "upstream", &expected]);
+    let output = run(dots(&world)
+        .env("MISE_GLOBAL_CONFIG_FILE", &global)
+        .env("MISE_CONFIG_FILE", &local)
+        .env("MISE_CD", world.base().join("absent"))
+        .env("MISE_TRUSTED_CONFIG_PATHS", &alternate)
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args(["bootstrap", "--update", "--dry-run", "--only", "dotfiles"]));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(&format!("git -C {} pull --ff-only", alternate.display())),
+        "{output:?}"
+    );
 }
 
 #[test]

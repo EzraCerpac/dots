@@ -13,10 +13,9 @@ const CASK: &str = "widget";
 const RECIPE: &str = r#"#!/bin/sh
 if [ "$1" = --prefix ]; then
     printf '/opt/homebrew\n'
-    if [ -n "${EXPECTED_DOTS:-}" ]; then
-        if cmp -s "$(command -v dots)" "$EXPECTED_DOTS"; then
-            printf '%s\n' "$DOTS_ROOT" "${MISE_ENV-unset}" > "$FIXTURE/child-environment"
-        fi
+    if [ "${CAPTURE_CHILD:-}" = 1 ]; then
+        printf '%s\n' "$DOTS_ROOT" "${MISE_ENV-unset}" > "$FIXTURE/child-environment"
+        /bin/cat "$(command -v dots)" > "$FIXTURE/child-dots"
     fi
     exit 0
 fi
@@ -153,9 +152,10 @@ fn new_brew_path() {
     let expected = command.get_program().to_owned();
     let output = command
         .arg("path")
+        .env("PATH", &fixture.directory)
         .env("DOTS_ROOT", &empty)
         .env("MISE_ENV", "ignored")
-        .env("EXPECTED_DOTS", expected)
+        .env("CAPTURE_CHILD", "1")
         .output()
         .unwrap();
     status(&output, 0);
@@ -166,6 +166,12 @@ fn new_brew_path() {
     assert_eq!(
         fixture.read("child-environment"),
         format!("{}\nunset\n", empty.display())
+    );
+    let child = fs::read(fixture.directory.join("child-dots"))
+        .expect("Homebrew fixture did not capture dots on its PATH");
+    assert!(
+        child == fs::read(expected).unwrap(),
+        "Homebrew child did not find the running dots executable first on PATH"
     );
 }
 

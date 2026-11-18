@@ -102,8 +102,9 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
         if let Some(live) = &self.live
             && live != &self.root
-            && let Some(raw) = configured_urls(self.ctx, self.run, live, "remote.origin.url")?
         {
+            let raw = configured_urls(self.ctx, self.run, live, "remote.origin.url")?
+                .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
             self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
         }
         if let Some(raw_push) =
@@ -374,10 +375,15 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(())
     }
 
-    pub(super) fn gh(&self, args: &[&str], action: &str) -> Result<Output, Fail> {
+    pub(super) fn gh(&self, operation: &str, args: &[&str], action: &str) -> Result<Output, Fail> {
         let mut cmd = self.ctx.command("gh", Cwd::Dir(&self.root))?;
-        cmd.args(["pr", "--repo", &format!("github.com/{}", self.slug)])
-            .args(args);
+        cmd.args([
+            "pr",
+            operation,
+            "--repo",
+            &format!("github.com/{}", self.slug),
+        ])
+        .args(args);
         self.checked(cmd, "gh", action)
     }
 

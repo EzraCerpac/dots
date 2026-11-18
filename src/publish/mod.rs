@@ -262,8 +262,8 @@ struct PullRequest {
 
 fn find_request(workspace: &Workspace<'_, '_>, name: &str) -> Result<Option<PullRequest>, Fail> {
     let result = workspace.gh(
+        "list",
         &[
-            "list",
             "--head",
             name,
             "--state",
@@ -347,13 +347,15 @@ fn write_pull_request(
     if let Some(request) = request {
         let number = request.number.to_string();
         workspace.gh(
-            &[&["edit", &number][..], &common].concat(),
+            "edit",
+            &[&[number.as_str()][..], &common].concat(),
             "update the pull request",
         )?;
         Ok(request.url.clone())
     } else {
         let result = workspace.gh(
-            &[&["create", "--head", name][..], &common].concat(),
+            "create",
+            &[&["--head", name][..], &common].concat(),
             "create the pull request",
         )?;
         let stdout = String::from_utf8_lossy(&result.stdout);

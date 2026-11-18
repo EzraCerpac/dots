@@ -589,7 +589,7 @@ exit "$status"
 
 fn success(command: &mut FixtureCommand<'_>) -> String {
     let result = command.output().unwrap();
-    assert!(result.status.success(), "{:?}\n{result:?}", &**command);
+    assert!(result.status.success(), "{:?}\n{result:?}", **command);
     String::from_utf8(result.stdout).unwrap()
 }
 

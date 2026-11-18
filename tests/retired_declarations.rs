@@ -221,7 +221,7 @@ fn success(cmd: &mut FixtureCommand<'_>) -> Output {
     assert!(
         output.status.success(),
         "{:?}:\n{}\n{}",
-        &**cmd,
+        **cmd,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

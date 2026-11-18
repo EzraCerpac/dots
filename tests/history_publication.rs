@@ -233,7 +233,7 @@ exec "$FIXTURE_REAL_GIT" "$@"
 
 fn ok(cmd: &mut FixtureCommand<'_>) -> Output {
     let result = cmd.output().unwrap();
-    assert!(result.status.success(), "{:?}\n{result:?}", &**cmd);
+    assert!(result.status.success(), "{result:?}");
     result
 }
 

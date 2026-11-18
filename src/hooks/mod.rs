@@ -147,6 +147,16 @@ fn run_stage<'a>(
     }
     let label = label.into();
     let stage = run.start(&label);
+    run_started_stage(run, stage, &label, env, execute)
+}
+
+fn run_started_stage<'a>(
+    run: &Run<'_>,
+    stage: StageId,
+    label: &str,
+    env: ChildEnv<'a>,
+    execute: impl FnOnce(StageId, ChildEnv<'a>) -> Result<u8, Fail>,
+) -> Outcome {
     if run.cancelled() {
         run.finish(stage, Outcome::Cancelled);
         return Outcome::Cancelled;
@@ -375,7 +385,13 @@ mod tests {
                 "MISE_SYSTEM_SHIMS_DIR",
                 "MISE_SHARED_INSTALL_DIRS",
             ];
-            for case in ["update hook", "bootstrap hook", "recipe", "admitted"] {
+            for case in [
+                "update hook",
+                "bootstrap hook",
+                "recipe",
+                "admitted",
+                "after admission",
+            ] {
                 // Isolate the process-wide signal handler from other tests.
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .env_clear()
@@ -413,21 +429,27 @@ mod tests {
             flags: Flags::default(),
         };
         let run = Run::begin(&ctx, Sink::Unreported);
-        if case == "admitted" {
-            let outcome = run_stage(
-                &run,
-                "Admitted stage",
-                ChildEnv::Recipe(Mode::Update),
-                |_, _| {
+        if case == "admitted" || case == "after admission" {
+            let label = "Admitted stage";
+            let env = ChildEnv::Recipe(Mode::Update);
+            let outcome = if case == "after admission" {
+                let stage = run.start(label);
+                interrupt();
+                run_started_stage(&run, stage, label, env, |_, _| {
+                    panic!("cancelled admitted stage ran setup");
+                })
+            } else {
+                run_stage(&run, label, env, |_, _| {
                     interrupt();
                     Ok(0)
-                },
-            );
+                })
+            };
             assert_eq!(outcome, Outcome::Cancelled);
             let snapshot = run.snapshot();
             let [stage] = snapshot.stages.as_slice() else {
                 panic!("expected one admitted stage");
             };
+            assert_eq!(stage.label, label);
             assert_eq!(stage.outcome, Some(Outcome::Cancelled));
             assert!(stage.issues.is_empty());
         } else {

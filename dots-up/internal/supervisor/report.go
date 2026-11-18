@@ -394,16 +394,20 @@ func printReportHighlights(w io.Writer, report Report, statusInventoryShown bool
 	}
 }
 
-func printStatusEvent(e ui.Event) bool {
+func printStatusEvent(e ui.Event) {
 	switch e.Kind {
 	case "run_start":
-		printProgress(e)
+		name := e.Command
+		if name == "" {
+			name = "up"
+		}
+		fmt.Printf("dots %s · %s · %s\n", ui.CleanLine(name), ui.CleanLine(e.Profile), ui.CleanLine(e.Host))
 	case "item_upsert":
-		fmt.Printf("  %s · %s  %s — %s\n", e.Group, e.Label, e.Status, e.Summary)
-	default:
-		return false
+		fmt.Printf("  %s · %s  %s — %s\n", ui.CleanLine(e.Group), ui.CleanLine(e.Label), ui.CleanLine(e.Status), ui.CleanLine(e.Summary))
+		if e.Action != "" {
+			fmt.Printf("    %s\n", ui.CleanLine(e.Action))
+		}
 	}
-	return true
 }
 
 // printIssue prints one attention item with its error, next step and log.

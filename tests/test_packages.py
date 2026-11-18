@@ -211,6 +211,54 @@ esac
     def declarations(self, host: str) -> dict:
         return self.config(host).get("bootstrap", {}).get("packages", {})
 
+    def test_remove_suggests_only_a_unique_managed_match(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        source = config / "config.toml"
+        (config / "dots").mkdir()
+        for held, ambiguous in [(False, False), (True, False), (True, True), (False, True)]:
+            with self.subTest(held=held, ambiguous=ambiguous):
+                declarations = BASE + '\n[bootstrap.packages]\n"brew-cask:codexbar" = "latest"\n'
+                if ambiguous:
+                    declarations += '"brew:codexbar" = "latest"\n'
+                source.write_text(declarations)
+                (config / "dots/exceptions.tsv").write_text("base\tmanual\thold=brew-cask:codexbar\n" if held else "")
+                before = source.read_bytes()
+                result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                                      str(self.bin / "mise"), str(config), "codex-bar")
+                message = "dots: no declaration or managed app matches 'codex-bar'"
+                if not held and not ambiguous:
+                    message += ". Did you mean 'brew-cask:codexbar'?"
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stderr.strip(), message)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(source.read_bytes(), before)
+
+    def test_remove_hint_respects_unreadable_app_ownership(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        (config / "config.toml").write_text(BASE + '\n[tools]\n"github:example/codexbar" = "latest"\n')
+        markers = self.root / "home-a/state/dots/github-apps"
+        markers.mkdir(parents=True)
+        (markers / "broken.json").write_text("{")
+        for flags in ([], ["--keep-installed"]):
+            result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                                  str(self.bin / "mise"), str(config), *flags, "codex-bar")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual("Did you mean 'github:example/codexbar'?" in result.stderr, bool(flags))
+
+    def test_remove_accepts_alias_from_second_declaration(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        source = config / "config.toml"
+        declarations = BASE + '\n[bootstrap.packages]\n"brew:fd" = "latest"\n"brew:homebrew/core/fd" = "latest"\n'
+        source.write_text(declarations)
+        result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                              str(self.bin / "mise"), str(config), "--base", "--keep-installed",
+                              "--dry-run", "homebrew/core/fd")
+        self.assertIn("Forget brew:fd", self.succeeded(result))
+        self.assertEqual(source.read_text(), declarations)
+
     def local_tool(self) -> None:
         plugin = self.root / "plugin"
         scripts = plugin / "bin"

@@ -1,0 +1,52 @@
+#compdef dots
+# Load with: source <(dots completions zsh) after compinit.
+# For autoloading, put _dots on fpath before compinit.
+
+_dots() {
+    local line value description display
+    local -a args values descriptions prefixes prefix_descriptions
+    local i
+    for ((i=2; i<CURRENT; i++)); do
+        value=${(Q)words[i]}
+        [[ ${words[i]} == '~/'* ]] && value="$HOME${value[2,-1]}"
+        args+=( "$value" )
+    done
+    args+=( "${(Q)PREFIX}" )
+    local reply
+    reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${args[@]}" 2>/dev/null) || return 1
+    case $reply in
+        (:files|:dirs|:files=|:dirs=)
+            [[ $reply == *= ]] && compset -P 1 '*='
+            if [[ $reply == :dirs* ]]; then _directories; else _files; fi
+            return ;;
+    esac
+
+    for line in "${(@f)reply}"; do
+        value=${line%%$'\t'*}
+        [[ -n $value ]] || continue
+        display=$value
+        if [[ $line == *$'\t'* ]]; then
+            description=${line#*$'\t'}
+            [[ -z $description ]] || display="$value -- $description"
+        fi
+        if [[ $value == *: ]]; then
+            prefixes+=( "$value" )
+            prefix_descriptions+=( "$display" )
+        else
+            values+=( "$value" )
+            descriptions+=( "$display" )
+        fi
+    done
+    if (( $#prefixes )); then
+        compadd -U -S '' -d prefix_descriptions -a prefixes
+    fi
+    if (( $#values )); then
+        compadd -U -d descriptions -a values
+    fi
+}
+
+if [[ ${zsh_eval_context[-1]} == loadautofunc ]]; then
+    _dots "$@"
+elif (( $+functions[compdef] )); then
+    compdef _dots dots
+fi

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/EzraCerpac/dots/dots-up/internal/commands"
+	"github.com/EzraCerpac/dots/dots-up/internal/completion"
 	"github.com/EzraCerpac/dots/dots-up/internal/launcher"
 	"github.com/EzraCerpac/dots/dots-up/internal/supervisor"
 	"github.com/charmbracelet/x/term"
@@ -17,6 +18,10 @@ import (
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "complete" {
+		completion.Run(os.Stdout, args[1:], defaultRoot())
+		return 0
+	}
 	fs := flag.NewFlagSet("dots-up", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var opts supervisor.Options
@@ -31,7 +36,7 @@ func run(args []string) int {
 	fs.BoolVar(&opts.NoWait, "no-wait", false, "close when the command finishes")
 	fs.BoolVar(&opts.Last, "last", false, "reopen the latest saved report")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: dots-up [--mas] [--plain | --verbose] [--no-wait] [--last]\n       dots-up --command COMMAND [display flags] -- [ARGS...]\nInteractive dots commands share a dashboard; noninteractive runs show concise progress.")
+		fmt.Fprintln(fs.Output(), "Usage: dots-up [--mas] [--plain | --verbose] [--no-wait] [--last]\n       dots-up --command COMMAND [display flags] -- [ARGS...]\nThe full update defaults to a dashboard in a suitable interactive terminal. Individual commands print to scrollback.")
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

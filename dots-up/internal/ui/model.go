@@ -327,16 +327,16 @@ func (m *Model) applyEvent(e Event) {
 			expandedGroup = groups[m.ExpandedGroup]
 		}
 	}
-	e.Label, e.Group, e.Summary, e.Action = cleanLine(e.Label), cleanLine(e.Group), cleanLine(e.Summary), cleanLine(e.Action)
+	e.Label, e.Group, e.Summary, e.Action = CleanLine(e.Label), CleanLine(e.Group), CleanLine(e.Summary), CleanLine(e.Action)
 	if m.isUp() && e.Group == "Source" {
 		e.Group = "Source & settings"
 	}
-	e.Item, e.Before, e.After = cleanLine(e.Item), cleanLine(e.Before), cleanLine(e.After)
+	e.Item, e.Before, e.After = CleanLine(e.Item), CleanLine(e.Before), CleanLine(e.After)
 	e.Detail = sanitizeLog(e.Detail)
 	switch e.Kind {
 	case "run_start":
 		m.RunID, m.Profile, m.Host, m.Running = e.ID, e.Profile, e.Host, true
-		m.Command = cleanLine(e.Command)
+		m.Command = CleanLine(e.Command)
 		m.StartedAt = time.Now()
 	case "item_upsert":
 		i := m.stageIndex(e.ID)
@@ -646,7 +646,8 @@ func safeLogPath(root, path string) string {
 	return path
 }
 
-func cleanLine(s string) string { return strings.Join(strings.Fields(sanitizeLog(s)), " ") }
+// CleanLine formats one event field for a terminal row.
+func CleanLine(s string) string { return strings.Join(strings.Fields(sanitizeLog(s)), " ") }
 
 func sanitizeLog(s string) string {
 	s = ansi.Strip(s)
@@ -657,7 +658,7 @@ func sanitizeLog(s string) string {
 		if r < 32 && r != '\n' && r != '\t' {
 			return -1
 		}
-		if r == 127 {
+		if r >= 127 && r <= 159 {
 			return -1
 		}
 		return r

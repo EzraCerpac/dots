@@ -4,7 +4,7 @@ Status: Frozen for 1.0. Changes go through the coordinator as amendments to this
 Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation, the 1.0 guarantee for the running `dots` on children's `PATH`, file adoption and removal, software version syntax, status program versions, history enrollment and restore, retired declarations, and publish validation.
 Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
 Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish origin and `dev` ancestry checks.
-Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, and local versus published settings history.
+Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -1110,7 +1110,12 @@ Each such file is a native track entry with one `host-ID` profile variant per ma
 
 The variant names that machine's stream in history, so another machine never applies it.
 A variant that has history must never be renamed or removed.
-When `dots` checks declarations before saving a checkpoint, every spelling of the tracked entry must declare `encrypt = true`.
+As in 0.4.0, every spelling of the target in its effective declaring file must say `encrypt = true`.
+A fully shadowed spelling in a lower-priority file does not block a proven encrypted capture.
+**New in 1.0:** before a `dots`-initiated checkpoint, `dots` checks every file the native save would capture, including automatic, initial manual-baseline and machine-local captures.
+Passing a named path to mise does not establish which files it will capture.
+If any file would be saved unencrypted, `dots` refuses before the save and leaves the edits in place.
+Variants active only on other machines stay outside this check.
 On a target bootstrapped by [`dots remote`](#dots-remote), native mise stores a tracked file in plaintext locally when target history is enabled and the file is tracked without encryption.
 Tracked files end at mode 0600.
 `dots_state_repo` is required for backup, restore and enrollment, and follows [Remotes](#remotes).
@@ -1156,14 +1161,14 @@ It stops with exit status 2 at the first failed check:
 
 Then it saves a checkpoint locally.
 **New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in every local checkpoint reachable from the history branch that the destination host branch lacks.
-A current unencrypted declaration still fails check 4 with exit 2 before the audit or any remote contact.
+A current unencrypted declaration still fails check 4 with exit 2 before the local save or any remote contact.
 With mise's default `history.allow_plaintext_history = false`, a plaintext or invalid encrypted payload stops backup with exit 1 before native sync, and no history is sent.
 The diagnostic on stderr names the escaped path and checkpoint and gives the recovery action:
 
 > Keep the current store and inspect the checkpoint in a private copy.
 > To publish fresh history, copy your configuration with encrypted tracking, set its history origin and dots_state_repo to an empty private repository, and run dots backup with a separate MISE_STATE_DIR.
 
-Backup reads the effective setting with `mise settings get history.allow_plaintext_history`, including mise's `MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY` override.
+Backup reads the effective `[settings.history]` setting with `mise settings get history.allow_plaintext_history`, including mise's `MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY` override.
 Only a successful `true` skips this audit; native sync still applies its own checks.
 If the setting cannot be read as a boolean, backup stops before sync.
 Only native `mise bootstrap dotfiles sync` publishes to the state repository, and `dots backup` reports successful publication.

@@ -6,6 +6,7 @@ mod support;
 mod pty;
 
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -305,7 +306,7 @@ case "$1" in
         ;;
     dir)
         case "$(pwd -P)" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
-        for path in public-*.txt synthetic-token.txt; do
+        for path in public-*.txt synthetic-token.txt payload.zip opaque.bin binary.dat; do
             if [ -f "$path" ] && [ ! -L "$path" ]; then
                 printf '%s\n' "$path" >> "$PUBLISH_LOG/scan-input"
             fi
@@ -318,7 +319,10 @@ if [ "${PUBLISH_REAL_SCAN-}" = 1 ]; then
     command=$1
     shift
     PATH="$PUBLISH_LOG/scan-bin" "$PUBLISH_GITLEAKS" "$command" \
-        --report-format json --report-path "$PUBLISH_LOG/findings.json" "$@" || status=$?
+        --report-format json --report-path "$PUBLISH_LOG/findings.json" "$@" \
+        2> "$PUBLISH_LOG/scan-stderr" || status=$?
+    cat "$PUBLISH_LOG/scan-stderr" >&2
+    printf '%s\n' "$status" > "$PUBLISH_LOG/scan-status"
 fi
 : > "$PUBLISH_LOG/scan-complete"
 exit "$status"
@@ -600,6 +604,160 @@ fn write_token(root: &Path) {
         format!("github_token = \"{}\"\n", synthetic_token()),
     )
     .unwrap();
+}
+
+fn zipped(name: &str, contents: &[u8]) -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    zip.start_file(
+        name,
+        zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated),
+    )
+    .unwrap();
+    zip.write_all(contents).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+#[ignore = "P-10 archive screening"]
+fn new_publish_finds_a_redacted_secret_one_archive_level_deep() {
+    let fixture = Publication::new(None, false);
+    let token = synthetic_token();
+    let archive = fixture.workspace.join("payload.zip");
+    fs::write(
+        &archive,
+        zipped(
+            "nested/synthetic-token.txt",
+            format!("github_token = \"{token}\"\n").as_bytes(),
+        ),
+    )
+    .unwrap();
+    let original = fs::read(&archive).unwrap();
+    fixture.jj(&["describe", "-m", "Add an archive"]);
+    let bookmark = "wip/archive";
+    fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
+    let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
+    let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
+    fixture.real_scan(&mut command);
+    let mut terminal = Pty::spawn(command);
+    terminal.send("n\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(1));
+    assert!(transcript.contains("gitleaks found potential secrets"));
+    assert!(!transcript.contains("[y/N]"));
+    assert!(!transcript.contains(&token));
+    assert_eq!(fixture.read_log("scan-input"), "payload.zip\n");
+    let report = fixture.read_log("findings.json");
+    assert!(!report.contains(&token));
+    let findings: Vec<serde_json::Value> = serde_json::from_str(&report).unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| {
+                finding["RuleID"] == "github-pat"
+                    && finding["Secret"] == "REDACTED"
+                    && finding["File"].as_str().is_some_and(|path| {
+                        path.contains("payload.zip") && path.ends_with("nested/synthetic-token.txt")
+                    })
+            })
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(archive).unwrap(), original);
+    assert_eq!(
+        fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]),
+        head
+    );
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 archive screening"]
+fn new_publish_allows_a_clean_one_level_archive_to_reach_confirmation() {
+    let fixture = Publication::new(None, false);
+    fs::write(
+        fixture.workspace.join("payload.zip"),
+        zipped("nested/notes.txt", b"fixture notes\n"),
+    )
+    .unwrap();
+    fixture.jj(&["describe", "-m", "Add a clean archive"]);
+    let mut command = fixture.dots(&["publish"]);
+    fixture.real_scan(&mut command);
+    fixture.approve(command, "@", &["payload.zip"]);
+}
+
+#[test]
+#[ignore = "P-10 archive screening"]
+fn new_publish_allows_native_success_without_a_skip_signal() {
+    let fixture = Publication::new(None, false);
+    fs::write(fixture.workspace.join("opaque.bin"), [0, 129, 254, 7]).unwrap();
+    fixture.jj(&["describe", "-m", "Add opaque binary data"]);
+    let mut command = fixture.dots(&["publish"]);
+    fixture.real_scan(&mut command);
+    fixture.approve(command, "@", &["opaque.bin"]);
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    let native_log = fixture.read_log("scan-stderr");
+    assert!(!native_log.contains("exceeds max archive depth"));
+    assert!(!native_log.contains("skipping binary file"));
+}
+
+#[test]
+#[ignore = "P-10 archive screening"]
+fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmation() {
+    const PDF: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+    let nested = zipped("inner.zip", &zipped("notes.txt", b"fixture notes\n"));
+    for (path, bytes, signal, field, diagnostic) in [
+        (
+            "payload.zip",
+            nested.as_slice(),
+            "skipping archive: exceeds max archive depth",
+            "max_archive_depth=1",
+            "one-level scan limit",
+        ),
+        (
+            "binary.dat",
+            PDF,
+            "skipping binary file",
+            "mime_type=application/pdf",
+            "unsupported file format",
+        ),
+    ] {
+        let fixture = Publication::new(None, false);
+        let input = fixture.workspace.join(path);
+        fs::write(&input, bytes).unwrap();
+        fixture.jj(&["describe", "-m", "Add fixture data"]);
+        let bookmark = "wip/archive";
+        fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
+        let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
+        let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
+        fixture.real_scan(&mut command);
+        let mut terminal = Pty::spawn(command);
+        terminal.send("n\n");
+        let (status, transcript) = terminal.finish();
+        assert_eq!(status.code(), Some(1), "{transcript}");
+        assert!(!transcript.contains("[y/N]"), "{transcript}");
+        assert!(
+            !transcript.contains("Proposed pull request"),
+            "{transcript}"
+        );
+        assert!(transcript.contains(diagnostic), "{transcript}");
+        assert!(!transcript.contains(fixture.log.to_str().unwrap()));
+        assert_eq!(fixture.read_log("scan-input"), format!("{path}\n"));
+        assert_eq!(fixture.read_log("scan-status"), "0\n");
+        assert!(
+            fixture
+                .read_log("scan-stderr")
+                .lines()
+                .any(|line| line.contains(signal) && line.contains(field) && line.contains(path)),
+            "native gitleaks did not report the expected format or depth skip"
+        );
+        assert_eq!(fs::read(input).unwrap(), bytes);
+        assert_eq!(
+            fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]),
+            head
+        );
+        fixture.assert_no_publication();
+    }
 }
 
 #[test]

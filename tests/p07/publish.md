@@ -2,7 +2,7 @@
 
 P-07 accounts for all seven cases in `tests/test_dots_publish.mjs`, identical in
 the base checkout and oracle `f5c8a0e`. The suite has nine `unchanged_` cases,
-including two shared-dev cases, five `new_` cases and zero dropped cases.
+including two shared-dev cases, nine `new_` cases and zero dropped cases.
 Each test drives the executable
 selected by the absolute `DOTS_BIN`; the tests remain ignored as `P-10` until
 that module exists. See `docs/rust-port.md:44–49` and `plan/plan.md:192,196`.
@@ -23,6 +23,10 @@ that module exists. See `docs/rust-port.md:44–49` and `plan/plan.md:192,196`.
 | No legacy case | `new_invalid_repository_setting_exits_two_before_tool_probes` | The shared base configuration rejects invalid TOML and an invalid repository setting with exit 2. No tool probe or remote contact occurs. |
 | No legacy case | `new_publish_rejects_absent_unsafe_or_mismatched_raw_origins_before_tool_probes` | Missing, malformed, credential-bearing and mismatched raw origins in either the live checkout or the publish workspace get a one-line status-1 rejection before tool probes. A fixture-local alias rewrite demonstrates that a matching effective URL cannot repair a wrong raw origin. The rejected URL and synthetic credential marker stay out of the diagnostic. |
 | No legacy case | `new_publish_checks_effective_fetch_and_every_push_url_before_contact` | `docs/contract.md:243–245`. Independently redirect fetch and push, then set a second mismatched push URL after a matching one. Check real Git effective URLs, status 1 and zero attempts at transport. |
+| New archive screening | `new_publish_finds_a_redacted_secret_one_archive_level_deep` | A real Gitleaks `github-pat` finding names the ZIP member and redacts its value. The TTY transcript stays clean and never prompts. The local bookmark, archive bytes, remote refs and PRs stay unchanged. |
+| New archive screening | `new_publish_allows_a_clean_one_level_archive_to_reach_confirmation` | A clean compressed ZIP reaches actual confirmation, then the fixture verifies the approved OID in its bare remote. |
+| New archive screening | `new_publish_allows_native_success_without_a_skip_signal` | Real Gitleaks exits zero without a depth or unsupported-format signal on opaque binary bytes. Publication reaches confirmation and publishes the expected revision. |
+| New archive screening | `new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmation` | A nested ZIP emits a native depth-limit warning. PDF bytes in a `.dat` emit a native unsupported-format record. Each scanner exits zero and publish refuses before preview, confirmation, push or PR mutation. |
 
 The legacy suite imports the publisher and supplies a custom repository validator, a frozen clock,
 a command runner, a confirmation callback and the disclosure inputs directly.

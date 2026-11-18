@@ -9,8 +9,8 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use support::World;
+use std::process::Output;
+use support::{FixtureCommand, World};
 
 const PLAN_OUTPUT: &str = "fixture plan output: preview editor settings\n";
 
@@ -20,7 +20,7 @@ fn executable(path: &Path, script: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let tools = world.home().join("fixture-tools");
     let temporary = world.home().join("tmp");
     fs::create_dir_all(&temporary).unwrap();
@@ -222,7 +222,6 @@ fn unchanged_piped_sync_replays_metadata_without_syncing() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_status_prints_one_profile_diagnostic_and_saves_it() {
     let world = World::new();
     let output = dots(&world)
@@ -247,7 +246,6 @@ fn unchanged_status_prints_one_profile_diagnostic_and_saves_it() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_failed_apply_report_names_the_target_to_rerun() {
     let world = World::new();
     let output = dots(&world)
@@ -264,7 +262,6 @@ fn unchanged_failed_apply_report_names_the_target_to_rerun() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_plan_prints_the_preview_and_saves_private_stage_metadata() {
     let world = World::new();
     let config = world.root().join("config.toml");

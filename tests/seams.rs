@@ -275,15 +275,15 @@ fn seams_direct_child_helper() {
 
 #[test]
 fn seams_direct_inherited_streams_and_private_report() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path();
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let cwd = world.base();
     let state = cwd.join("state");
     // The surrounding manager state can predate the Rust reports directory.
     fs::create_dir_all(state.join("dots")).unwrap();
     fs::set_permissions(state.join("dots"), fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let mut child = world
+        .command(std::env::current_exe().unwrap())
         .current_dir(cwd)
-        .env_clear()
         .env("DOTS_TEST_DIRECT_HELPER", "1")
         .env("DOTS_ROOT", cwd)
         .env("XDG_STATE_HOME", &state)
@@ -392,12 +392,12 @@ fn seams_report_round_trip_and_fragment_fold() {
         assert_eq!(run.end(31), 31);
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .env_clear()
-        .env("DOTS_TEST_REPORT_ROUND_TRIP", dir.path())
-        .env("XDG_STATE_HOME", dir.path())
-        .env("DOTS_ROOT", dir.path())
+    let world = support::World::with_dots(env!("CARGO_BIN_EXE_dots"));
+    let output = world
+        .command(std::env::current_exe().unwrap())
+        .env("DOTS_TEST_REPORT_ROUND_TRIP", world.base())
+        .env("XDG_STATE_HOME", world.base())
+        .env("DOTS_ROOT", world.base())
         .args([
             "--exact",
             "seams_report_round_trip_and_fragment_fold",

@@ -6,13 +6,13 @@ use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use dots_cli::{report::Report, ui::transcript};
 use serde_json::{Value, json};
-use support::World;
+use support::{FixtureCommand, World};
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let home = world.home();
     let mut command = world.dots();
     command

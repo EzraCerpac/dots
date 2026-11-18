@@ -4,9 +4,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 
 fn minimal(world: &World, declarations: &str) {
     fs::write(
@@ -27,7 +27,7 @@ fn real_mise() -> PathBuf {
         .expect("standalone mise on PATH")
 }
 
-fn with_mise(world: &World) -> Command {
+fn with_mise(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     let mise = real_mise();
     command
@@ -43,7 +43,7 @@ fn script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn output(command: &mut Command, status: i32) -> Output {
+fn output(command: &mut FixtureCommand<'_>, status: i32) -> Output {
     let output = command.output().unwrap();
     assert_eq!(output.status.code(), Some(status), "{output:?}");
     output

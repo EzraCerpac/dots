@@ -4,9 +4,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
-use support::World;
+use support::{FixtureCommand, World};
 
 const CONFIG: &str = "[vars]\ndots_profiles = \"laptop server\"\n";
 const HOOKS: &str = "dots/hooks/update.d";
@@ -50,7 +50,7 @@ impl UpdateFixture {
         Self { world, path }
     }
 
-    fn dots(&self) -> Command {
+    fn dots(&self) -> FixtureCommand<'_> {
         let mut command = self.world.dots();
         command
             .env("PATH", &self.path)
@@ -63,7 +63,7 @@ impl UpdateFixture {
         command
     }
 
-    fn up(&self, mode: &str) -> Command {
+    fn up(&self, mode: &str) -> FixtureCommand<'_> {
         let mut command = self.dots();
         command.args([mode, "up"]);
         command
@@ -109,7 +109,7 @@ fn script(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn run(command: &mut Command) -> Output {
+fn run(command: &mut FixtureCommand<'_>) -> Output {
     command.output().unwrap()
 }
 

@@ -6,9 +6,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 use toml_edit::DocumentMut;
 
 const BASE: &str = "[vars]\ndots_profiles = \"desktop server\"\n";
@@ -46,7 +46,7 @@ fn bin(world: &World) -> PathBuf {
     bin
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut cmd = world.dots(); // World clears the caller's environment.
     let home = world.home();
     let scratch = world.root().parent().unwrap();
@@ -125,11 +125,10 @@ fn dots(world: &World) -> Command {
     cmd
 }
 
-fn fixture_child(world: &World, program: &Path) -> Command {
+fn fixture_child<'a>(world: &'a World, program: &Path) -> FixtureCommand<'a> {
     let environment = dots(world);
-    let mut child = Command::new(program);
+    let mut child = world.command(program);
     child
-        .env_clear()
         .envs(
             environment
                 .get_envs()
@@ -651,7 +650,7 @@ fn installed(world: &World, key: &str) -> bool {
     world.home().join("installed").join(key).is_file()
 }
 
-fn up(world: &World) -> Command {
+fn up(world: &World) -> FixtureCommand<'_> {
     let mut command = dots(world);
     command
         .args(["--verbose", "up"])
@@ -846,7 +845,7 @@ fn unchanged_mas_tool_formula_keeps_its_normal_brew_pass() {
     assert!(!world.home().join("mas.log").exists());
 }
 
-fn no_path_mas(world: &World) -> Command {
+fn no_path_mas(world: &World) -> FixtureCommand<'_> {
     let mut command = up(world);
     let fallback = env::var_os("PATH").unwrap_or_default();
     let mut path = vec![bin(world)];

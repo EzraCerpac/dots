@@ -239,10 +239,19 @@ impl<'a> FixtureCommand<'a> {
                 self.check_path("mise config fallback", &config.join("mise"))?;
             }
         }
-        self.check_path(
-            "XDG_STATE_HOME/dots",
-            &Path::new(value("XDG_STATE_HOME").unwrap()).join("dots"),
-        )
+        let state = Path::new(value("XDG_STATE_HOME").unwrap()).join("dots");
+        self.check_path("XDG_STATE_HOME/dots", &state)?;
+        if value("DOTS_SKILL_LINKS") != Some(OsStr::new("0")) {
+            for file in [
+                "skill-links",
+                "skill-links.tmp",
+                "skill-notices",
+                "skills/dots/SKILL.md",
+            ] {
+                self.check_path(file, &state.join(file))?;
+            }
+        }
+        Ok(())
     }
 
     fn check_path(&self, name: &str, path: &Path) -> io::Result<()> {

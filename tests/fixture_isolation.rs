@@ -81,6 +81,16 @@ fn fixture_checks_effective_state_paths_and_keeps_agent_roots_absent() {
         marker(&world, &path).env_clear().output().unwrap_err(),
         "HOME",
     );
+    let state = world.home().join(".local/state/dots");
+    fs::create_dir(&state).unwrap();
+    symlink(&untouched, state.join("skill-notices")).unwrap();
+    refused(
+        marker(&world, &path)
+            .env_remove("DOTS_SKILL_LINKS")
+            .output()
+            .unwrap_err(),
+        "skill-notices",
+    );
     assert!(!path.exists());
     assert_eq!(fs::read(&untouched).unwrap(), b"original");
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 1);

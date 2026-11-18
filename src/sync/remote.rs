@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{config::RepoSetting, run::Run};
 
@@ -216,71 +216,47 @@ impl RemoteHeads {
     }
 }
 
-/// A private ref namespace keeps fetched objects alive without modifying
-/// origin's configured remote-tracking branches or FETCH_HEAD.
-pub(super) struct Fetch<'a> {
-    git: Git<'a>,
-    prefix: String,
-}
-
-impl<'a> Fetch<'a> {
-    pub fn new(git: &Git<'a>, nonce: &str) -> Self {
-        Self {
-            git: git.clone(),
-            prefix: format!("refs/dots-sync/{nonce}/"),
+pub(super) fn fetch(git: &Git<'_>, run: &Run<'_>, origin: &Origin) -> io::Result<RemoteHeads> {
+    const PREFIX: &str = "refs/remotes/origin/";
+    const REFSPEC: &str = "+refs/heads/*:refs/remotes/origin/*";
+    let cmd = PinnedRemote::new(&origin.fetch)?.command(
+        git,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+            "--no-recurse-submodules",
+            "--atomic",
+            "--prune",
+            "--no-prune-tags",
+            "--refmap=",
+        ],
+        &[REFSPEC],
+    )?;
+    checked(bounded(cmd, run, NETWORK_BUDGET)?)?;
+    let mut heads = BTreeMap::new();
+    let output = git.get([
+        "for-each-ref",
+        "--format=%(objectname)%00%(refname)%00%(symref)",
+        PREFIX,
+    ])?;
+    for line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let (id, ref_info) = split(line, 0)?;
+        let (name, symbolic) = split(ref_info, 0)?;
+        if !symbolic.is_empty() {
+            continue;
         }
+        let name = std::str::from_utf8(name).map_err(io::Error::other)?;
+        let leaf = name
+            .strip_prefix(PREFIX)
+            .ok_or_else(|| invalid("unexpected fetched ref"))?;
+        heads.insert(format!("refs/heads/{leaf}"), oid(id)?);
     }
-
-    pub fn heads(&self, run: &Run<'_>, origin: &Origin) -> io::Result<RemoteHeads> {
-        let refspec = format!("+refs/heads/*:{}*", self.prefix);
-        let cmd = PinnedRemote::new(&origin.fetch)?.command(
-            &self.git,
-            &[
-                "fetch",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--no-auto-maintenance",
-                "--no-recurse-submodules",
-                "--prune",
-                "--no-prune-tags",
-                "--refmap=",
-            ],
-            &[&refspec],
-        )?;
-        checked(bounded(cmd, run, NETWORK_BUDGET)?)?;
-        let mut heads = BTreeMap::new();
-        let output = self.git.get([
-            "for-each-ref",
-            "--format=%(objectname)%00%(refname)",
-            &self.prefix,
-        ])?;
-        for line in output
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            let (id, name) = split(line, 0)?;
-            let name = std::str::from_utf8(name).map_err(io::Error::other)?;
-            let leaf = name
-                .strip_prefix(&self.prefix)
-                .ok_or_else(|| invalid("unexpected fetched ref"))?;
-            heads.insert(format!("refs/heads/{leaf}"), oid(id)?);
-        }
-        Ok(RemoteHeads(heads))
-    }
-}
-
-impl Drop for Fetch<'_> {
-    fn drop(&mut self) {
-        let Ok(refs) = self
-            .git
-            .text(["for-each-ref", "--format=%(refname)", &self.prefix])
-        else {
-            return;
-        };
-        for name in refs.lines().filter(|name| name.starts_with(&self.prefix)) {
-            let _ = self.git.get(["update-ref", "-d", name]);
-        }
-    }
+    Ok(RemoteHeads(heads))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -339,24 +315,8 @@ pub(super) fn push(
         )
         .map_err(|_| PushError::NotAttempted)?;
     cmd.env("LC_ALL", "C");
-    let started = Instant::now();
     let output = bounded(cmd, run, NETWORK_BUDGET).map_err(|_| PushError::Unconfirmed)?;
-    push_status(&output, &refspec, expected == Some(revision))?;
-
-    let budget = NETWORK_BUDGET.saturating_sub(started.elapsed());
-    if budget.is_zero() {
-        return Err(PushError::Unconfirmed);
-    }
-    let cmd = remote
-        .command(git, &["ls-remote", "--exit-code", "--refs"], &[DEV])
-        .map_err(|_| PushError::Unconfirmed)?;
-    let advertised = bounded(cmd, run, budget)
-        .and_then(checked)
-        .map_err(|_| PushError::Unconfirmed)?;
-    if advertised != format!("{revision}\t{DEV}\n").as_bytes() {
-        return Err(PushError::Unconfirmed);
-    }
-    Ok(())
+    push_status(&output, &refspec, expected == Some(revision))
 }
 
 fn push_status(output: &Output, refspec: &str, already_current: bool) -> Result<(), PushError> {
@@ -479,14 +439,13 @@ mod tests {
         .unwrap();
 
         let run = Run::begin(&ctx, Sink::Unreported);
-        let fetch = Fetch::new(&git, "pinned");
-        let heads = fetch.heads(&run, &origin).unwrap();
+        let heads = fetch(&git, &run, &origin).unwrap();
         assert_eq!(heads.main(), Some(approved.as_str()));
         assert_eq!(heads.dev(), None);
         git.get(["show-ref", "--verify", "refs/tags/private-tag"])
             .unwrap();
         push(&git, &run, &origin, heads.dev(), &approved).unwrap();
-        let updated = fetch.heads(&run, &origin).unwrap();
+        let updated = fetch(&git, &run, &origin).unwrap();
         assert_eq!(updated.dev(), Some(approved.as_str()));
         assert_eq!(
             push(&git, &run, &origin, None, &approved),
@@ -537,10 +496,7 @@ mod tests {
 
         let origin = Origin::load(&git, None).unwrap().unwrap();
         let run = Run::begin(&ctx, Sink::Unreported);
-        assert_eq!(
-            push(&git, &run, &origin, None, &approved),
-            Err(PushError::Unconfirmed)
-        );
+        push(&git, &run, &origin, None, &approved).unwrap();
         assert!(
             Git::new(&ctx, &path)
                 .get(["for-each-ref"])

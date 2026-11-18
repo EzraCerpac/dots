@@ -638,27 +638,23 @@ fn dev_binding_rejects_a_clean_switch_to_the_same_commit() {
 
 #[test]
 fn unconfirmed_push_record_retains_both_exact_tips_and_expected_absence() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmp = tempfile::tempdir().unwrap();
     let candidate = "a".repeat(40);
     let previous = "b".repeat(40);
     for expected in [None, Some(previous.as_str())] {
-        let record = super::prepare_push_record(tmp.path(), expected, &candidate).unwrap();
-        let record = record.keep();
-        assert_eq!(
-            fs::metadata(&record).unwrap().permissions().mode() & 0o777,
-            0o700
+        let mut receipt = crate::receipt::Receipt::new(None, "not pushed");
+        super::unconfirmed_push(&mut receipt, expected, &candidate);
+        assert!(receipt.shared.is_empty());
+        assert_eq!(receipt.outcome, "dev push unconfirmed");
+        let expected = expected.unwrap_or("(absent)");
+        assert!(
+            receipt.issues[0]
+                .diagnostic
+                .contains(&format!("candidate {candidate} · expected {expected}"))
         );
-        let path = record.join("push.json");
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(
-            saved,
-            serde_json::json!({ "candidate": candidate, "expected_dev": expected })
+        assert!(
+            receipt.issues[0]
+                .next_action
+                .contains("Compare refs/heads/dev")
         );
     }
 }

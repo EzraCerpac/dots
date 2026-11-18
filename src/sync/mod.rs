@@ -26,7 +26,7 @@ use crate::{Args, Ctx, Fail};
 
 use git::{Git, repository_dirs};
 use lock::RepoLock;
-use remote::{Fetch, Origin, PushError, RemoteHeads};
+use remote::{Origin, PushError, RemoteHeads};
 use snapshot::{ScanError, Scratch, changed, machine_local_in_history};
 
 const RERUN: &str = "Review the checkout and rerun dots sync.";
@@ -450,18 +450,12 @@ fn synchronize(
     verify_dev(&git, &before).or_note("The dev checkout changed during capture", GIT)?;
     let mut index = snapshot.bytes().to_vec();
     drop(snapshot);
-    let fetch = Fetch::new(
-        &git,
-        scratch
-            .nonce()
-            .or_note("Could not reserve temporary fetch refs", GIT)?,
-    );
 
     let approved = match scan_candidate(run, &scratch, &before, &unscanned, &local_paths, receipt) {
         Ok(approved) => approved,
         Err(error) => {
             if !run.cancelled()
-                && let Ok(heads) = fetch.heads(run, &origin)
+                && let Ok(heads) = remote::fetch(&git, run, &origin)
             {
                 incoming(receipt, &git, &heads, &before);
             }
@@ -497,7 +491,7 @@ fn synchronize(
         .confirm_capture(&git, &shared.dir, &local_tree)
         .or_note("Could not record the saved copy baseline", RERUN)?;
 
-    let Ok(mut heads) = fetch.heads(run, &origin) else {
+    let Ok(mut heads) = remote::fetch(&git, run, &origin) else {
         return Err(Note(
             "origin is offline or its refs could not be fetched",
             "Check the repository and your Git credentials, then rerun dots sync.",
@@ -614,9 +608,6 @@ fn synchronize(
             ))
         };
         active(run)?;
-        let push_record = prepare_push_record(&shared.dir, heads.dev(), &merged)
-            .or_note("Could not record the planned dev push", GIT)?;
-        active(run)?;
         dense_index(&git)?;
         verify_dev(&git, &approved).or_note("The dev checkout changed before pushing", GIT)?;
         let pushed = match remote::push(&git, run, &origin, heads.dev(), &merged) {
@@ -629,22 +620,7 @@ fn synchronize(
                 ));
             }
             Err(PushError::Unconfirmed) => {
-                let record = push_record.keep().join("push.json");
-                receipt.outcome = if receipt.saved.is_empty() {
-                    "dev push unconfirmed".into()
-                } else {
-                    "local work saved · dev push unconfirmed".into()
-                };
-                let mut item = Issue::new(
-                    "Could not verify whether origin accepted the dev push",
-                    "Compare refs/heads/dev at origin's push URL before retrying dots sync.",
-                );
-                let expected = heads.dev().unwrap_or("(absent)");
-                item.diagnostic
-                    .push_str(&format!(" · candidate {merged} · expected {expected}"));
-                item.next_action
-                    .push_str(&format!(" Push record: {record:?}"));
-                receipt.issues.push(item);
+                unconfirmed_push(receipt, heads.dev(), &merged);
                 return Ok(());
             }
         };
@@ -716,7 +692,7 @@ fn synchronize(
         if attempt == 3 {
             break;
         }
-        let refreshed = fetch.heads(run, &origin).or_note(
+        let refreshed = remote::fetch(&git, run, &origin).or_note(
             "Could not verify dev after the rejected push",
             "Check origin and the Git credential helper, then rerun dots sync.",
         )?;
@@ -750,25 +726,20 @@ fn dense_index(git: &Git<'_>) -> Result<(), Note> {
     )
 }
 
-fn prepare_push_record(
-    git_dir: &Path,
-    expected: Option<&str>,
-    candidate: &str,
-) -> io::Result<tempfile::TempDir> {
-    let record = guard::private_dir(git_dir, "dots-sync-push-")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(record.path().join("push.json"))?;
-    serde_json::to_writer(
-        &mut file,
-        &serde_json::json!({ "candidate": candidate, "expected_dev": expected }),
-    )?;
-    file.sync_all()?;
-    File::open(record.path())?.sync_all()?;
-    File::open(git_dir)?.sync_all()?;
-    Ok(record)
+fn unconfirmed_push(receipt: &mut Receipt, expected: Option<&str>, attempted: &str) {
+    receipt.outcome = if receipt.saved.is_empty() {
+        "dev push unconfirmed".into()
+    } else {
+        "local work saved · dev push unconfirmed".into()
+    };
+    let mut item = Issue::new(
+        "Could not verify whether origin accepted the dev push",
+        "Compare refs/heads/dev at origin's push URL before retrying dots sync.",
+    );
+    let expected = expected.unwrap_or("(absent)");
+    item.diagnostic
+        .push_str(&format!(" · candidate {attempted} · expected {expected}"));
+    receipt.issues.push(item);
 }
 
 fn scan_candidate(

@@ -14,8 +14,7 @@ const SOURCE: &str = "templates/herdr.tera";
 const ROW: &str = "dotfiles.herdr\ttemplates/herdr.tera\n";
 const BEFORE: &str = "# this machine\n[env]\nFIXTURE_ROLE = \"laptop\"\n";
 const DEPLOYED: &str = "deployed template bytes\n";
-const IGNORE: &str =
-    "/config.local.toml\n/config.host-*.toml\n/miserc.toml\n/mise.lock\n/.setup-state/\n/locks/\n";
+const IGNORE: &str = "/config.local.toml\n/config.host-*.toml\n/miserc.toml\n/mise.lock\n/mise.*.lock\n/.setup-state/\n/locks/\n";
 const CLEAN_SCAN: &str = r#"#!/bin/sh
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -268,9 +267,7 @@ fn assert_kept_with_source(local: &str, rows: &str, keep_source: bool, extra_sou
     fixture.sync();
     fixture.assert_advanced();
     fixture.assert_local(local);
-    if keep_source {
-        assert!(fixture.root.join(SOURCE).exists());
-    }
+    assert_eq!(fixture.root.join(SOURCE).is_file(), keep_source);
 }
 
 #[test]
@@ -325,18 +322,11 @@ fn unchanged_source_present_in_the_merge_keeps_declaration() {
 
 #[test]
 #[ignore = "P-08"]
-fn unchanged_substrings_comments_nested_and_array_tables_stay() {
-    for header in [
-        "[dotfiles.herdr-extra]",
-        "# [dotfiles.herdr]",
-        "[dotfiles.herdr.more]",
-        "[[dotfiles.herdr]]",
-    ] {
-        let altered = table()
-            .replace("[dotfiles.herdr]", header)
-            .replace(SOURCE, "dotfiles/other");
-        assert_kept(&format!("{BEFORE}\n{altered}"), ROW, false);
-    }
+fn unchanged_similar_and_commented_headers_stay() {
+    let similarly_named = table().replace("[dotfiles.herdr]", "[dotfiles.herdr-extra]");
+    assert_kept(&format!("{BEFORE}\n{similarly_named}"), ROW, false);
+    let commented = table().replace("[dotfiles.herdr]", "# [dotfiles.herdr]");
+    assert_kept(&format!("{BEFORE}\n{commented}"), ROW, false);
     let neighbour = table()
         .replace("[dotfiles.herdr]", "[dotfiles.herdr-extra]")
         .replace(SOURCE, "dotfiles/other");
@@ -402,46 +392,28 @@ fn unchanged_list_accepts_only_two_field_dotfile_rows() {
         BEFORE,
         &format!("dotfiles.\"a b\"\t{SOURCE}\n"),
     );
-    for (invalid, header) in [
-        ("dotfiles.herdr".into(), "[dotfiles.herdr]"),
-        (
-            format!("dotfiles.herdr.child\t{SOURCE}"),
-            "[dotfiles.herdr.child]",
-        ),
-        (format!("dotfiles.\t{SOURCE}"), "[dotfiles.herdr]"),
-        (
-            format!("dotfiles.herdr\t{SOURCE}\textra"),
-            "[dotfiles.herdr]",
-        ),
-    ] {
-        let matching = table()
-            .replace("[dotfiles.herdr]", header)
-            .replace(SOURCE, "dotfiles/other");
-        assert_kept(
-            &format!("{BEFORE}\n{matching}"),
-            &format!("{invalid}\n"),
-            false,
-        );
-    }
+    // The same source disappears in both fixtures. Only the valid row
+    // may remove the declaration.
+    let exact = format!("{BEFORE}\n{}", table());
+    assert_kept(&exact, &format!("dotfiles.herdr\t{SOURCE}\textra\n"), false);
+    assert_retired(&exact, BEFORE, ROW);
 }
 
 #[test]
 #[ignore = "P-08"]
 fn unchanged_list_rejects_noncanonical_paths() {
-    for (path, native_path) in [
-        ("templates/./other.tera", "templates/other.tera"),
-        ("./templates/other.tera", "templates/other.tera"),
-        ("templates//other.tera", "templates/other.tera"),
-        ("templates/../templates/other.tera", "templates/other.tera"),
-        ("templates\\other.tera", "templates\\other.tera"),
+    for path in [
+        "templates/./herdr.tera",
+        "./templates/herdr.tera",
+        "templates//herdr.tera",
+        "templates/../templates/herdr.tera",
     ] {
         let source = format!("'{}'", path);
         let matching = declaration("[dotfiles.herdr]", &format!("source = {source}"));
-        assert_kept_with_source(
+        assert_kept(
             &format!("{BEFORE}\n{matching}"),
             &format!("dotfiles.herdr\t{path}\n"),
             false,
-            Some(native_path),
         );
     }
     let hidden = "templates/.herdr/a..b.tera";

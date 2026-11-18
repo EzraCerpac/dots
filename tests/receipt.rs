@@ -211,7 +211,7 @@ impl ReceiptWorld {
         f.write(
             &f.root,
             ".gitignore",
-            "/config.local.toml\n/miserc.toml\n/config.host-*.toml\n/mise.lock\n/.setup-state/\n/locks/\n",
+            "/config.local.toml\n/miserc.toml\n/config.host-*.toml\n/mise.lock\n/mise.*.lock\n/.setup-state/\n/locks/\n",
         );
         f.commit(&f.root);
         f.git(&f.root, &["remote", "add", "origin", origin]);

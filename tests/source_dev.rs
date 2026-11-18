@@ -149,7 +149,7 @@ impl Repo {
         fixture.write(&fixture.a, "config.toml", &fixture.config);
         fixture.write(&fixture.a, "text", TEXT);
         fixture.write(&fixture.a, ".gitignore",
-            "/config.local.toml\n/miserc.toml\n/config.host-*.toml\n/mise.lock\n/.setup-state/\n/locks/\n");
+            "/config.local.toml\n/miserc.toml\n/config.host-*.toml\n/mise.lock\n/mise.*.lock\n/.setup-state/\n/locks/\n");
         fixture.commit(&fixture.a, "Initial");
         fixture.git(&fixture.a, &["push", "-q", "origin", "main"]);
         fixture.git(&fixture.a, &["switch", "-qc", "dev"]);
@@ -614,10 +614,16 @@ sync_case!(unchanged_public_edit_push_excludes_private_files, || {
     f.write(&f.a, "config.local.toml", "[env]\nPRIVATE=\"yes\"\n");
     f.write(&f.a, ".setup-state/state.json", "{}\n");
     f.write(&f.a, "locks/tool.lock", "held\n");
+    f.write(&f.a, "mise.laptop.lock", "private lockfile\n");
     has(&f.sync(&f.a), "pushed");
     assert_eq!(f.remote(), f.tip(&f.a));
     assert_eq!(f.blob("dev", "new"), "ordinary public edit");
-    for private in ["config.local.toml", ".setup-state", "locks/"] {
+    for private in [
+        "config.local.toml",
+        ".setup-state",
+        "locks/",
+        "mise.laptop.lock",
+    ] {
         absent(&f.tree(), private);
     }
     f.clean(&f.a);
@@ -1151,20 +1157,23 @@ sync_case!(
 sync_case!(
     unchanged_private_file_in_unpublished_history_blocks_push,
     || {
-        let f = Repo::new();
-        let before = f.remote();
-        f.write(&f.a, "config.host-private.toml", "[env]\nPRIVATE=\"yes\"\n");
-        f.git(&f.a, &["add", "-f", "config.host-private.toml"]);
-        f.git(&f.a, &["commit", "-qm", "Private history"]);
-        let forbidden = f.tip(&f.a);
-        f.git(&f.a, &["rm", "-q", "--cached", "config.host-private.toml"]);
-        f.git(&f.a, &["commit", "-qm", "Untrack private settings"]);
-        let tip = f.tip(&f.a);
-        let receipt = f.sync(&f.a);
-        has(&receipt, "config.host-private.toml");
-        has(&receipt, &forbidden[..12]);
-        assert_eq!(f.remote(), before);
-        assert_eq!(f.tip(&f.a), tip);
+        for private in ["config.host-private.toml", "mise.laptop.lock"] {
+            let f = Repo::new();
+            let before = f.remote();
+            f.write(&f.a, private, "private fixture contents\n");
+            f.git(&f.a, &["add", "-f", private]);
+            f.git(&f.a, &["commit", "-qm", "Private history"]);
+            let forbidden = f.tip(&f.a);
+            f.git(&f.a, &["rm", "-q", "--", private]);
+            f.git(&f.a, &["commit", "-qm", "Remove the private file"]);
+            assert!(!f.a.join(private).exists());
+            let tip = f.tip(&f.a);
+            let receipt = f.sync(&f.a);
+            has(&receipt, private);
+            has(&receipt, &forbidden[..12]);
+            assert_eq!(f.remote(), before);
+            assert_eq!(f.tip(&f.a), tip);
+        }
     }
 );
 

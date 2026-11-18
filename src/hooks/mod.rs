@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
+use crate::Fail;
 use crate::config::{Root, Vars};
 use crate::process::{BundlePipe, Mise, is_executable};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId, exit_code};
-use crate::{Ctx, Env, Fail, Flags};
 
 pub mod exceptions;
 use exceptions::Mode;
@@ -122,18 +122,6 @@ fn hook_label(stem: &str) -> String {
     label.replace(['-', '_'], " ")
 }
 
-// P-09 owns Run::ctx(). Remove this shim when the getter lands on rust.
-fn stage_context() -> Result<Ctx, Fail> {
-    let env = Env::current()
-        .map_err(|error| Fail::new(1, format!("cannot read environment: {error}")))?;
-    let root = Root::resolve(&env)?;
-    Ok(Ctx {
-        env,
-        root,
-        flags: Flags::default(),
-    })
-}
-
 enum ChildEnv<'a> {
     Hook(HookEnv<'a>),
     Recipe(Mode),
@@ -199,8 +187,7 @@ fn run_child(
     args: &[&str],
     env: ChildEnv<'_>,
 ) -> Result<u8, Fail> {
-    let ctx = stage_context()?;
-    let mut child = Mise::new(&ctx)?.exec(path, args.iter().map(OsStr::new))?;
+    let mut child = Mise::new(run.ctx())?.exec(path, args.iter().map(OsStr::new))?;
 
     let changes = if matches!(
         env,

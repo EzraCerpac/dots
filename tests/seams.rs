@@ -188,6 +188,7 @@ fn seams_direct_child_helper() {
             next: "dots test".into(),
             tail: Some("ignored stream".into()),
             log: Some("ignored path".into()),
+            terminal_exit: None,
         },
     );
     run.finish(stage, Outcome::Failed);

@@ -180,6 +180,7 @@ impl<'a> Run<'a> {
                 command,
                 finished_at_ms: report::timestamp(),
                 status,
+                cancelled: false,
                 next,
                 stages,
             };

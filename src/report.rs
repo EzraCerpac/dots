@@ -83,6 +83,8 @@ pub struct Issue {
     pub next: String,
     pub tail: Option<String>,
     pub log: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_exit: Option<u8>,
 }
 
 impl Issue {
@@ -92,6 +94,7 @@ impl Issue {
             next: next.into(),
             tail: None,
             log: None,
+            terminal_exit: None,
         }
     }
 }
@@ -103,6 +106,7 @@ pub enum Outcome {
     Deferred,
     Skipped,
     Failed,
+    Cancelled,
 }
 
 impl Outcome {
@@ -131,6 +135,8 @@ pub struct Report {
     pub command: Command,
     pub finished_at_ms: u64,
     pub status: u8,
+    #[serde(default)]
+    pub cancelled: bool,
     pub next: Option<String>,
     pub stages: Vec<Stage>,
 }

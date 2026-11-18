@@ -343,9 +343,9 @@ Configuration commands, `dots test` and `dots mise` exit with their child's stat
 `dots up` and `dots bootstrap` exit 0 when every stage completed, was skipped or was deferred, and 1 when any stage failed.
 `dots sync` with valid arguments exits 0 every time, including a missing configuration, a missing mise or gitleaks, and a stopped run; its receipt carries the problem.
 `dots sync` with invalid arguments exits 2.
-Ctrl-C cancels the current stage's entire process group, and no later stage starts.
+Ctrl-C cancels the entire process group of every active stage, such as an App Store stage running alongside others with `--mas`, before `dots` exits, and no later stage starts.
 A cancellation is not a stage failure, so the rule above for `dots up` and `dots bootstrap` does not apply to it.
-A cancelled run exits with the cancelled child's own status, unchanged, when the child exits with one.
+A cancelled run exits with the status of the interrupted foreground child, unchanged, when that child exits with one; cleaning up other active stages does not replace it.
 Otherwise it exits with a nonzero status, and no particular value is promised.
 `dots sync` still exits 0, and its receipt records the stopped run.
 **Changed from 0.3.5:** `dots bundle` usage errors exit 2, not 1.

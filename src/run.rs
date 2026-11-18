@@ -162,6 +162,15 @@ impl<'a> Run<'a> {
         self.supervisor.probe(cmd, input, false)
     }
 
+    /// Capture a noninteractive command in an owned session with a result deadline.
+    pub fn probe_detached(
+        &self,
+        cmd: ChildCommand,
+        budget: std::time::Duration,
+    ) -> io::Result<Output> {
+        self.supervisor.probe_detached(cmd, budget)
+    }
+
     pub fn change(&self, id: StageId, change: Change) {
         if let Some(stage) = self
             .stages

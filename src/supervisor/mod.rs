@@ -60,6 +60,7 @@ enum Placement {
     Foreground,
     Background,
     Detached,
+    DetachedProbe,
     #[cfg(test)]
     HeadlessForeground,
 }
@@ -99,16 +100,16 @@ struct Entry {
     target: libc::pid_t,
     foreground: bool,
     native: bool,
+    verify_wait: bool,
 }
 
 struct Cancellation {
-    start: Instant,
+    shutdown: Shutdown,
     // TTY line discipline already delivered the interrupt to this group. While
     // its leader still runs, let it decide how to handle the keystroke.
     terminal_pid: Option<libc::pid_t>,
     foreground: Option<libc::pid_t>,
     status: Option<u8>,
-    escalation: Escalation,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -117,6 +118,44 @@ enum Escalation {
     Interrupt,
     Terminate,
     Kill,
+}
+
+#[derive(Clone, Copy)]
+struct Shutdown {
+    start: Instant,
+    escalation: Escalation,
+}
+
+impl Shutdown {
+    fn begin() -> Self {
+        Self {
+            start: Instant::now(),
+            escalation: Escalation::Interrupt,
+        }
+    }
+
+    fn advance(&mut self, mut signal: impl FnMut(libc::c_int)) {
+        for (delay, step, signo) in [
+            (TERM_AFTER, Escalation::Terminate, libc::SIGTERM),
+            (KILL_AFTER, Escalation::Kill, libc::SIGKILL),
+        ] {
+            if self.start.elapsed() >= delay
+                && self.escalation != Escalation::Kill
+                && self.escalation != step
+            {
+                self.escalation = step;
+                signal(signo);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProbeBudget {
+    start: Instant,
+    limit: Duration,
+    received: bool,
+    shutdown: Option<Shutdown>,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +273,41 @@ impl Supervisor {
         Pipes::take(&mut running.child)?.collect(&mut running)
     }
 
+    pub(crate) fn probe_detached(
+        &self,
+        mut command: Command,
+        limit: Duration,
+    ) -> io::Result<Output> {
+        let start = Instant::now();
+        if self.cancelled() {
+            return Err(interrupted());
+        }
+        if limit.is_zero() {
+            return Err(probe_timed_out());
+        }
+        command.stdin(Stdio::null());
+        self.spawn_streams(&mut command, true);
+        let mut running = self.spawn(command, Placement::DetachedProbe, false)?;
+        running.budget = Some(ProbeBudget {
+            start,
+            limit,
+            received: false,
+            shutdown: None,
+        });
+        let result = Pipes::take(&mut running.child).and_then(|pipes| pipes.collect(&mut running));
+        let expired = running
+            .budget
+            .is_some_and(|budget| budget.shutdown.is_some());
+        drop(running);
+        if self.cancelled() {
+            Err(interrupted())
+        } else if expired {
+            Err(probe_timed_out())
+        } else {
+            result
+        }
+    }
+
     fn spawn_streams(&self, command: &mut Command, capture: bool) {
         let stream = || {
             if capture {
@@ -268,7 +342,11 @@ impl Supervisor {
                 "another foreground stage is already running",
             ));
         }
-        let fragment = matches!(self.mode, Mode::Fragment);
+        let verify_wait = matches!(placement, Placement::DetachedProbe);
+        if verify_wait {
+            require_waitable_children()?;
+        }
+        let fragment = matches!(self.mode, Mode::Fragment) && !verify_wait;
         let job_control = matches!(placement, Placement::Foreground) && !fragment;
         let terminal = if job_control {
             TerminalJob::start(None)?
@@ -278,7 +356,7 @@ impl Supervisor {
         if let Some(terminal) = &terminal {
             command.process_group(terminal.group());
         } else if !fragment {
-            if matches!(placement, Placement::Detached) {
+            if matches!(placement, Placement::Detached | Placement::DetachedProbe) {
                 unsafe {
                     // setsid makes a new group as well as a new session.
                     command.pre_exec(|| {
@@ -313,6 +391,7 @@ impl Supervisor {
             target,
             foreground: placement.foreground(),
             native,
+            verify_wait,
         };
         state.children.push(entry);
         state.refresh_signals();
@@ -323,6 +402,7 @@ impl Supervisor {
             terminal,
             entry,
             job_control,
+            budget: None,
             leader_exit: None,
             last_output: Instant::now(),
             group_cleanup: None,
@@ -446,34 +526,24 @@ impl State {
         let Some(cancel) = &mut self.cancel else {
             return;
         };
-        for (delay, escalation, signal) in [
-            (TERM_AFTER, Escalation::Terminate, libc::SIGTERM),
-            (KILL_AFTER, Escalation::Kill, libc::SIGKILL),
-        ] {
-            if cancel.start.elapsed() >= delay
-                && cancel.escalation != Escalation::Kill
-                && cancel.escalation != escalation
-            {
-                cancel.escalation = escalation;
-                for entry in &self.children {
-                    if Some(entry.pid) != cancel.terminal_pid {
-                        signal_target(entry.target, signal, &mut self.warnings);
-                    }
+        cancel.shutdown.advance(|signal| {
+            for entry in &mut self.children {
+                if Some(entry.pid) != cancel.terminal_pid {
+                    entry.signal(signal, &mut self.warnings);
                 }
             }
-        }
+        });
     }
 
     fn cancel(&mut self, signal: Option<libc::c_int>, terminal_pid: Option<libc::pid_t>) {
         if let Some(cancel) = &mut self.cancel {
             if let Some(signal) = signal
                 && let Some(pid) = cancel.terminal_pid.take()
-                && let Some(entry) = self.children.iter().find(|entry| entry.pid == pid)
+                && let Some(entry) = self.children.iter_mut().find(|entry| entry.pid == pid)
             {
                 // An explicit signal to dots supersedes a terminal-only cancel.
-                signal_target(entry.target, signal, &mut self.warnings);
-                cancel.start = Instant::now();
-                cancel.escalation = Escalation::Interrupt;
+                entry.signal(signal, &mut self.warnings);
+                cancel.shutdown = Shutdown::begin();
             }
             return;
         }
@@ -487,19 +557,14 @@ impl State {
                 .then_some(entry.pid)
             });
         self.cancel = Some(Cancellation {
-            start: Instant::now(),
+            shutdown: Shutdown::begin(),
             terminal_pid,
             foreground,
             status: None,
-            escalation: Escalation::Interrupt,
         });
-        for entry in &self.children {
+        for entry in &mut self.children {
             if Some(entry.pid) != terminal_pid {
-                signal_target(
-                    entry.target,
-                    signal.unwrap_or(libc::SIGINT),
-                    &mut self.warnings,
-                );
+                entry.signal(signal.unwrap_or(libc::SIGINT), &mut self.warnings);
             }
         }
     }
@@ -520,12 +585,35 @@ impl State {
     }
 }
 
+impl Entry {
+    fn signal(&mut self, signal: libc::c_int, warnings: &mut Vec<String>) -> bool {
+        if self.verify_wait
+            && self.target != 0
+            && let Err(error) = observe(self.pid, false)
+        {
+            self.abandon(&error, warnings);
+            return false;
+        }
+        signal_target(self.target, signal, warnings)
+    }
+
+    fn abandon(&mut self, error: &io::Error, warnings: &mut Vec<String>) {
+        if self.target != 0 {
+            self.target = 0;
+            warnings.push(format!(
+                "dots: lost ownership of the probe's processes ({error})"
+            ));
+        }
+    }
+}
+
 struct Running<'a> {
     supervisor: &'a Supervisor,
     child: Child,
     terminal: Option<TerminalJob>,
     entry: Entry,
     job_control: bool,
+    budget: Option<ProbeBudget>,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_cleanup: Option<Instant>,
@@ -558,12 +646,29 @@ impl Running<'_> {
 
         let supervisor = self.supervisor;
         let mut state = supervisor.state();
-        let observation = observe(self.entry.pid, self.job_control)?;
-        if !matches!(observation, Observed::Exited { .. })
+        let observation = self.observe(&mut state, self.job_control)?;
+        let exited = matches!(observation, Observed::Exited { .. });
+        if let Some(budget) = &mut self.budget {
+            if !budget.received && budget.shutdown.is_none() && state.cancel.is_none() {
+                if budget.start.elapsed() >= budget.limit {
+                    signal_target(self.entry.target, libc::SIGINT, &mut state.warnings);
+                    budget.shutdown = Some(Shutdown::begin());
+                } else if exited && drained {
+                    // Cleanup of a completed operation is outside the result budget.
+                    budget.received = true;
+                }
+            }
+            if let Some(shutdown) = &mut budget.shutdown {
+                shutdown.advance(|signal| {
+                    signal_target(self.entry.target, signal, &mut state.warnings);
+                });
+            }
+        }
+        if !exited
             && self.leader_kill.is_none()
-            && state.cancel.as_ref().is_some_and(|cancel| {
-                cancel.escalation == Escalation::Kill && cancel.terminal_pid != Some(self.entry.pid)
-            })
+            && self
+                .shutdown(&state)
+                .is_some_and(|s| s.escalation == Escalation::Kill)
         {
             // A group signal can succeed for its observer or a descendant
             // even when the native leader refuses it.
@@ -575,6 +680,16 @@ impl Running<'_> {
                     "could not stop the interrupted child",
                 ));
             }
+        }
+        if !exited
+            && self.budget.is_some()
+            && self
+                .shutdown(&state)
+                .is_some_and(|s| s.start.elapsed() >= KILL_AFTER + GROUP_RETIRE_GRACE)
+        {
+            return Err(io::Error::other(
+                "could not confirm that the probe leader stopped",
+            ));
         }
         match observation {
             Observed::Running => return Ok(None),
@@ -595,25 +710,25 @@ impl Running<'_> {
                 return Ok(None);
             }
             Observed::Exited { signal } => {
-                if state.cancel.is_none() && signal == Some(libc::SIGINT) {
+                if !self.entry.verify_wait && state.cancel.is_none() && signal == Some(libc::SIGINT)
+                {
                     state.terminal_interrupt(self.entry, self.draining);
                 }
             }
         }
         let exited_at = *self.leader_exit.get_or_insert_with(Instant::now);
         let idle = self.last_output.max(exited_at).elapsed();
-        let cleanup = state
-            .cancel
-            .as_ref()
-            .filter(|cancel| cancel.terminal_pid != Some(self.entry.pid));
-        if let Some(cancel) = cleanup {
-            if self.entry.target < 0 && cancel.escalation != Escalation::Kill {
+        if let Some(shutdown) = self.shutdown(&state) {
+            if self.entry.target < 0 && shutdown.escalation != Escalation::Kill {
                 return Ok(None);
             }
-            if !drained && cancel.start.elapsed() < KILL_AFTER + DRAIN_AFTER_KILL {
+            if !drained && shutdown.start.elapsed() < KILL_AFTER + DRAIN_AFTER_KILL {
                 return Ok(None);
             }
         } else if !drained {
+            if self.budget.is_some() {
+                return Ok(None);
+            }
             let delay = if matches!(self.group_members(), Ok(true)) {
                 OWNED_DRAIN_IDLE
             } else {
@@ -641,7 +756,13 @@ impl Running<'_> {
         if display_pending && state.cancel.is_none() {
             return Ok(None);
         }
-        let status = self.child.wait()?;
+        let status = match self.child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                self.abandon(&mut state, &error);
+                return Err(error);
+            }
+        };
         self.reaped = true;
         if let Some(cancel) = &mut state.cancel
             && cancel.foreground == Some(self.entry.pid)
@@ -670,6 +791,42 @@ impl Running<'_> {
 
     fn output_progress(&mut self) {
         self.last_output = Instant::now();
+    }
+
+    fn shutdown(&self, state: &State) -> Option<Shutdown> {
+        self.budget.and_then(|budget| budget.shutdown).or_else(|| {
+            state
+                .cancel
+                .as_ref()
+                .filter(|cancel| cancel.terminal_pid != Some(self.entry.pid))
+                .map(|cancel| cancel.shutdown)
+        })
+    }
+
+    fn observe(&mut self, state: &mut State, stops: bool) -> io::Result<Observed> {
+        if self.entry.verify_wait
+            && state
+                .children
+                .iter()
+                .any(|entry| entry.pid == self.entry.pid && entry.target == 0)
+        {
+            self.entry.target = 0;
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
+        observe(self.entry.pid, stops).inspect_err(|error| self.abandon(state, error))
+    }
+
+    fn abandon(&mut self, state: &mut State, error: &io::Error) {
+        if self.entry.verify_wait {
+            if let Some(entry) = state
+                .children
+                .iter_mut()
+                .find(|entry| entry.pid == self.entry.pid)
+            {
+                entry.abandon(error, &mut state.warnings);
+            }
+            self.entry.target = 0;
+        }
     }
 
     fn group_members(&mut self) -> Result<bool, String> {
@@ -758,36 +915,37 @@ impl Running<'_> {
 impl Drop for Running<'_> {
     fn drop(&mut self) {
         let mut state = self.supervisor.state();
-        if !self.reaped {
+        if !self.reaped && (!self.entry.verify_wait || self.observe(&mut state, false).is_ok()) {
             signal_target(self.entry.target, libc::SIGKILL, &mut state.warnings);
             self.group_cleanup = Some(Instant::now());
             self.membership = None;
             // Signal the leader separately if a mixed-privilege group accepted
             // SIGKILL only for some of its members.
-            if self.leader_kill.unwrap_or_else(|| {
+            let signalled = self.leader_kill.unwrap_or_else(|| {
                 signal_target(self.entry.pid, libc::SIGKILL, &mut state.warnings)
-            }) {
-                let until = Instant::now() + GROUP_RETIRE_GRACE;
-                loop {
-                    let retired = self.retired(&mut state);
-                    let exited =
-                        matches!(observe(self.entry.pid, false), Ok(Observed::Exited { .. }));
-                    if retired && exited {
-                        let _ = self.child.wait();
-                        break;
-                    }
-                    if Instant::now() >= until && retired {
+            });
+            let until = Instant::now() + GROUP_RETIRE_GRACE;
+            loop {
+                let observation = self.observe(&mut state, false);
+                if self.entry.verify_wait && observation.is_err() {
+                    break;
+                }
+                let retired = self.retired(&mut state);
+                if retired && matches!(observation, Ok(Observed::Exited { .. })) {
+                    let _ = self.child.wait();
+                    break;
+                }
+                if retired && (!signalled || Instant::now() >= until) {
+                    if signalled {
                         state
                             .warnings
                             .push("dots: could not confirm that the command leader stopped".into());
-                        break;
                     }
-                    drop(state);
-                    std::thread::sleep(TICK);
-                    state = self.supervisor.state();
+                    break;
                 }
-            } else {
-                let _ = self.child.try_wait();
+                drop(state);
+                std::thread::sleep(TICK);
+                state = self.supervisor.state();
             }
         }
         drop(self.terminal.take());
@@ -802,6 +960,31 @@ enum Observed {
     Exited { signal: Option<libc::c_int> },
 }
 
+fn require_waitable_children() -> io::Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+        return Err(io::Error::other(
+            "the probe requires waitable child processes",
+        ));
+    }
+    Ok(())
+}
+
+fn interrupted() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "dots run was cancelled")
+}
+
+fn probe_timed_out() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the probe exceeded its result deadline",
+    )
+}
+
 fn observe(pid: libc::pid_t, stops: bool) -> io::Result<Observed> {
     // As in the PTY spike, WNOWAIT reserves the leader PID through cleanup.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -809,13 +992,14 @@ fn observe(pid: libc::pid_t, stops: bool) -> io::Result<Observed> {
     if stops {
         options |= libc::WSTOPPED;
     }
-    let result = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) };
-    if result == -1 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            return Ok(Observed::Running);
+    loop {
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) } == 0 {
+            break;
         }
-        return Err(error);
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
     if unsafe { info.si_pid() } == 0 {
         return Ok(Observed::Running);

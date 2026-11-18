@@ -304,33 +304,6 @@ where
     stage().map_err(|error| Fail::new(1, format!("could not stage dots child arguments: {error}")))
 }
 
-#[cfg(test)]
-mod launcher_tests {
-    use super::*;
-
-    #[test]
-    fn path_search_skips_missing_and_denied_entries_and_stops_on_enoexec() {
-        let mut candidates = Vec::new();
-        let error = exec_search(
-            "example".as_ref(),
-            "/missing:/denied:/plain:/later".as_ref(),
-            |path| {
-                candidates.push(path.to_owned());
-                io::Error::from_raw_os_error(match path.parent().unwrap().to_str().unwrap() {
-                    "/missing" => libc::ENOENT,
-                    "/denied" => libc::EACCES,
-                    _ => libc::ENOEXEC,
-                })
-            },
-        );
-        assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC));
-        assert_eq!(
-            candidates,
-            ["/missing/example", "/denied/example", "/plain/example"].map(std::path::PathBuf::from)
-        );
-    }
-}
-
 pub(crate) fn is_executable(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -368,5 +341,32 @@ impl BundlePipe {
             "P-05",
             "attaching the bootstrap hook's secret descriptor",
         ))
+    }
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    #[test]
+    fn path_search_skips_missing_and_denied_entries_and_stops_on_enoexec() {
+        let mut candidates = Vec::new();
+        let error = exec_search(
+            "example".as_ref(),
+            "/missing:/denied:/plain:/later".as_ref(),
+            |path| {
+                candidates.push(path.to_owned());
+                io::Error::from_raw_os_error(match path.parent().unwrap().to_str().unwrap() {
+                    "/missing" => libc::ENOENT,
+                    "/denied" => libc::EACCES,
+                    _ => libc::ENOEXEC,
+                })
+            },
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC));
+        assert_eq!(
+            candidates,
+            ["/missing/example", "/denied/example", "/plain/example"].map(std::path::PathBuf::from)
+        );
     }
 }

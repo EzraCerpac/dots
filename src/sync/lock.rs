@@ -1,6 +1,5 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -22,6 +21,7 @@ impl RepoLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(common_git_dir.join("dots-source-rust.lock"))?;
@@ -38,16 +38,11 @@ impl RepoLock {
         }
 
         loop {
-            // SAFETY: file owns this descriptor for the duration of the call
-            // and retains it in the guard on success.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Some(Self { _file: file }));
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::WouldBlock => return Ok(None),
-                io::ErrorKind::Interrupted => continue,
-                _ => return Err(error),
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(TryLockError::Error(error)) => return Err(error),
             }
         }
     }

@@ -234,6 +234,19 @@ esac
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(source.read_bytes(), before)
 
+    def test_remove_hint_respects_unreadable_app_ownership(self) -> None:
+        config = self.root / "a"
+        config.mkdir()
+        (config / "config.toml").write_text(BASE + '\n[tools]\n"github:example/codexbar" = "latest"\n')
+        markers = self.root / "home-a/state/dots/github-apps"
+        markers.mkdir(parents=True)
+        (markers / "broken.json").write_text("{")
+        for flags in ([], ["--keep-installed"]):
+            result = self.on_host("a", sys.executable, str(MANAGER / "lib/dots-remove.py"),
+                                  str(self.bin / "mise"), str(config), *flags, "codex-bar")
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual("Did you mean 'github:example/codexbar'?" in result.stderr, bool(flags))
+
     def test_remove_accepts_alias_from_second_declaration(self) -> None:
         config = self.root / "a"
         config.mkdir()

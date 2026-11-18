@@ -476,7 +476,7 @@ class CommandBackendTests(ContractTestCase):
         self.assertIn("up to date", replay.stdout.lower())
         self.assertNotIn("editor.ini", replay.stdout)
 
-    def test_status_profile_diagnosis_is_saved_and_printed_once(self) -> None:
+    def test_status_backend_prints_and_emits_profile_diagnosis(self) -> None:
         events = self.f.base / "events"
         mise = write(self.f.base / "bin/profiles-mise", "#!/bin/sh\necho laptop\n", 0o755)
         result = subprocess.run(["bash", "-c", 'exec 3>"$0"; exec "$@"', str(events), sys.executable,

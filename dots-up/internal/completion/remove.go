@@ -62,6 +62,14 @@ func (t *target) addAliases(key string) {
 	t.aliases[strings.ToLower(tail[strings.LastIndexByte(tail, '/')+1:])] = true
 }
 
+func (t *target) indexAliases(index map[string][]string, id string) {
+	for alias := range t.aliases {
+		if !slices.Contains(index[alias], id) {
+			index[alias] = append(index[alias], id)
+		}
+	}
+}
+
 type targets map[string]*target
 
 func (all targets) ensure(id string) *target {
@@ -71,7 +79,7 @@ func (all targets) ensure(id string) *target {
 	return all[id]
 }
 
-func (all targets) readMarkers(scoped bool) {
+func (all targets) readMarkers(scoped bool, index map[string][]string) {
 	state := os.Getenv("XDG_STATE_HOME")
 	if state == "" {
 		state = filepath.Join(os.Getenv("HOME"), ".local", "state")
@@ -91,9 +99,16 @@ func (all targets) readMarkers(scoped bool) {
 		id := canonicalTarget("github:" + owner["repo"])
 		app := owner["path"]
 		name := filepath.Base(app)
-		if id == "" || (scoped && all[id] == nil) ||
-			app != filepath.Join(applicationsDir, name) || name == ".app" || name == "..app" ||
-			!strings.HasSuffix(name, ".app") || !safeText(app) || !safeText(owner["bundle_id"]) ||
+		if id == "" || (scoped && all[id] == nil) || !filepath.IsAbs(app) || !strings.HasSuffix(name, ".app") {
+			continue
+		}
+		// Removal indexes schema-valid markers before validating their on-disk ownership.
+		// Their aliases can be ambiguous even when the marker cannot be offered.
+		record := target{aliases: map[string]bool{strings.ToLower(id): true, strings.ToLower(strings.TrimSuffix(name, ".app")): true}}
+		record.addAliases(id)
+		record.indexAliases(index, id)
+		if app != filepath.Join(applicationsDir, name) || name == ".app" || name == "..app" ||
+			!safeText(app) || !safeText(owner["bundle_id"]) ||
 			file.Name() != fmt.Sprintf("%x.json", sha256.Sum256([]byte(name))) {
 			continue
 		}
@@ -109,8 +124,9 @@ func (all targets) readMarkers(scoped bool) {
 		// drops the declaration or the bundle is no longer on disk.
 		t := all.ensure(id)
 		t.app = true
-		t.addAliases(id)
-		t.aliases[strings.ToLower(strings.TrimSuffix(name, ".app"))] = true
+		for alias := range record.aliases {
+			t.aliases[alias] = true
+		}
 	}
 }
 
@@ -135,16 +151,14 @@ func removalTargets(root, prefix string, used map[string]bool, values map[string
 			}
 		}
 	}
+	index := make(map[string][]string)
 	if !used["scope"] || len(all) > 0 {
-		all.readMarkers(used["scope"])
+		all.readMarkers(used["scope"], index)
 	}
 
-	index := make(map[string][]string)
 	for id, t := range all {
 		t.aliases[strings.ToLower(id)] = true
-		for alias := range t.aliases {
-			index[alias] = append(index[alias], id)
-		}
+		t.indexAliases(index, id)
 	}
 	resolve := func(word string) string {
 		id := canonicalTarget(word)

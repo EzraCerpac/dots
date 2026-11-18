@@ -43,10 +43,13 @@ if args[:2] != ["internal", "shell-complete"]:
     raise SystemExit
 
 words = args[2:]
+if words[:2] == ["remove", "--path"] and len(words) == 3:
+    print(":files")
+    raise SystemExit
 if len(words) > 2:
     raise SystemExit
 if words[0] == "file":
-    print(":files")
+    print(":files=" if words[-1].startswith("--path=") else ":files")
 elif words[0] == "dir":
     print(":dirs")
 else:
@@ -71,6 +74,8 @@ class ShellCompletions(unittest.TestCase):
             dots = root / "dots"
             dots.write_text(f"#!{sys.executable}\n" + MOCK)
             dots.chmod(0o755)
+            (root / "-draft=prod").mkdir()
+            (root / "-draft=prod/config.toml").touch()
             (root / "env=prod").mkdir()
             (root / "env=prod/config.toml").touch()
             (root / "config\tlocal.toml").touch()
@@ -192,6 +197,13 @@ class ShellCompletions(unittest.TestCase):
                 self.assert_completion(shell, b"dots file --path=env=prod/con\t",
                                        ["file", "--path=env=prod/con"],
                                        ["file", "--path=env=prod/config.toml"])
+
+    def test_separate_option_shaped_filename(self):
+        for shell in SHELL_FILES:
+            with self.subTest(shell=shell):
+                self.assert_completion(shell, b"dots remove --path -draft=prod/con\t",
+                                       ["remove", "--path", "-draft=prod/con"],
+                                       ["remove", "--path", "-draft=prod/config.toml"])
 
     def test_bash_preserves_tab_in_filename(self):
         self.assert_completion("bash", b"dots file config\t", ["file", "config"], ["file", "config\tlocal.toml"])

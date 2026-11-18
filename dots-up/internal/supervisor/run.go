@@ -264,8 +264,7 @@ func Run(opts Options) int {
 			return
 		}
 		// An owned group can still hold the output or event pipe after its leader exits.
-		if childFinished && (!backend.processGroup || (eventFinished && outputFinished) ||
-			syscall.Kill(-backend.command.Process.Pid, 0) != nil) {
+		if childFinished && (!backend.processGroup || errors.Is(syscall.Kill(-backend.command.Process.Pid, 0), syscall.ESRCH)) {
 			return
 		}
 		waitCancellation = cancelBackend(backend)
@@ -599,6 +598,11 @@ func Run(opts Options) int {
 			if !ok {
 				eventFinished = true
 				eventInput = nil
+				// readEvents sends any final diagnostic before it closes backendEvents.
+				select {
+				case backendError = <-eventErr:
+				default:
+				}
 				continue
 			}
 			handleEvent(e)
@@ -749,6 +753,12 @@ func Run(opts Options) int {
 		}
 	}
 
+	// EOF and a queued signal can become ready in the same iteration.
+	select {
+	case <-interrupts:
+		requestCancel()
+	default:
+	}
 	if terminalState != nil {
 		_ = stopRelay()
 	}
@@ -794,7 +804,11 @@ func Run(opts Options) int {
 	emit(runEnd)
 	reportSaved := false
 	if files != nil {
-		reportSaved = files.finish(exitCode, profile, host, time.Now()) == nil
+		if err := files.finish(exitCode, profile, host, time.Now()); err != nil {
+			fmt.Fprintf(os.Stderr, "dots %s: could not finalize report: %v\n", opts.Command, err)
+		} else {
+			reportSaved = true
+		}
 	}
 	if events != nil {
 		close(events)
@@ -1341,7 +1355,9 @@ func cancelBackend(b *backend) func() {
 			return true
 		}
 	}
-	_ = kill(syscall.SIGINT)
+	if err := kill(syscall.SIGINT); errors.Is(err, syscall.EPERM) {
+		fmt.Fprintln(os.Stderr, "dots: permission denied signalling the command; its processes may still be running")
+	}
 	go func() {
 		defer close(done)
 		if graceElapsed(150*time.Millisecond) && kill(syscall.SIGTERM) == nil && graceElapsed(500*time.Millisecond) {

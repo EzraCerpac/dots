@@ -215,7 +215,7 @@ sh -c '
     trap "" INT TERM
     while kill -0 "$1" 2>/dev/null; do sleep 0.01; done
     printf "%s\n" "$$"
-    exec sleep 3
+    exec sleep 10
 ' sh "$$" &
 exit 0
 `)

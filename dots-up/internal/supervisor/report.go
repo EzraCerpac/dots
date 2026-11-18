@@ -401,11 +401,11 @@ func printStatusEvent(e ui.Event) {
 		if name == "" {
 			name = "up"
 		}
-		fmt.Printf("dots %s · %s · %s\n", name, e.Profile, e.Host)
+		fmt.Printf("dots %s · %s · %s\n", ui.CleanLine(name), ui.CleanLine(e.Profile), ui.CleanLine(e.Host))
 	case "item_upsert":
-		fmt.Printf("  %s · %s  %s — %s\n", e.Group, e.Label, e.Status, e.Summary)
+		fmt.Printf("  %s · %s  %s — %s\n", ui.CleanLine(e.Group), ui.CleanLine(e.Label), ui.CleanLine(e.Status), ui.CleanLine(e.Summary))
 		if e.Action != "" && e.Status != "ok" && e.Status != "skipped" {
-			fmt.Printf("    %s\n", e.Action)
+			fmt.Printf("    %s\n", ui.CleanLine(e.Action))
 		}
 	}
 }

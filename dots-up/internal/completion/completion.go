@@ -176,9 +176,6 @@ func suggest(words []string, root string) (string, candidates) {
 	endOptions := false
 	var pending option
 	for _, word := range words {
-		if !safeText(word) {
-			return "", nil
-		}
 		if pending.name != "" {
 			if word == "" {
 				return "", nil

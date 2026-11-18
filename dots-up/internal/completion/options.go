@@ -132,6 +132,9 @@ func addOptions(result candidates, options []option, used map[string]bool) {
 func optionValues(flag option, root, lead, prefix string) (string, candidates) {
 	switch flag.value {
 	case ":files", ":dirs":
+		if lead != "" {
+			return flag.value + "=", nil
+		}
 		return flag.value, nil
 	case "profile", "part":
 		var names []string

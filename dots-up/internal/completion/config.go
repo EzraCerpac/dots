@@ -75,6 +75,8 @@ func miseBinary() string {
 	return binary
 }
 
+var configProbeTimeout = 1200 * time.Millisecond
+
 func activeConfigs(root string) []string {
 	binary := miseBinary()
 	if binary == "" {
@@ -88,7 +90,7 @@ func activeConfigs(root string) []string {
 	}
 	defer os.RemoveAll(scratch)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), configProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "-C", root, "config", "ls", "--json")
 	cmd.Dir = root

@@ -38,7 +38,7 @@ def stage_start(id, group, label, handoff=False):
 
 def stage_end(id, label, code, state=None, summary=None, action="", detail=""):
     state = state or ("ok" if code == 0 else "attention" if code == 3 else "failed")
-    if state != "ok" and not action:
+    if state in ("failed", "attention") and not action:
         action = f"Review the command output and rerun {shlex.join(['dots', command, *arguments])}."
     emit("stage_end", id=id, label=label, status=state, exit_code=code, summary=summary or ("completed" if code == 0 else f"exit {code}"), action=action, detail=detail)
     return state
@@ -230,7 +230,9 @@ def main():
                 # The producer emitted its own stage result and typed issues.
                 state, code = ("attention" if code == 3 else "ok"), 0
             else:
-                stage_end(command, command, code)
+                if code == 130:
+                    state = "cancelled"
+                stage_end(command, command, code, state=state)
     except KeyboardInterrupt:
         code, state = 130, "cancelled"
     except (OSError, RuntimeError) as error:

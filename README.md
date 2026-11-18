@@ -61,6 +61,7 @@ For mise, release archives, or a Homebrew shell that does not load completions a
 | Zsh | `~/.zshrc`, after `compinit` | `source <(dots completions zsh)` |
 | Bash | `~/.bashrc` | `eval "$(dots completions bash)"` |
 
+For a Bash login shell, source `~/.bashrc` from your Bash login profile or put the loader in that profile.
 Each new shell loads completions from the active release.
 From a source checkout, build `bin/dots-up` as shown above.
 Try `dots remove ` followed by Tab to see managed tools, packages and apps.

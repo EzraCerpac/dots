@@ -56,10 +56,10 @@ _dots_complete() {
     local reply value native_paths=0 file_prefix='' file_word=$word
     reply=$(MISE_SAFE=1 MISE_NO_ENV=1 MISE_NO_HOOKS=1 MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_AUTO_UPDATE=0 command dots internal shell-complete "${words[@]:1}" "$word" 2>/dev/null) || return
     case $reply in
-        :files|:dirs)
+        :files|:dirs|:files=|:dirs=)
             native_paths=1
-            if [[ $word == -*=* ]]; then file_prefix=${word%%=*}=; file_word=${word#*=}; fi
-            if [[ $reply == :dirs ]]; then reply=$(compgen -d -- "$file_word")
+            if [[ $reply == *= ]]; then file_prefix=${word%%=*}=; file_word=${word#*=}; fi
+            if [[ $reply == :dirs* ]]; then reply=$(compgen -d -- "$file_word")
             else reply=$(compgen -f -- "$file_word"); fi ;;
     esac
     while IFS= read -r value; do

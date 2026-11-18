@@ -90,7 +90,7 @@ func Run(events <-chan Event, control io.Writer, stateDir string, noWait bool) e
 				sawEnd = true
 			}
 			if e.Kind == "run_start" && e.Command != "" {
-				command = cleanLine(e.Command)
+				command = CleanLine(e.Command)
 			}
 			switch {
 			case e.Kind == "stage_start" && e.Terminal == "handoff":

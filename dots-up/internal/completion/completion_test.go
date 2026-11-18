@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture(t *testing.T, root, name, body string, mode os.FileMode) {
@@ -32,7 +33,7 @@ func response(t *testing.T, root string, words ...string) []string {
 		if line == "" {
 			continue
 		}
-		if line == ":files" || line == ":dirs" {
+		if strings.TrimSuffix(line, "=") == ":files" || strings.TrimSuffix(line, "=") == ":dirs" {
 			result = append(result, line)
 			continue
 		}
@@ -80,7 +81,7 @@ func TestCommandGrammar(t *testing.T) {
 		{[]string{"add", "npm:prettier", "ca"}, []string{"cargo:"}},
 		{[]string{"add", "--asset", ""}, nil},
 		{[]string{"uninstall", "--profile=la"}, []string{"--profile=laptop"}},
-		{[]string{"uninstall", "--path=./set"}, []string{":files"}},
+		{[]string{"uninstall", "--path=./set"}, []string{":files="}},
 		{[]string{"init", ""}, []string{":dirs"}},
 		{[]string{"init", "dir", ""}, nil},
 		{[]string{"remote", "host", "--identity-file", ""}, []string{":files"}},
@@ -120,6 +121,8 @@ ignored = "latest"
 `, 0600)
 	fixture(t, root, "config.server.toml", "[tools]\nserver = 'latest'\n", 0600)
 	fixture(t, caller, "chosen.toml", "[tools]\nchosen = { version = 'latest' }\n", 0600)
+	fixture(t, caller, "chosen\tlocal.toml", "[tools]\nripgrep = 'latest'\n", 0600)
+	expect(t, root, []string{"remove", "--path", "chosen\tlocal.toml", "rip"}, []string{"ripgrep"})
 	fixture(t, caller, "trailing.toml", "[tools]\n'github:Owner/Widget/' = 'latest'\n", 0600)
 	expect(t, root, []string{"remove", "--path", "trailing.toml", "wid"}, nil)
 	fixture(t, caller, "broken.toml", "[tools]\nbroken = {\n", 0600)
@@ -156,6 +159,10 @@ printf '%s\n' "$COMPLETION_PROBE_OUTPUT"
 }
 
 func TestActiveRemoveAndOwnership(t *testing.T) {
+	// This test checks the discovered targets, independent of host load at shell startup.
+	oldTimeout := configProbeTimeout
+	configProbeTimeout = 10 * time.Second
+	t.Cleanup(func() { configProbeTimeout = oldTimeout })
 	root := t.TempDir()
 	// On macOS the temp directory can be reached through symlinked prefixes.
 	root, err := filepath.EvalSymlinks(root)
@@ -210,6 +217,8 @@ func TestActiveRemoveAndOwnership(t *testing.T) {
 	expect(t, root, []string{"remove", "https://github.com/OWNER/widget.git", "Wid"}, nil)
 	expect(t, root, []string{"remove", "--base", "stand"}, nil)
 	expect(t, root, []string{"remove", "--base", ""}, []string{"node"})
+	app("other/widget", "Stale Widget.app", "invalid.json")
+	expect(t, root, []string{"remove", "wid"}, []string{"github:owner/widget"})
 	log, err := os.ReadFile(os.Getenv("COMPLETION_PROBE_LOG"))
 	if err != nil || string(log) != "-C\n"+root+"\nconfig\nls\n--json\n" {
 		t.Fatalf("unexpected probe call %q (%v)", log, err)

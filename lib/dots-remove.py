@@ -156,7 +156,7 @@ def discover(paths):
     return declarations
 
 
-def resolve(targets, declarations, records):
+def resolve(targets, declarations, records, *, allow_app_hint=True):
     index = {}
     for identity, entries in declarations.items():
         for entry in entries:
@@ -180,6 +180,8 @@ def resolve(targets, declarations, records):
             close = difflib.get_close_matches(name.casefold(), index, n=max(1, len(index)), cutoff=0.8)
             suggestions = {identity for alias in close for identity in index[alias]}
             if len(suggestions) == 1 and held_by(suggestion := suggestions.pop()) is None:
+                if suggestion.startswith("github:") and not allow_app_hint:
+                    raise ValueError(message)
                 if ":" not in suggestion and len(index[suggestion.casefold()]) > 1:
                     suggestion = f"mise:{suggestion}"
                 message += f". Did you mean {suggestion!r}?"
@@ -412,7 +414,7 @@ def main(argv=None):
     if args.path or args.base or args.profile:
         records = {key: value for key, value in records.items() if key in declarations}
     try:
-        identities = resolve(args.targets, declarations, records)
+        identities = resolve(args.targets, declarations, records, allow_app_hint=args.keep_installed or not ownership_errors)
     except ValueError:
         if ownership_errors and not args.keep_installed and any(target.startswith(("github:", "https://")) for target in args.targets):
             raise ValueError("unknown managed app ownership; refusing removal: " + "; ".join(ownership_errors)) from None

@@ -4,9 +4,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 
 const MINIMAL: &str = "[vars]\ndots_profiles = \"laptop server\"\n";
 
@@ -41,8 +41,8 @@ const MISE_DIRS: &[(&str, &str)] = &[
     ("MISE_SHARED_INSTALL_DIRS", "shared-installs"),
 ];
 
-fn isolate(world: &World, command: &mut Command) {
-    let base = world.root().parent().unwrap();
+fn isolate(world: &World, command: &mut FixtureCommand<'_>) {
+    let base = world.base();
     let private = world.home().join("mise-fixture");
     for dir in ["codex", "claude", "tmp", "bin"] {
         fs::create_dir_all(private.join(dir)).unwrap();
@@ -52,10 +52,14 @@ fn isolate(world: &World, command: &mut Command) {
         fs::create_dir_all(&dir).unwrap();
         command.env(key, dir);
     }
+    let guard_file = private.join("guard.sh");
+    let guarded_exec = private.join("guarded-exec");
     command
         .env_remove("__MISE_DIFF")
         .env("P05_FIXTURE_BASE", base)
         .env("P05_MISE_DIRS", &private)
+        .env("P05_FIXTURE_GUARD", &guard_file)
+        .env("P05_GUARDED_EXEC", &guarded_exec)
         .env("MISE_CONFIG_DIR", world.root())
         .env("MISE_CEILING_PATHS", base)
         .env("CODEX_HOME", private.join("codex"))
@@ -70,58 +74,74 @@ fn isolate(world: &World, command: &mut Command) {
     if let Some(real) = program("mise") {
         command.env("P05_REAL_MISE", real);
     }
-    // Quiet selection validation reconstructs part of mise's environment. Check
-    // the remaining values at the executable boundary before running real mise.
-    let mut wrapper = String::from(
-        r#"#!/bin/sh
-set -eu
-unset __MISE_DIFF
+    // FixtureCommand checks the initial launch. Recheck private paths where a
+    // nested mise invocation or callback is about to execute.
+    let mut guard = String::from(
+        r#"unset __MISE_DIFF
+outside_fixture() {
+    echo "bootstrap fixture path escaped isolation" >&2
+    exit 97
+}
 private_path() {
+    case "$1" in */../*|*/..) outside_fixture ;; esac
     case "$1" in
-        "$P05_FIXTURE_BASE"/*) ;;
-        *) echo "bootstrap fixture directory escaped isolation" >&2; exit 97 ;;
+        "$P05_FIXTURE_BASE"|"$P05_FIXTURE_BASE"/*) ;;
+        *) outside_fixture ;;
+    esac
+    probe=$1
+    while [ ! -d "$probe" ]; do
+        [ ! -L "$probe" ] || outside_fixture
+        probe=${probe%/*}
+    done
+    physical=$(CDPATH='' cd -P "$probe" && pwd -P) || outside_fixture
+    case "$physical" in
+        "$P05_FIXTURE_BASE"|"$P05_FIXTURE_BASE"/*) ;;
+        *) outside_fixture ;;
     esac
 }
-for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$TMPDIR"; do
+for path in "$(pwd -P)" "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$TMPDIR"; do
     private_path "$path"
+done
+for path in "${MISE_CONFIG_FILE:-}" "${MISE_GLOBAL_CONFIG_FILE:-}" "${MISE_SYSTEM_CONFIG_FILE:-}"; do
+    if [ -n "$path" ]; then private_path "$path"; fi
 done
 "#,
     );
     for (key, dir) in MISE_DIRS {
         use std::fmt::Write as _;
         writeln!(
-            wrapper,
+            guard,
             r#": "${{{key}:=$P05_MISE_DIRS/{dir}}}"
 export {key}
 private_path "${key}""#
         )
         .unwrap();
     }
-    wrapper.push_str("exec \"$P05_REAL_MISE\" \"$@\"\n");
+    write(&guard_file, &guard, 0o600);
+    write(
+        &guarded_exec,
+        "#!/bin/sh\nset -eu\n. \"$P05_FIXTURE_GUARD\"\nexec \"$@\"\n",
+        0o755,
+    );
     let mise = private.join("bin/mise");
-    write(&mise, &wrapper, 0o755);
+    write(
+        &mise,
+        "#!/bin/sh\nset -eu\n. \"$P05_FIXTURE_GUARD\"\nexec \"$P05_REAL_MISE\" \"$@\"\n",
+        0o755,
+    );
     command
         .env("DOTS_MISE_BIN", &mise)
         .env("SETUP_MISE_BIN", mise);
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     isolate(world, &mut command);
     command
 }
 
-fn age_keygen(world: &World, program: &Path) -> Command {
-    let mut command = Command::new(program);
-    let inherited = world.dots();
-    command
-        .env_clear()
-        .envs(
-            inherited
-                .get_envs()
-                .filter_map(|(key, value)| value.map(|value| (key, value))),
-        )
-        .current_dir(world.root());
+fn fixture_command<'a>(world: &'a World, program: &Path) -> FixtureCommand<'a> {
+    let mut command = world.command(program);
     isolate(world, &mut command);
     command
 }
@@ -131,6 +151,7 @@ fn test_mise(world: &World) -> PathBuf {
     write(
         &fake,
         r#"#!/bin/sh
+. "$P05_FIXTURE_GUARD"
 if [ "$1" = "--quiet" ]; then exec "$REAL_MISE" "$@"; fi
 while [ "$1" = "-C" ] || [ "$1" = "-E" ]; do shift 2; done
 case "$*" in
@@ -172,7 +193,7 @@ exit 0
     fake
 }
 
-fn fake(world: &World) -> Command {
+fn fake(world: &World) -> FixtureCommand<'_> {
     let mut command = dots(world);
     let base_mise = world.home().join("mise-fixture/bin/mise");
     let fake = test_mise(world);
@@ -196,7 +217,7 @@ fn legacy(world: &World) -> bool {
         .success()
 }
 
-fn complete(world: &World) -> Command {
+fn complete(world: &World) -> FixtureCommand<'_> {
     let mut command = fake(world);
     command.args(if legacy(world) {
         ["internal", "complete"]
@@ -212,7 +233,7 @@ fn minimal(world: &World) {
 }
 
 fn hook(world: &World, name: &str, body: &str, mode: u32) {
-    let script = format!("#!/bin/sh\nset -eu\n{body}\n");
+    let script = format!("#!/bin/sh\nset -eu\n. \"$P05_FIXTURE_GUARD\"\n{body}\n");
     write(
         &world.root().join("dots/hooks/bootstrap.d").join(name),
         &script,
@@ -220,7 +241,7 @@ fn hook(world: &World, name: &str, body: &str, mode: u32) {
     );
 }
 
-fn run(command: &mut Command) -> Output {
+fn run(command: &mut FixtureCommand<'_>) -> Output {
     command.output().unwrap()
 }
 
@@ -487,17 +508,14 @@ fn new_native_failure_says_complete_did_not_run() {
 fn new_remote_uses_literal_url_and_rejects_a_git_rewrite() {
     let world = World::new();
     minimal(&world);
-    let bin = world.home().join("bin");
+    let bin = world.home().join("mise-fixture/bin");
     write(&bin.join("ssh"), "#!/bin/sh\nexit 92\n", 0o755);
-    let mut paths = vec![bin];
-    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    let path = env::join_paths(paths).unwrap();
     write(
         &world.root().join("config.toml"),
         &format!("{MINIMAL}dots_source_repo = \"https://example.invalid/dotfiles\"\n"),
         0o644,
     );
-    let output = run(fake(&world).env("PATH", &path).args([
+    let output = run(fake(&world).args([
         "remote",
         "fixture.invalid",
         "--profile",
@@ -523,7 +541,7 @@ fn new_remote_uses_literal_url_and_rejects_a_git_rewrite() {
         "https://example.invalid/",
     ]));
     assert_success(&rewrite);
-    let rejected = run(fake(&world).env("PATH", &path).args([
+    let rejected = run(fake(&world).args([
         "remote",
         "fixture.invalid",
         "--profile",
@@ -601,9 +619,9 @@ fn unchanged_bundle_round_trip_is_encrypted_and_exclusive() {
     };
     let world = World::new();
     let identity = world.home().join("age-keys");
-    let generated = run(age_keygen(&world, &keygen).arg("-o").arg(&identity));
+    let generated = run(fixture_command(&world, &keygen).arg("-o").arg(&identity));
     assert_success(&generated);
-    let public = run(age_keygen(&world, &keygen).arg("-y").arg(&identity));
+    let public = run(fixture_command(&world, &keygen).arg("-y").arg(&identity));
     assert_success(&public);
     let recipient = stdout(&public).trim();
     let input = world.home().join("private.json");
@@ -673,6 +691,7 @@ DOTS_RESTORED = "1"
         &world.root().join("dots/exceptions/fixture-recipe"),
         r#"#!/bin/sh
 set -eu
+. "$P05_FIXTURE_GUARD"
 test "$#" = 1
 test "$1" = --install-only
 test -z "${DOTS_BUNDLE_FD+x}"
@@ -683,11 +702,12 @@ exit 4
 "#,
         0o755,
     );
-    let bin = world.home().join("bin");
+    let bin = world.home().join("mise-fixture/bin");
     let age = bin.join("age");
     write(
         &age,
         r#"#!/bin/sh
+. "$P05_FIXTURE_GUARD"
 [ "$1" = --decrypt ] && [ -f "$3" ] && [ -f "$5" ] || exit 91
 printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"}}'
 "#,
@@ -715,15 +735,7 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
         "fixture ciphertext",
         0o600,
     );
-    let mut command = fake(&world);
-    let path = command
-        .get_envs()
-        .find(|(name, _)| *name == "PATH")
-        .and_then(|(_, value)| value)
-        .unwrap();
-    let path = env::join_paths(std::iter::once(bin).chain(env::split_paths(path))).unwrap();
-    let mut child = command
-        .env("PATH", path)
+    let mut child = fake(&world)
         .env("NATIVE_FIXTURE_CALLBACK", world.dots().get_program())
         .env("FIXTURE_REAL_EXEC", "1")
         .current_dir(world.home())
@@ -780,7 +792,7 @@ fn new_pre_dotfiles_persists_selection_through_mise_x_before_tools() {
     let config = format!(
         r#"{MINIMAL}
 [bootstrap.hooks]
-pre-dotfiles = 'test "$MISE_HISTORY_ENABLED" = 0 && test ! -e "$HOME/applied" && SETUP_PROFILE=laptop "$DOTS_MISE_BIN" x -- dots bootstrap persist-selected'
+pre-dotfiles = 'test "$MISE_HISTORY_ENABLED" = 0 && test ! -e "$HOME/applied" && SETUP_PROFILE=laptop "$DOTS_MISE_BIN" x -- "$P05_GUARDED_EXEC" dots bootstrap persist-selected'
 [dotfiles]
 "~/applied" = {{ source = "input", mode = "copy" }}
 "~/tracked" = {{ mode = "track" }}
@@ -925,13 +937,11 @@ fn new_bootstrap_creates_only_a_missing_machine_key_after_recovery_is_ready() {
         &format!("{MINIMAL}dots_state_repo = \"file:///fixture-history\"\n"),
         0o644,
     );
-    let bin = world.home().join("bin");
-    let mut paths = vec![bin.clone()];
-    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
-    let path = env::join_paths(paths).unwrap();
+    let bin = world.home().join("mise-fixture/bin");
     write(
         &bin.join("age-keygen"),
         r#"#!/bin/sh
+. "$P05_FIXTURE_GUARD"
 case "${1-}" in
     -y) [ -f "$2" ] || exit 91; printf '%s\n' age1fixture-public | tr -d '-' ;;
     "") printf '%s\n' AGE-SECRET-KEY-FIXTURE-ONLY; printf 'generated\n' >> "$HOME/generation";;
@@ -943,11 +953,7 @@ esac
     let recovery = world.home().join("recovery-key");
     let key = world.home().join(".config/age/keys.txt");
     let generation = world.home().join("generation");
-    let complete = || {
-        run(complete(&world)
-            .env("PATH", &path)
-            .env("SETUP_AGE_IDENTITY", &recovery))
-    };
+    let complete = || run(complete(&world).env("SETUP_AGE_IDENTITY", &recovery));
     let missing = complete();
     assert!(
         stdout(&missing).contains("deferred: Encrypted local history"),
@@ -1112,6 +1118,7 @@ fn new_cancelled_bundle_probe_keeps_its_streams_private() {
     write(
         &world.home().join("mise-fixture/bin/age"),
         r#"#!/bin/sh
+. "$P05_FIXTURE_GUARD"
 printf "synthetic-capture-sensitive-marker\n"
 printf "synthetic-capture-sensitive-marker\n" >&2
 touch "$HOME/probe-ready"
@@ -1192,8 +1199,8 @@ fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
     }
     let key = |name: &str| {
         let path = world.home().join(name);
-        assert_success(&run(age_keygen(&world, &keygen).arg("-o").arg(&path)));
-        let recipient = run(age_keygen(&world, &keygen).arg("-y").arg(&path));
+        assert_success(&run(fixture_command(&world, &keygen).arg("-o").arg(&path)));
+        let recipient = run(fixture_command(&world, &keygen).arg("-y").arg(&path));
         assert_success(&recipient);
         (path, stdout(&recipient).trim().to_owned())
     };
@@ -1217,7 +1224,7 @@ fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
         0o640,
     );
     let seed_mise = seed.home().join("mise-fixture/bin/mise");
-    assert_success(&run(age_keygen(&seed, &seed_mise)
+    assert_success(&run(fixture_command(&seed, &seed_mise)
         .env("MISE_TRUSTED_CONFIG_PATHS", seed.root())
         .env("MISE_ENV", "laptop,host-fixture-host")
         .args(["bootstrap", "dotfiles", "save"])));
@@ -1256,7 +1263,7 @@ fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
     );
 
     let ciphertext = world.home().join("bootstrap.age");
-    let mut encrypt = age_keygen(&world, &age)
+    let mut encrypt = fixture_command(&world, &age)
         .args(["-r", &bundle_key, "-o"])
         .arg(&ciphertext)
         .stdin(Stdio::piped())
@@ -1306,15 +1313,11 @@ command = "false"
         &wrapper,
         r#"#!/bin/sh
 set -eu
-unset __MISE_DIFF
-for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR"; do
-    case "$path" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
-done
+. "$P05_FIXTURE_GUARD"
 printf '%s\n' "$*" >> "$HOME/native-calls"
 case "$1 ${2-} ${3-}" in
     'bootstrap services apply')
         [ "$#" -eq 4 ] && [ "$4" = '--yes' ] && [ "$MISE_HISTORY_ENABLED" = 0 ] || exit 95
-        case "$MISE_GLOBAL_CONFIG_FILE" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
         test ! -s "$MISE_SYSTEM_CONFIG_FILE"
         cp "$MISE_GLOBAL_CONFIG_FILE" "$HOME/scoped-services.toml"
         exit 0
@@ -1350,10 +1353,7 @@ exec "$P05_MISE_DIRS/bin/mise" "$@"
         &callback,
         r#"#!/bin/sh
 set -eu
-unset __MISE_DIFF
-for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR" "$MISE_STATE_DIR"; do
-    case "$path" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
-done
+. "$P05_FIXTURE_GUARD"
 test ! -d "$MISE_STATE_DIR/history/repo.git"
 exec "$P05_DOTS" bootstrap complete
 "#,
@@ -1418,7 +1418,7 @@ exec "$P05_DOTS" bootstrap complete
     );
     assert_eq!(fs::read(&recovery).unwrap(), recovery_before);
     assert_eq!(fs::read(&bundle_identity).unwrap(), bundle_before);
-    let machine_recipient = run(age_keygen(&world, &keygen).arg("-y").arg(&machine));
+    let machine_recipient = run(fixture_command(&world, &keygen).arg("-y").arg(&machine));
     assert_success(&machine_recipient);
     let local = fs::read_to_string(world.root().join("config.local.toml")).unwrap();
     let config = local.parse::<toml_edit::DocumentMut>().unwrap();

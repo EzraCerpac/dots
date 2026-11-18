@@ -1,0 +1,64 @@
+#!/bin/sh
+set -eu
+cd "$DOTS_ROOT"
+while [ "$#" -gt 0 ]; do
+    case "$1" in -C|-E) shift 2;; --quiet) shift;; *) break;; esac
+done
+case "${1-}" in
+    exec)
+        shift
+        [ "$1" != "--" ] || shift
+        exec "$@"
+        ;;
+    config)
+        case "$2" in
+            ls) printf '[]\n' ;;
+            get)
+                for last; do :; done
+                case "$last" in
+                    vars.dots_profiles) printf 'laptop\n' ;;
+                    *) exit 1 ;;
+                esac
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    which)
+        case "$2" in jq) command -v jq ;; *) exit 1 ;; esac
+        ;;
+    ls)
+        if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
+        if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
+        ;;
+    install) printf 'install tools\n' >> calls; : > installed ;;
+    upgrade) printf '%s\n' "$*" >> calls ;;
+    settings)
+        printf '{"system_packages":{"managers":null}}\n'
+        ;;
+    bootstrap)
+        case "$2:$3" in
+            dotfiles:paths)
+                printf 'checkpoint inventory\n' >> calls
+                [ ! -f fail-checkpoint ] || exit 8
+                printf '{"entries":[]}\n'
+                ;;
+            dotfiles:save) printf 'checkpoint save\n' >> calls ;;
+            packages:status)
+                if [ -f packages.json ]; then cat packages.json; else printf '{}\n'; fi
+                ;;
+            packages:apply|packages:upgrade)
+                shift 2
+                printf 'packages %s\n' "$*" >> calls
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    --version)
+        [ ! -f fail-version ] || exit 8
+        if [ -f updated ]; then printf '2026.11.9 macos-x64\n'; else printf '2026.11.8 macos-x64\n'; fi
+        ;;
+    self-update)
+        if [ "$2" != "--help" ]; then printf 'self-update\n' >> calls; : > updated; fi
+        ;;
+    *) exit 1 ;;
+esac

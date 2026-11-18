@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+cd "$DOTS_ROOT"
+case "$1" in
+    --prefix) printf '/usr/local\n' ;;
+    list)
+        [ -f brew-version ] || exit 1
+        if [ "$2" = "--versions" ]; then
+            printf 'fixture %s\n' "$(cat brew-version)"
+        fi
+        ;;
+    install) printf '1\n' > brew-version ;;
+    outdated) if [ -f brew-outdated ]; then printf 'fixture\n'; fi ;;
+    upgrade)
+        [ ! -f brew-failed ] || exit 8
+        printf '2\n' > brew-version
+        ;;
+    *) exit 1 ;;
+esac

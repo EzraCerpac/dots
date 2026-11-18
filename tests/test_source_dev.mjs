@@ -439,6 +439,21 @@ test('offline work is queued as origin/dev..dev and pushed next time', available
   assert.equal(f.remote(), f.dev(f.a));
 });
 
+test('the offline count includes the local snapshot recorded during checkout', available, t => {
+  const f = fixture(t);
+  f.write(f.b, 'upstream', 'updated remotely\n');
+  f.sync(f.b);
+  git(f.a, 'fetch', '-q', 'origin', 'dev');
+  git(f.a, 'update-ref', 'refs/heads/dev', f.remote());
+  f.write(f.a, 'local', 'queued offline\n');
+  fs.renameSync(f.origin, f.origin + '.offline');
+  const result = f.producer(f.a);
+  const count = Number(git(f.a, 'rev-list', '--count', 'dev', '^origin/dev', '^origin/main'));
+  assert.ok(count > 0);
+  assert.equal(result.issues.find(issue => issue.summary === 'Origin unreachable').detail,
+    `${count} unpushed commit${count === 1 ? '' : 's'}`);
+});
+
 test('a push race is merged and retried', available, t => {
   const f = fixture(t);
   const hook = path.join(f.a, '.git/hooks/pre-push');
@@ -494,6 +509,21 @@ test('sync publishes only dev even with push.followTags enabled', available, t =
   assert.match(f.sync(f.a).text, /· pushed /);
   assert.equal(f.remote(), f.dev(f.a));
   assert.equal(git(f.origin, 'tag', '--list'), '');
+});
+
+test('a retry leaves withdrawn remote history withdrawn', available, t => {
+  const f = fixture(t), original = f.remote();
+  f.write(f.b, 'upstream', 'first remote update\n');
+  f.sync(f.b);
+  const withdrawn = f.remote();
+  f.sync(f.a);
+  f.write(f.a, 'local', 'local edit\n');
+  prePush(f, `set -eu\nrm "$0"\ngit -C '${f.origin}' update-ref refs/heads/dev '${original}' '${withdrawn}'`);
+  const result = f.producer(f.a);
+  assert.match(result.issues[0].detail, /previously published history was removed/);
+  assert.equal(f.remote(), original);
+  assert.equal(git(f.a, 'show', 'dev:local'), 'local edit');
+  assert.deepEqual(result.groups.map(group => group.kind), ['saved']);
 });
 
 test('a rejected push keeps its reason without copying hook output to receipts or logs', available, t => {

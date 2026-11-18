@@ -29,7 +29,7 @@ impl Logs {
                     Ok(file) => diagnostic.file = Some(file),
                     Err(error) => {
                         self.warnings.push(warning(&error));
-                        diagnostic.path = None;
+                        diagnostic.incomplete();
                     }
                 }
             }
@@ -129,16 +129,15 @@ impl Logs {
         let Some((_, diagnostic)) = self.diagnostics.iter().find(|(key, _)| *key == id) else {
             return;
         };
-        issue.log = diagnostic.path.clone();
+        if !diagnostic.incomplete {
+            issue.log = diagnostic.path.clone();
+        }
         issue.tail = diagnostic.tail();
     }
 
-    pub(super) fn replay(&self, id: StageId) -> Option<(PathBuf, bool)> {
+    pub(super) fn replay(&self, id: StageId) -> Option<PathBuf> {
         let (_, diagnostic) = self.diagnostics.iter().find(|(key, _)| *key == id)?;
-        Some((
-            diagnostic.path.clone()?,
-            diagnostic.tail.last() != Some(&b'\n'),
-        ))
+        diagnostic.path.clone()
     }
 }
 
@@ -146,6 +145,7 @@ impl Logs {
 pub(super) struct Diagnostic {
     path: Option<PathBuf>,
     file: Option<File>,
+    incomplete: bool,
     tail: Vec<u8>,
     warning: Option<String>,
 }
@@ -153,7 +153,7 @@ pub(super) struct Diagnostic {
 impl Diagnostic {
     pub(super) fn incomplete(&mut self) {
         self.file = None;
-        self.path = None;
+        self.incomplete = true;
     }
 
     pub(super) fn record(&mut self, bytes: &[u8]) {

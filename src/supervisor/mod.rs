@@ -33,6 +33,7 @@ const KILL_AFTER: Duration = Duration::from_millis(650);
 const OWNED_DRAIN_IDLE: Duration = Duration::from_secs(30);
 const DRAIN_AFTER_KILL: Duration = Duration::from_millis(250);
 const GROUP_CHECK_TICK: Duration = Duration::from_millis(50);
+const PROBE_STOP_CHECK_TICK: Duration = Duration::from_millis(100);
 const GROUP_RETIRE_GRACE: Duration = Duration::from_secs(1);
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -483,6 +484,7 @@ impl<'a> Supervisor<'a> {
         state.refresh_signals();
         drop(state);
         drop(launch);
+        let probe = matches!(placement, Placement::Probe) && !fragment;
         let mut running = Running {
             supervisor: self,
             child,
@@ -490,7 +492,9 @@ impl<'a> Supervisor<'a> {
             entry,
             job_control,
             budget: None,
-            probe: matches!(placement, Placement::Probe) && !fragment,
+            probe,
+            probe_stop_check: (probe && terminal::controlling_terminal().is_some())
+                .then(Instant::now),
             leader_exit: None,
             last_output: Instant::now(),
             group_cleanup: None,
@@ -578,19 +582,19 @@ impl<'a> Supervisor<'a> {
     pub(crate) fn replay_alongside(&self, id: StageId, output: &mut impl Write) -> io::Result<()> {
         if matches!(self.mode, Mode::Up { verbose: true, .. }) {
             let replay = self.logs.lock().unwrap().replay(id);
-            if let Some((path, needs_newline)) = replay {
+            if let Some(path) = replay {
                 let mut log = File::open(path)?;
                 let mut bytes = [0; 8192];
-                let mut shown = false;
+                let mut last = None;
                 while !self.cancelled() {
                     let count = log.read(&mut bytes)?;
                     if count == 0 {
                         break;
                     }
                     output.write_all(&bytes[..count])?;
-                    shown = true;
+                    last = Some(bytes[count - 1]);
                 }
-                if shown && needs_newline {
+                if last.is_some_and(|byte| byte != b'\n') {
                     output.write_all(b"\n")?;
                 }
             }
@@ -707,6 +711,7 @@ struct Running<'a> {
     job_control: bool,
     budget: Option<ProbeBudget>,
     probe: bool,
+    probe_stop_check: Option<Instant>,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_cleanup: Option<Instant>,
@@ -742,6 +747,16 @@ impl Running<'_> {
         let mut state = supervisor.state();
         let observation = self.observe(&mut state, self.job_control || self.probe)?;
         let exited = matches!(observation, Observed::Exited);
+        if state.cancel.is_none()
+            && (matches!(observation, Observed::Running) || exited && !drained)
+            && self.probe_group_stopped()?
+        {
+            // A launcher can block the job-control signal while its reader stops.
+            self.reserve_probe_foreground(&mut state)?;
+            drop(state);
+            self.handle_stop(libc::SIGTTIN)?;
+            return Ok(None);
+        }
         if let Some(budget) = &mut self.budget {
             budget.cancelled = state.cancel.is_some();
             if !budget.received && budget.shutdown.is_none() && !budget.cancelled {
@@ -801,19 +816,7 @@ impl Running<'_> {
                     if !matches!(signal, libc::SIGTTIN | libc::SIGTTOU) {
                         return Err(io::Error::other("probe stopped"));
                     }
-                    if state.children.iter().any(|child| child.foreground) {
-                        return Err(io::Error::other(
-                            "probe needs the terminal while another foreground command is active",
-                        ));
-                    }
-                    // Reserve the foreground before releasing admission.
-                    self.entry.foreground = true;
-                    state
-                        .children
-                        .iter_mut()
-                        .find(|child| child.pid == self.entry.pid)
-                        .unwrap()
-                        .foreground = true;
+                    self.reserve_probe_foreground(&mut state)?;
                 }
                 drop(state);
                 if acknowledge_stop(self.entry.pid)? {
@@ -953,6 +956,33 @@ impl Running<'_> {
             }
             self.entry.target = 0;
         }
+    }
+
+    fn probe_group_stopped(&mut self) -> io::Result<bool> {
+        let Some(last) = &mut self.probe_stop_check else {
+            return Ok(false);
+        };
+        if self.entry.foreground || last.elapsed() < PROBE_STOP_CHECK_TICK {
+            return Ok(false);
+        }
+        *last = Instant::now();
+        groups::has_stopped_child(-self.entry.target, self.entry.pid)
+    }
+
+    fn reserve_probe_foreground(&mut self, state: &mut State) -> io::Result<()> {
+        if state.children.iter().any(|child| child.foreground) {
+            return Err(io::Error::other(
+                "probe needs the terminal while another foreground command is active",
+            ));
+        }
+        self.entry.foreground = true;
+        state
+            .children
+            .iter_mut()
+            .find(|child| child.pid == self.entry.pid)
+            .unwrap()
+            .foreground = true;
+        Ok(())
     }
 
     fn group_members(&mut self) -> Result<bool, String> {

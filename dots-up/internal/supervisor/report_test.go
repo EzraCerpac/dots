@@ -124,16 +124,6 @@ func TestRunReportsArePrivateAndRetentionPreservesActiveRun(t *testing.T) {
 	}
 }
 
-func TestSummaryCountsAttentionStageResults(t *testing.T) {
-	got := summary(Report{
-		ExitCode: 0,
-		Events:   []ui.Event{{V: 1, Kind: "stage_end", ID: "auth", Status: "attention"}},
-	}, "/state/run")
-	if !strings.Contains(got, "1 item(s) needing attention") {
-		t.Fatalf("summary omitted the attention result: %s", got)
-	}
-}
-
 func TestCommandSummaryNeedsAttentionDespiteExitZero(t *testing.T) {
 	got := summary(Report{
 		Command:  "sync",
@@ -145,18 +135,23 @@ func TestCommandSummaryNeedsAttentionDespiteExitZero(t *testing.T) {
 	}
 }
 
-func TestReportHighlightsCarryEachIssuesOutputLogAndNextStep(t *testing.T) {
+func TestLegacyUpReportKeepsChangesAndActionableIssues(t *testing.T) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "Breaks.log")
 	if err := os.WriteFile(log, []byte("step one\nboom: disk full\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var b strings.Builder
-	printReportHighlights(&b, Report{Events: []ui.Event{
+	printUpReport(&b, Report{Events: []ui.Event{
+		{V: 1, Kind: "stage_start", ID: "source-sync", Group: "Source", Label: "Sync configuration"},
+		{V: 1, Kind: "change", Stage: "source-sync", Item: "Configuration source", Before: "old", After: "new"},
+		{V: 1, Kind: "stage_end", ID: "source-sync", Status: "ok"},
 		{V: 1, Kind: "stage_start", ID: "Breaks", Label: "Breaks"},
 		{V: 1, Kind: "stage_end", ID: "Breaks", Status: "failed", Summary: "failed (exit 7)", Action: "Fix the error above, then run dots up", LogPath: log},
 	}}, dir, false)
 	for _, want := range []string{
+		"dots up · Completed with issues",
+		"    updated  Configuration source  old → new",
 		"    × Breaks — failed (exit 7)",
 		"        step one",
 		"        boom: disk full",

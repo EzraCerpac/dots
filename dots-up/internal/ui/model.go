@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -106,6 +107,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			return m, nil
+		}
+		if m.outcomesView() && m.ExpandedGroup < 0 {
+			switch v.String() {
+			case "enter", "right", "space":
+				rows := m.outcomeRows()
+				if len(rows) == 0 {
+					return m, nil
+				}
+				m.SelectedGroup = m.outcomeSelection(rows)
+			case "d":
+				m.Diagnostics = true
+				if m.SelectedGroup < 0 || !m.hasSelectedChild() {
+					if m.CurrentMain >= 0 {
+						m.selectGroup(m.groupIndex(stageGroup(m.Stages[m.CurrentMain])))
+					} else if len(m.Stages) > 0 {
+						m.selectGroup(m.groupIndex(stageGroup(m.Stages[0])))
+					} else {
+						m.selectGroup(0)
+					}
+				}
+				m.refreshDetail()
+				return m, nil
+			}
 		}
 		if m.outcomesView() && m.ExpandedGroup >= 0 {
 			switch v.String() {
@@ -288,6 +312,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) apply(e Event) {
+	m.applyEvent(e)
+	m.refreshDetail()
+}
+
+func (m *Model) applyEvent(e Event) {
 	selectedGroup, expandedGroup := "", ""
 	if m.isUp() {
 		groups := m.groups()
@@ -391,8 +420,6 @@ func (m *Model) apply(e Event) {
 	if m.AttentionExpanded {
 		m.syncIssueSelection()
 	}
-	m.resize()
-	m.refreshDetail()
 }
 
 func (m Model) stageIndex(id string) int {
@@ -496,19 +523,25 @@ func (m *Model) selectGroup(index int) {
 }
 
 func (m *Model) moveGroup(delta int) {
-	index := m.SelectedGroup + delta
 	if m.outcomesView() {
-		if delta > 0 && m.SelectedGroup == len(m.groups())-1 {
-			index = -1
+		rows := m.outcomeRows()
+		if len(rows) == 0 {
+			return
 		}
-		if delta < 0 && m.SelectedGroup < 0 {
-			index = len(m.groups()) - 1
+		index := slices.Index(rows, m.SelectedGroup)
+		if index < 0 {
+			index = 0
+			if delta < 0 {
+				index = len(rows) - 1
+			}
+		} else {
+			index = (index + delta + len(rows)) % len(rows)
 		}
-	}
-	m.selectGroup(index)
-	if m.outcomesView() {
+		m.selectGroup(rows[index])
 		m.scrollToOutcomeGroup()
+		return
 	}
+	m.selectGroup(m.SelectedGroup + delta)
 }
 
 func (m *Model) moveChild(delta int) {
@@ -777,7 +810,7 @@ func (m Model) overviewContent() string {
 func (m *Model) refreshDetail() {
 	content := m.overviewContent()
 	if m.outcomesView() {
-		content = m.outcomesContent()
+		content = m.outcomesContent(false)
 	}
 	if !m.overview() {
 		content = "Select a stage to see details."
@@ -808,7 +841,11 @@ func (m *Model) refreshDetail() {
 					fmt.Fprintf(&b, "Next: %s\n", s.Action)
 				}
 				for _, c := range s.Changes {
-					fmt.Fprint(&b, "\n"+ChangeLine(c.Action, c.Item, c.Before, c.After))
+					line := ChangeLine(c.Action, c.Item, c.Before, c.After)
+					if m.isUp() {
+						line = s.changeLine(c)
+					}
+					fmt.Fprint(&b, "\n"+line)
 				}
 				if s.Summary == "" && len(s.Changes) == 0 {
 					b.WriteString("Working…")
@@ -831,7 +868,7 @@ func (m *Model) resize() {
 	if m.outcomesView() {
 		m.viewport.SetWidth(max(1, m.Width))
 		m.viewport.SoftWrap = m.ExpandedGroup >= 0
-		m.viewport.SetHeight(max(1, min(m.Height-6, m.viewport.TotalLineCount())))
+		m.viewport.SetHeight(max(1, min(m.Height-3, m.viewport.TotalLineCount())))
 		return
 	}
 	m.viewport.SoftWrap = true

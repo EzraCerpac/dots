@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -52,8 +53,10 @@ func TestEveryOutcomeRemainsReachableInLongReports(t *testing.T) {
 
 func TestAttentionRowFollowsLastArea(t *testing.T) {
 	m := NewModel(t.TempDir(), false)
+	m.apply(Event{Kind: "stage_start", ID: "tools", Group: "Tools"})
+	m.apply(Event{Kind: "change", Stage: "tools", Item: "tool", Action: "changed"})
 	m.apply(Event{Kind: "notice", Severity: "attention", Summary: "Review source changes"})
-	m.selectGroup(len(m.groups()) - 1)
+	m.selectGroup(m.groupIndex("Tools"))
 	m = press(m, tea.KeyPressMsg{Code: tea.KeyDown})
 	if m.SelectedGroup != -1 {
 		t.Fatal("Down after last area did not select attention")
@@ -64,7 +67,7 @@ func TestAttentionRowFollowsLastArea(t *testing.T) {
 	}
 	m = press(m, tea.KeyPressMsg{Code: tea.KeyLeft})
 	m = press(m, tea.KeyPressMsg{Code: tea.KeyUp})
-	if m.SelectedGroup != len(m.groups())-1 {
+	if m.SelectedGroup != m.groupIndex("Tools") {
 		t.Fatal("Up from attention did not return to last area")
 	}
 }
@@ -104,12 +107,12 @@ func TestExpandedAreaWrapsCompleteRevisionTransitions(t *testing.T) {
 					}
 				}
 				if m.viewport.AtBottom() {
-					for _, line := range lines[3 : 3+m.viewport.Height()] {
+					for _, line := range lines[2 : 2+m.viewport.Height()] {
 						rows = append(rows, strings.TrimRight(line, " "))
 					}
 					break
 				}
-				rows = append(rows, strings.TrimRight(lines[3], " "))
+				rows = append(rows, strings.TrimRight(lines[2], " "))
 				m = press(m, tea.KeyPressMsg{Code: tea.KeyDown})
 			}
 			content := strings.Join(rows, "")
@@ -117,5 +120,33 @@ func TestExpandedAreaWrapsCompleteRevisionTransitions(t *testing.T) {
 				t.Fatalf("vertical scrolling lost revision text: %s", content)
 			}
 		})
+	}
+}
+
+func TestUpOverviewShowsCurrentWorkAndConcreteOutcomes(t *testing.T) {
+	m := NewModel(t.TempDir(), false)
+	m.apply(Event{Kind: "run_start", Command: "up"})
+	m.apply(Event{Kind: "stage_start", ID: "source-sync", Group: "Source & settings", Label: "Sync configuration"})
+	const change = "Shared on dev · edited config.toml (+1 −1)"
+	m.apply(Event{Kind: "change", Stage: "source-sync", Action: "changed", Item: change})
+	m.apply(Event{Kind: "stage_end", ID: "source-sync", Status: "ok", Summary: "Sync complete"})
+	m.apply(Event{Kind: "stage_start", ID: "tools", Group: "Tools", Label: "Update CLI tools"})
+	m.Elapsed = 7 * time.Second
+	view := ansi.Strip(m.View().Content)
+	for _, want := range []string{"Update CLI tools · 7s", change, "d diagnostics"} {
+		if strings.Count(view, want) != 1 {
+			t.Fatalf("expected one %q in overview:\n%s", want, view)
+		}
+	}
+	for _, hidden := range []string{"changed  " + change, "Sync complete", "Needs attention", "Packages", "verified changes", "waiting"} {
+		if strings.Contains(view, hidden) {
+			t.Fatalf("overview contains %q:\n%s", hidden, view)
+		}
+	}
+	t.Logf("Live dashboard:\n%s", view)
+	m = press(m, tea.KeyPressMsg{Code: 'd'})
+	view = ansi.Strip(m.View().Content)
+	if !m.Diagnostics || !strings.Contains(view, "Update CLI tools") || !strings.Contains(view, "Tools") {
+		t.Fatalf("diagnostics cannot find active stage:\n%s", view)
 	}
 }

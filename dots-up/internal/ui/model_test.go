@@ -256,7 +256,7 @@ func TestSpaceCollapseFromDetailsRestoresAreaOverview(t *testing.T) {
 	m = press(m, tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = press(m, tea.KeyPressMsg{Code: tea.KeySpace})
 	view := m.View().Content
-	if m.ExpandedGroup >= 0 || m.DetailFocus || m.Diagnostics || !strings.Contains(view, "1 updated") || strings.Contains(view, "STAGE DETAILS") {
+	if m.ExpandedGroup >= 0 || m.DetailFocus || m.Diagnostics || !strings.Contains(view, "updated  ripgrep") || strings.Contains(view, "STAGE DETAILS") {
 		t.Fatalf("Space left stale diagnostics in the overview: %s", view)
 	}
 }
@@ -357,7 +357,7 @@ func TestOverviewShowsSixChangesBeforeTwentyFailures(t *testing.T) {
 			t.Fatalf("tool %d not immediately visible exactly once: %s", i, content)
 		}
 	}
-	for _, text := range []string{"Tools · 6 updated", "20 failed", "Needs attention", "20 need attention", "Finished"} {
+	for _, text := range []string{"Tools", "Failed (exit 1)", "Needs attention · 20"} {
 		if !strings.Contains(content, text) {
 			t.Fatalf("missing %q: %s", text, content)
 		}
@@ -377,7 +377,7 @@ func TestNoticeAndStageAttentionDeduplication(t *testing.T) {
 	m = send(m, Event{V: 1, Kind: "notice", Stage: "plugins", Severity: "error", Summary: "Plugin update failed"})
 	m = send(m, Event{V: 1, Kind: "run_end", ExitCode: 1})
 	content := m.View().Content
-	if !strings.Contains(content, "1 failed") || !strings.Contains(content, "1 need attention") {
+	if !strings.Contains(content, "Needs attention · 1") || strings.Count(content, "Plugin update failed") != 1 {
 		t.Fatal("duplicate failure notice inflated attention count")
 	}
 }
@@ -387,7 +387,7 @@ func TestNoticeOnlyMarksSuccessfulRunForAttention(t *testing.T) {
 	m = send(m, Event{V: 1, Kind: "notice", Severity: "attention", Summary: "Source sync deferred"})
 	m = send(m, Event{V: 1, Kind: "run_end", ExitCode: 0})
 	view := m.View().Content
-	if !strings.Contains(view, "Needs attention") || !strings.Contains(view, "1 need attention") {
+	if !strings.Contains(view, "Completed with issues") || !strings.Contains(view, "Needs attention · 1") {
 		t.Fatal("notice-only run was shown as complete")
 	}
 }

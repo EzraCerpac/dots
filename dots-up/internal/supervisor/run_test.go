@@ -367,3 +367,39 @@ func captureOutput(t *testing.T, run func() int) (int, string) {
 	}
 	return code, string(data)
 }
+
+func TestPlainUpPrintsOneCompactSummaryAndReplaysIt(t *testing.T) {
+	const change = "Shared on dev · edited config.toml (+1 −1)"
+	useTextRunner(t, runnerEvents+`
+emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture"}'
+emit '{"v":1,"kind":"stage_start","id":"source-sync","group":"Source & settings","label":"Sync configuration"}'
+emit '{"v":1,"kind":"change","stage":"source-sync","item":"`+change+`","action":"changed"}'
+emit '{"v":1,"kind":"stage_end","id":"source-sync","status":"ok","summary":"Source sync succeeded"}'
+emit '{"v":1,"kind":"stage_start","id":"tools","group":"Tools","label":"Update tools"}'
+emit '{"v":1,"kind":"stage_end","id":"tools","status":"attention","summary":"Tool upgrade deferred","action":"Free up disk space and rerun dots up"}'
+emit '{"v":1,"kind":"run_end","exit_code":0}'
+`)
+	opts := Options{StateDir: t.TempDir(), Plain: true}
+	code, live := captureRun(t, opts)
+	replayCode, replay := captureOutput(t, func() int { return ShowLast(opts) })
+	if code != 0 || replayCode != 0 {
+		t.Fatalf("live exit %d, replay exit %d", code, replayCode)
+	}
+	for _, output := range []string{live, replay} {
+		for _, want := range []string{"dots up · Completed with issues", change, "Tool upgrade deferred", "Next: Free up disk space"} {
+			if strings.Count(output, want) != 1 {
+				t.Fatalf("expected %q once:\n%s", want, output)
+			}
+		}
+		for _, hidden := range []string{"changed  " + change, "Source sync succeeded", "Report:", "no verified changes"} {
+			if strings.Contains(output, hidden) {
+				t.Fatalf("unexpected %q:\n%s", hidden, output)
+			}
+		}
+	}
+	if !strings.HasPrefix(live, "→ Sync configuration · ") || !strings.Contains(live, "dots up --last") ||
+		strings.Contains(replay, "→ Sync configuration") || strings.Contains(replay, "dots up --last") {
+		t.Fatalf("unexpected progress or replay hints:\n%s\n%s", live, replay)
+	}
+	t.Logf("Plain run:\n%sSaved replay:\n%s", live, replay)
+}

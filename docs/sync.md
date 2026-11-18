@@ -118,6 +118,7 @@ Sync never force-pushes, skips validation, discards uncommitted edits or writes 
 - Recovery files stay on the same filesystem as the target.
   When that is impossible, sync reports the path and keeps both versions; a checkout whose Git metadata shares the file's filesystem resumes automatic capture.
 - Other targets are applied in dependency order with the usual mise hooks, and matching reload commands run once, after the writes.
+  A validated pre-hook runs in the real configuration checkout, with `DOTS_ROOT` pointing there. Its public edits stay in that checkout for the next screened sync.
 
 ## The receipt
 

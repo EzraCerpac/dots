@@ -109,7 +109,9 @@ App-written files that must not be shared in plain text go in encrypted settings
 - List each machine that keeps the file as its own `{ profile = "host-my-laptop" }` variant.
   Never rename or remove an existing variant: it names that machine's stream in history.
 - `dots restore` fetches private history and uses mise to apply it to the actual tracked files.
-  Mise can checkpoint live content locally for undo, encrypted to the configured recipients.
+  Before a fetch or other operation that can capture live content, restore requires a nonempty recipient configuration and plaintext history disabled.
+  Mise chooses the recipients of each new age-encrypted undo checkpoint, which must be decryptable by the identity in use.
+  An incoming checkpoint can have different recipients. Restore can use the replacement identity after the old private key is lost.
   If both sides changed the same lines, restore exits 1 and keeps the live edit.
   Only an explicit `dots backup` publishes those checkpoints as part of the private history.
 - Bootstrap secrets come from an age-encrypted bundle and reach bootstrap hooks only through the file descriptor in `DOTS_BUNDLE_FD`.

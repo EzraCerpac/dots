@@ -92,6 +92,17 @@ fn fixture_checks_effective_state_paths_and_keeps_agent_roots_absent() {
         fs::read(&path).unwrap(),
         world.home().as_os_str().as_encoded_bytes()
     );
+    let output = world
+        .command("/bin/sh")
+        .without_home()
+        .args([
+            "-eu",
+            "-c",
+            r#"test "${HOME+x}" != x && test -n "$XDG_STATE_HOME""#,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
     for dir in [".agents", ".claude", ".codex"] {
         assert!(!world.home().join(dir).exists());
     }

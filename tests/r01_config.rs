@@ -304,7 +304,9 @@ fn rust_selection_validation_gives_mise_private_staged_directories() {
         "mise-check",
         r#"
 set -eu
-test "$HOME" != "$EXPECTED_FIXTURE"
+test "${MISE_GLOBAL_CONFIG_FILE+x}" != x
+test "${MISE_SHARED_INSTALL_DIRS+x}" != x
+test "${__MISE_DIFF+x}" != x
 case "$HOME" in "$EXPECTED_FIXTURE"/tmp/*) ;; *) exit 80 ;; esac
 for dir in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" \
     "$TMPDIR" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$MISE_SYSTEM_CONFIG_DIR" \
@@ -332,6 +334,9 @@ printf '[{"path":"%s/config.laptop.toml"},{"path":"%s/config.host-demo-machine.t
             ])
             .env("DOTS_MISE_BIN", mise)
             .env("EXPECTED_FIXTURE", &f.base)
+            .env("MISE_GLOBAL_CONFIG_FILE", f.base.join("unstaged.toml"))
+            .env("MISE_SHARED_INSTALL_DIRS", f.base.join("unstaged-installs"))
+            .env("__MISE_DIFF", "caller-only")
             .output()
             .unwrap(),
     );

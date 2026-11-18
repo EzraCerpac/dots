@@ -146,6 +146,8 @@ fn ordered(text: &str, parts: &[&str]) {
 #[test]
 #[ignore = "P-04"]
 fn unchanged_invalid_update_configuration_stops_dependent_work() {
+    // The legacy renderer nonce framed the startup failure. The CLI diagnostic
+    // and the absence of dependent work expose the failure without that protocol.
     let f = UpdateFixture::new();
     f.hook("10-unexpected", "touch \"$HOME/unexpected\"");
     let output = run(f.up("--plain").env("FIXTURE_CONFIG_FAILURE", "1"));
@@ -308,6 +310,7 @@ if grep -q '^self-update' "$HOME/mise-calls"; then exit 1; fi"#,
 #[test]
 #[ignore = "P-04"]
 fn unchanged_hook_changes_are_visible_in_plain_output() {
+    // The old renderer's event descriptor is gone. Check the printed changes.
     let f = UpdateFixture::new();
     f.hook(
         "10-Changes",
@@ -470,7 +473,8 @@ printf '%s:%s\n' "${0##*/}" "$line" >> "$HOME/read-lines""#,
     );
 }
 
-// Covers both legacy sync-attention cases through public diagnostics and follow-on work.
+// Covers both legacy sync-attention cases through public diagnostics and follow-on
+// work. The Node backend's exit codes and typed renderer frames are gone.
 #[test]
 #[ignore = "P-08"]
 fn unchanged_update_reports_a_sync_issue_and_continues_maintenance() {
@@ -508,8 +512,10 @@ fn unchanged_update_reports_a_sync_issue_and_continues_maintenance() {
 }
 
 #[test]
-#[ignore = "P-11"]
-fn unchanged_plain_update_shows_problem_output_and_reachable_logs() {
+#[ignore = "P-04"]
+fn unchanged_plain_update_shows_failed_and_deferred_hook_output() {
+    // Retained Bash fallback log paths belonged to the old updater. The
+    // actionable hook output belongs in ordinary up scrollback.
     let f = UpdateFixture::new();
     f.hook("10-Waits", "echo 'fixture needs a login'; exit 3");
     f.hook(
@@ -521,28 +527,13 @@ fn unchanged_plain_update_shows_problem_output_and_reachable_logs() {
         &text,
         &[
             "Waits",
+            "deferred",
             "Breaks",
+            "failed",
             "fixture needs a login",
             "fixture step one",
             "fixture disk full",
         ],
-    );
-    let state = f.world.home().join(".local/state/dots");
-    let prefix = format!("{}/", state.display());
-    // Read the log paths the CLI actually printed, independent of their layout.
-    let logs: Vec<_> = text
-        .lines()
-        .filter_map(|line| line.find(&prefix).map(|index| &line[index..]))
-        .filter_map(|path| fs::read_to_string(path.trim()).ok())
-        .collect();
-    assert!(
-        logs.iter().any(|log| log.contains("fixture needs a login")),
-        "{text}"
-    );
-    assert!(
-        logs.iter()
-            .any(|log| log.contains("fixture step one") && log.contains("fixture disk full")),
-        "{text}"
     );
 }
 

@@ -484,7 +484,10 @@ test('sync does not recreate dev if it disappears after fetch', available, async
   for (const timing of ['before push', 'while pushing']) {
     await t.test(timing, t => {
       const f = fixture(t), before = f.remote();
-      const remove = `git -C '${f.origin}' update-ref -d refs/heads/dev '${before}'`;
+      f.write(f.b, 'withdrawn', 'remote only\n');
+      f.sync(f.b);
+      const withdrawn = f.remote();
+      const remove = `git -C '${f.origin}' update-ref -d refs/heads/dev '${withdrawn}'`;
       if (timing === 'before push') duringValidation(f, remove);
       else prePush(f, `set -eu\nrm "$0"\n${remove}`);
       f.write(f.a, 'local', 'saved before deletion\n');
@@ -495,7 +498,12 @@ test('sync does not recreate dev if it disappears after fetch', available, async
       assert.deepEqual(result.groups, [{ kind: 'saved', before, after: f.dev(f.a) }]);
       assert.equal(git(f.origin, 'for-each-ref', 'refs/heads/dev'), '');
       assert.equal(git(f.a, 'show', 'dev:local'), 'saved before deletion');
+      assert.match(result.header, /not applied/);
+      assert.equal(fs.existsSync(path.join(f.a, 'withdrawn')), false);
       f.clean(f.a);
+      delete process.env.DEV_TEST_CONFIG_HOOK;
+      assert.match(f.sync(f.a).text, /· pushed /);
+      assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'withdrawn'), '');
     });
   }
 });
@@ -516,7 +524,6 @@ test('a retry leaves withdrawn remote history withdrawn', available, t => {
   f.write(f.b, 'upstream', 'first remote update\n');
   f.sync(f.b);
   const withdrawn = f.remote();
-  f.sync(f.a);
   f.write(f.a, 'local', 'local edit\n');
   prePush(f, `set -eu\nrm "$0"\ngit -C '${f.origin}' update-ref refs/heads/dev '${original}' '${withdrawn}'`);
   const result = f.producer(f.a);
@@ -524,6 +531,10 @@ test('a retry leaves withdrawn remote history withdrawn', available, t => {
   assert.equal(f.remote(), original);
   assert.equal(git(f.a, 'show', 'dev:local'), 'local edit');
   assert.deepEqual(result.groups.map(group => group.kind), ['saved']);
+  assert.match(result.header, /not applied/);
+  assert.equal(fs.existsSync(path.join(f.a, 'upstream')), false);
+  assert.match(f.sync(f.a).text, /· pushed /);
+  assert.equal(git(f.origin, 'ls-tree', 'dev', '--', 'upstream'), '');
 });
 
 test('a rejected push keeps its reason without copying hook output to receipts or logs', available, t => {

@@ -13,11 +13,22 @@ const show = ['--input-type=module', '-e',
   'const { showLast } = await import(process.argv[1]); process.exitCode = showLast(process.argv[2]);', modulePath];
 const gitAvailable = requires('git');
 
+function gitEnvironment(inherited) {
+  const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !key.startsWith('GIT_')));
+  return { ...env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+}
+
+test.beforeEach(t => {
+  // Imported receipt functions run Git using this process's environment.
+  const original = process.env;
+  process.env = gitEnvironment(original);
+  t.after(() => { process.env = original; });
+});
+
 function fixture(t, inherited = process.env) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dots-receipt-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const env = Object.fromEntries(Object.entries(inherited).filter(([key]) => !key.startsWith('GIT_')));
-  Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
+  const env = gitEnvironment(inherited);
   delete env.DOTS_UP_RUN_DIR;
   delete env.DOTS_UP_STREAM_NONCE;
   delete env.DOTS_UP_EVENT_FD;

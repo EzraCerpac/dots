@@ -38,7 +38,8 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
 7. Only fast-forwards `origin/dev`.
    Git checks that the remote tip still matches the one used to validate the update.
    Sync merges and retries up to three times if another machine advanced the branch.
-   If published history disappears during a retry, sync keeps local work and asks you to inspect the remote.
+   If published history disappears during a retry, sync keeps local work,
+   skips the withdrawn checkout and dotfile changes, and asks you to inspect the remote.
    A push that fails for any other reason is not retried, and one that takes longer than 60 seconds is stopped; Git never prompts for credentials here.
    Stopping it stops Git, not a hook or credential helper Git started, so a push may still land later; the next sync reconciles it.
    Diagnostics include the failed operation and recovery action. URLs have credentials removed.

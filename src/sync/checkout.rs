@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, FileType, OpenOptions, TryLockError};
+use std::fs::{self, DirEntry, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -147,40 +147,48 @@ pub(super) fn previous_index_base(
     temporary: &Path,
     head: &str,
 ) -> io::Result<Option<String>> {
-    let worktree_head = git
-        .id(["rev-parse", "--verify", "HEAD@{0}^{commit}"])
-        .ok()
-        .filter(|logged| logged != head);
-    let previous = if let Some(logged) = &worktree_head {
-        logged.clone()
-    } else if let Ok(logged) = git.id(["rev-parse", "--verify", "refs/heads/dev@{1}^{commit}"]) {
-        logged
-    } else {
-        return Ok(None);
-    };
-    if previous == head {
-        return Ok(None);
-    }
     fs::write(temporary, index)?;
     let staged = git.indexed(temporary).id(["write-tree"])?;
-    let old = git.tree(&previous)?;
     let current = git.tree(head)?;
     let index = git.tree(&staged)?;
-    if index == current || old == current {
+    let staged_paths = changed(&current, &index);
+    if staged_paths.is_empty() {
         return Ok(None);
     }
-    if worktree_head.is_some() && index == old {
-        return Ok(Some(previous));
-    }
-    if changed(&old, &current)
-        .iter()
-        .any(|path| index.get(path) == old.get(path))
-    {
-        // A staged revert or deletion can look exactly like a stale index.
-        // An unrelated staged edit can also leave just part of it stale.
+    if !git.output(["reflog", "exists", "HEAD"])?.status.success() {
         return Err(invalid(
-            "the dev move and staged edits cannot be distinguished",
+            "could not establish a worktree index base without a HEAD reflog",
         ));
+    }
+    // HEAD@{0} can resolve to the live ref even when the logged OID
+    // differs. Use the actual worktree log and inspect older entries too:
+    // several ref-only moves can have occurred since the index was written.
+    let log = git.text(["reflog", "show", "--format=%H", "HEAD"])?;
+    if log.is_empty() {
+        return Err(invalid(
+            "could not establish a worktree index base from an empty HEAD reflog",
+        ));
+    }
+    let mut seen = BTreeSet::from([head.to_owned()]);
+    for (position, record) in log.lines().enumerate() {
+        let previous = oid(record.as_bytes())?;
+        if !seen.insert(previous.clone()) {
+            continue;
+        }
+        let old = git.tree(&previous)?;
+        if position == 0 && index == old {
+            return Ok(Some(previous));
+        }
+        if staged_paths
+            .iter()
+            .any(|path| index.get(path) == old.get(path))
+        {
+            // A staged revert or deletion can look exactly like a stale
+            // entry, even when unrelated staged edits make the trees differ.
+            return Err(invalid(
+                "the dev move and staged edits cannot be distinguished",
+            ));
+        }
     }
     Ok(None)
 }
@@ -749,20 +757,43 @@ fn prune_empty_ancestors(
 
 // Only these disposable leaves may be removed after retirement. A directory
 // or an unexpected entry may contain recovery data and must travel intact.
-fn disposable(name: &OsStr, kind: FileType) -> bool {
+fn numeric_pair(text: &str, separator: char) -> bool {
+    text.split_once(separator).is_some_and(|(first, second)| {
+        first.parse::<u64>().is_ok() && second.parse::<u64>().is_ok()
+    })
+}
+
+fn disposable(entry: &DirEntry) -> io::Result<bool> {
+    let kind = entry.file_type()?;
+    let name = entry.file_name();
     let Some(name) = name.to_str() else {
-        return false;
+        return Ok(false);
     };
     let numbered = |prefix| {
         name.strip_prefix(prefix)
             .is_some_and(|number| number.parse::<usize>().is_ok())
     };
-    (kind.is_file()
+    let numbered_pair = |prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| numeric_pair(suffix, '-'))
+    };
+    // Directory identity markers encode numbers as a symlink target. They
+    // are journal metadata even though the target is not a filesystem path.
+    if kind.is_symlink() && (numbered("removed-dir-old-") || numbered_pair("removed-dir-old-dir-"))
+    {
+        let target = fs::read_link(entry.path())?;
+        return Ok(target
+            .to_str()
+            .and_then(|target| target.split_once('/'))
+            .is_some_and(|(parent, moved)| numeric_pair(parent, ':') && numeric_pair(moved, ':')));
+    }
+    Ok((kind.is_file()
         && (matches!(
             name,
             "plan.json" | "index.before" | "index.after" | "index.install" | "started" | "finished"
-        ) || numbered("done-")))
-        || ((kind.is_file() || kind.is_symlink()) && (numbered("expected-") || numbered("new-")))
+        ) || numbered("done-")
+            || numbered_pair("pruned-")))
+        || ((kind.is_file() || kind.is_symlink()) && (numbered("expected-") || numbered("new-"))))
 }
 
 fn recovery_paths(journal: &Path) -> Vec<PathBuf> {
@@ -770,7 +801,7 @@ fn recovery_paths(journal: &Path) -> Vec<PathBuf> {
         let mut saved = Vec::new();
         for entry in fs::read_dir(journal)? {
             let entry = entry?;
-            if !disposable(&entry.file_name(), entry.file_type()?) {
+            if !disposable(&entry)? {
                 saved.push(entry.path());
             }
         }
@@ -782,7 +813,7 @@ fn recovery_paths(journal: &Path) -> Vec<PathBuf> {
 fn clean_retired(journal: &Path) -> io::Result<()> {
     for entry in fs::read_dir(journal)? {
         let entry = entry?;
-        if disposable(&entry.file_name(), entry.file_type()?) {
+        if disposable(&entry)? {
             fs::remove_file(entry.path())?;
         }
     }
@@ -891,6 +922,12 @@ mod tests {
             ])
             .unwrap();
         assert!(!git.root().join("added").exists());
+        let live_head = git.id(["rev-parse", "--verify", "HEAD"]).unwrap();
+        let logged_head = git
+            .id(["reflog", "show", "-1", "--format=%H", "HEAD"])
+            .unwrap();
+        assert_eq!(live_head, after);
+        assert_eq!(logged_head, before);
 
         let dir = git.root().join(".git");
         let index = index_snapshot(&dir).unwrap();
@@ -956,6 +993,57 @@ mod tests {
             fs::read(git.root().join("staged")).unwrap(),
             b"independent unstaged edit"
         );
+    }
+
+    #[test]
+    fn two_ref_only_moves_do_not_turn_an_unmaterialized_path_into_a_deletion() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        let live = git.root().join("x");
+        fs::write(&live, b"introduced").unwrap();
+        git.get(["add", "x"]).unwrap();
+        let added = fixture_commit(&git, "add x");
+        fs::write(&live, b"latest dev bytes").unwrap();
+        git.get(["add", "x"]).unwrap();
+        let edited = fixture_commit(&git, "edit x");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        git.get([
+            "update-ref",
+            "-m",
+            "dev adds x",
+            "refs/heads/dev",
+            &added,
+            &before,
+        ])
+        .unwrap();
+        git.get([
+            "update-ref",
+            "-m",
+            "dev edits x",
+            "refs/heads/dev",
+            &edited,
+            &added,
+        ])
+        .unwrap();
+        assert_eq!(
+            git.id(["reflog", "show", "-1", "--format=%H", "HEAD"])
+                .unwrap(),
+            edited
+        );
+
+        let probe = fixture.path().join("probe.index");
+        assert!(previous_index_base(&git, &index, &probe, &edited).is_err());
+        assert_eq!(git.id(["rev-parse", "refs/heads/dev"]).unwrap(), edited);
+        assert_eq!(
+            git.get(["show", "refs/heads/dev:x"]).unwrap(),
+            b"latest dev bytes"
+        );
+        assert!(!live.exists());
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
     }
 
     #[test]
@@ -1192,10 +1280,33 @@ mod tests {
         assert!(
             backups
                 .iter()
-                .all(|path| path.exists() && !path.starts_with(dir.join(PENDING)))
+                .all(|path| path.exists() && !path.starts_with(dir.join(PENDING))),
+            "invalid retired recovery paths: {:?}",
+            backups
+                .iter()
+                .map(|path| (path, fs::symlink_metadata(path).map(|md| md.file_type())))
+                .collect::<Vec<_>>()
         );
         assert_eq!(fs::read(live).unwrap(), b"incoming file");
         assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    }
+
+    #[test]
+    fn retired_journal_preserves_a_link_that_is_not_a_directory_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let journal = fixture.path();
+        let metadata = journal.join("removed-dir-old-dir-2-0");
+        let foreign = journal.join("removed-dir-old-1");
+        std::os::unix::fs::symlink("12:34/56:78", &metadata).unwrap();
+        std::os::unix::fs::symlink("unrelated-file", &foreign).unwrap();
+
+        assert_eq!(
+            recovery_paths(journal).as_slice(),
+            std::slice::from_ref(&foreign)
+        );
+        assert!(clean_retired(journal).is_err());
+        assert!(fs::symlink_metadata(metadata).is_err());
+        assert_eq!(fs::read_link(foreign).unwrap(), Path::new("unrelated-file"));
     }
 
     #[test]

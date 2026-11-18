@@ -1,16 +1,286 @@
+mod patch;
+mod store;
+
+use std::fs;
+use std::io::{self, IsTerminal as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::{Deserialize, Serialize};
+
+use crate::run::Outcome;
 use crate::{Args, Ctx, Fail};
 
-pub fn last(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
-    Err(Fail::unported("P-09", "dots sync --last"))
+#[derive(Clone, Copy, Debug)]
+pub enum Display {
+    Standalone,
+    Plain,
+    Embedded,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Receipt {
-    _private: (),
+    #[serde(with = "store::optional_path")]
+    pub checkout: Option<PathBuf>,
+    pub outcome: String,
+    pub issues: Vec<Issue>,
+    pub shared: Vec<ChangeGroup>,
+    pub saved: Vec<ChangeGroup>,
+    pub updated: Vec<ChangeGroup>,
+    pub recovered: Vec<ChangeGroup>,
+    pub kept: usize,
+    pub pulled_dev: usize,
+    pub pulled_main: usize,
+    pub local_only: bool,
+    pub stage_outcome: Outcome,
+    #[serde(with = "store::paths")]
+    pub recovery_files: Vec<PathBuf>,
+    pub adopted_revision: Option<(String, String)>,
 }
 
-pub fn emit(_ctx: &Ctx, _receipt: &Receipt) -> Result<(), Fail> {
-    Err(Fail::unported(
-        "P-09",
-        "recording and printing a sync receipt",
-    ))
+impl Receipt {
+    pub fn new(checkout: Option<PathBuf>, outcome: &'static str) -> Self {
+        Self {
+            checkout,
+            outcome: outcome.into(),
+            issues: Vec::new(),
+            shared: Vec::new(),
+            saved: Vec::new(),
+            updated: Vec::new(),
+            recovered: Vec::new(),
+            kept: 0,
+            pulled_dev: 0,
+            pulled_main: 0,
+            local_only: false,
+            stage_outcome: Outcome::Completed,
+            recovery_files: Vec::new(),
+            adopted_revision: None,
+        }
+    }
+
+    fn groups(&self) -> [(&'static str, &[ChangeGroup]); 4] {
+        [
+            ("Shared on dev", &self.shared),
+            ("Saved locally", &self.saved),
+            ("Updated in this checkout", &self.updated),
+            ("Finished pending checkout", &self.recovered),
+        ]
+    }
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Issue {
+    pub diagnostic: String,
+    pub next_action: String,
+}
+
+impl Issue {
+    /// Only pass a sanitized diagnostic and action, never backend output.
+    pub fn new(diagnostic: &'static str, next_action: &'static str) -> Self {
+        Self {
+            diagnostic: diagnostic.into(),
+            next_action: next_action.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChangeGroup {
+    pub before: Option<String>,
+    pub after: Option<String>,
+    #[serde(with = "store::paths")]
+    pub paths: Vec<PathBuf>,
+}
+
+impl ChangeGroup {
+    /// Endpoints are verified full commit IDs and paths are relative to the checkout.
+    pub fn new(before: Option<String>, after: Option<String>, paths: Vec<PathBuf>) -> Self {
+        Self {
+            before,
+            after,
+            paths,
+        }
+    }
+}
+
+pub fn emit(ctx: &Ctx, receipt: &Receipt, display: Display) -> Result<(), Fail> {
+    let root = physical_root(ctx);
+    let saved = store::save(&ctx.env, &root, receipt);
+    let mut output = metadata(receipt, false);
+    if patch_eligible(ctx, display) {
+        output.push_str(&patch::render(
+            &ctx.env,
+            &root,
+            receipt,
+            false,
+            patch::MAX_BYTES - output.len().min(patch::MAX_BYTES),
+        ));
+    }
+    write_stdout(&output);
+    saved.map_err(|error| {
+        Fail::new(
+            1,
+            format!("could not save the sync receipt for replay: {error}"),
+        )
+    })
+}
+
+pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
+    let root = physical_root(ctx);
+    let receipt = match store::load(&ctx.env, &root) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            write_stdout("No sync receipt for this checkout.\n");
+            return Ok(0);
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "dots sync: could not read the latest receipt: {error}"
+            );
+            write_stdout("No sync receipt for this checkout.\n");
+            return Ok(0);
+        }
+    };
+    let mut output = metadata(&receipt, true);
+    if patch_eligible(ctx, Display::Standalone) {
+        if output.len() > patch::MAX_BYTES - 128 {
+            let prefix = &output[..output.floor_char_boundary(patch::MAX_BYTES - 128)];
+            output.truncate(prefix.rfind('\n').map_or(0, |end| end + 1));
+            output.push_str("Additional receipt metadata omitted.\n");
+        } else {
+            let remaining = patch::MAX_BYTES - output.len();
+            output.push_str(&patch::render(&ctx.env, &root, &receipt, true, remaining));
+        }
+        if page(&ctx.env, &output) {
+            return Ok(0);
+        }
+    }
+    write_stdout(&output);
+    Ok(0)
+}
+
+fn physical_root(ctx: &Ctx) -> PathBuf {
+    fs::canonicalize(ctx.root.path()).unwrap_or_else(|_| ctx.root.path().to_owned())
+}
+
+fn patch_eligible(ctx: &Ctx, display: Display) -> bool {
+    matches!(display, Display::Standalone)
+        && !ctx.flags.plain
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+}
+
+fn write_stdout(text: &str) {
+    let _ = io::stdout().lock().write_all(text.as_bytes());
+}
+
+fn page(env: &crate::Env, text: &str) -> bool {
+    let Ok(mut child) = local_command(env, "less")
+        .args(["-FX"])
+        .env("LESSSECURE", "1")
+        .env("LESSHISTFILE", "-")
+        .env_remove("LESS")
+        .env_remove("LESSOPEN")
+        .env_remove("LESSCLOSE")
+        .env_remove("LESSSECURE_ALLOW")
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let _ = child.wait();
+    true
+}
+
+fn local_command(env: &crate::Env, program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    for key in ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"] {
+        if let Some(value) = env.get(key) {
+            command.env(key, value);
+        }
+    }
+    command
+}
+
+fn printable(text: &str) -> String {
+    let mut printable = String::new();
+    for c in text.chars() {
+        if terminal_control(c) {
+            printable.extend(c.escape_default());
+        } else {
+            printable.push(c);
+        }
+    }
+    printable
+}
+
+fn terminal_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn path_label(path: &Path) -> String {
+    match path.to_str() {
+        Some(path) => printable(path),
+        None => path
+            .as_os_str()
+            .as_encoded_bytes()
+            .escape_ascii()
+            .to_string(),
+    }
+}
+
+fn metadata(receipt: &Receipt, replay: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    if replay {
+        text.push_str("Latest sync\n");
+    }
+    for issue in &receipt.issues {
+        let _ = writeln!(text, "{}", printable(&issue.diagnostic));
+        let _ = writeln!(text, "  {}", printable(&issue.next_action));
+    }
+    let outcome = printable(&receipt.outcome);
+    let _ = write!(text, "dots sync: ");
+    if !receipt.local_only {
+        let saved = receipt
+            .saved
+            .iter()
+            .map(|group| group.paths.len())
+            .sum::<usize>();
+        let _ = write!(
+            text,
+            "saved {saved} locally · kept {} files on disk · pulled dev +{}, main +{} · ",
+            receipt.kept, receipt.pulled_dev, receipt.pulled_main
+        );
+    }
+    let _ = writeln!(text, "{outcome}");
+    for (label, groups) in receipt.groups() {
+        let paths = groups.iter().flat_map(|group| &group.paths);
+        let count = paths.clone().count();
+        if count == 0 {
+            continue;
+        }
+        let _ = writeln!(text, "{label}");
+        let limit = if replay { count } else { 5 };
+        for path in paths.take(limit) {
+            let _ = writeln!(text, "  {}", path_label(path));
+        }
+        if count > limit {
+            let _ = writeln!(text, "  … and {} more", count - limit);
+        }
+    }
+    for path in &receipt.recovery_files {
+        let _ = writeln!(text, "Recovery copy at {}", path_label(path));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests;

@@ -35,6 +35,10 @@ pub struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
+    pub fn ctx(&self) -> &'a Ctx {
+        self.ctx
+    }
+
     pub fn begin(ctx: &'a Ctx, sink: Sink) -> Self {
         Self {
             ctx,

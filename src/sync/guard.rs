@@ -323,10 +323,22 @@ pub(super) fn write_private(path: &Path, image: &Image) -> io::Result<()> {
 }
 
 fn same_inode(first: &Dir, one: &CString, second: &Dir, two: &CString) -> io::Result<bool> {
-    use nix::{fcntl::AtFlags, sys::stat::fstatat};
-    let one = fstatat(&first.0, one.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
-    let two = fstatat(&second.0, two.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
-    Ok((one.st_dev, one.st_ino) == (two.st_dev, two.st_ino))
+    fn identity(dir: &Dir, name: &CString) -> io::Result<(libc::dev_t, libc::ino_t)> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the open directory and C string stay valid through fstatat.
+        checked(unsafe {
+            libc::fstatat(
+                dir.fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })?;
+        // SAFETY: a successful fstatat initialized the buffer.
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.st_dev, stat.st_ino))
+    }
+    Ok(identity(first, one)? == identity(second, two)?)
 }
 
 fn verify_parent(root: &Dir, path: &Path, held: &Dir) -> io::Result<()> {
@@ -392,6 +404,7 @@ fn replace_with(
     new_slot: &CStrName,
     expected: &Image,
     replacement: &Image,
+    consume_replacement: bool,
     before_move: impl Fn() -> io::Result<()>,
     before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
@@ -462,7 +475,11 @@ fn replace_with(
     if !matches!(replacement, Image::Absent) {
         before_publish()?;
         verify_parent(root, path, &parent)?;
-        staging.link_to(&new_slot.0, &parent, &name)?;
+        if consume_replacement {
+            staging.move_to(&new_slot.0, &parent, &name)?;
+        } else {
+            staging.link_to(&new_slot.0, &parent, &name)?;
+        }
         verify_parent(root, path, &parent)?;
     }
     Ok(())
@@ -493,6 +510,30 @@ pub(super) fn replace_exact(
         new,
         expected,
         replacement,
+        false,
+        || Ok(()),
+        || Ok(()),
+    )
+}
+
+pub(super) fn replace_consuming(
+    root: &Dir,
+    path: &Path,
+    staging: &Dir,
+    old_slot: &CStrName,
+    new_slot: &CStrName,
+    expected: &Image,
+    replacement: &Image,
+) -> io::Result<()> {
+    replace_with(
+        root,
+        path,
+        staging,
+        old_slot,
+        new_slot,
+        expected,
+        replacement,
+        true,
         || Ok(()),
         || Ok(()),
     )
@@ -519,6 +560,7 @@ pub(super) fn replace_at_boundary(
         new,
         expected,
         replacement,
+        false,
         before_move,
         before_publish,
     )

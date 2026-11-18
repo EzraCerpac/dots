@@ -11,7 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::{receipt::Receipt, run::Run};
 
 use super::git::{Entry, Git, Tree, invalid, relative};
-use super::guard::{CStrName, Dir, Image, private_dir, replace_exact, write_private};
+use super::guard::{CStrName, Dir, Image, private_dir, write_private};
 use super::validation::{self, Retirement, Validated};
 use super::{issue, path_issue};
 
@@ -113,7 +113,23 @@ fn planned_targets(run: &Run<'_>, overlay: &Path, live: &Path) -> io::Result<Vec
     Ok(targets)
 }
 
+fn hooks_disabled(run: &Run<'_>) -> bool {
+    run.ctx()
+        .env
+        .get("MISE_NO_HOOKS")
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 fn apply_pre_hooks(run: &Run<'_>, git: &Git<'_>, plan: &ApplyPlan, receipt: &mut Receipt) -> bool {
+    if hooks_disabled(run) {
+        return true;
+    }
     for hook in &plan.configs.pre {
         if hook_failed(
             receipt,
@@ -185,6 +201,7 @@ pub(super) struct Copies {
     state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
     written: BTreeSet<PathBuf>,
+    deployments: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -201,6 +218,57 @@ struct Captured {
 
 const STATE: &str = "dots-sync-copies.json";
 const COPY_ACTION: &str = "Review the source and deployed copy, then rerun dots sync.";
+
+fn native_deployments(run: &Run<'_>) -> io::Result<BTreeMap<PathBuf, String>> {
+    let env = &run.ctx().env;
+    let state = env
+        .get("MISE_STATE_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("XDG_STATE_HOME")
+                .filter(|path| !path.is_empty())
+                .map(|path| Path::new(path).join("mise"))
+        })
+        .or_else(|| env.home().map(|home| home.join(".local/state/mise")));
+    let Some(state) = state else {
+        return Ok(BTreeMap::new());
+    };
+    let directory = state.join("dotfiles/targets");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error),
+    };
+    let dir = Dir::open(&directory)?;
+    let mut deployments = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().is_none_or(|ext| ext != "toml") {
+            continue;
+        }
+        let Image::Regular { bytes, .. } = dir.read_path(Path::new(&entry.file_name()))? else {
+            continue;
+        };
+        let Ok(doc) = std::str::from_utf8(&bytes)
+            .unwrap_or_default()
+            .parse::<DocumentMut>()
+        else {
+            continue;
+        };
+        if doc.get("version").and_then(Item::as_integer) == Some(1)
+            && let (Some(target), Some(digest)) = (
+                doc.get("target").and_then(Item::as_str),
+                doc.get("content_digest").and_then(Item::as_str),
+            )
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            deployments.insert(PathBuf::from(target), digest.to_ascii_lowercase());
+        }
+    }
+    Ok(deployments)
+}
 
 impl Copies {
     pub fn load(dir: &Path) -> io::Result<Self> {
@@ -250,6 +318,7 @@ impl Copies {
         let filesystem = Dir::open(Path::new("/"))?;
         let configs = Configs::read_at(run, git.root(), false)?;
         let discovered = status_at(run, git.root(), false)?;
+        self.deployments = native_deployments(run)?;
         for target in &discovered {
             if matches!(target.mode.as_str(), "track" | "track-local") {
                 continue;
@@ -272,10 +341,28 @@ impl Copies {
             {
                 continue;
             }
-            let Some(source) = target
-                .effective_source()
-                .and_then(|source| source.strip_prefix(git.root()).ok())
-            else {
+            let Some(source) = target.effective_source() else {
+                continue;
+            };
+            let Ok(source) = source.strip_prefix(git.root()) else {
+                // A native deployment or identical source is the common
+                // version for a copy fed by an earlier target.
+                if let Some(Image::Regular { bytes, mode }) = self.observed.get(&destination) {
+                    let digest: [u8; 32] = Sha256::digest(bytes).into();
+                    let matches = read_copy(source, target.permissions.as_deref())
+                        .is_ok_and(|image| image == self.observed[&destination])
+                        || self.deployments.get(&destination).is_some_and(|native| {
+                            *native == format!("{:x}", Sha256::digest(bytes))
+                        });
+                    if matches {
+                        self.state.known.entry(destination).or_insert(KnownCopy {
+                            source: source.to_owned(),
+                            entry: None,
+                            mode: Some(*mode),
+                            deployed: Some(digest),
+                        });
+                    }
+                }
                 continue;
             };
             let native = if git.root().join(source).is_dir() {
@@ -634,7 +721,7 @@ impl Copies {
         }
         self.persist(git_dir)?;
 
-        let reload_failed = native_reload(
+        if native_reload(
             run,
             git_dir,
             git.root(),
@@ -643,23 +730,25 @@ impl Copies {
             &self.written,
             receipt,
         )
-        .is_err();
-        if reload_failed {
+        .is_err()
+        {
             issue(
                 receipt,
                 "Could not match mise dotfile reloads",
                 "Check history.reload and run the matching commands.",
             );
         }
-        for hook in &configs.post {
-            validated.ready_to_apply(git)?;
-            if hook_failed(
-                receipt,
-                "mise post-dotfiles hook failed",
-                "Check the post-dotfiles hook and rerun dots sync.",
-                invoke(run, git.root(), git.root(), selectors, hook),
-            ) {
-                break;
+        if !hooks_disabled(run) {
+            for hook in &configs.post {
+                validated.check_overlay_locals()?;
+                if hook_failed(
+                    receipt,
+                    "mise post-dotfiles hook failed",
+                    "Check the post-dotfiles hook and rerun dots sync.",
+                    invoke(run, git.root(), git.root(), selectors, hook),
+                ) {
+                    break;
+                }
             }
         }
         Ok(())
@@ -703,8 +792,18 @@ impl Copies {
                 }
             })
             .transpose()?;
+        let copy_child = target.mode == "template"
+            && validated.apply.targets.iter().any(|candidate| {
+                candidate.mode == "copy"
+                    && absolute_target(run, &candidate.target).is_ok_and(|parent| {
+                        destination != parent && destination.starts_with(parent)
+                    })
+            });
         if target.mode == "template"
-            && filesystem.read_path(fs_relative(destination)?)? == Image::Directory
+            && (filesystem.read_path(fs_relative(destination)?)? == Image::Directory
+                || copy_child
+                    && self.state.known.contains_key(destination)
+                    && filesystem.read_path(fs_relative(destination)?)? != Image::Absent)
         {
             path_issue(
                 receipt,
@@ -718,7 +817,20 @@ impl Copies {
         match target.mode.as_str() {
             "copy" if source.as_ref().is_some_and(|source| source.is_dir()) => {
                 let source = source.as_deref().expect("directory source");
+                let approved = source
+                    .strip_prefix(git.root())
+                    .ok()
+                    .map(|relative| {
+                        stage_tree(run, git_dir, &validated.apply.root.join(relative), &rules)
+                    })
+                    .transpose()?;
                 for (relative, image) in stage_tree(run, git_dir, source, &rules)? {
+                    if approved
+                        .as_ref()
+                        .is_some_and(|leaves| !leaves.contains_key(&relative))
+                    {
+                        continue;
+                    }
                     let path = destination.join(relative);
                     if !all_jobs.contains(&path) {
                         desired.insert(path, image);
@@ -824,14 +936,20 @@ impl Copies {
                 None
             };
             if current != replacement {
-                validated.ready_to_apply(git)?;
+                validated.check_overlay_locals()?;
                 let still_observed = observed
                     .get(&path)
-                    .or_else(|| observed.get(destination))
                     .map_or(current == Image::Absent, |before| *before == current);
                 let manageable = match (&current, known, &baseline) {
                     (Image::Absent, _, _) => true,
                     (_, Some(known), Some(base)) => known.matches(&current, base, known.mode),
+                    (Image::Regular { bytes, .. }, None, _)
+                        if self.deployments.contains_key(&path) =>
+                    {
+                        self.deployments
+                            .get(&path)
+                            .is_some_and(|digest| *digest == format!("{:x}", Sha256::digest(bytes)))
+                    }
                     (Image::Regular { .. }, None, _) => matches!(
                         target.mode.as_str(),
                         "absent" | "template" | "inline" | "content"
@@ -1063,6 +1181,12 @@ fn prepare_write(
     let private = private_dir(recovery_parent, ".dots-recovery-")?;
     write_private(&private.path().join("expected"), before)?;
     write_private(&private.path().join("replacement"), after)?;
+    if *after != Image::Absent {
+        fs::hard_link(
+            private.path().join("replacement"),
+            private.path().join("publish"),
+        )?;
+    }
     File::open(private.path())?.sync_all()?;
     let plan = WritePlan {
         anchor: anchor.into(),
@@ -1092,7 +1216,7 @@ pub(super) fn recover(git_dir: &Path, receipt: &mut Receipt) -> io::Result<()> {
 }
 
 fn complete_write(git_dir: &Path, plan: &WritePlan, receipt: &mut Receipt) -> io::Result<()> {
-    reconcile_write(git_dir, plan, receipt, replace_exact)
+    reconcile_write(git_dir, plan, receipt, super::guard::replace_consuming)
 }
 
 fn reconcile_write(
@@ -1110,15 +1234,22 @@ fn reconcile_write(
     let stage = Dir::open(&plan.stage)?;
     let before = stage.read_path(Path::new("expected"))?;
     let after = stage.read_path(Path::new("replacement"))?;
-    let result = write(
-        &root,
-        &plan.path,
-        &stage,
-        &CStrName::new("previous")?,
-        &CStrName::new("replacement")?,
-        &before,
-        &after,
-    );
+    // Consuming the publication name proves the install even if the live
+    // inode has since been replaced by an editor.
+    let result =
+        if after != Image::Absent && stage.read_path(Path::new("publish"))? == Image::Absent {
+            Ok(())
+        } else {
+            write(
+                &root,
+                &plan.path,
+                &stage,
+                &CStrName::new("previous")?,
+                &CStrName::new("publish")?,
+                &before,
+                &after,
+            )
+        };
     let previous = plan.stage.join("previous");
     if fs::symlink_metadata(&previous).is_ok() {
         receipt.recovery_files.push(previous.clone());
@@ -1149,7 +1280,7 @@ fn reconcile_write(
     fs::remove_file(git_dir.join(PENDING))?;
     File::open(git_dir)?.sync_all()?;
     if fs::symlink_metadata(previous).is_ok() {
-        for leaf in ["expected", "replacement"] {
+        for leaf in ["expected", "replacement", "publish"] {
             let _ = fs::remove_file(plan.stage.join(leaf));
         }
     } else {
@@ -1998,6 +2129,40 @@ mod tests {
             assert!(!fixture.git.join(PENDING).exists());
             assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
         }
+    }
+
+    #[test]
+    fn a_late_atomic_save_keeps_the_new_bytes_after_completed_install() {
+        let fixture = Fixture::new();
+        let plan = fixture.stage();
+        let stage = Dir::open(&plan.stage).unwrap();
+        let root = Dir::open(&plan.anchor).unwrap();
+        let previous = stage.read_path(Path::new("expected")).unwrap();
+        let replacement = stage.read_path(Path::new("replacement")).unwrap();
+        super::super::guard::replace_consuming(
+            &root,
+            &plan.path,
+            &stage,
+            &CStrName::new("previous").unwrap(),
+            &CStrName::new("publish").unwrap(),
+            &previous,
+            &replacement,
+        )
+        .unwrap();
+        let prepared = fixture.root.join("editor-save");
+        fs::write(&prepared, b"late atomic save").unwrap();
+        fs::rename(prepared, plan.anchor.join(&plan.path)).unwrap();
+        let mut receipt = fixture.receipt();
+        recover(&fixture.git, &mut receipt).unwrap();
+        assert_eq!(
+            fs::read(plan.anchor.join(&plan.path)).unwrap(),
+            b"late atomic save"
+        );
+        let [backup] = receipt.recovery_files.as_slice() else {
+            panic!("expected the old inode");
+        };
+        assert_eq!(fs::read(backup).unwrap(), b"committed source");
+        assert!(!has_pending(&fixture.git));
     }
 
     #[test]

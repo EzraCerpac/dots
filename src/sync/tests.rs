@@ -620,6 +620,10 @@ fn failed_reload_remains_pending_after_a_completed_copy_write() {
     );
     assert!(!home.join("reloaded").exists());
     fs::write(home.join("reload-ready"), "").unwrap();
+    let unchanged = shared_mise_sync(&ctx);
+    assert!(unchanged.issues.is_empty(), "{:?}", unchanged.issues);
+    assert!(!home.join("reloaded").exists());
+    fs::write(git.root().join("source"), "new approved source\n").unwrap();
     let second = shared_mise_sync(&ctx);
     assert!(second.issues.is_empty(), "{:?}", second.issues);
     assert!(home.join("reloaded").is_file());

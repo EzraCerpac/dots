@@ -644,6 +644,11 @@ fn prune_empty_ancestors(
     for (number, directory) in nested_ancestors(old, target).into_iter().enumerate() {
         let slot = format!("old-dir-{position}-{number}");
         verify_directory_slot(root, stage, directory, &slot, plan)?;
+        if stage.read_path(Path::new(&slot))? == Image::Directory
+            && root.read_path(directory)? == Image::Absent
+        {
+            continue;
+        }
         replace_exact(
             root,
             directory,
@@ -736,6 +741,18 @@ fn park_pending(
     if let Err(error) = fs::rename(pending, &recovery) {
         let _ = fs::remove_dir(&recovery);
         return Err(error);
+    }
+    // Completed empty directory transitions do not contain user bytes.
+    // rmdir refuses any directory into which an editor has added a file.
+    if recovery.join("finished").is_file() {
+        for entry in fs::read_dir(&recovery)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry.file_name().as_encoded_bytes().starts_with(b"old-")
+            {
+                let _ = fs::remove_dir(entry.path());
+            }
+        }
     }
     progress.backups = recovery_paths(&recovery);
     parent.sync_all()?;

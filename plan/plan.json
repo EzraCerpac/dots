@@ -38,7 +38,7 @@
     },
     {
       "title": "Acceptance and rollout",
-      "body": "**G-1, the cutover**, passes when the whole suite is green against the Rust binary on macOS, Ubuntu and the distribution containers, the old implementation is deleted, the council is satisfied, and Ezra's configuration pins the release candidate, checked with `dots up` on one machine. His other machines pick it up at their next `dots up`; G-2 covers them.\n\n**G-2, 1.0.0**, passes when Ezra has used the release candidate for a week, including daily sync on two machines and one restore, and the README, demo, template repository and crate are ready.\n\n**Recovery** until 1.0.0: revert the pull request in Ezra's configuration that pins the release candidate. The configuration then runs 0.3.5 with its old hooks again."
+      "body": "**G-1, the cutover**, passes when the whole suite is green against the Rust binary on macOS, Ubuntu and the distribution containers, the old implementation is deleted, the council is satisfied, and Ezra's configuration pins the release candidate, checked with `dots up` on one machine. His other machines pick it up at their next `dots up`; G-2 covers them.\n\n**G-2, 1.0.0**, passes when Ezra has used the release candidate for a week, including daily sync on two machines and one restore, and the README, demo, template repository and crate are ready.\n\n**Recovery** until 1.0.0: revert the pull request in Ezra's configuration that pins the release candidate. The configuration then runs 0.3.5 with its old hooks again. On a machine where the candidate itself cannot run, bring the configuration checkout to the reverted revision with Git and run `mise install`; neither step needs `dots`."
     }
   ],
   "milestones": [
@@ -53,7 +53,7 @@
       "id": "M2",
       "title": "The Rust binary passes the whole suite",
       "depends_on": ["I-01"],
-      "acceptance": ["Every scenario passes against the Rust binary on macOS, Ubuntu, Fedora, Arch and Alpine"],
+      "acceptance": ["Every scenario passes against the Rust binary on every platform in the CI matrix"],
       "owner": "Lead B"
     },
     {
@@ -176,10 +176,10 @@
       "phase": "2 Foundation",
       "workstream": "Rust core",
       "owner": "Sol 6.2 (high) under Lead B",
-      "deliverables": ["Container jobs in rust.yml that run the suite on Fedora, Arch and Alpine", "A first-run job: a container with only mise and Git runs the README quickstart"],
+      "deliverables": ["Container jobs in rust.yml that run the suite on Fedora, Arch and Alpine", "A first-run job: in a container with only mise and Git, dots init then dots up. It may fail until both commands exist and is required from I-01 on"],
       "depends_on": ["Q-01"],
       "prerequisites": [],
-      "acceptance": ["The jobs run on every pull request and report per scenario", "A distribution that cannot pass is taken out of the matrix only by a change to this plan, which also changes I-01 and G-1"],
+      "acceptance": ["The distribution jobs run on every pull request and report per scenario", "A distribution that cannot pass is taken out of the matrix only by a change to this plan, which also changes I-01 and G-1"],
       "duration": null
     },
     {
@@ -344,10 +344,10 @@
       "phase": "4 Cutover",
       "workstream": "Contract",
       "owner": "Sol 6.2 (high) in the configuration repository; the coordinator merges at G-1",
-      "deliverables": ["The Atuin and Tailscale scripts and their tests as hooks and commands of that configuration", "Recipes and hooks calling the new subcommands in place of the sourced libraries", "A pull request against that repository's main that also pins the release candidate"],
+      "deliverables": ["The Atuin and Tailscale scripts and their tests as hooks and commands of that configuration", "Recipes and hooks calling the new subcommands in place of the sourced libraries", "A pull request against that repository's main; the version pin is added at G-1, once the tag exists"],
       "depends_on": ["P-02", "P-05"],
       "prerequisites": [],
-      "acceptance": ["The configuration's own tests pass against the Rust binary", "No file in it sources a manager library or calls dots internal home", "A container bootstrap of each profile completes"],
+      "acceptance": ["The configuration's own tests pass against a dots built from this repository's main", "No file in it sources a manager library or calls dots internal home", "A container bootstrap of each profile completes"],
       "duration": null
     },
     {
@@ -381,7 +381,7 @@
       "workstream": "Release",
       "owner": "Coordinator runs the council and approves the tag",
       "kind": "gate",
-      "deliverables": ["Council review of the whole repository", "Tag v1.0.0-rc.1", "X-01's pull request merged"],
+      "deliverables": ["Council review of the whole repository", "Tag v1.0.0-rc.1", "X-01's pull request merged after the pin to that tag is added to it and its tests pass on the released archive"],
       "depends_on": ["D-01", "X-01", "A-05"],
       "prerequisites": [],
       "acceptance": ["Both council members are satisfied", "CI is green on macOS, Ubuntu, Fedora, Arch and Alpine", "dots up succeeds on this machine from the release candidate"],

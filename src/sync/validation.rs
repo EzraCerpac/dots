@@ -95,16 +95,6 @@ impl Validated {
         }
         Ok(())
     }
-
-    pub fn expected_source(&self, git: &Git<'_>, tree: &Tree, path: &Path) -> io::Result<Image> {
-        Image::checkout(git, &self.revision, path, tree.get(path))
-    }
-
-    pub fn record_hook_file(&mut self, path: &Path, image: Image) {
-        if let Some(input) = self.configs.get_mut(path) {
-            *input = image;
-        }
-    }
 }
 
 pub(super) struct Retirement {

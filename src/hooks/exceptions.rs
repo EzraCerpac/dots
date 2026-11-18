@@ -2,7 +2,7 @@ use crate::config::{Exceptions, selection};
 use crate::run::{Outcome, Run, Sink};
 use crate::{Args, Ctx, Fail};
 
-use super::{ChildEnv, run_stage};
+use super::{ChildEnv, run_child, run_stage};
 
 #[derive(Clone, Copy)]
 pub enum Mode {
@@ -39,7 +39,9 @@ fn run_selected(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<bo
         } else {
             &[]
         };
-        let outcome = run_stage(run, &label, &recipe.path, args, ChildEnv::Recipe(mode));
+        let outcome = run_stage(run, label.as_str(), ChildEnv::Recipe(mode), |stage, env| {
+            run_child(run, stage, &recipe.path, args, env)
+        });
         if matches!(mode, Mode::InstallOnly) && outcome == Outcome::Failed && !run.cancelled() {
             eprintln!("Failed installer exception: {}", recipe.name);
         }

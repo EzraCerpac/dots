@@ -46,7 +46,9 @@ ln -s ~/.local/share/dots/bin/dots ~/.local/bin/dots
 `dots --version` prints the version and how it was installed (`mise`, `homebrew`, `checkout` or `archive`); `dots internal home` prints the directory it runs from, and `DOTS_HOME` overrides it.
 
 The `dots-up` renderer adds the interactive menu, live progress and saved reports; without it every command still works with plain output.
-`dots` uses the first renderer that reports the capability `dots-shared-cli/3` from `DOTS_UP_BIN`, its own `bin/dots-up`, `mise which dots-up` or `PATH`.
+`dots` checks its own `bin/dots-up`, `mise which dots-up` and `PATH` for a renderer that reports `dots-shared-cli/3`.
+`DOTS_UP_BIN` overrides that search.
+Update or unset it if it points to an older renderer.
 
 ## Updating
 

@@ -89,6 +89,8 @@ Search with `/` in the pager and press `q` to return.
 Replay reads the recorded Git revisions locally.
 Piped output and saved reports contain metadata only.
 Binary, encrypted and unverified changes remain visible as file entries.
+Showing a patch requires Gitleaks to return a clean JSON report.
+Versions that omit the report on a clean scan show the file list only.
 
 ### Verbose diagnostics
 

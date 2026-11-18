@@ -403,21 +403,38 @@ class CommandBackendTests(ContractTestCase):
     @requires("node")
     def test_standalone_sync_attaches_its_own_stage_and_preserves_public_exit(self) -> None:
         events = self.f.base / "events"
+        report_dir = self.f.base / "run"
+        report_dir.mkdir()
         result = subprocess.run(["bash", "-c", 'exec 3>"$0"; exec "$@"', str(events), sys.executable,
                                  str(self.f.manager / "lib/dots-command-backend.py"), str(self.f.mise), str(self.f.config), "sync"],
-                                cwd=self.f.config, env={**self.f.env, "DOTS_UP_EVENT_FD": "3", "FIXTURE_REAL_SYNC": "1"},
+                                cwd=self.f.config, env={**self.f.env, "DOTS_UP_EVENT_FD": "3", "FIXTURE_REAL_SYNC": "1",
+                                                       "DOTS_UP_RUN_DIR": str(report_dir)},
                                 capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("not a Git repository", result.stdout)
+        preview = self.f.dots("internal", "sync-present", str(report_dir / "sync.json"))
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(preview.stdout.count("Could not save this sync for replay."), 1)
         parsed = [json.loads(line) for line in events.read_text().splitlines()]
         self.assertEqual([(e["id"], e["status"]) for e in parsed if e["kind"] == "stage_end"], [("sync", "attention")])
         self.assertEqual([(e["status"], e["exit_code"]) for e in parsed if e["kind"] == "run_end"], [("attention", 0)])
 
+    def test_up_last_finds_the_latest_finished_bash_log(self) -> None:
+        state = self.f.home / ".local/state/dots/up"
+        for run in ("20261201", "20261202", "20261203"):
+            write(state / run / ".fallback", "")
+        write(state / "20261203/.active", "")
+        replay = self.f.dots("up", "--last")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertIn(str(state / "20261202/stages"), replay.stdout)
+
     @requires("git", "node", "gitleaks")
     def test_public_sync_records_changed_files_and_replays_without_syncing(self) -> None:
-        env = {**self.f.env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        self.f.env = {key: value for key, value in self.f.env.items() if not key.startswith("GIT_")}
+        self.f.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_ALLOW_PROTOCOL="file",
+                          FIXTURE_REAL_SYNC="1", FAKE_HISTORY_STATUS='{"files": [], "edits": []}')
         def git(*args):
-            return subprocess.check_output(["git", *args], cwd=self.f.config, env=env, text=True).strip()
+            return subprocess.check_output(["git", *args], cwd=self.f.config, env=self.f.env, text=True).strip()
         git("init", "-q", "-b", "main")
         git("config", "user.name", "Fixture")
         git("config", "user.email", "fixture@example.invalid")
@@ -425,6 +442,9 @@ class CommandBackendTests(ContractTestCase):
         write(self.f.config / "config.toml", '[vars]\ndots_source_repo = "fixture/config"\n')
         git("add", ".")
         git("commit", "-qm", "base")
+        if subprocess.run(["git", "merge-tree", "--write-tree", "-X", "theirs", "HEAD", "HEAD"],
+                          cwd=self.f.config, env=self.f.env, capture_output=True).returncode:
+            self.skipTest("sync requires Git with merge-tree -X")
         origin = str(self.f.base / "origin.git")
         git("clone", "-q", "--bare", ".", origin)
         git("remote", "add", "origin", "https://github.com/fixture/config")
@@ -432,7 +452,6 @@ class CommandBackendTests(ContractTestCase):
         git("switch", "-qc", "dev")
         git("push", "-q", "origin", "dev")
         write(self.f.config / "editor.ini", "tab_size = 4\n")
-        self.f.env.update(FIXTURE_REAL_SYNC="1", FAKE_HISTORY_STATUS='{"files": [], "edits": []}', GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
         run = self.f.dots("sync")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("Shared on dev", run.stdout)
@@ -446,12 +465,16 @@ class CommandBackendTests(ContractTestCase):
         self.assertNotIn("tab_size", replay.stdout)
         self.assertEqual(git("rev-parse", "HEAD"), head)
         self.assertEqual(git("status", "--porcelain"), "M editor.ini")
+        self.assertEqual((self.f.config / "editor.ini").read_text(), "tab_size = 8\n")
         git("restore", "editor.ini")
         clean = self.f.dots("sync")
         self.assertEqual(clean.returncode, 0)
         self.assertEqual(len(clean.stdout.strip().splitlines()), 1, clean.stdout)
         self.assertIn("up to date", clean.stdout.lower())
-        self.assertNotIn("editor.ini", self.f.dots("sync", "--last").stdout)
+        replay = self.f.dots("sync", "--last")
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertIn("up to date", replay.stdout.lower())
+        self.assertNotIn("editor.ini", replay.stdout)
 
     def test_failed_standalone_command_names_the_command_to_rerun(self) -> None:
         import json

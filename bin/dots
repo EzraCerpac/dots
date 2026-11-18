@@ -328,7 +328,16 @@ case "$command_name" in
             [[ "$has_last" -eq 1 || "$has_no_wait" -eq 1 ]] || set -- --no-wait "$@"
             exec "$renderer" --root "$root" --home "$DOTS_HOME" "$@"
         fi
+        fallback_state="${XDG_STATE_HOME:-$HOME/.local/state}/dots/up"
         if [[ "$has_last" -eq 1 ]]; then
+            fallback_reports=("$fallback_state"/*)
+            for ((index=${#fallback_reports[@]} - 1; index >= 0; index--)); do
+                candidate="${fallback_reports[index]}"
+                if [[ -f "$candidate/.fallback" && ! -e "$candidate/.active" ]]; then
+                    printf 'Latest retained Bash update logs: %s/stages\n' "$candidate"
+                    exit 0
+                fi
+            done
             echo 'dots: dashboard renderer is unavailable; no saved report was opened' >&2
             exit 2
         fi
@@ -346,7 +355,6 @@ case "$command_name" in
             if [[ "$has_plain" -eq 0 ]]; then
                 fallback_args+=(--plain)
             fi
-            fallback_state="${XDG_STATE_HOME:-$HOME/.local/state}/dots/up"
             fallback_run="$fallback_state/$(date -u +%Y%m%dT%H%M%SZ)-$$"
             if mkdir -p "$fallback_state" && chmod 700 "$fallback_state" \
                 && mkdir -p "$fallback_run/stages" \

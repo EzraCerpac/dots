@@ -775,7 +775,9 @@ if [[ "${#attention_logs[@]}" -gt 0 ]]; then
 fi
 if [[ "${#failures[@]}" -eq 0 ]]; then
     if [[ "${#deferred[@]}" -gt 0 ]]; then
-        if [[ -n "${DOTS_UP_RUN_DIR:-}" && -f "$DOTS_UP_RUN_DIR/.fallback" ]]; then : > "$DOTS_UP_RUN_DIR/.attention"; fi
+        if [[ -n "${DOTS_UP_RUN_DIR:-}" && -f "$DOTS_UP_RUN_DIR/.fallback" ]]; then
+            : > "$DOTS_UP_RUN_DIR/.attention" || echo "dots: could not mark the run for log retention" >&2
+        fi
         printf '\nUpdate report: completed; needs attention: '
         printf '%s; ' "${deferred[@]}"
         printf '\n'

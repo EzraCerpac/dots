@@ -1,0 +1,2 @@
+legacy_case	reason
+EnrollHistoryTests.test_an_entry_for_another_host_stops	The fake marked a host-other-only entry active on host-fx. Native mise filters it out before enrollment. The no-files scenario exercises native filtering and checks deferral and unchanged file mode.

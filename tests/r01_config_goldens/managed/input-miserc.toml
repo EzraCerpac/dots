@@ -1,0 +1,5 @@
+# Early environment selectors
+"env" = ['server', 'host-old-machine', 'local-extra', 'second-extra', 'local-extra'] # Preserve extras
+
+["env_sets"]
+env = ["other"] # Unrelated selector array

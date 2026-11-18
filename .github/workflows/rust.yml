@@ -81,6 +81,96 @@ jobs:
       - name: Run all tests natively
         run: mise run test
 
+  legacy-oracle:
+    name: v0.4.0 oracle (${{ matrix.os }})
+    if: github.event_name == 'pull_request' && github.base_ref == 'rust'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+          - os: macos-15
+            platform: darwin-arm64
+    env:
+      MISE_VERSION: v2026.11.9
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends fish jq rsync zsh
+
+      - name: Install Fish on macOS
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: Install the pinned Rust toolchain and oracle tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_YES: "1"
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          curl -fsSL https://mise.run | sh
+          mise_bin="$HOME/.local/bin/mise"
+          test "$("$mise_bin" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
+          printf '%s\n' "${mise_bin%/*}" >> "$GITHUB_PATH"
+          cd "$RUNNER_TEMP"
+          "$mise_bin" use --global node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest
+          # World replaces HOME and XDG paths. Give it installed binaries instead of shims.
+          "$mise_bin" bin-paths >> "$GITHUB_PATH"
+
+      - name: Verify and unpack the pinned oracle
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          repo=https://github.com/EzraCerpac/dots
+          tag=v0.4.0
+          commit=f5c8a0e83b333dbea6c0b5f19725cc818ffca674
+          test "$(git ls-remote "$repo.git" "refs/tags/$tag" | cut -f1)" = "$commit"
+          archive="dots-${tag#v}-$PLATFORM"
+          oracle="$(mktemp -d "$RUNNER_TEMP/dots-oracle.XXXXXX")"
+          cd "$oracle"
+          for asset in SHA256SUMS "$archive.tar.gz"; do
+            curl -fsSL --retry 3 "$repo/releases/download/$tag/$asset" -o "$asset"
+          done
+          # Pin the published manifest so replaced assets can't change the oracle.
+          printf '%s  SHA256SUMS\n' dc1319f9a2087383ef4fb443b96cd117b3d7c2d18a2fc784dc4e1a3fe864f6c3 | shasum -a 256 -c
+          awk -v asset="$archive.tar.gz" '$2 == asset' SHA256SUMS | shasum -a 256 -c
+          tar -xzf "$archive.tar.gz"
+          printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"
+
+      - name: Run unchanged black-box scenarios against the archive
+        run: |
+          for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
+            command -v "$tool"
+          done
+          test "$(DOTS_SKILL_LINKS=0 "$DOTS_BIN" --version)" = 'dots 0.4.0 (archive)'
+          test "$("${DOTS_BIN%/*}/dots-up" --capabilities)" = 'dots-shared-cli/3'
+          # Discover every integration suite. Libtest's default filter matches substrings.
+          listing="$(mise run test -- --test '*' -- --list --format terse)"
+          scenarios=()
+          while IFS= read -r entry; do
+            case "${entry##*::}" in
+              unchanged_*': test') scenarios+=("${entry%: test}") ;;
+            esac
+          done <<< "$listing"
+          if (( ${#scenarios[@]} == 0 )); then
+            echo 'No unchanged black-box scenarios found' >&2
+            exit 1
+          fi
+          mise run test -- --test '*' -- --include-ignored --exact "${scenarios[@]}"
+
   rust-distros:
     name: Rust scenarios (${{ matrix.distro }})
     runs-on: ubuntu-24.04

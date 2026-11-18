@@ -186,11 +186,12 @@ func TestStatusPrintsStructuredInventoryInTextModes(t *testing.T) {
 emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture-nas"}'
 emit '{"v":1,"kind":"item_upsert","label":"sample-tool@1","group":"Tools","status":"ok","summary":"1.2.3"}'
 emit '{"v":1,"kind":"item_upsert","label":"brew:sample-package","group":"Packages","status":"ok","summary":"2.3.4"}'
+emit '{"v":1,"kind":"item_upsert","label":"repository","group":"Source","status":"attention","summary":"Git on dev","action":"Legacy sync state; see docs/sync.md"}'
 emit '{"v":1,"kind":"item_upsert","label":"missing-tool","group":"Tools","status":"missing","summary":"not available"}'
 emit '{"v":1,"kind":"item_upsert","label":"settings history","group":"History","status":"skipped","summary":"disabled"}'
 emit '{"v":1,"kind":"run_end","exit_code":0}'
 `)
-	expect := []string{"laptop · fixture-nas", "sample-tool@1  ok — 1.2.3", "brew:sample-package  ok — 2.3.4", "missing-tool  missing", "settings history  skipped"}
+	expect := []string{"laptop · fixture-nas", "sample-tool@1  ok — 1.2.3", "brew:sample-package  ok — 2.3.4", "missing-tool  missing", "settings history  skipped", "repository  attention — Git on dev\n    Legacy sync state; see docs/sync.md"}
 	for _, opts := range []Options{{}, {Plain: true}, {Verbose: true}} {
 		opts.Command, opts.StateDir = "status", t.TempDir()
 		code, output := captureRun(t, opts)

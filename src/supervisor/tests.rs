@@ -790,14 +790,21 @@ fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
             result.is_some()
         });
     drain(&mut outer, &mut transcript);
+    let foreground = unsafe { libc::tcgetpgrp(master) };
+    let phase = fs::read_to_string(fixture.path().join("probe-phase")).unwrap_or_default();
+    let observer = fs::read_to_string(fixture.path().join("observer-used")).unwrap_or_default();
     drop(outer);
     if !exited {
         let _ = child.kill();
-        let _ = wait_until(|| child.try_wait().unwrap().is_some());
+        let _ = wait_until(|| {
+            result = child.try_wait().unwrap();
+            result.is_some()
+        });
     }
     assert!(
-        exited && result.unwrap().success(),
-        "{}",
+        exited && result.is_some_and(|status| status.success()),
+        "fixture PID {}, status {result:?}, foreground {foreground}, phase {phase:?}, observer {observer:?}\n{}",
+        child.id(),
         String::from_utf8_lossy(&transcript)
     );
 }
@@ -819,9 +826,11 @@ fn check_tty_probe(path: &Path) {
         &pinned,
         r#"#!/bin/sh
 PATH=/usr/bin:/bin
-: > "$FIXTURE_TRACE"
+printf 'ready\n' >> "$FIXTURE_TRACE"
 printf R
-if [ "$(dd bs=1 count=1 2>/dev/null)" = F ]; then printf F; fi
+marker=$(dd bs=1 count=1 2>/dev/null)
+printf 'dd status %s, marker %s\n' "$?" "$marker" >> "$FIXTURE_TRACE"
+if [ "$marker" = F ]; then printf F; fi
 "#,
     )
     .unwrap();
@@ -841,14 +850,18 @@ if [ "$(dd bs=1 count=1 2>/dev/null)" = F ]; then printf F; fi
     let mut input = tempfile::tempfile_in(path).unwrap();
     input.write_all(b"private stdin\n").unwrap();
     input.seek(SeekFrom::Start(0)).unwrap();
+    let phase = path.join("probe-phase");
     let output = supervisor
         .probe(
             shell(
                 r#"printf 'probe prompt\n' >/dev/tty
+            printf 'reading tty\n' > "$1"
             IFS= read -r answer </dev/tty || exit 31
+            printf 'reading private input\n' > "$1"
             IFS= read -r private || exit 32
-            printf '%s:%s' "$answer" "$private""#,
-                &[],
+            printf '%s:%s' "$answer" "$private"
+            printf 'returning\n' > "$1""#,
+                &[&phase],
             ),
             Stdio::from(input),
             false,
@@ -858,6 +871,7 @@ if [ "$(dd bs=1 count=1 2>/dev/null)" = F ]; then printf F; fi
     assert_eq!(output.stdout, b"tty answer:private stdin");
     assert!(observed.is_file());
 
+    fs::write(&phase, "checking competing foreground").unwrap();
     let ready = path.join("foreground");
     let release = path.join("release");
     std::thread::scope(|scope| {
@@ -890,7 +904,9 @@ if [ "$(dd bs=1 count=1 2>/dev/null)" = F ]; then printf F; fi
         );
     });
 
+    fs::write(&phase, "checking termios reclaim").unwrap();
     check_terminal_reclaim(&ctx, &supervisor);
+    fs::write(&phase, "complete").unwrap();
 }
 
 fn check_terminal_reclaim(ctx: &crate::Ctx, supervisor: &Supervisor<'_>) {

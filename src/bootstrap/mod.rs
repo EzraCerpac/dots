@@ -191,6 +191,8 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         native.extend([format!("--{key}").into(), url.into()]);
     }
 
+    // Only persist-selected reads the MISE_ENV supplied by its own caller.
+    // An outer bootstrap must not pass the caller's project selector to mise.
     let restore_selection = restore
         .map(|machine| {
             let mut vars = ctx.env.vars.clone();

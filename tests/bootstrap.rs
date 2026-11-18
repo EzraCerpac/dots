@@ -789,10 +789,23 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
 fn new_pre_dotfiles_persists_selection_through_mise_x_before_tools() {
     let world = World::new();
     minimal(&world);
+    let pre_dotfiles = world.base().join("pre-dotfiles");
+    write(
+        &pre_dotfiles,
+        r#"#!/bin/sh
+set -eu
+. "$P05_FIXTURE_GUARD"
+test -z "${MISE_ENV:-}"
+test "$MISE_HISTORY_ENABLED" = 0
+test ! -e "$HOME/applied"
+SETUP_PROFILE=laptop SETUP_MACHINE_ID=fixture-host exec "$DOTS_MISE_BIN" x -- "$P05_GUARDED_EXEC" dots bootstrap persist-selected
+"#,
+        0o755,
+    );
     let config = format!(
         r#"{MINIMAL}
 [bootstrap.hooks]
-pre-dotfiles = 'test "$MISE_HISTORY_ENABLED" = 0 && test ! -e "$HOME/applied" && SETUP_PROFILE=laptop "$DOTS_MISE_BIN" x -- "$P05_GUARDED_EXEC" dots bootstrap persist-selected'
+pre-dotfiles = {pre_dotfiles:?}
 [dotfiles]
 "~/applied" = {{ source = "input", mode = "copy" }}
 "~/tracked" = {{ mode = "track" }}
@@ -806,12 +819,12 @@ pre-dotfiles = 'test "$MISE_HISTORY_ENABLED" = 0 && test ! -e "$HOME/applied" &&
         0o600,
     );
     let output = run(dots(&world)
+        .env("MISE_ENV", "server,external")
         .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
         .env(
             "MISE_SYSTEM_CONFIG_FILE",
             world.home().join("empty-system.toml"),
         )
-        .env("SETUP_MACHINE_ID", "fixture-host")
         .args(["bootstrap", "--yes"]));
     assert_success(&output);
     assert_eq!(

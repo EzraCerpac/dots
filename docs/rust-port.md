@@ -34,7 +34,7 @@ R-01 runs children on caller stdio and saves stage metadata and status privately
 P-12 formats plain step, outcome and report-list lines from `snapshot()` and R-01's private `report::{list, load}`, without ratatui or crossterm; queries live with their data's writer.
 No run uses a PTY or relays the terminal, and one writer owns it at a time.
 In full `up` or `update` with interactive scrollback, hooks and recipes run under `Interactive`.
-They inherit the caller's stdin, stdout, stderr and controlling terminal from spawn, preserving any redirected descriptors, and their output reaches the caller directly without capture.
+They inherit the caller's stdin, stdout, stderr and controlling terminal from spawn, and their output reaches the terminal directly without capture.
 P-11 captures hook and recipe stdout and stderr in concise output, including headless runs and `--plain`, while passing through the caller's stdin.
 `Ordinary` stage output and captured hook and recipe output go to private logs that feed issue tails.
 `--verbose` mirrors captured output while retaining logs and tails.

@@ -245,7 +245,6 @@ fn unchanged_brew_cask_reports_verified_install_and_upgrade() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-02"]
 fn unchanged_brew_recipe_without_a_change_sink_can_install() {
     let fixture = Fixture::new();
     fixture.executable(

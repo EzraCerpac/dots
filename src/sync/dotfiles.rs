@@ -514,6 +514,7 @@ impl Copies {
             return Ok(());
         }
         let mut jobs = BTreeMap::new();
+        let mut results = BTreeMap::new();
         for target in targets {
             if matches!(target.mode.as_str(), "track" | "track-local") {
                 continue;
@@ -531,6 +532,7 @@ impl Copies {
                     &path,
                     COPY_ACTION,
                 );
+                results.insert(path, false);
                 continue;
             }
             let depends = [definition.as_ref(), group.map(|(_, item)| item)]
@@ -574,13 +576,24 @@ impl Copies {
                     .push(path.clone());
             }
         }
-        let dependencies = |names: &[String]| {
+        let dependencies = |names: &[String], current: &Path| {
             names
                 .iter()
                 .flat_map(|name| {
-                    group_members.get(name).cloned().unwrap_or_else(|| {
-                        absolute_target(run, Path::new(name)).into_iter().collect()
-                    })
+                    group_members.get(name).map_or_else(
+                        || {
+                            absolute_target(run, Path::new(name))
+                                .into_iter()
+                                .collect::<Vec<_>>()
+                        },
+                        |paths| {
+                            paths
+                                .iter()
+                                .filter(|path| path.as_path() != current)
+                                .cloned()
+                                .collect()
+                        },
+                    )
                 })
                 .collect::<Vec<_>>()
         };
@@ -596,15 +609,16 @@ impl Copies {
             }
         }
 
-        let mut results = BTreeMap::new();
         while !jobs.is_empty() {
             if run.cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
             }
             let next = jobs
                 .iter()
-                .find(|(_, (_, _, deps, _, _))| {
-                    dependencies(deps).iter().all(|dep| !jobs.contains_key(dep))
+                .find(|(path, (_, _, deps, _, _))| {
+                    dependencies(deps, path)
+                        .iter()
+                        .all(|dep| !jobs.contains_key(dep))
                 })
                 .map(|(path, _)| path.clone());
             let Some(path) = next else {
@@ -616,7 +630,7 @@ impl Copies {
                 break;
             };
             let (target, definition, depends, _, _) = jobs.remove(&path).expect("job was present");
-            if dependencies(&depends)
+            if dependencies(&depends, &path)
                 .iter()
                 .any(|dep| results.get(dep) == Some(&false))
             {

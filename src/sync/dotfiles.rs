@@ -4,13 +4,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::{receipt::Receipt, run::Run};
 
 use super::git::{Entry, Git, Tree, invalid, relative};
 use super::guard::{CStrName, Dir, Image, private_dir, replace_exact, write_private};
-use super::validation::{self, Retirement};
+use super::validation::{self, Retirement, Validated};
 use super::{issue, path_issue};
 
 #[derive(Deserialize)]
@@ -44,6 +45,44 @@ impl Target {
     }
 }
 
+pub(super) struct ApplyPlan {
+    root: PathBuf,
+    targets: Vec<Target>,
+    configs: Configs,
+}
+
+impl ApplyPlan {
+    pub fn new(run: &Run<'_>, root: PathBuf, live: &Path) -> io::Result<Self> {
+        let remap = |path: &mut PathBuf| {
+            if let Ok(relative) = path.strip_prefix(&root) {
+                *path = live.join(relative);
+            }
+        };
+        let mut targets = status_at(run, &root, true)?;
+        for target in &mut targets {
+            remap(&mut target.target);
+            if let Some(source) = target.source.as_mut() {
+                remap(source);
+            }
+            if let Some(origin) = target.origin.as_mut() {
+                remap(&mut origin.config);
+                if let Some(source) = origin.source.as_mut() {
+                    remap(source);
+                }
+            }
+        }
+        let mut configs = Configs::read_at(run, &root, true)?;
+        for (path, _) in &mut configs.docs {
+            remap(path);
+        }
+        Ok(Self {
+            root,
+            targets,
+            configs,
+        })
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct KnownCopy {
     source: PathBuf,
@@ -53,9 +92,21 @@ struct KnownCopy {
 
 #[derive(Default)]
 pub(super) struct Copies {
-    known: BTreeMap<PathBuf, KnownCopy>,
+    state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
-    captured: BTreeMap<PathBuf, Image>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct CopyState {
+    known: BTreeMap<PathBuf, KnownCopy>,
+    captured: BTreeMap<PathBuf, Captured>,
+    changed: BTreeSet<PathBuf>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct Captured {
+    mode: u32,
+    digest: [u8; 32],
 }
 
 const STATE: &str = "dots-sync-copies.json";
@@ -65,11 +116,22 @@ impl Copies {
     pub fn load(dir: &Path) -> io::Result<Self> {
         match File::open(dir.join(STATE)) {
             Ok(file) => {
-                let known = serde_json::from_reader(file).map_err(io::Error::other)?;
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum OnDisk {
+                    Current(CopyState),
+                    Previous(BTreeMap<PathBuf, KnownCopy>),
+                }
+                let state = match serde_json::from_reader(file).map_err(io::Error::other)? {
+                    OnDisk::Current(state) => state,
+                    OnDisk::Previous(known) => CopyState {
+                        known,
+                        ..CopyState::default()
+                    },
+                };
                 Ok(Self {
-                    known,
-                    observed: BTreeMap::new(),
-                    captured: BTreeMap::new(),
+                    state,
+                    ..Self::default()
                 })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
@@ -79,7 +141,7 @@ impl Copies {
 
     pub fn persist(&self, dir: &Path) -> io::Result<()> {
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        serde_json::to_writer(&mut tmp, &self.known).map_err(io::Error::other)?;
+        serde_json::to_writer(&mut tmp, &self.state).map_err(io::Error::other)?;
         tmp.as_file().sync_all()?;
         tmp.persist(dir.join(STATE))?;
         File::open(dir)?.sync_all()
@@ -114,7 +176,7 @@ impl Copies {
                     continue;
                 }
                 let path = dest.join(rules.destination(relative));
-                self.known.entry(path).or_insert_with(|| KnownCopy {
+                self.state.known.entry(path).or_insert_with(|| KnownCopy {
                     source: leaf.clone(),
                     entry: entry.clone(),
                     mode: None,
@@ -135,7 +197,7 @@ impl Copies {
         let root = Dir::open(git.root())?;
         let filesystem = Dir::open(Path::new("/"))?;
         let configs = Configs::read_at(run, git.root(), false)?;
-        let discovered = status(run, git.root())?;
+        let discovered = status_at(run, git.root(), false)?;
         for target in &discovered {
             if matches!(target.mode.as_str(), "track" | "track-local") {
                 continue;
@@ -165,6 +227,7 @@ impl Copies {
                 }
                 let path = destination.join(rules.destination(relative));
                 let record = self
+                    .state
                     .known
                     .entry(path.clone())
                     .or_insert_with(|| KnownCopy {
@@ -220,7 +283,11 @@ impl Copies {
                 // Persist the common source before displacement, so a crash
                 // cannot make the changed deployed bytes into a new baseline.
                 self.persist(git_dir)?;
-                let Image::Regular { bytes, .. } = &deployed else {
+                let Image::Regular {
+                    bytes,
+                    mode: deployed_mode,
+                } = &deployed
+                else {
                     unreachable!()
                 };
                 let Image::Regular { mode, .. } = &live else {
@@ -235,8 +302,14 @@ impl Copies {
                     leaf,
                     git_dir,
                     git_dir,
-                    &live,
-                    &replacement,
+                    (&live, &replacement),
+                    Some(WriteEffect::Capture {
+                        deployed: path.clone(),
+                        baseline: Captured {
+                            mode: *deployed_mode,
+                            digest: Sha256::digest(bytes).into(),
+                        },
+                    }),
                     receipt,
                 )
                 .is_err()
@@ -251,7 +324,7 @@ impl Copies {
                         return Err(invalid("copy capture recovery is pending"));
                     }
                 } else {
-                    self.captured.insert(path, deployed);
+                    self.state = Self::load(git_dir)?.state;
                 }
             }
         }
@@ -264,22 +337,25 @@ impl Copies {
         git_dir: &Path,
         tree: &Tree,
     ) -> io::Result<()> {
-        if self.captured.is_empty() {
+        if self.state.captured.is_empty() {
             return Ok(());
         }
-        for (path, observed) in std::mem::take(&mut self.captured) {
-            let Some(known) = self.known.get_mut(&path) else {
+        for (path, observed) in std::mem::take(&mut self.state.captured) {
+            let Some(known) = self.state.known.get_mut(&path) else {
                 continue;
             };
             let Some(entry) = tree.get(&known.source) else {
+                self.state.captured.insert(path, observed);
                 continue;
             };
             let shared = Image::from_git(git, Some(entry))?;
-            if let Image::Regular { mode, .. } = &observed {
-                if same_copy(&observed, &shared, None) {
-                    known.entry = entry.clone();
-                    known.mode = Some(*mode);
-                }
+            if let Image::Regular { bytes, .. } = &shared
+                && <[u8; 32]>::from(Sha256::digest(bytes)) == observed.digest
+            {
+                known.entry = entry.clone();
+                known.mode = Some(observed.mode);
+            } else {
+                self.state.captured.insert(path, observed);
             }
         }
         self.persist(git_dir)
@@ -291,22 +367,27 @@ impl Copies {
         git: &Git<'_>,
         git_dir: &Path,
         tree: &Tree,
+        validated: &Validated,
         receipt: &mut Receipt,
     ) -> io::Result<()> {
         let filesystem = Dir::open(Path::new("/"))?;
-        let targets = status(run, git.root())?;
+        let ApplyPlan {
+            root,
+            targets,
+            configs,
+        } = &validated.apply;
+        validated.ready_to_apply(git.root())?;
         if targets.is_empty() {
             return Ok(());
         }
-        let configs = Configs::read_at(run, git.root(), false)?;
         let mut jobs = BTreeMap::new();
         for target in targets {
             if matches!(target.mode.as_str(), "track" | "track-local") {
                 continue;
             }
             let path = absolute_target(run, &target.target)?;
-            let definition = configs.definition(&target, &path);
-            let group = configs.group(run, &target, &path);
+            let definition = configs.definition(target, &path);
+            let group = configs.group(run, target, &path);
             let depends = [definition.as_ref(), group.map(|(_, item)| item)]
                 .into_iter()
                 .flatten()
@@ -328,7 +409,7 @@ impl Copies {
             .into_iter()
             .map(|(path, image)| (path, Ok(image)))
             .collect::<BTreeMap<_, _>>();
-        for path in jobs.keys().chain(self.known.keys()) {
+        for path in jobs.keys().chain(self.state.known.keys()) {
             if !observed.contains_key(path) {
                 observed.insert(path.clone(), filesystem.read_path(fs_relative(path)?));
             }
@@ -354,7 +435,8 @@ impl Copies {
                 .collect::<Vec<_>>()
         };
         for hook in &configs.pre {
-            if invoke(run, git.root(), hook).is_err() {
+            validated.ready_to_apply(git.root())?;
+            if invoke(run, root, git.root(), hook).is_err() {
                 issue(
                     receipt,
                     "mise pre-dotfiles hook failed",
@@ -365,7 +447,6 @@ impl Copies {
         }
 
         let mut results = BTreeMap::new();
-        let mut changed = BTreeSet::new();
         while !jobs.is_empty() {
             if run.cancelled() {
                 return Err(io::ErrorKind::Interrupted.into());
@@ -407,11 +488,10 @@ impl Copies {
                 &filesystem,
                 &observed,
                 &path,
-                &target,
+                target,
                 definition.as_ref(),
-                &configs,
+                validated,
                 &all_jobs,
-                &mut changed,
             );
             results.insert(path.clone(), matches!(changed_now, Ok(true)));
             if changed_now.is_err() {
@@ -421,6 +501,9 @@ impl Copies {
                     &path,
                     COPY_ACTION,
                 );
+                if has_pending(git_dir) {
+                    return Err(invalid("dotfile replacement recovery is pending"));
+                }
             }
         }
         self.persist(git_dir)?;
@@ -429,17 +512,26 @@ impl Copies {
         for (selector, command) in &configs.reload {
             let matches = absolute_target(run, Path::new(selector))
                 .ok()
-                .is_some_and(|pattern| changed.iter().any(|path| path_matches(&pattern, path)));
-            if matches && reloaded.insert(command) && invoke(run, git.root(), command).is_err() {
-                issue(
-                    receipt,
-                    "mise dotfile reload failed",
-                    "Check the matching history.reload command and rerun it.",
-                );
+                .is_some_and(|pattern| {
+                    self.state
+                        .changed
+                        .iter()
+                        .any(|path| path_matches(&pattern, path))
+                });
+            if matches && reloaded.insert(command) {
+                validated.ready_to_apply(git.root())?;
+                if invoke(run, root, git.root(), command).is_err() {
+                    issue(
+                        receipt,
+                        "mise dotfile reload failed",
+                        "Check the matching history.reload command and rerun it.",
+                    );
+                }
             }
         }
         for hook in &configs.post {
-            if invoke(run, git.root(), hook).is_err() {
+            validated.ready_to_apply(git.root())?;
+            if invoke(run, root, git.root(), hook).is_err() {
                 issue(
                     receipt,
                     "mise post-dotfiles hook failed",
@@ -448,6 +540,8 @@ impl Copies {
                 break;
             }
         }
+        self.state.changed.clear();
+        self.persist(git_dir)?;
         Ok(())
     }
 
@@ -464,10 +558,11 @@ impl Copies {
         destination: &Path,
         target: &Target,
         definition: Option<&Item>,
-        configs: &Configs,
+        validated: &Validated,
         all_jobs: &BTreeSet<PathBuf>,
-        changed: &mut BTreeSet<PathBuf>,
     ) -> io::Result<bool> {
+        validated.ready_to_apply(git.root())?;
+        let configs = &validated.apply.configs;
         let mut desired = BTreeMap::new();
         let mut sources = BTreeMap::new();
         match target.mode.as_str() {
@@ -503,7 +598,8 @@ impl Copies {
                 desired.insert(destination.to_owned(), Image::Absent);
             }
             "template" | "inline" | "content" => {
-                let image = configs.render(run, git, git_dir, target, definition)?;
+                let image =
+                    configs.render(run, git, git_dir, target, definition, &validated.apply.root)?;
                 desired.insert(destination.to_owned(), image);
             }
             _ => return Err(invalid("unrecognized mise dotfile mode")),
@@ -513,36 +609,51 @@ impl Copies {
         for (path, mut replacement) in desired {
             let relative_path = fs_relative(&path)?;
             let current = filesystem.read_path(relative_path)?;
-            let known = self.known.get(&path);
+            let known = self.state.known.get(&path);
             let baseline = known
                 .map(|known| Image::from_git(git, Some(&known.entry)))
                 .transpose()?;
-            if let Image::Regular { mode, .. } = &mut replacement {
-                if let (
-                    Some(known),
-                    Image::Regular {
-                        mode: current_mode, ..
-                    },
-                ) = (known, &current)
+            if let (
+                Image::Regular { mode, .. },
+                Some(known),
+                Image::Regular {
+                    mode: current_mode, ..
+                },
+            ) = (&mut replacement, known, &current)
+                && known.mode.is_none()
+                && path != destination
+            {
+                if let Some(Image::Regular { mode: old, .. }) = baseline.as_ref()
+                    && (old ^ *mode) & 0o100 != 0
+                    && (current_mode ^ *mode) & 0o100 != 0
                 {
-                    if known.mode.is_none() && path != destination {
-                        if let Some(Image::Regular { mode: old, .. }) = baseline.as_ref() {
-                            if (old ^ *mode) & 0o100 != 0 && (current_mode ^ *mode) & 0o100 != 0 {
-                                path_issue(
-                                    receipt,
-                                    "Kept a copy with unverified deployed permissions",
-                                    &path,
-                                    COPY_ACTION,
-                                );
-                                clean = false;
-                                continue;
-                            }
-                        }
-                        *mode = *current_mode;
-                    }
+                    path_issue(
+                        receipt,
+                        "Kept a copy with unverified deployed permissions",
+                        &path,
+                        COPY_ACTION,
+                    );
+                    clean = false;
+                    continue;
                 }
+                *mode = *current_mode;
             }
+            let next_baseline = if let (Some(source), Image::Regular { mode, .. }) =
+                (sources.get(&path), &replacement)
+                && let Ok(source) = source.strip_prefix(git.root())
+                && let Some(entry) = tree.get(source)
+                && replacement.git_eq(&Image::from_git(git, Some(entry))?)
+            {
+                Some(KnownCopy {
+                    source: source.into(),
+                    entry: entry.clone(),
+                    mode: Some(*mode),
+                })
+            } else {
+                None
+            };
             if current != replacement {
+                validated.ready_to_apply(git.root())?;
                 let still_observed = observed
                     .get(&path)
                     .and_then(|value| value.as_ref().ok())
@@ -570,17 +681,19 @@ impl Copies {
                     continue;
                 }
 
-                let Some(parent) = path.parent() else {
-                    return Err(invalid("dotfile target has no parent"));
-                };
                 filesystem.parent(relative_path, !matches!(replacement, Image::Absent))?;
+                let recovery = recovery_parent(&path, git.root(), git_dir)?;
+                self.persist(git_dir)?;
                 if install(
                     Path::new("/"),
                     relative_path,
                     git_dir,
-                    parent,
-                    &current,
-                    &replacement,
+                    &recovery,
+                    (&current, &replacement),
+                    Some(WriteEffect::Deploy {
+                        target: path.clone(),
+                        baseline: next_baseline,
+                    }),
                     receipt,
                 )
                 .is_err()
@@ -591,41 +704,43 @@ impl Copies {
                         &path,
                         COPY_ACTION,
                     );
-                    if git_dir.join(PENDING).exists() {
+                    if has_pending(git_dir) {
                         return Err(invalid("dotfile replacement recovery is pending"));
                     }
                     clean = false;
                     continue;
                 }
-                changed.insert(path.clone());
-            }
-            self.known.remove(&path);
-            if let (Some(source), Image::Regular { mode, .. }) = (sources.get(&path), &replacement)
-            {
-                if let Ok(source) = source.strip_prefix(git.root()) {
-                    if let Some(entry) = tree.get(source) {
-                        if replacement.git_eq(&Image::from_git(git, Some(entry))?) {
-                            self.known.insert(
-                                path,
-                                KnownCopy {
-                                    source: source.into(),
-                                    entry: entry.clone(),
-                                    mode: Some(*mode),
-                                },
-                            );
-                        }
-                    }
-                }
+                self.state = Self::load(git_dir)?.state;
+            } else if let Some(baseline) = next_baseline {
+                self.state.known.insert(path, baseline);
+            } else {
+                self.state.known.remove(&path);
             }
         }
         Ok(clean)
     }
 }
 
+fn recovery_parent(target: &Path, checkout: &Path, git_dir: &Path) -> io::Result<PathBuf> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| invalid("dotfile target has no parent"))?
+        .canonicalize()?;
+    let checkout = checkout.canonicalize()?;
+    let git_dir = git_dir.canonicalize()?;
+    if parent.starts_with(checkout) {
+        // Git metadata is never a publishable path. A target on a nested
+        // mount cannot use it to recover and will fail before displacement.
+        Ok(git_dir)
+    } else {
+        Ok(parent)
+    }
+}
+
 pub(super) fn retire(
     git: &Git<'_>,
     git_dir: &Path,
-    retired: Vec<Retirement>,
+    retired: &[Retirement],
     receipt: &mut Receipt,
 ) -> io::Result<bool> {
     let mut clean = true;
@@ -635,8 +750,8 @@ pub(super) fn retire(
             &row.path,
             git_dir,
             git_dir,
-            &row.before,
-            &row.after,
+            (&row.before, &row.after),
+            None,
             receipt,
         )
         .is_err()
@@ -656,10 +771,10 @@ pub(super) fn retire(
 const PENDING: &str = "dots-sync-write.json";
 
 pub(super) fn has_pending(directory: &Path) -> bool {
-    match fs::symlink_metadata(directory.join(PENDING)) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        _ => true,
-    }
+    !matches!(
+        fs::symlink_metadata(directory.join(PENDING)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -667,6 +782,32 @@ struct WritePlan {
     anchor: PathBuf,
     path: PathBuf,
     stage: PathBuf,
+    #[serde(default)]
+    effect: Option<WriteEffect>,
+}
+
+#[derive(Deserialize, Serialize)]
+enum WriteEffect {
+    Capture {
+        deployed: PathBuf,
+        baseline: Captured,
+    },
+    Deploy {
+        target: PathBuf,
+        baseline: Option<KnownCopy>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum CaptureFailure {
+    Journal,
+    Device,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CAPTURE_FAILURE: std::cell::Cell<Option<CaptureFailure>> = const { std::cell::Cell::new(None) };
 }
 
 fn install(
@@ -674,24 +815,53 @@ fn install(
     path: &Path,
     git_dir: &Path,
     recovery_parent: &Path,
-    before: &Image,
-    after: &Image,
+    images: (&Image, &Image),
+    effect: Option<WriteEffect>,
     receipt: &mut Receipt,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    let fault = matches!(effect, Some(WriteEffect::Capture { .. }))
+        .then(|| CAPTURE_FAILURE.take())
+        .flatten();
     let plan = prepare_write(
         anchor,
         path,
         git_dir,
         recovery_parent,
-        before,
-        after,
+        images,
+        effect,
         |record, path| {
+            #[cfg(test)]
+            if fault == Some(CaptureFailure::Journal) {
+                return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+            }
             record
                 .persist_noclobber(path)
                 .map(drop)
                 .map_err(io::Error::other)
         },
     )?;
+    #[cfg(test)]
+    if fault == Some(CaptureFailure::Device) {
+        return reconcile_write(
+            git_dir,
+            &plan,
+            receipt,
+            |root, path, stage, old, new, before, after| {
+                super::guard::replace_at_boundary(
+                    root,
+                    path,
+                    stage,
+                    old,
+                    new,
+                    before,
+                    after,
+                    || Err(io::Error::from_raw_os_error(nix::libc::EXDEV)),
+                    || Ok(()),
+                )
+            },
+        );
+    }
     complete_write(git_dir, &plan, receipt)
 }
 
@@ -700,8 +870,8 @@ fn prepare_write(
     path: &Path,
     git_dir: &Path,
     recovery_parent: &Path,
-    before: &Image,
-    after: &Image,
+    (before, after): (&Image, &Image),
+    effect: Option<WriteEffect>,
     save_record: impl FnOnce(tempfile::NamedTempFile, PathBuf) -> io::Result<()>,
 ) -> io::Result<WritePlan> {
     let private = private_dir(recovery_parent, ".dots-recovery-")?;
@@ -712,6 +882,7 @@ fn prepare_write(
         anchor: anchor.into(),
         path: path.into(),
         stage: private.path().into(),
+        effect,
     };
     let mut record = tempfile::NamedTempFile::new_in(git_dir)?;
     record.write_all(&serde_json::to_vec(&plan).map_err(io::Error::other)?)?;
@@ -769,6 +940,25 @@ fn reconcile_write(
             return result;
         }
     }
+    if result.is_ok()
+        && let Some(effect) = &plan.effect
+    {
+        let mut copies = Copies::load(git_dir)?;
+        match effect {
+            WriteEffect::Capture { deployed, baseline } => {
+                copies.state.captured.insert(deployed.clone(), *baseline);
+            }
+            WriteEffect::Deploy { target, baseline } => {
+                if let Some(baseline) = baseline {
+                    copies.state.known.insert(target.clone(), baseline.clone());
+                } else {
+                    copies.state.known.remove(target);
+                }
+                copies.state.changed.insert(target.clone());
+            }
+        }
+        copies.persist(git_dir)?;
+    }
     // Removing the control record before cleaning staging makes either a
     // retry or completed displacement recoverable across interruption.
     fs::remove_file(git_dir.join(PENDING))?;
@@ -798,12 +988,12 @@ fn same_copy(current: &Image, base: &Image, mode: Option<u32>) -> bool {
     }
 }
 
-fn status(run: &Run<'_>, root: &Path) -> io::Result<Vec<Target>> {
+fn status_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Vec<Target>> {
     let output = validation::probe(
         run,
         root,
         ["bootstrap", "dotfiles", "status", "--json"],
-        false,
+        preview,
     )?;
     serde_json::from_slice::<Status>(&output)
         .map(|status| status.files)
@@ -812,17 +1002,17 @@ fn status(run: &Run<'_>, root: &Path) -> io::Result<Vec<Target>> {
 
 fn absolute_target(run: &Run<'_>, path: &Path) -> io::Result<PathBuf> {
     let mut parts = path.components();
-    if let Some(std::path::Component::Normal(tilde)) = parts.next() {
-        if tilde == "~" {
-            let home = run
-                .ctx()
-                .env
-                .home()
-                .ok_or_else(|| invalid("HOME is unavailable"))?;
-            let result = home.join(parts.as_path());
-            fs_relative(&result)?;
-            return Ok(result);
-        }
+    if let Some(std::path::Component::Normal(tilde)) = parts.next()
+        && tilde == "~"
+    {
+        let home = run
+            .ctx()
+            .env
+            .home()
+            .ok_or_else(|| invalid("HOME is unavailable"))?;
+        let result = home.join(parts.as_path());
+        fs_relative(&result)?;
+        return Ok(result);
     }
     fs_relative(path)?;
     Ok(path.to_owned())
@@ -1154,6 +1344,7 @@ impl Configs {
         git_dir: &Path,
         target: &Target,
         item: Option<&Item>,
+        preview: &Path,
     ) -> io::Result<Image> {
         let tmp = private_dir(git_dir, "dots-dotfile-")?;
         let root = tmp.path().join("config");
@@ -1180,10 +1371,12 @@ impl Configs {
                 let mut definition = item.cloned().unwrap_or_else(|| Item::Table(Table::new()));
                 if let Some(table) = definition.as_table_like_mut() {
                     table.remove("depends");
-                    if let Some(source) = target.effective_source() {
-                        if let Some(source) = source.to_str().filter(|_| source.is_absolute()) {
-                            table.insert("source", value(source));
-                        }
+                    if let Some(source) = target
+                        .effective_source()
+                        .filter(|source| source.is_absolute())
+                        .and_then(Path::to_str)
+                    {
+                        table.insert("source", value(source));
                     }
                     if let Some(array) = table.get_mut("variants").and_then(Item::as_array_mut) {
                         for entry in array.iter_mut() {
@@ -1219,11 +1412,10 @@ impl Configs {
         }
         for selector in ["miserc.toml", "mise.lock"] {
             if let Ok(image @ Image::Regular { .. }) =
-                Dir::open(git.root())?.read_path(Path::new(selector))
+                Dir::open(preview)?.read_path(Path::new(selector))
+                && !root.join(selector).exists()
             {
-                if !root.join(selector).exists() {
-                    write_private(&root.join(selector), &image)?;
-                }
+                write_private(&root.join(selector), &image)?;
             }
         }
         let mut command = validation::command(
@@ -1266,14 +1458,29 @@ fn strings(item: &Item) -> Vec<String> {
     }
 }
 
-fn invoke(run: &Run<'_>, _root: &Path, expression: &str) -> io::Result<()> {
+fn invoke(run: &Run<'_>, overlay: &Path, root: &Path, expression: &str) -> io::Result<()> {
     if run.cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
-    let command = crate::process::Mise::new(run.ctx())
-        .map_err(io::Error::other)?
-        .exec("/bin/sh", ["-o", "errexit", "-c", expression])
-        .map_err(io::Error::other)?;
+    use std::ffi::OsStr;
+    let mut command = validation::command(
+        run,
+        overlay,
+        [
+            "exec",
+            "--",
+            "/bin/sh",
+            "-e",
+            "-c",
+            "cd \"$1\"; exec /bin/sh -e -c \"$2\"",
+            "dots-sync-hook",
+        ]
+        .map(OsStr::new)
+        .into_iter()
+        .chain([root.as_os_str(), OsStr::new(expression)]),
+        true,
+    )?;
+    command.env("DOTS_ROOT", root);
     if run.probe(command)?.status.success() {
         Ok(())
     } else {
@@ -1295,7 +1502,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("checkout");
+            let root = temp.path().canonicalize().unwrap().join("checkout");
             let git = root.join(".git");
             fs::create_dir_all(&git).unwrap();
             fs::write(root.join("source"), b"committed source").unwrap();
@@ -1320,8 +1527,11 @@ mod tests {
                 Path::new("source"),
                 &self.git,
                 &self.git,
-                &Dir::open(&self.root)?.read_path(Path::new("source"))?,
-                &Dir::open(self._temp.path())?.read_path(Path::new("deployed"))?,
+                (
+                    &Dir::open(&self.root)?.read_path(Path::new("source"))?,
+                    &Dir::open(self._temp.path())?.read_path(Path::new("deployed"))?,
+                ),
+                None,
                 save,
             )
         }
@@ -1389,6 +1599,50 @@ mod tests {
             assert!(!fixture.git.join(PENDING).exists());
             assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
         }
+    }
+
+    #[test]
+    fn checkout_dotfile_recovery_stays_in_git_metadata_across_resume() {
+        let fixture = Fixture::new();
+        let source = fixture.root.join("source");
+        let stage_parent = recovery_parent(&source, &fixture.root, &fixture.git).unwrap();
+        let plan = prepare_write(
+            Path::new("/"),
+            fs_relative(&source).unwrap(),
+            &fixture.git,
+            &stage_parent,
+            (
+                &Dir::open(&fixture.root)
+                    .unwrap()
+                    .read_path(Path::new("source"))
+                    .unwrap(),
+                &Image::Regular {
+                    bytes: b"replacement".to_vec(),
+                    mode: 0o644,
+                },
+            ),
+            None,
+            |record, path| {
+                record
+                    .persist_noclobber(path)
+                    .map(drop)
+                    .map_err(io::Error::other)
+            },
+        )
+        .unwrap();
+        fs::rename(&source, plan.stage.join("previous")).unwrap();
+        assert!(plan.stage.starts_with(&fixture.git));
+        assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 1);
+
+        let mut receipt = fixture.receipt();
+        recover(&fixture.git, &mut receipt).unwrap();
+        assert_eq!(fs::read(source).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
+        assert_eq!(receipt.recovery_files, [plan.stage.join("previous")]);
+        assert_eq!(
+            fs::read(&receipt.recovery_files[0]).unwrap(),
+            b"committed source"
+        );
     }
 
     #[test]
@@ -1470,8 +1724,8 @@ mod tests {
             Path::new("new-target"),
             &fixture.git,
             &fixture.git,
-            &Image::Absent,
-            &planned,
+            (&Image::Absent, &planned),
+            None,
             |record, path| {
                 record
                     .persist_noclobber(path)

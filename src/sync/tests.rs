@@ -217,3 +217,206 @@ fn push_source_ignores_a_branch_named_like_the_verified_oid() {
         approved
     );
 }
+
+#[test]
+#[ignore = "requires the hosted mise and gitleaks lane and real history checkpoint"]
+fn failed_capture_journal_still_shares_an_unrelated_edit_and_retries() {
+    capture_failure_still_shares(super::dotfiles::CaptureFailure::Journal);
+}
+
+#[test]
+#[ignore = "requires the hosted mise and gitleaks lane and real history checkpoint"]
+fn cross_device_capture_still_shares_an_unrelated_edit_and_retries() {
+    capture_failure_still_shares(super::dotfiles::CaptureFailure::Device);
+}
+
+fn capture_failure_still_shares(fault: super::dotfiles::CaptureFailure) {
+    use super::dotfiles::CAPTURE_FAILURE;
+    use crate::{
+        receipt::Display,
+        run::{Run, Sink},
+    };
+
+    let (fixture, mut ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let root = ctx.root.path();
+    ctx.env.vars.insert(
+        "MISE_TRUSTED_CONFIG_PATHS".into(),
+        root.as_os_str().to_owned(),
+    );
+    ctx.env
+        .vars
+        .insert("MISE_CEILING_PATHS".into(), root.as_os_str().to_owned());
+    let deployed = world.join("home/deployed");
+    fs::write(root.join("source"), b"tracked baseline\n").unwrap();
+    fs::write(&deployed, b"deployed edit\n").unwrap();
+    fs::write(
+        root.join("config.toml"),
+        "[vars]\ndots_profiles = 'default'\n[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        "/config.local.toml\n/config.host-*.toml\n/miserc.toml\n/mise.lock\n/mise.*.lock\n/locks/\n/.setup-state/\n",
+    )
+    .unwrap();
+    let git = Git::new(&ctx, ctx.root.path());
+    git.get(["config", "user.name", "Fixture"]).unwrap();
+    git.get(["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    git.get(["add", ".gitignore", "config.toml", "source"])
+        .unwrap();
+    fixture_commit(&git, "seed");
+    let remote = world.join("bare-origin");
+    git.get(["init", "--bare", "--quiet", remote.to_str().unwrap()])
+        .unwrap();
+    git.get([
+        "remote",
+        "add",
+        "origin",
+        &format!("file://{}", remote.display()),
+    ])
+    .unwrap();
+    fs::write(root.join("public.txt"), b"unrelated public change\n").unwrap();
+
+    let sync = || {
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let stage = run.start("Sync");
+        super::run(&run, stage, super::load(&ctx), Display::Embedded)
+    };
+    CAPTURE_FAILURE.set(Some(fault));
+    let first = sync();
+    assert!(
+        CAPTURE_FAILURE.take().is_none(),
+        "capture was never attempted"
+    );
+    assert_eq!(
+        first.outcome,
+        "pushed dev",
+        "{:?}",
+        first
+            .issues
+            .iter()
+            .map(|issue| &issue.diagnostic)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        first
+            .issues
+            .iter()
+            .any(|issue| issue.diagnostic.contains("Could not capture deployed copy"))
+    );
+    assert_eq!(
+        fs::read(root.join("source")).unwrap(),
+        b"tracked baseline\n"
+    );
+    assert_eq!(fs::read(&deployed).unwrap(), b"deployed edit\n");
+    let published = Git::new(&ctx, &remote);
+    assert_eq!(
+        published
+            .get(["show", "refs/heads/dev:public.txt"])
+            .unwrap(),
+        b"unrelated public change\n"
+    );
+    assert_eq!(
+        published.get(["show", "refs/heads/dev:source"]).unwrap(),
+        b"tracked baseline\n"
+    );
+
+    let retry = sync();
+    assert_eq!(retry.outcome, "pushed dev");
+    assert_eq!(fs::read(root.join("source")).unwrap(), b"deployed edit\n");
+    assert_eq!(fs::read(deployed).unwrap(), b"deployed edit\n");
+    assert_eq!(
+        published.get(["show", "refs/heads/dev:source"]).unwrap(),
+        b"deployed edit\n"
+    );
+}
+
+#[test]
+fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_receipts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for displaced in [false, true] {
+        let (fixture, ctx) = git_fixture();
+        let world = fixture.path().canonicalize().unwrap();
+        let git = Git::new(&ctx, ctx.root.path());
+        let target = git.root().join("file");
+        fs::write(&target, b"old working version").unwrap();
+        git.get(["add", "file"]).unwrap();
+        let before = fixture_commit(&git, "before");
+        fs::write(&target, b"incoming version").unwrap();
+        git.get(["add", "file"]).unwrap();
+        let after = fixture_commit(&git, "incoming");
+        git.get(["reset", "--hard", &before]).unwrap();
+
+        let dir = git.root().join(".git");
+        super::checkout::begin(
+            &git,
+            &dir,
+            &super::checkout::index_snapshot(&dir).unwrap(),
+            &before,
+            &after,
+            true,
+        )
+        .unwrap();
+        if displaced {
+            fs::rename(&target, dir.join("dots-sync-pending/old-0")).unwrap();
+        }
+
+        let run_child = |mode| {
+            let output = isolated(&world, std::env::current_exe().unwrap())
+                .env(RECEIPT_CHILD, mode)
+                .args([
+                    "--exact",
+                    "sync::tests::receipt_save_failure_child",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.status.success(),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            stdout
+        };
+        let live = run_child("1");
+        let backup = live
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery copy at "))
+            .unwrap();
+        let backup = Path::new(backup);
+        assert!(backup.starts_with(&dir));
+        assert!(
+            backup
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("dots-sync-recovery-")
+        );
+        assert_eq!(
+            fs::metadata(backup.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert_eq!(fs::read(backup).unwrap(), b"old working version");
+        assert_eq!(fs::read(&target).unwrap(), b"incoming version");
+        assert!(!dir.join("dots-sync-pending").exists());
+
+        let replay = run_child("replay");
+        assert!(
+            replay
+                .lines()
+                .any(|line| line.strip_prefix("Recovery copy at ") == backup.to_str())
+        );
+        assert_eq!(fs::read(backup).unwrap(), b"old working version");
+    }
+}

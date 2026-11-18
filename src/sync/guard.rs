@@ -1,11 +1,11 @@
 //! Compare, displace and create exclusively using anchored directory handles.
 
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::libc;
@@ -182,8 +182,28 @@ impl Dir {
     }
 
     fn move_to(&self, name: &CString, saved: &Dir, slot: &CString) -> io::Result<()> {
-        // SAFETY: both directory descriptors and names live through renameat.
-        let result = unsafe { libc::renameat(self.fd(), name.as_ptr(), saved.fd(), slot.as_ptr()) };
+        // SAFETY: both descriptors and names live through the exclusive
+        // rename. An existing destination remains untouched.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                self.fd(),
+                name.as_ptr(),
+                saved.fd(),
+                slot.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result = unsafe {
+            libc::renameatx_np(
+                self.fd(),
+                name.as_ptr(),
+                saved.fd(),
+                slot.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
         checked(result)?;
         saved.0.sync_all()?;
         self.0.sync_all()
@@ -214,6 +234,53 @@ impl Dir {
         // SAFETY: the directory descriptor and name live through unlinkat.
         checked(unsafe { libc::unlinkat(self.fd(), name.as_ptr(), libc::AT_REMOVEDIR) })?;
         self.0.sync_all()
+    }
+
+    fn identity(&self) -> io::Result<PathBuf> {
+        let metadata = self.0.metadata()?;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()).into())
+    }
+
+    fn record_directory_removal(&self, marker: &CString, identity: &Path) -> io::Result<()> {
+        let identity = c_string(identity.as_os_str())?;
+        // SAFETY: marker and identity are valid C strings and the staging
+        // descriptor is open. symlinkat records the entire identity at once.
+        checked(unsafe { libc::symlinkat(identity.as_ptr(), self.fd(), marker.as_ptr()) })?;
+        self.0.sync_all()
+    }
+
+    fn is_empty(&self) -> io::Result<bool> {
+        let fd = self.0.try_clone()?.into_raw_fd();
+        // SAFETY: on success the stream owns this duplicate.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            // SAFETY: fdopendir did not consume the descriptor.
+            drop(unsafe { File::from_raw_fd(fd) });
+            return Err(error);
+        }
+        let result = loop {
+            nix::errno::Errno::clear();
+            // SAFETY: stream is open and each entry is used before readdir
+            // is called again.
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let errno = nix::errno::Errno::last_raw();
+                break if errno == 0 {
+                    Ok(true)
+                } else {
+                    Err(io::Error::from_raw_os_error(errno))
+                };
+            }
+            // SAFETY: readdir supplies a NUL-terminated d_name.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if !matches!(name.to_bytes(), b"." | b"..") {
+                break Ok(false);
+            }
+        };
+        // SAFETY: the stream is open and no entry is borrowed now.
+        unsafe { libc::closedir(stream) };
+        result
     }
 }
 
@@ -271,6 +338,72 @@ pub(super) fn write_private(path: &Path, image: &Image) -> io::Result<()> {
     }
 }
 
+fn verify_parent(root: &Dir, path: &Path, held: &Dir) -> io::Result<()> {
+    let (current, _) = root.parent(path, false)?;
+    if current.identity()? == held.identity()? {
+        Ok(())
+    } else {
+        Err(invalid("target's parent changed during replacement"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn displace_directory(
+    root: &Dir,
+    path: &Path,
+    parent: &Dir,
+    name: &CString,
+    staging: &Dir,
+    old_slot: &CStrName,
+    current: &Image,
+    replacement: &Image,
+    before_move: impl Fn() -> io::Result<()>,
+) -> io::Result<bool> {
+    let mut marker = b"removed-dir-".to_vec();
+    marker.extend_from_slice(old_slot.0.as_bytes());
+    let marker = c_name(OsStr::from_bytes(&marker))?;
+    let mut proof = staging.read(&marker)?;
+    let parent_id = parent.identity()?;
+    if staging.read(&old_slot.0)? == Image::Absent {
+        if *current != Image::Directory {
+            return Err(invalid("no displaced directory for this replacement"));
+        }
+        let child = parent.subdir(OsStr::from_bytes(name.as_bytes()), false)?;
+        if !child.is_empty()? {
+            return Err(invalid("target directory has local files"));
+        }
+        let identity = parent_id.join(child.identity()?);
+        if proof == Image::Absent {
+            staging.record_directory_removal(&marker, &identity)?;
+            proof = Image::Link(identity);
+        } else if proof != Image::Link(identity) {
+            return Err(invalid("another directory claimed the target"));
+        }
+        before_move()?;
+        verify_parent(root, path, parent)?;
+        parent.move_to(name, staging, &old_slot.0)?;
+    }
+
+    let current = parent.read(name)?;
+    verify_parent(root, path, parent)?;
+    if staging.read(&old_slot.0)? == Image::Directory {
+        let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
+        if proof == Image::Link(parent_id.join(moved.identity()?)) {
+            if &current == replacement {
+                return Ok(true);
+            }
+            if current == Image::Absent && moved.is_empty()? {
+                return Ok(false);
+            }
+        }
+    }
+    if current == Image::Absent {
+        let _ = staging.move_to(&old_slot.0, parent, name);
+    }
+    Err(invalid("directory or target changed during replacement"))
+}
+
 /// Publish a staged image, remembering the displaced inode even on success.
 /// Re-entering with the same recovery directory after an interruption is safe.
 #[allow(clippy::too_many_arguments)]
@@ -288,14 +421,29 @@ fn replace_with(
     let (parent, name) = root.parent(path, !matches!(replacement, Image::Absent))?;
     let current = parent.read(&name)?;
     let displaced = staging.read(&old_slot.0)?;
-    if !matches!(displaced, Image::Absent) {
+    if *expected == Image::Directory {
+        if displace_directory(
+            root,
+            path,
+            &parent,
+            &name,
+            staging,
+            old_slot,
+            &current,
+            replacement,
+            before_move,
+        )? {
+            return Ok(());
+        }
+    } else if !matches!(displaced, Image::Absent) {
         if !matches!(replacement, Image::Absent) && &current == replacement {
             return Ok(());
         }
         if &displaced != expected {
             if current == Image::Absent {
-                let _ =
-                    before_publish().and_then(|()| staging.link_to(&old_slot.0, &parent, &name));
+                let _ = before_publish()
+                    .and_then(|()| verify_parent(root, path, &parent))
+                    .and_then(|()| staging.link_to(&old_slot.0, &parent, &name));
             }
             return Err(invalid("displaced file changed"));
         }
@@ -308,20 +456,22 @@ fn replace_with(
     } else if &current == expected {
         match current {
             Image::Absent => (),
-            Image::Directory => parent.remove_empty(&name)?,
             _ => {
                 before_move()?;
+                verify_parent(root, path, &parent)?;
                 parent.move_to(&name, staging, &old_slot.0)?;
+                verify_parent(root, path, &parent)?;
                 if &staging.read(&old_slot.0)? != expected {
                     // Restore by exclusive link only; the recovered inode
                     // stays private if a writer has already claimed the path.
                     let _ = before_publish()
+                        .and_then(|()| verify_parent(root, path, &parent))
                         .and_then(|()| staging.link_to(&old_slot.0, &parent, &name));
                     return Err(invalid("target changed during replacement"));
                 }
             }
         }
-    } else if &current == replacement && matches!(expected, Image::Absent | Image::Directory) {
+    } else if &current == replacement && *expected == Image::Absent {
         // A completed exclusive install survives interruption before the
         // caller's journal advances.
         return Ok(());
@@ -331,7 +481,9 @@ fn replace_with(
 
     if !matches!(replacement, Image::Absent) {
         before_publish()?;
+        verify_parent(root, path, &parent)?;
         staging.link_to(&new_slot.0, &parent, &name)?;
+        verify_parent(root, path, &parent)?;
     }
     Ok(())
 }
@@ -459,5 +611,143 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(live).unwrap(), b"competing file");
         assert_eq!(fs::read(stage.path().join("previous")).unwrap(), b"before");
+    }
+
+    #[test]
+    fn directory_replacement_resumes_after_displacement_and_keeps_a_claimant() {
+        let world = tempfile::tempdir().unwrap();
+        let root = private_dir(world.path(), "root").unwrap();
+        let stage = private_dir(world.path(), "stage").unwrap();
+        let live = root.path().join("target");
+        fs::create_dir(&live).unwrap();
+        let original = fs::metadata(&live).unwrap().ino();
+        let replacement = bytes(b"new file");
+        write_private(&stage.path().join("new"), &replacement).unwrap();
+        let root_dir = Dir::open(root.path()).unwrap();
+        let stage_dir = Dir::open(stage.path()).unwrap();
+        let path = Path::new("target");
+        let old = CStrName::new("old").unwrap();
+        let new = CStrName::new("new").unwrap();
+
+        let error = replace_at_boundary(
+            &root_dir,
+            path,
+            &stage_dir,
+            &old,
+            &new,
+            &Image::Directory,
+            &replacement,
+            || Ok(()),
+            || Err(io::ErrorKind::Interrupted.into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!live.exists());
+        assert_eq!(
+            fs::metadata(stage.path().join("old")).unwrap().ino(),
+            original
+        );
+
+        fs::create_dir(&live).unwrap();
+        fs::write(live.join("user-file"), b"keep this").unwrap();
+        assert!(
+            replace_exact(
+                &root_dir,
+                path,
+                &stage_dir,
+                &old,
+                &new,
+                &Image::Directory,
+                &replacement
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(live.join("user-file")).unwrap(), b"keep this");
+
+        fs::rename(&live, root.path().join("claimant")).unwrap();
+        replace_exact(
+            &root_dir,
+            path,
+            &stage_dir,
+            &old,
+            &new,
+            &Image::Directory,
+            &replacement,
+        )
+        .unwrap();
+        assert_eq!(fs::read(live).unwrap(), b"new file");
+        assert_eq!(
+            fs::metadata(stage.path().join("old")).unwrap().ino(),
+            original
+        );
+    }
+
+    #[test]
+    fn directory_swapped_during_displacement_is_restored_without_clobbering() {
+        let world = tempfile::tempdir().unwrap();
+        let root = private_dir(world.path(), "root").unwrap();
+        let stage = private_dir(world.path(), "stage").unwrap();
+        let live = root.path().join("target");
+        fs::create_dir(&live).unwrap();
+        let replacement = bytes(b"new file");
+        write_private(&stage.path().join("new"), &replacement).unwrap();
+
+        let error = replace_at_boundary(
+            &Dir::open(root.path()).unwrap(),
+            Path::new("target"),
+            &Dir::open(stage.path()).unwrap(),
+            &CStrName::new("old").unwrap(),
+            &CStrName::new("new").unwrap(),
+            &Image::Directory,
+            &replacement,
+            || {
+                fs::rename(&live, root.path().join("saved-by-user"))?;
+                fs::create_dir(&live)?;
+                fs::write(live.join("user-file"), b"foreign directory")
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(live.join("user-file")).unwrap(),
+            b"foreign directory"
+        );
+        assert!(root.path().join("saved-by-user").is_dir());
+        assert!(!stage.path().join("old").exists());
+    }
+
+    #[test]
+    fn changing_the_parent_during_displacement_keeps_both_directories() {
+        let world = tempfile::tempdir().unwrap();
+        let root = private_dir(world.path(), "root").unwrap();
+        let stage = private_dir(world.path(), "stage").unwrap();
+        let parent = root.path().join("sub");
+        fs::create_dir_all(parent.join("target")).unwrap();
+        let replacement = bytes(b"new file");
+        write_private(&stage.path().join("new"), &replacement).unwrap();
+
+        let error = replace_at_boundary(
+            &Dir::open(root.path()).unwrap(),
+            Path::new("sub/target"),
+            &Dir::open(stage.path()).unwrap(),
+            &CStrName::new("old").unwrap(),
+            &CStrName::new("new").unwrap(),
+            &Image::Directory,
+            &replacement,
+            || {
+                fs::rename(&parent, root.path().join("saved-parent"))?;
+                fs::create_dir_all(parent.join("target"))?;
+                fs::write(parent.join("target/user-file"), b"foreign directory")
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(parent.join("target/user-file")).unwrap(),
+            b"foreign directory"
+        );
+        assert!(root.path().join("saved-parent/target").is_dir());
     }
 }

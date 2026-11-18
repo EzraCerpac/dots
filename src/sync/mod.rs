@@ -173,10 +173,10 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
             receipt.stage_outcome = Outcome::Deferred;
         }
         Loaded::Ready(shared) => {
-            if let Err(Note(reason, fix)) = synchronize(execution, stage, shared, &mut receipt) {
-                if !execution.cancelled() {
-                    issue(&mut receipt, reason, fix);
-                }
+            if let Err(Note(reason, fix)) = synchronize(execution, stage, shared, &mut receipt)
+                && !execution.cancelled()
+            {
+                issue(&mut receipt, reason, fix);
             }
         }
     }
@@ -267,6 +267,19 @@ fn synchronize(
             GIT,
         ));
     }
+    let root = git
+        .root()
+        .canonicalize()
+        .or_note("Could not verify the source checkout directory", GIT)?;
+    for metadata in [&shared.dir, &shared.common] {
+        if metadata.starts_with(&root) && !metadata.starts_with(root.join(".git")) {
+            return Err(Note(
+                "Git metadata is inside a publishable checkout path",
+                "Move Git metadata outside the worktree or into .git, then rerun dots sync.",
+            ));
+        }
+    }
+    dense_index(&git)?;
     if let Some(recovery) = finish_pending(run, &git, &shared.dir, receipt)? {
         let paths = recovery.paths.clone();
         adoption(receipt, &recovery);
@@ -336,6 +349,7 @@ fn synchronize(
         "Could not verify the index against the current dev ref",
         GIT,
     )? {
+        dense_index(&git)?;
         let old = git
             .tree(&previous)
             .or_note("Could not verify the preceding dev tree", GIT)?;
@@ -374,6 +388,7 @@ fn synchronize(
     copies
         .seed(run, &scratch, &base)
         .or_note("Could not verify the previous dotfile declarations", RERUN)?;
+    dense_index(&git)?;
     copies
         .capture(run, &git, &shared.dir, &base, receipt)
         .or_note(
@@ -416,10 +431,10 @@ fn synchronize(
     let approved = match scan_candidate(run, &scratch, &before, &unscanned, &local_paths, receipt) {
         Ok(approved) => approved,
         Err(error) => {
-            if !run.cancelled() {
-                if let Ok(heads) = fetch.heads(run, &origin) {
-                    incoming(receipt, &git, &heads, &before);
-                }
+            if !run.cancelled()
+                && let Ok(heads) = fetch.heads(run, &origin)
+            {
+                incoming(receipt, &git, &heads, &before);
             }
             return Err(scan_note(error));
         }
@@ -432,6 +447,7 @@ fn synchronize(
     receipt.kept = local_paths.len().saturating_sub(saved_paths.len());
     if approved != before {
         active(run)?;
+        dense_index(&git)?;
         scratch
             .promote(&approved, &before)
             .or_note("Could not retain the clean local commit", GIT)?;
@@ -542,28 +558,32 @@ fn synchronize(
 
         let blocked = checkout::preflight(&scratch.git, &approved, &local_tree, &merged_tree)
             .or_note("Could not verify incoming checkout paths", RERUN)?;
+        let sharing = if heads.dev() == Some(merged.as_str()) {
+            None
+        } else {
+            let published_tree = match heads.dev() {
+                Some(head) => git
+                    .tree(head)
+                    .or_note("Could not verify the published dev tree", GIT)?,
+                None => git::Tree::new(),
+            };
+            Some(ChangeGroup::new(
+                heads.dev().map(str::to_owned),
+                Some(merged.clone()),
+                changed(&published_tree, &merged_tree),
+            ))
+        };
         active(run)?;
         scratch
             .promote(&merged, &approved)
             .or_note("Could not retain the validated merged revision", GIT)?;
         if remote::push(&git, run, &origin, heads.dev(), &merged).is_ok() {
-            receipt.outcome = if heads.dev() == Some(merged.as_str()) {
-                "dev up to date".into()
-            } else {
+            receipt.outcome = if let Some(sharing) = sharing {
+                receipt.shared.push(sharing);
                 "pushed dev".into()
+            } else {
+                "dev up to date".into()
             };
-            if heads.dev() != Some(merged.as_str()) {
-                let published_tree = heads
-                    .dev()
-                    .and_then(|head| git.tree(head).ok())
-                    .unwrap_or_default();
-                let paths = changed(&published_tree, &merged_tree);
-                receipt.shared.push(ChangeGroup::new(
-                    heads.dev().map(str::to_owned),
-                    Some(merged.clone()),
-                    paths,
-                ));
-            }
             if !blocked.is_empty() {
                 for checkout::Blocked(path) in blocked {
                     path_issue(
@@ -578,6 +598,7 @@ fn synchronize(
 
             active(run)?;
             if merged != approved {
+                dense_index(&git)?;
                 checkout::begin(&git, &shared.dir, &index, &approved, &merged, true)
                     .or_note("Could not prepare guarded checkout", GIT)?;
                 let installed = finish_pending(run, &git, &shared.dir, receipt)?
@@ -601,11 +622,11 @@ fn synchronize(
                     RERUN,
                 ));
             }
-            if dotfiles::retire(&git, &shared.dir, validated.retired, receipt)
+            if dotfiles::retire(&git, &shared.dir, &validated.retired, receipt)
                 .or_note("Could not update retired machine-local declarations", RERUN)?
             {
                 copies
-                    .apply(run, &git, &shared.dir, &merged_tree, receipt)
+                    .apply(run, &git, &shared.dir, &merged_tree, &validated, receipt)
                     .or_note("Could not safely apply the validated dotfiles", RERUN)?;
             }
             return Ok(());
@@ -637,6 +658,13 @@ fn synchronize(
         "NOT SHARED: the conditional dev push failed or timed out",
         "Check origin, credentials and remote branch policies, then rerun dots sync.",
     ))
+}
+
+fn dense_index(git: &Git<'_>) -> Result<(), Note> {
+    git.ensure_dense_index().or_note(
+        "Sync kept the checkout because the full Git index could not be verified",
+        "Disable sparse checkout and clear skip-worktree entries, then rerun dots sync.",
+    )
 }
 
 fn scan_candidate(
@@ -716,7 +744,10 @@ fn finish_pending(
     receipt: &mut Receipt,
 ) -> Result<Option<checkout::Installed>, Note> {
     match checkout::finish(git, dir, || run.cancelled()) {
-        Ok(Some((installed, _backups))) => Ok(Some(installed)),
+        Ok(Some((installed, backups))) => {
+            receipt.recovery_files.extend(backups);
+            Ok(Some(installed))
+        }
         Ok(None) => Ok(None),
         Err(error) => {
             receipt.recovery_files.extend(error.backups);

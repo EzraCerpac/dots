@@ -12,6 +12,7 @@ use toml_edit::{Document, DocumentMut, Item, Key, Table};
 
 use crate::{Env, config, process::Mise, run::Run};
 
+use super::dotfiles::ApplyPlan;
 use super::git::{Git, Tree, checked, invalid, local};
 use super::guard::{Dir, Image, private_dir, write_private};
 use super::snapshot::Scratch;
@@ -35,13 +36,40 @@ impl std::fmt::Display for ConfigLocation {
 impl std::error::Error for ConfigLocation {}
 
 pub(super) struct Validated {
+    _preview: tempfile::TempDir,
+    pub apply: ApplyPlan,
     pub retired: Vec<Retirement>,
     local: BTreeMap<PathBuf, Image>,
+    configs: BTreeMap<PathBuf, Image>,
 }
 
 impl Validated {
     pub fn still_current(&self, root: &Path) -> io::Result<bool> {
         Ok(self.local == local_files(root)?)
+    }
+
+    pub fn ready_to_apply(&self, root: &Path) -> io::Result<()> {
+        let mut local = local_files(root)?;
+        for (path, original) in &self.local {
+            let expected = self
+                .retired
+                .iter()
+                .find(|row| &row.path == path)
+                .map_or(original, |row| &row.after);
+            if local.remove(path).as_ref() != Some(expected) {
+                return Err(invalid("machine-local inputs changed after validation"));
+            }
+        }
+        if !local.is_empty() {
+            return Err(invalid("machine-local inputs changed after validation"));
+        }
+        let live = Dir::open(root)?;
+        for (path, expected) in &self.configs {
+            if !live.read_path(path)?.git_eq(expected) {
+                return Err(invalid("configuration inputs changed after validation"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -70,16 +98,16 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
             };
             documents.insert(path.clone(), parse_at(path, bytes)?);
         }
+        write_private(&root.join(path), image)?;
         ignored.push(path.clone());
     }
+    protect_future_hosts(&root)?;
     check_ignored(&scratch.live, &root, &ignored)?;
     let retired = retire(&root, &documents, &local)?;
-    for (path, before) in &local {
-        let image = retired
-            .iter()
-            .find(|row| row.path == *path)
-            .map_or(before, |row| &row.after);
-        write_private(&root.join(path), image)?;
+    for row in &retired {
+        let path = root.join(&row.path);
+        fs::remove_file(&path)?;
+        write_private(&path, &row.after)?;
     }
     if !matches!(fs::symlink_metadata(root.join("config.toml")), Ok(md) if md.is_file()) {
         return Err(invalid("merged configuration has no config.toml"));
@@ -125,7 +153,22 @@ pub(super) fn validate(run: &Run<'_>, scratch: &Scratch<'_>, tree: &Tree) -> io:
         ],
         true,
     )?;
-    Ok(Validated { retired, local })
+    let private = Dir::open(&root)?;
+    let mut configs = BTreeMap::new();
+    for file in files {
+        let path = file.path.strip_prefix(&root).map_err(io::Error::other)?;
+        if !local.contains_key(path) {
+            configs.insert(path.to_owned(), private.read_path(path)?);
+        }
+    }
+    let apply = ApplyPlan::new(run, root, scratch.live.root())?;
+    Ok(Validated {
+        _preview: preview,
+        apply,
+        retired,
+        local,
+        configs,
+    })
 }
 
 fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
@@ -133,7 +176,11 @@ fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
     let mut files = BTreeMap::new();
     for entry in fs::read_dir(root)? {
         let path = PathBuf::from(entry?.file_name());
-        if local(&path) && !matches!(path.to_str(), Some("locks" | ".setup-state")) {
+        let name = path.as_os_str().as_bytes();
+        if local(&path)
+            && !name.eq_ignore_ascii_case(b"locks")
+            && !name.eq_ignore_ascii_case(b".setup-state")
+        {
             let image = anchored.read_path(&path)?;
             if !matches!(image, Image::Regular { .. }) {
                 return Err(invalid("machine-local config is not a regular file"));
@@ -281,6 +328,64 @@ fn check_ignored(git: &Git<'_>, root: &Path, paths: &[PathBuf]) -> io::Result<()
     Ok(())
 }
 
+/// Check the root patterns as well as the native selector probes. One
+/// ignored sample cannot prove that a specific future host stays ignored.
+fn protect_future_hosts(root: &Path) -> io::Result<()> {
+    const PREFIX: &[u8] = b"config.host-";
+    const SUFFIX: &[u8] = b".toml";
+    let Image::Regular { bytes, .. } = Dir::open(root)?.read_path(Path::new(".gitignore"))? else {
+        return Err(invalid(
+            "no root ignore rules protect future host selectors",
+        ));
+    };
+    let mut protected = false;
+    let patterns = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    for line in patterns.split(|&byte| byte == b'\n') {
+        let mut line = line.strip_suffix(b"\r").unwrap_or(line);
+        while let Some(trimmed) = line.strip_suffix(b" ") {
+            line = trimmed;
+        }
+        if line.is_empty() || line.starts_with(b"#") || line.ends_with(b"/") {
+            continue;
+        }
+        let negated = line.starts_with(b"!");
+        if negated {
+            line = &line[1..];
+        }
+        line = line.strip_prefix(b"/").unwrap_or(line);
+        while let Some(name) = line.strip_prefix(b"**/") {
+            line = name;
+        }
+        if !negated && line.contains(&b'/') {
+            continue;
+        }
+
+        let wildcard = |byte: &u8| matches!(byte, b'*' | b'?' | b'[' | b'\\');
+        let prefix = line.iter().position(wildcard).unwrap_or(line.len());
+        let suffix = line.iter().rposition(wildcard).map_or(0, |last| last + 1);
+        if negated {
+            let first = line[..prefix].to_ascii_lowercase();
+            let last = line[suffix..].to_ascii_lowercase();
+            if (first.starts_with(PREFIX) || PREFIX.starts_with(&first))
+                && (last.ends_with(SUFFIX) || SUFFIX.ends_with(&last))
+            {
+                protected = false;
+            }
+        } else if suffix == prefix + 1
+            && line[prefix] == b'*'
+            && PREFIX.starts_with(&line[..prefix])
+            && SUFFIX.ends_with(&line[suffix..])
+        {
+            protected = true;
+        }
+    }
+    if protected {
+        Ok(())
+    } else {
+        Err(invalid("merged ignore rules expose future host selectors"))
+    }
+}
+
 fn is_mise_config(path: &Path) -> bool {
     path.components().count() == 1
         && path.to_str().is_some_and(|name| {
@@ -331,10 +436,7 @@ fn retire(
                 if matches!(
                     error.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                ()
-            }
+                ) => {}
             Err(error) => return Err(error),
         }
         let locations = docs
@@ -468,6 +570,30 @@ fn whole_line(original: &str, span: Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protects_future_host_selectors_even_with_a_specific_negation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ignore = fixture.path().join(".gitignore");
+        for pattern in [
+            "/config.host-*.toml\n",
+            "/config.host-*.toml\n!config.host-readme.md\n",
+            "!/**/config.host-tomorrow.toml\n**/config.host-*.toml\n",
+            "*.toml\n!/config.toml\n",
+        ] {
+            fs::write(&ignore, pattern).unwrap();
+            assert!(protect_future_hosts(fixture.path()).is_ok(), "{pattern}");
+        }
+        for pattern in [
+            "/config.host-today.toml\n",
+            "/config.host-*.toml\n!/config.host-tomorrow.toml\n",
+            "/config.host-*.toml\n!/**/config.host-tomorrow.toml\n",
+            "/config.host-*.toml\n!/config.host-[a/b].toml\n",
+        ] {
+            fs::write(&ignore, pattern).unwrap();
+            assert!(protect_future_hosts(fixture.path()).is_err(), "{pattern}");
+        }
+    }
 
     #[test]
     fn retirement_compares_decoded_source_and_preserves_other_tables() {

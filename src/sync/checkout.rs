@@ -1,10 +1,16 @@
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+use std::time::Duration;
 
+use nix::libc;
 use serde::{Deserialize, Serialize};
 
 use super::git::{Git, Tree, invalid, oid};
@@ -14,10 +20,10 @@ use super::snapshot::changed;
 const PENDING: &str = "dots-sync-pending";
 
 pub(super) fn has_pending(directory: &Path) -> bool {
-    match fs::symlink_metadata(directory.join(PENDING)) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        _ => true,
-    }
+    !matches!(
+        fs::symlink_metadata(directory.join(PENDING)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -326,13 +332,121 @@ fn replace_index(staged: &Path, directory: &Path) -> io::Result<()> {
         Ok(()) => (),
         Err(error)
             if error.kind() == io::ErrorKind::AlreadyExists
-                && fingerprints_match(&next, staged)? =>
-        {
-            ()
-        }
+                && fingerprints_match(&next, staged)? => {}
         Err(error) => return Err(error),
     }
     fs::rename(next, directory.join("index"))
+}
+
+/// Git locks both the symbolic HEAD and its referent during a prepared
+/// transaction. EOF releases both without updating them if sync stops.
+struct RefTransaction {
+    child: Child,
+    input: Option<ChildStdin>,
+    output: ChildStdout,
+}
+
+impl RefTransaction {
+    fn prepare(
+        git: &Git<'_>,
+        head: &str,
+        desired: &str,
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        let mut child = git
+            .command(["update-ref", "-m", "dots sync", "--stdin"])?
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let input = child.stdin.take();
+        let output = child.stdout.take().expect("requested Git transaction pipe");
+        let mut transaction = Self {
+            child,
+            input,
+            output,
+        };
+        transaction.request("start\n", b"start: ok\n", cancelled)?;
+        let update = if head == desired {
+            format!("verify HEAD {head}^{{commit}}\nprepare\n")
+        } else {
+            format!("update HEAD {desired}^{{commit}} {head}^{{commit}}\nprepare\n")
+        };
+        transaction.request(&update, b"prepare: ok\n", cancelled)?;
+        if git.text(["symbolic-ref", "HEAD"])? != "refs/heads/dev" {
+            return Err(invalid("the checked out branch changed"));
+        }
+        Ok(transaction)
+    }
+
+    fn request(
+        &mut self,
+        request: &str,
+        response: &[u8],
+        cancelled: &impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.input
+            .as_mut()
+            .expect("Git transaction input remains open")
+            .write_all(request.as_bytes())?;
+        for expected in response {
+            loop {
+                if cancelled() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let mut poll = libc::pollfd {
+                    fd: self.output.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll describes one live pipe for this call.
+                match unsafe { libc::poll(&mut poll, 1, 100) } {
+                    0 => continue,
+                    -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {
+                        continue;
+                    }
+                    -1 => return Err(io::Error::last_os_error()),
+                    _ => break,
+                }
+            }
+            let mut byte = [0];
+            self.output.read_exact(&mut byte)?;
+            if byte[0] != *expected {
+                return Err(invalid("unexpected Git transaction response"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RefTransaction {
+    fn drop(&mut self) {
+        drop(self.input.take());
+        let wait = |child: &mut Child| {
+            for _ in 0..20 {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        if wait(&mut self.child) {
+            return;
+        }
+        // Only this invocation's process group is targeted. Give Git time
+        // to clean its own ref locks before bounding a stuck hook.
+        let group = -(self.child.id() as libc::pid_t);
+        // SAFETY: group is the private group created for the child.
+        unsafe { libc::kill(group, libc::SIGTERM) };
+        if !wait(&mut self.child) {
+            // SAFETY: the child is still alive in the same private group.
+            unsafe { libc::kill(group, libc::SIGKILL) };
+            let _ = self.child.wait();
+        }
+    }
 }
 
 fn apply(
@@ -352,6 +466,11 @@ fn apply(
     }
     let head = git.id(["rev-parse", "--verify", "HEAD^{commit}"])?;
     if head != plan.before && head != plan.after {
+        if !pending.join("started").exists() && !pending.join("finished").exists() {
+            release_index(directory, pending)?;
+            fs::remove_dir_all(pending)?;
+            File::open(directory)?.sync_all()?;
+        }
         return Err(invalid("branch changed while checkout was pending"));
     }
 
@@ -383,6 +502,15 @@ fn apply(
         }
         return Err(invalid("Git index changed while sync was running"));
     }
+    let mut reference = match RefTransaction::prepare(git, &head, &plan.after, &cancelled) {
+        Ok(reference) => reference,
+        Err(error) => {
+            if !pending.join("started").exists() {
+                release_index(directory, pending)?;
+            }
+            return Err(error);
+        }
+    };
     if !pending.join("started").exists() {
         write_synced(pending.join("started"), b"verified index\n")?;
         File::open(pending)?.sync_all()?;
@@ -393,7 +521,6 @@ fn apply(
     if plan.checkout && !index_contains_after {
         let root = Dir::open(git.root())?;
         let stage = Dir::open(pending)?;
-        let mut pruned = BTreeSet::new();
         for (position, item) in mutations(&old, &new).into_iter().enumerate() {
             let marker = pending.join(format!("done-{position}"));
             if marker.is_file() {
@@ -415,26 +542,21 @@ fn apply(
                 replacement = prepare_leaf(git, pending, &plan.after, &item, &expected, &new_name)?;
             }
 
-            if expected == Image::Directory && !matches!(replacement, Image::Absent) {
-                // Tracked leaves in the directory have already been displaced.
-                // Remove only their now-empty ancestors, never unknown entries.
-                for leaf in old.keys().filter(|leaf| leaf.starts_with(&item)) {
-                    for parent in leaf
-                        .ancestors()
-                        .skip(1)
-                        .take_while(|parent| *parent != item)
-                    {
-                        if pruned.insert(parent.to_path_buf()) {
-                            root.remove_dir_if_empty(parent)?;
-                        }
-                    }
-                }
+            let old_name = format!("old-{position}");
+            if expected == Image::Directory
+                && replacement != Image::Absent
+                && stage.read_path(Path::new(&old_name))? == Image::Absent
+                && root.read_path(&item)? == Image::Directory
+            {
+                // A shared ancestor can become empty only after every
+                // descendant is gone, regardless of lexical order.
+                prune_empty_ancestors(&root, &old, &item)?;
             }
             replace_exact(
                 &root,
                 &item,
                 &stage,
-                &CStrName::new(&format!("old-{position}"))?,
+                &CStrName::new(&old_name)?,
                 &CStrName::new(&format!("new-{position}"))?,
                 &expected,
                 &replacement,
@@ -462,26 +584,7 @@ fn apply(
         }
         File::open(directory)?.sync_all()?;
     }
-    if head == plan.before {
-        if let Err(error) = git.get([
-            "update-ref",
-            "-m",
-            "dots sync",
-            "refs/heads/dev",
-            &plan.after,
-            &plan.before,
-        ]) {
-            if !plan.checkout && !cancelled() {
-                // With no worktree displacement, restore the original index
-                // and permit a fresh snapshot after the ref lock is released.
-                replace_index(&pending.join("index.before"), directory)?;
-                File::open(directory)?.sync_all()?;
-                release_index(directory, pending)?;
-                fs::remove_dir_all(pending)?;
-            }
-            return Err(error);
-        }
-    }
+    reference.request("commit\n", b"commit: ok\n", &cancelled)?;
     write_synced(pending.join("finished"), b"installed index and dev\n")?;
     File::open(pending)?.sync_all()?;
     release_index(directory, pending)?;
@@ -492,6 +595,24 @@ fn apply(
         paths,
         index_after: fs::read(pending.join("index.after"))?,
     })
+}
+
+fn prune_empty_ancestors(root: &Dir, old: &Tree, target: &Path) -> io::Result<()> {
+    let unique: BTreeSet<_> = old
+        .keys()
+        .filter(|leaf| leaf.starts_with(target))
+        .flat_map(|leaf| {
+            leaf.ancestors()
+                .skip(1)
+                .take_while(|parent| *parent != target)
+        })
+        .collect();
+    let mut parents: Vec<_> = unique.into_iter().collect();
+    parents.sort_unstable_by_key(|path| Reverse(path.components().count()));
+    for parent in parents {
+        root.remove_dir_if_empty(parent)?;
+    }
+    Ok(())
 }
 
 fn backup_paths(directory: &Path) -> Vec<PathBuf> {
@@ -547,12 +668,113 @@ pub(super) fn finish(
         let recovery = recovery.keep();
         backups = backup_paths(&recovery);
     }
+    File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| Interrupted {
+            path: None,
+            backups: backups.clone(),
+        })?;
     Ok(Some((installed, backups)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_head_transaction_excludes_competing_git_writers() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        let after = fixture_commit(&git, "desired");
+        let other = fixture_commit(&git, "competing commit");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let mut transaction = RefTransaction::prepare(&git, &before, &after, &|| false).unwrap();
+        assert!(
+            git.get(["update-ref", "refs/heads/dev", &other, &before])
+                .is_err()
+        );
+        assert!(
+            git.get(["symbolic-ref", "HEAD", "refs/heads/elsewhere"])
+                .is_err()
+        );
+        transaction
+            .request("commit\n", b"commit: ok\n", &|| false)
+            .unwrap();
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    }
+
+    #[test]
+    fn competing_ref_before_checkout_does_not_leave_a_partial_install() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let live = git.root().join("edit");
+        fs::write(&live, b"baseline").unwrap();
+        git.get(["add", "edit"]).unwrap();
+        let before = fixture_commit(&git, "baseline");
+        fs::write(&live, b"incoming edit").unwrap();
+        git.get(["add", "edit"]).unwrap();
+        let after = fixture_commit(&git, "desired");
+        let other = fixture_commit(&git, "competing commit");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, true).unwrap();
+        git.get(["update-ref", "refs/heads/dev", &other, &before])
+            .unwrap();
+        assert!(finish(&git, &dir, || false).is_err());
+        assert!(!has_pending(&dir));
+        assert_eq!(fs::read(live).unwrap(), b"baseline");
+        assert_eq!(index_snapshot(&dir).unwrap(), index);
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), other);
+    }
+
+    #[test]
+    fn nested_directory_replacement_resumes_final_journal_cleanup() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let live = git.root().join("replace");
+        fs::create_dir_all(live.join("middle/deep")).unwrap();
+        fs::write(live.join("middle/deep/leaf"), b"original").unwrap();
+        git.get(["add", "replace"]).unwrap();
+        let before = fixture_commit(&git, "nested directory");
+        fs::remove_dir_all(&live).unwrap();
+        fs::write(&live, b"incoming file").unwrap();
+        git.get(["add", "replace"]).unwrap();
+        let after = fixture_commit(&git, "file in place of directory");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, true).unwrap();
+        assert!(
+            apply(
+                &git,
+                &dir,
+                &dir.join(PENDING),
+                &mut None,
+                || false,
+                replace_index
+            )
+            .is_ok()
+        );
+        assert!(dir.join(PENDING).join("finished").is_file());
+        let (_, backups) = finish(&git, &dir, || false).unwrap().unwrap();
+        assert!(
+            backups
+                .iter()
+                .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"original"))
+        );
+        assert!(
+            backups
+                .iter()
+                .all(|path| path.exists() && !path.starts_with(dir.join(PENDING)))
+        );
+        assert_eq!(fs::read(live).unwrap(), b"incoming file");
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    }
 
     #[test]
     fn recognizes_only_its_own_index_lock_on_resume() {

@@ -5,9 +5,9 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
-use support::World;
+use support::{FixtureCommand, World};
 
 const BRANCH: &str = "host-fixture";
 const REF: &str = "refs/heads/host-fixture";
@@ -76,7 +76,7 @@ impl Fixture {
         }
     }
 
-    fn base(&self, command: &mut Command) {
+    fn base(&self, command: &mut FixtureCommand<'_>) {
         let home = self.world.home();
         command
             .env("PATH", &self.path)
@@ -103,20 +103,13 @@ impl Fixture {
             .env("GIT_ALLOW_PROTOCOL", "file:ssh");
     }
 
-    fn command(&self, program: &Path) -> Command {
-        let world = self.world.dots();
-        let mut command = Command::new(program);
-        command.env_clear().current_dir(self.world.root());
-        for (key, value) in world.get_envs() {
-            if let Some(value) = value {
-                command.env(key, value);
-            }
-        }
+    fn command(&self, program: &Path) -> FixtureCommand<'_> {
+        let mut command = self.world.command(program);
         self.base(&mut command);
         command
     }
 
-    fn dots(&self, args: &[&str], remote: &Path) -> Command {
+    fn dots(&self, args: &[&str], remote: &Path) -> FixtureCommand<'_> {
         let mut cmd = self.world.dots();
         self.base(&mut cmd);
         let transport = self.script(
@@ -165,7 +158,7 @@ esac
             .args(["--origin", URL, "--recipient", recipient]))
     }
 
-    fn git(&self, store: Option<&Path>) -> Command {
+    fn git(&self, store: Option<&Path>) -> FixtureCommand<'_> {
         let mut cmd = self.world.git();
         self.base(&mut cmd);
         if let Some(store) = store {
@@ -174,7 +167,7 @@ esac
         cmd
     }
 
-    fn mise(&self, args: &[&str]) -> Command {
+    fn mise(&self, args: &[&str]) -> FixtureCommand<'_> {
         let mut cmd = self.command(&self.mise);
         cmd.args(["-E", "laptop,host-fixture"]).args(args);
         cmd
@@ -354,7 +347,7 @@ fn tool(name: &str) -> PathBuf {
     find_tool(name).unwrap_or_else(|| panic!("native history scenarios require {name} on PATH"))
 }
 
-fn ok(command: &mut Command) -> Output {
+fn ok(command: &mut FixtureCommand<'_>) -> Output {
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -620,8 +613,22 @@ fn new_native_sync_can_succeed_without_publishing_a_conflicting_checkpoint() {
     assert_eq!(fs::read(local.active()).unwrap(), LOCAL_EDIT);
     let backup = local.dots(&["backup"], &remote).output().unwrap();
     assert_eq!(backup.status.code(), Some(1), "{}", messages(&backup));
-    assert!(messages(&backup).contains("checkpoint saved locally; publication is pending"));
+    let pending = messages(&backup);
+    let diagnostic = pending
+        .lines()
+        .find(|line| line.contains("checkpoint saved locally; publication is pending"))
+        .unwrap_or_else(|| panic!("{pending}"));
+    assert!(diagnostic.contains("Run mise dot status"));
     assert!(!messages(&backup).contains("Settings backup published"));
+    let native_status = ok(local.mise(&["dot", "status"]).env("GIT_ALLOW_PROTOCOL", ""));
+    let status = messages(&native_status);
+    assert!(
+        status.contains("both sides changed the same lines"),
+        "{status}"
+    );
+    eprintln!(
+        "dots backup exit 1: {diagnostic}\nmise dot status exit 0: both sides changed the same lines"
+    );
     assert_eq!(local.tip(&remote, REF), remote_edit);
     assert_eq!(local.tip(&local.store(), "refs/heads/main"), saved);
 }

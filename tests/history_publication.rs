@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
 use dots_cli::{Fail, config};
-use publication::{GitAccess, git_environment, git_parameters};
+use publication::{GitAccess, HttpPolicy, git_environment, git_parameters};
 use support::{FixtureCommand, World};
 
 const BRANCH: &str = "host-fixture";
@@ -183,13 +183,14 @@ exec "$FIXTURE_REAL_GIT" "$@"
             BRANCH,
             &self.origin,
             &self.tip(&self.store, "refs/heads/main"),
+            false,
         )
         .map(|_| ())
     }
 
     fn probe(&self, args: &[&str], access: GitAccess<'_>) -> Result<Output, Fail> {
         let mut cmd = self.git(&self.store);
-        if let Some(parameters) = git_parameters(access, cmd.get_envs())? {
+        if let Some(parameters) = git_parameters(access, cmd.get_envs()) {
             cmd.env("GIT_CONFIG_PARAMETERS", parameters);
         }
         cmd.envs(git_environment(access))
@@ -428,6 +429,7 @@ fn new_changed_destination_tip_refuses() {
         BRANCH,
         &history.origin,
         &tip,
+        false,
     )
     .unwrap_err();
     assert!(err.diagnostic.contains("changed during verification"));
@@ -654,6 +656,7 @@ fn new_split_routes_refuse_before_any_remote_contact() {
         BRANCH,
         origin,
         &tip,
+        false,
     )
     .unwrap_err();
     assert!(error.diagnostic.contains("different fetch and push routes"));
@@ -689,6 +692,7 @@ fn new_only_ref_queries_allow_git_transport_and_do_not_prompt() {
         BRANCH,
         &history.origin,
         &tip,
+        false,
     )
     .unwrap();
     assert_eq!(ref_queries.get(), 2);
@@ -840,6 +844,7 @@ fn new_per_origin_git_service_override_is_ambiguous() {
             BRANCH,
             &history.origin,
             &tip,
+            false,
         )
         .unwrap_err();
         assert!(
@@ -896,7 +901,7 @@ fn new_http_exact_scope_disables_redirects_without_changing_other_git_config() {
     // guarded fixture reads the exact parameters that native sync inherits.
     let mut native = std::process::Command::new("mise");
     native.env_clear().env("GIT_CONFIG_PARAMETERS", prior);
-    publication::constrain_http(&mut native, Some(url));
+    publication::constrain_http(&mut native, Some(&HttpPolicy::Exact(url.to_owned())));
     let parameters = native
         .get_envs()
         .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten())
@@ -941,9 +946,7 @@ fn new_git_askpass_is_suppressed_and_provisioned_helpers_still_work() {
         if let Some(helper) = helper {
             cmd.args(["-c", &format!("credential.helper={}", helper.display())]);
         }
-        let params = git_parameters(GitAccess::Remote, cmd.get_envs())
-            .unwrap()
-            .unwrap();
+        let params = git_parameters(GitAccess::Remote, cmd.get_envs()).unwrap();
         cmd.envs(git_environment(GitAccess::Remote))
             .env("GIT_CONFIG_PARAMETERS", params)
             .stdin(Stdio::from(fs::File::open(&file).unwrap()))
@@ -959,50 +962,163 @@ fn new_git_askpass_is_suppressed_and_provisioned_helpers_still_work() {
 }
 
 #[test]
-fn new_ssh_uses_batch_mode_and_rejects_custom_launchers() {
+fn new_stock_ssh_guard_uses_batch_mode_with_existing_agent() {
     let history = History::new();
     let mut cmd = history.git(&history.remote);
     let provisioned = history.world.base().join("fixture-agent");
     cmd.env("SSH_AUTH_SOCK", &provisioned);
-    assert!(git_parameters(GitAccess::Ssh, cmd.get_envs()).is_ok());
+    assert!(!publication::has_ssh_launcher(|name| fixture_env(
+        &cmd, name
+    )));
     cmd.envs(git_environment(GitAccess::Ssh));
-    let env = |name| {
-        cmd.get_envs()
-            .find_map(|(key, value)| (key == name).then_some(value))
-            .flatten()
-    };
-    assert_eq!(env("GIT_SSH_COMMAND").unwrap(), "ssh -oBatchMode=yes");
-    assert_eq!(env("SSH_ASKPASS_REQUIRE").unwrap(), "never");
-    assert_eq!(env("SSH_AUTH_SOCK").unwrap(), provisioned.as_os_str());
+    assert_eq!(
+        fixture_env(&cmd, "GIT_SSH_COMMAND").unwrap(),
+        "ssh -oBatchMode=yes"
+    );
+    assert_eq!(fixture_env(&cmd, "SSH_ASKPASS_REQUIRE").unwrap(), "never");
+    assert_eq!(
+        fixture_env(&cmd, "SSH_AUTH_SOCK").unwrap(),
+        provisioned.as_os_str()
+    );
+}
 
+fn fixture_env<'a>(cmd: &'a FixtureCommand<'_>, name: &str) -> Option<&'a std::ffi::OsStr> {
+    cmd.get_envs()
+        .find_map(|(key, value)| (key == name).then_some(value))
+        .flatten()
+}
+
+#[test]
+fn new_configured_ssh_audits_full_local_ancestry_without_probing_the_wrapper() {
+    let history = History::new();
     let origin = "ssh://git@fixture.invalid/state.git";
-    history.configure(Some(true), true);
+    history.configure(Some(false), false);
+    let old = history.save();
+    history.configure(None, false);
     let tip = history.save();
-    let err = publication::preflight(
-        |args, access| {
-            assert!(access == GitAccess::Local);
-            history
-                .git(&history.store)
-                .envs(git_environment(access))
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "core.sshCommand")
-                .env("GIT_CONFIG_VALUE_0", "synthetic-wrapper")
-                .args(args)
-                .output()
-                .map_err(|_| Fail::new(1, "fixture Git did not run"))
-        },
-        BRANCH,
-        origin,
-        &tip,
-    )
-    .unwrap_err();
-    assert!(err.diagnostic.contains("custom SSH launcher"));
-    assert!(!err.diagnostic.contains("synthetic-wrapper"));
-    for key in ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"] {
-        let mut custom = history.git(&history.store);
-        custom.env(key, "synthetic-alternate");
-        let err = git_parameters(GitAccess::Ssh, custom.get_envs()).unwrap_err();
-        assert!(err.diagnostic.contains("custom SSH launcher"));
-        assert!(!err.diagnostic.contains("synthetic-alternate"));
+
+    // Model both environment and effective Git config without invoking SSH.
+    for command in [
+        "ssh -i '/fixture/private identity'",
+        "ssh -F /fixture/ssh_config",
+        "opaque-launcher",
+    ] {
+        for from_env in [true, false] {
+            let mut launch = history.git(&history.store);
+            if from_env {
+                launch.env("GIT_SSH_COMMAND", command);
+            }
+            let err = publication::preflight(
+                |args, access| {
+                    assert!(access.is_local());
+                    let mut git = history.git(&history.store);
+                    if !from_env {
+                        git.env("GIT_CONFIG_COUNT", "1")
+                            .env("GIT_CONFIG_KEY_0", "core.sshCommand")
+                            .env("GIT_CONFIG_VALUE_0", command);
+                    }
+                    git.envs(git_environment(access))
+                        .args(args)
+                        .output()
+                        .map_err(|_| Fail::new(1, "fixture Git did not run"))
+                },
+                BRANCH,
+                origin,
+                &tip,
+                publication::has_ssh_launcher(|name| fixture_env(&launch, name)),
+            )
+            .unwrap_err();
+            assert!(err.diagnostic.contains(UNSCOPED) && err.diagnostic.contains(&old));
+            assert!(!err.diagnostic.contains(command));
+        }
+    }
+    history.empty_remote(&old);
+}
+
+#[test]
+fn new_unverified_http_scope_audits_full_local_ancestry_before_network() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let run = |history: &History, tip: &str| {
+        publication::preflight(
+            |args, access| match access {
+                GitAccess::CheckHttp(_) => Ok(Output {
+                    status: std::process::ExitStatus::from_raw(128 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"private Git URL matcher diagnostic".to_vec(),
+                }),
+                GitAccess::Local => history.probe(args, access),
+                _ => panic!("an unverified HTTP route must not supply ref ancestry"),
+            },
+            BRANCH,
+            "http://%31%32%37.0.0.1:9/fixture",
+            tip,
+            false,
+        )
+    };
+    let history = History::new();
+    history.configure(Some(false), false);
+    let old = history.save();
+    history.configure(None, false);
+    let tip = history.save();
+    let refusal = run(&history, &tip).unwrap_err();
+    assert!(refusal.diagnostic.contains(UNSCOPED) && refusal.diagnostic.contains(&old));
+    assert!(
+        !refusal
+            .diagnostic
+            .contains("private Git URL matcher diagnostic")
+    );
+
+    let clean = History::new();
+    clean.configure(Some(true), true);
+    let tip = clean.save();
+    assert_eq!(run(&clean, &tip).unwrap(), Some(HttpPolicy::Default));
+    clean.empty_remote(&tip);
+}
+
+#[test]
+fn new_age_ssh_recipient_stanzas_require_the_builtin_fields() {
+    let tag = "A".repeat(6);
+    let share = "A".repeat(43);
+    let rsa = "A".repeat(342);
+    let raw = |args: &str, body: &str| {
+        let mut bytes = format!("age-encryption.org/v1\n-> {args}\n").into_bytes();
+        for line in body.as_bytes().chunks(64) {
+            bytes.extend_from_slice(line);
+            bytes.push(b'\n');
+        }
+        if body.len() % 64 == 0 {
+            bytes.push(b'\n');
+        }
+        bytes.extend(format!("--- {share}\n").as_bytes());
+        bytes.extend([0; 33]);
+        bytes
+    };
+    let ed = format!("ssh-ed25519 {tag} {share}");
+    assert!(publication::age_file(&raw(&ed, &share)));
+    for (args, body) in [
+        ("ssh-ed25519".to_owned(), share.as_str()),
+        (format!("ssh-ed25519 {share}"), share.as_str()),
+        (format!("ssh-ed25519 AAAAAQ {share} extra"), share.as_str()),
+        (format!("ssh-ed25519 AAAAAB {share}"), share.as_str()),
+        (
+            format!("ssh-ed25519 {tag} {}", &share[..42]),
+            share.as_str(),
+        ),
+        (ed.clone(), ""),
+        (ed, &share[..42]),
+    ] {
+        assert!(!publication::age_file(&raw(&args, body)));
+    }
+
+    let rsa_args = format!("ssh-rsa {tag}");
+    assert!(publication::age_file(&raw(&rsa_args, &rsa)));
+    for (args, body) in [
+        ("ssh-rsa".to_owned(), rsa.as_str()),
+        (format!("ssh-rsa {tag} extra"), rsa.as_str()),
+        ("ssh-rsa AAAAAB".to_owned(), rsa.as_str()),
+        (rsa_args, &rsa[..340]),
+    ] {
+        assert!(!publication::age_file(&raw(&args, body)));
     }
 }

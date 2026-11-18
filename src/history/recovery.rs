@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use nix::libc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::Fail;
 use crate::config::{RepoSetting, Vars, selection};
@@ -17,21 +18,23 @@ use super::native::{Native, exists, private_dir};
 use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origin};
 
 const PREVIOUS: &str = "repo.git.pre-restore.";
+const ATTEMPT: &str = ".dots-restore-attempt.";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
 
 #[derive(Deserialize, Serialize)]
 struct Journal {
     root: PathBuf,
-    root_device: u64,
-    root_inode: u64,
     home: PathBuf,
+    paths: tracked::PathBinding,
     origin: String,
     branch: String,
     device: u64,
     inode: u64,
     seed: String,
+    initial: bool,
     progress: Progress,
+    obsolete_scope: Option<String>,
     previous: Option<Previous>,
 }
 
@@ -48,6 +51,8 @@ struct Attempt {
     target: String,
     head: String,
     live: BTreeMap<PathBuf, Option<FileVersion>>,
+    created: BTreeSet<PathBuf>,
+    scope: String,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,12 +95,13 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     let vars = Vars::read(&native.ctx.root)?;
     let expected = state_repo(&vars)?;
     validate_origin(native, &vars, origin)?;
+    verify_capture_policy(native)?;
     let (identity, recovered_keys) = keys::read_identity(native, identity)?;
     let mut local = LocalSettings::read(native)?;
     let mut recipients = local.recipients()?;
     recipients.extend(recovered_keys);
     keys::check_recipients(native, &recipients)?;
-    let paths = tracked::paths(native, Some(&branch))?;
+    let paths = tracked::restore_paths(native, Some(&branch))?;
     let store = native.store()?;
     let raw = local
         .origin()
@@ -124,24 +130,13 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
             Ok::<_, Fail>(record)
         })
         .transpose()?;
-    let prior_origin = native.effective_origin().ok();
-    if local.origin() != Some(&raw) || local.branch() != Some(&branch) {
-        if exists(&store)? && journal.is_none() && !initialize {
-            return Err(invalid(
-                "local history is connected elsewhere; inspect it before using dots restore --initialize-history",
-            ));
-        }
-        local.set_origin(&branch, &RepoSetting::parse(&raw)?)?;
-        local.install(native)?;
-    }
-    // The explicit fetch below must use the same native config that apply sees.
-    native.require_origin(&raw, &branch)?;
-
     if exists(&staging)? {
         if pending == Some(staged.as_path()) {
+            native.require_no_pending_operations()?;
             let record = journal
                 .as_ref()
                 .ok_or_else(|| blocked("pending history journal vanished"))?;
+            paths.check_binding(&record.paths, false)?;
             native.destinations(Some(&staged), &raw, expected, &vars)?;
             if revision(native, &staged, MAIN_REF)? != record.seed {
                 return Err(blocked("the staged history seed checkpoint changed"));
@@ -165,6 +160,8 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
             "an older pending restore cannot be safely resumed by this build; finish it with the dots version that started it",
         ));
     } else {
+        native.require_no_pending_operations()?;
+        let prior_origin = native.effective_origin().ok();
         let old = existing_directory(&store)?;
         let connected = old.is_some()
             && native.bare(&store).is_ok()
@@ -192,15 +189,21 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     };
 
     native.destinations(Some(&store), &raw, expected, &vars)?;
-    let recovery = Recovery {
+    // Classify and persist any store replacement before changing native origin
+    // settings. Failed staging must leave the old connection authoritative.
+    if local.origin() != Some(&raw) || local.branch() != Some(&branch) {
+        local.set_origin(&branch, &RepoSetting::parse(&raw)?)?;
+        local.install(native)?;
+    }
+    native.require_origin(&raw, &branch)?;
+    let mut recovery = Recovery {
         native,
         store: &store,
         origin: &raw,
         branch: &branch,
         identity: &identity,
-        paths: &paths,
+        paths,
     };
-    let pending = journal.is_some();
     if let Some(record) = journal {
         recovery.resume(record)?;
     } else {
@@ -210,11 +213,9 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     let mut local = LocalSettings::read(native)?;
     local.set_history(&branch, &RepoSetting::parse(&raw)?, &identity, &recipients)?;
     local.install(native)?;
-    if pending {
-        fs::remove_file(store.join(MARKER))
-            .map_err(|_| blocked("could not finish the pending restore marker"))?;
-        fsync_dir(&store)?;
-    }
+    fs::remove_file(store.join(MARKER))
+        .map_err(|_| blocked("could not finish the pending restore marker"))?;
+    fsync_dir(&store)?;
     Ok(())
 }
 
@@ -248,19 +249,88 @@ fn read_sync(store: &Path) -> Result<Option<SyncState>, Fail> {
         .map_err(|_| invalid("could not verify native history synchronization state"))
 }
 
+fn verify_capture_policy(native: &Native<'_, '_>) -> Result<(), Fail> {
+    #[derive(Deserialize)]
+    struct ConfigFile {
+        path: PathBuf,
+    }
+    let mut cmd = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
+    cmd.env("GIT_ALLOW_PROTOCOL", "");
+    if native
+        .text(cmd, "could not verify the plaintext history setting")?
+        .trim()
+        != "false"
+    {
+        return Err(invalid(
+            "plaintext history must be disabled before restore; set history.allow_plaintext_history to false and retry dots restore",
+        ));
+    }
+    let diagnostic = "no verified history recipient configuration; configure [history.encryption].recipients and retry dots restore";
+    let mut cmd = native.mise(&["config", "ls", "--json"])?;
+    cmd.env("GIT_ALLOW_PROTOCOL", "");
+    let files: Vec<ConfigFile> = serde_json::from_slice(&native.output(cmd, diagnostic)?)
+        .map_err(|_| invalid(diagnostic))?;
+    let managed = native.ctx.root.path();
+    // Inspect the native config inventory. This only proves that recipient
+    // configuration exists. Native mise reconciles its own saved policy.
+    for file in files {
+        if file
+            .path
+            .extension()
+            .is_none_or(|extension| extension != "toml")
+            || !file.path.starts_with(managed)
+        {
+            continue;
+        }
+        let source = fs::read_to_string(&file.path).map_err(|_| invalid(diagnostic))?;
+        let config = source
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|_| invalid(diagnostic))?;
+        let mut item = config.as_item();
+        let keys = ["history", "encryption", "recipients"]
+            .into_iter()
+            .all(|name| {
+                if let Some(next) = item.as_table_like().and_then(|table| table.get(name)) {
+                    item = next;
+                    true
+                } else {
+                    false
+                }
+            });
+        if keys {
+            let observed = item
+                .as_array()
+                .ok_or_else(|| invalid(diagnostic))?
+                .iter()
+                .map(|key| key.as_str().ok_or_else(|| invalid(diagnostic)))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if observed.is_empty()
+                || observed
+                    .iter()
+                    .any(|recipient| !keys::recipient_shape(recipient))
+            {
+                return Err(invalid(diagnostic));
+            }
+            return Ok(());
+        }
+    }
+    Err(invalid(diagnostic))
+}
+
 struct Recovery<'a, 'run, 'ctx> {
     native: &'a Native<'run, 'ctx>,
     store: &'a Path,
     origin: &'a str,
     branch: &'a str,
     identity: &'a Path,
-    paths: &'a [PathBuf],
+    paths: tracked::TrackedPaths,
 }
 
 impl Recovery<'_, '_, '_> {
     fn command(&self, args: &[&str], offline: bool) -> Result<Command, Fail> {
         let mut command = self.native.mise(args)?;
-        command
+        unmodified_git_graph(&mut command)
+            .env_remove("__MISE_HISTORY_LOCAL")
             .env("MISE_HISTORY_SYNC", "fetch-only")
             .env("MISE_AGE_IDENTITY_FILES", self.identity)
             .env("GIT_TERMINAL_PROMPT", "0");
@@ -271,23 +341,29 @@ impl Recovery<'_, '_, '_> {
     }
 
     fn fetch(&self) -> Result<String, Fail> {
+        self.native.require_no_pending_operations()?;
         let head = revision(self.native, self.store, MAIN_REF)?;
         self.verify(&head)?;
-        tracked::secure(self.native, self.paths)?;
+        verify_capture_policy(self.native)?;
+        self.paths.secure(self.native)?;
         self.native.require_origin(self.origin, self.branch)?;
+        self.paths.recheck(self.native)?;
+        self.native.require_no_pending_operations()?;
         let cmd = self.command(&["bootstrap", "dotfiles", "sync", "--fetch-only"], false)?;
         apply(self.native, cmd, "mise could not fetch encrypted history")?;
         revision(self.native, self.store, TRACKING_REF)
     }
 
-    fn verify(&self, commit: &str) -> Result<BTreeSet<PathBuf>, Fail> {
-        verify_tree(self.native, self.store, commit, self.branch, self.paths)
+    fn verify(&self, commit: &str) -> Result<VerifiedTree, Fail> {
+        verify_tree(self.native, self.store, commit, self.branch, &self.paths)
     }
 
-    fn verify_plan(&self, target: &str) -> Result<(), Fail> {
+    fn verify_plan(&self, target: &str) -> Result<BTreeSet<PathBuf>, Fail> {
         let head = revision(self.native, self.store, MAIN_REF)?;
-        let mut allowed = self.verify(&head)?;
-        allowed.extend(self.verify(target)?);
+        let local = self.verify(&head)?;
+        let remote = self.verify(target)?;
+        let allowed: BTreeSet<_> = local.paths.union(&remote.paths).collect();
+        let directories: BTreeSet<_> = local.missing.union(&remote.missing).cloned().collect();
         if revision(self.native, self.store, TRACKING_REF)? != target {
             return Err(blocked(
                 "fetched history changed while preparing restore; retry",
@@ -295,10 +371,8 @@ impl Recovery<'_, '_, '_> {
         }
         let sync = read_sync(self.store)?
             .ok_or_else(|| blocked("native fetch did not record a restore plan"))?;
-        if sync.upstream_commit.as_deref() != Some(target) || sync.pending_directories != 0 {
-            return Err(invalid(
-                "native restore plan has an unchecked checkpoint or directory mode change",
-            ));
+        if sync.upstream_commit.as_deref() != Some(target) {
+            return Err(invalid("native restore plan has an unchecked checkpoint"));
         }
         if !sync.conflicts.is_empty() {
             return Err(history_conflict());
@@ -310,103 +384,220 @@ impl Recovery<'_, '_, '_> {
                 .branch_path
                 .strip_prefix(&stem)
                 .and_then(|relative| home_path(&home, relative));
-            if application.configuration
-                || path.is_none_or(|path| !allowed.contains(&path))
-                || application
-                    .object
-                    .is_some_and(|(mode, oid)| mode != "100644" || !valid_oid(&oid))
-            {
+            if application.configuration || path.is_none_or(|path| !allowed.contains(&path)) {
+                return Err(unsafe_tree());
+            }
+            if let Some((mode, oid)) = application.object {
+                // The native plan contains the transient decrypted object ID.
+                // The persistent input envelopes were checked above.
+                if mode != "100644" || !valid_oid(&oid) {
+                    return Err(unsafe_tree());
+                }
+            }
+        }
+        self.paths.recheck(self.native)?;
+        if sync.pending_directories == 0 {
+            return Ok(BTreeSet::new());
+        }
+        self.verify_directories(&directories, sync.pending_directories)
+    }
+
+    fn verify_directories(
+        &self,
+        allowed: &BTreeSet<PathBuf>,
+        expected_count: usize,
+    ) -> Result<BTreeSet<PathBuf>, Fail> {
+        self.before_apply()?;
+        let mut command = self.command(&["bootstrap", "dotfiles", "pull", "--dry-run"], true)?;
+        command.env("NO_COLOR", "1").env_remove("MISE_TERM_WIDTH");
+        let plan = self.native.text(
+            command,
+            "could not verify native restore directory creation",
+        )?;
+        let home = physical_home(self.native)?;
+        let mut directories = BTreeSet::new();
+        for row in plan
+            .lines()
+            .filter_map(|line| line.trim_end().strip_suffix("setup"))
+        {
+            let Some(display) = row.trim_end().strip_suffix("permissions") else {
+                continue;
+            };
+            let display = display.trim();
+            let path = display
+                .strip_prefix("~/")
+                .and_then(|path| home_path(&home, path))
+                .or_else(|| {
+                    Path::new(display)
+                        .is_absolute()
+                        .then(|| PathBuf::from(display))
+                })
+                .filter(|path| allowed.contains(path))
+                .ok_or_else(unsafe_tree)?;
+            if !directories.insert(path) {
                 return Err(unsafe_tree());
             }
         }
-        if tracked::paths(self.native, Some(self.branch))? != self.paths {
-            return Err(blocked(
-                "active encrypted history paths changed while preparing restore",
-            ));
+        if directories.len() != expected_count {
+            return Err(unsafe_tree());
         }
-        Ok(())
+        Ok(directories)
     }
 
-    fn restore_established(&self) -> Result<(), Fail> {
+    fn restore_established(&mut self) -> Result<(), Fail> {
         let target = self.fetch()?;
-        self.verify_plan(&target)?;
-        self.pull()
+        let created = self.verify_plan(&target)?;
+        let attempt = self.attempt(target, self.paths.iter(), created)?;
+        let record = new_journal(
+            self.native,
+            self.store,
+            self.origin,
+            self.branch,
+            &self.paths,
+            attempt.head.clone(),
+            false,
+            Progress::Pulling(attempt),
+            None,
+        )?;
+        write_journal(self.store, &record)?;
+        self.resume(record)
     }
 
-    fn pull(&self) -> Result<(), Fail> {
-        let cmd = self.command(&["--yes", "bootstrap", "dotfiles", "pull"], true)?;
+    fn launch_attempt(&self, attempt: &Attempt, rollback: bool) -> Result<(), Fail> {
+        self.before_apply()?;
+        let command = self.attempt_command(attempt, rollback)?;
+        require_unchanged(&attempt.live, &BTreeSet::new())?;
         apply(
             self.native,
-            cmd,
+            command,
             "mise could not apply incoming private settings",
         )
     }
 
-    fn resume(&self, mut journal: Journal) -> Result<(), Fail> {
+    fn before_apply(&self) -> Result<(), Fail> {
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        self.verify(&head)?;
+        verify_capture_policy(self.native)?;
+        self.paths.recheck(self.native)?;
+        self.native.require_no_pending_operations()
+    }
+
+    fn resume(&mut self, mut journal: Journal) -> Result<(), Fail> {
         loop {
+            if let Some(scope) = journal.obsolete_scope.take() {
+                self.remove_scope(&scope)?;
+                write_journal(self.store, &journal)?;
+            }
+            let resumed = match &mut journal.progress {
+                Progress::Pulling(attempt) => {
+                    self.recover_attempt(attempt, &journal.paths, false)?
+                }
+                Progress::RollingBack(attempt) => {
+                    self.recover_attempt(attempt, &journal.paths, true)?
+                }
+                _ => false,
+            };
+            if resumed {
+                self.paths = tracked::restore_paths(self.native, Some(self.branch))?;
+                write_journal(self.store, &journal)?;
+            }
+            let obsolete_scope = match &journal.progress {
+                Progress::Pulling(attempt) | Progress::RollingBack(attempt) => {
+                    Some(attempt.scope.clone())
+                }
+                _ => None,
+            };
             journal.progress = match &journal.progress {
                 Progress::Prepared => {
+                    self.paths.check_binding(&journal.paths, false)?;
                     let target = self.fetch()?;
-                    self.verify_plan(&target)?;
-                    Progress::Pulling(self.attempt(target, self.paths.iter())?)
+                    let created = self.verify_plan(&target)?;
+                    Progress::Pulling(self.attempt(target, self.paths.iter(), created)?)
                 }
                 Progress::Pulling(attempt) => {
-                    let completed = self.completion(attempt, "apply")?;
+                    let completed = self.completion(attempt, false)?;
                     if completed.is_none() {
+                        self.paths.check_binding(&journal.paths, false)?;
                         require_unchanged(&attempt.live, &BTreeSet::new())?;
-                        self.verify_plan(&attempt.target)?;
-                        self.pull()?;
+                        if self.verify_plan(&attempt.target)? != attempt.created {
+                            return Err(unsafe_tree());
+                        }
+                        self.launch_attempt(attempt, false)?;
                     }
-                    let written = self.completion(attempt, "apply")?.unwrap_or_default();
+                    let completed = self.completion(attempt, false)?;
+                    if completed.is_some() {
+                        self.refresh_paths(&mut journal.paths, &attempt.created)?;
+                    } else {
+                        self.paths.check_binding(&journal.paths, false)?;
+                    }
+                    let written = completed.unwrap_or_default();
                     require_unchanged(&attempt.live, &written)?;
                     let allowed = self.verify(&attempt.target)?;
                     let remaining: BTreeMap<_, _> = attempt
                         .live
                         .iter()
-                        .filter(|(path, _)| allowed.contains(*path) && !written.contains(*path))
+                        .filter(|(path, _)| {
+                            allowed.paths.contains(*path) && !written.contains(*path)
+                        })
                         .map(|(path, version)| (path.clone(), version.clone()))
                         .collect();
-                    if remaining.is_empty() {
+                    if remaining.is_empty() || !journal.initial {
                         Progress::Applied
                     } else {
-                        Progress::RollingBack(Attempt {
-                            target: attempt.target.clone(),
-                            head: revision(self.native, self.store, MAIN_REF)?,
-                            live: remaining,
-                        })
+                        let created = self.verify_rollback(&attempt.target, remaining.keys())?;
+                        Progress::RollingBack(self.attempt(
+                            attempt.target.clone(),
+                            remaining.keys(),
+                            created,
+                        )?)
                     }
                 }
                 Progress::RollingBack(attempt) => {
-                    if self.completion(attempt, "rollback")?.is_none() {
+                    if self.completion(attempt, true)?.is_none() {
+                        self.paths.check_binding(&journal.paths, false)?;
                         require_unchanged(&attempt.live, &BTreeSet::new())?;
-                        self.verify_rollback(&attempt.target, attempt.live.keys())?;
+                        if self.verify_rollback(&attempt.target, attempt.live.keys())?
+                            != attempt.created
+                        {
+                            return Err(unsafe_tree());
+                        }
                         // Native rollback records the encrypted undo of the live files.
+                        self.before_apply()?;
                         let target = format!("commit:{}", attempt.target);
-                        for mode in ["--dry-run", "--yes"] {
-                            let mut command = self.command(
-                                &[
-                                    "bootstrap",
-                                    "dotfiles",
-                                    "rollback",
-                                    "--to",
-                                    &target,
-                                    mode,
-                                    "--",
-                                ],
-                                true,
-                            )?;
-                            command.args(attempt.live.keys());
-                            apply(
-                                self.native,
-                                command,
-                                "mise could not apply the first private history checkpoint",
-                            )?;
+                        let mut dry_run = self.command(
+                            &[
+                                "bootstrap",
+                                "dotfiles",
+                                "rollback",
+                                "--to",
+                                &target,
+                                "--dry-run",
+                                "--",
+                            ],
+                            true,
+                        )?;
+                        dry_run.args(attempt.live.keys());
+                        apply(
+                            self.native,
+                            dry_run,
+                            "mise could not verify the first private history checkpoint",
+                        )?;
+                        self.launch_attempt(attempt, true)?;
+                        if self.completion(attempt, true)?.is_none() {
+                            self.native.require_no_pending_operations()?;
+                            require_unchanged(&attempt.live, &BTreeSet::new())?;
+                            self.paths.check_binding(&journal.paths, false)?;
                         }
                     }
+                    self.refresh_paths(&mut journal.paths, &attempt.created)?;
                     Progress::Applied
                 }
-                Progress::Applied => return Ok(()),
+                Progress::Applied => {
+                    self.native.require_no_pending_operations()?;
+                    return self.paths.check_binding(&journal.paths, false);
+                }
             };
+            journal.obsolete_scope = obsolete_scope;
             write_journal(self.store, &journal)?;
         }
     }
@@ -415,12 +606,116 @@ impl Recovery<'_, '_, '_> {
         &self,
         target: String,
         paths: impl Iterator<Item = &'p PathBuf>,
+        created: BTreeSet<PathBuf>,
     ) -> Result<Attempt, Fail> {
         let live = paths
             .map(|path| Ok((path.clone(), file_version(path)?)))
             .collect::<Result<_, Fail>>()?;
         let head = revision(self.native, self.store, MAIN_REF)?;
-        Ok(Attempt { target, head, live })
+        let directory = tempfile::Builder::new()
+            .prefix(ATTEMPT)
+            .tempdir_in(self.store)
+            .map_err(|_| blocked("could not reserve a private native restore scope"))?;
+        symlink(self.native.ctx.root.path(), directory.path().join("root"))
+            .map_err(|_| blocked("could not bind the native restore to the configuration root"))?;
+        let scope = directory
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(unsafe_tree)?
+            .to_owned();
+        fsync_dir(directory.path())?;
+        let _retained = directory.keep();
+        fsync_dir(self.store)?;
+        Ok(Attempt {
+            target,
+            head,
+            live,
+            created,
+            scope,
+        })
+    }
+
+    fn scope_dir(&self, scope: &str) -> Result<PathBuf, Fail> {
+        let valid = scope.strip_prefix(ATTEMPT).is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+        if !valid {
+            return Err(unresolved_restore());
+        }
+        Ok(self.store.join(scope))
+    }
+
+    fn scope(&self, scope: &str) -> Result<PathBuf, Fail> {
+        let directory = self.scope_dir(scope)?;
+        let path = directory.join("root");
+        if !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir())
+            || !fs::read_link(&path).is_ok_and(|target| target == self.native.ctx.root.path())
+        {
+            return Err(unresolved_restore());
+        }
+        Ok(path)
+    }
+
+    fn remove_scope(&self, scope: &str) -> Result<(), Fail> {
+        let directory = self.scope_dir(scope)?;
+        if existing_directory(&directory)?.is_none() {
+            return Ok(());
+        }
+        if exists(&directory.join("root"))? {
+            fs::remove_file(self.scope(scope)?)
+                .map_err(|_| blocked("could not close the native restore scope"))?;
+        }
+        fs::remove_dir(directory).map_err(|_| blocked("could not close the native restore scope"))
+    }
+
+    fn attempt_command(&self, attempt: &Attempt, rollback: bool) -> Result<Command, Fail> {
+        let scope = self.scope(&attempt.scope)?;
+        let scope = scope.to_str().ok_or_else(unsafe_tree)?;
+        if rollback {
+            let target = format!("commit:{}", attempt.target);
+            let mut command = self.command(
+                &[
+                    "--cd",
+                    scope,
+                    "bootstrap",
+                    "dotfiles",
+                    "rollback",
+                    "--to",
+                    &target,
+                    "--yes",
+                    "--",
+                ],
+                true,
+            )?;
+            command.args(attempt.live.keys());
+            Ok(command)
+        } else {
+            self.command(
+                &["--cd", scope, "--yes", "bootstrap", "dotfiles", "pull"],
+                true,
+            )
+        }
+    }
+
+    fn refresh_paths(
+        &mut self,
+        binding: &mut tracked::PathBinding,
+        admitted: &BTreeSet<PathBuf>,
+    ) -> Result<(), Fail> {
+        let current = tracked::restore_paths(self.native, Some(self.branch))?;
+        current.check_binding(binding, true)?;
+        for path in current.created_directories(binding) {
+            if !admitted.contains(path)
+                || !fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_dir() && meta.mode() & 0o7777 == 0o700)
+            {
+                return Err(unsafe_tree());
+            }
+        }
+        *binding = current.binding().clone();
+        self.paths = current;
+        Ok(())
     }
 
     fn checkpoint(&self, commit: &str) -> Result<NativeCheckpoint, Fail> {
@@ -443,7 +738,11 @@ impl Recovery<'_, '_, '_> {
             .map_err(|_| invalid("could not read native checkpoint coverage"))
     }
 
-    fn completion(&self, attempt: &Attempt, kind: &str) -> Result<Option<BTreeSet<PathBuf>>, Fail> {
+    fn completion(
+        &self,
+        attempt: &Attempt,
+        rollback: bool,
+    ) -> Result<Option<BTreeSet<PathBuf>>, Fail> {
         let head = revision(self.native, self.store, MAIN_REF)?;
         if head == attempt.head {
             return Ok(None);
@@ -455,9 +754,11 @@ impl Recovery<'_, '_, '_> {
         let Some(operation) = native.operation else {
             return Ok(None);
         };
-        if operation.kind != kind
+        // A published native checkpoint deliberately omits argv and cwd.
+        // Its target, kind, ancestry, and covered paths identify completion.
+        if operation.kind != if rollback { "rollback" } else { "apply" }
             || operation.status != "completed"
-            || operation.to.or(operation.applied).as_deref() != Some(&attempt.target)
+            || operation.to.as_deref().or(operation.applied.as_deref()) != Some(&attempt.target)
         {
             return Ok(None);
         }
@@ -474,12 +775,105 @@ impl Recovery<'_, '_, '_> {
         Ok(Some(written))
     }
 
+    fn owns_operation(
+        &self,
+        attempt: &Attempt,
+        rollback: bool,
+        operation: &NativeOperation,
+    ) -> Result<bool, Fail> {
+        let command = self.attempt_command(attempt, rollback)?;
+        Ok(
+            operation.kind == if rollback { "rollback" } else { "apply" }
+                && operation.cwd == self.native.ctx.root.path()
+                && operation
+                    .argv
+                    .iter()
+                    .map(String::as_str)
+                    .eq(command.get_args())
+                && operation.to.as_deref().or(operation.applied.as_deref())
+                    == Some(&attempt.target),
+        )
+    }
+
+    fn recover_attempt(
+        &self,
+        attempt: &mut Attempt,
+        binding: &tracked::PathBinding,
+        rollback: bool,
+    ) -> Result<bool, Fail> {
+        let operations = self.native.pending_operations()?;
+        let [operation] = operations.as_slice() else {
+            return if operations.is_empty() {
+                Ok(false)
+            } else {
+                Err(unresolved_restore())
+            };
+        };
+        if operation.local {
+            return Err(unresolved_restore());
+        }
+        let pending = parent(self.store)
+            .join("index/pending")
+            .join(format!("{}.json", operation.uuid));
+        let record: NativePending =
+            serde_json::from_reader(read_private(&pending)?.take(64 * 1024 * 1024))
+                .map_err(|_| unresolved_restore())?;
+        let native = record.checkpoint.operation.ok_or_else(unresolved_restore)?;
+        if record.checkpoint.uuid != operation.uuid
+            || native.id != operation.uuid
+            || !self.owns_operation(attempt, rollback, &native)?
+        {
+            return Err(unresolved_restore());
+        }
+        self.paths.check_binding(binding, true)?;
+        let affected = native.written_paths(attempt)?;
+        for path in self.paths.created_directories(binding) {
+            if !attempt.created.contains(path)
+                || !affected.contains(path)
+                || !fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_dir() && meta.mode() & 0o7777 == 0o700)
+            {
+                return Err(unresolved_restore());
+            }
+        }
+        let completed = self.completion(attempt, rollback)?.is_some();
+        if !completed {
+            require_unchanged(&attempt.live, &affected)?;
+            if record.recovery != NativeRecovery::Pending {
+                native.verify_completed_writes()?;
+            }
+        }
+        let head = revision(self.native, self.store, MAIN_REF)?;
+        self.verify(&head)?;
+        verify_capture_policy(self.native)?;
+        self.paths.recheck(self.native)?;
+        if self.native.pending_operations()? != operations {
+            return Err(unresolved_restore());
+        }
+        let command = self.command(&["bootstrap", "dotfiles", "recover", &operation.uuid], true)?;
+        self.native.output(command, "native restore recovery needs attention; use mise dot history --pending to inspect the retained operation")?;
+        self.native.require_no_pending_operations()?;
+        if !completed && self.completion(attempt, rollback)?.is_none() {
+            let current = tracked::restore_paths(self.native, Some(self.branch))?;
+            current.check_binding(binding, false)?;
+            require_unchanged(&attempt.live, &affected)?;
+            for (path, previous) in &mut attempt.live {
+                if affected.contains(path) {
+                    *previous = file_version(path)?;
+                }
+            }
+            attempt.head = revision(self.native, self.store, MAIN_REF)?;
+        }
+        Ok(true)
+    }
+
     fn verify_rollback<'p>(
         &self,
         target: &str,
         paths: impl Iterator<Item = &'p PathBuf>,
-    ) -> Result<(), Fail> {
+    ) -> Result<BTreeSet<PathBuf>, Fail> {
         let allowed = self.verify(target)?;
+        let mut directories = BTreeSet::new();
         let checkpoint = self.checkpoint(target)?;
         let home = physical_home(self.native)?;
         let covered: BTreeSet<_> = checkpoint
@@ -503,7 +897,7 @@ impl Recovery<'_, '_, '_> {
             .map(|entry| entry.path)
             .collect::<Vec<_>>();
         for path in paths {
-            if !allowed.contains(path)
+            if !allowed.paths.contains(path)
                 || !covered.contains(path)
                 || unverified.iter().any(|entry| {
                     covered_path(&home, entry).is_none_or(|entry| path.starts_with(entry))
@@ -513,13 +907,16 @@ impl Recovery<'_, '_, '_> {
                     "first restore includes a path without complete encrypted checkpoint coverage",
                 ));
             }
+            directories.extend(
+                allowed
+                    .missing
+                    .iter()
+                    .filter(|parent| path.starts_with(parent))
+                    .cloned(),
+            );
         }
-        if tracked::paths(self.native, Some(self.branch))? != self.paths {
-            return Err(blocked(
-                "active encrypted history paths changed while preparing restore",
-            ));
-        }
-        Ok(())
+        self.paths.recheck(self.native)?;
+        Ok(directories)
     }
 }
 
@@ -558,12 +955,163 @@ struct NativePath {
 
 #[derive(Deserialize)]
 struct NativeOperation {
+    id: String,
     kind: String,
     status: String,
+    argv: Vec<String>,
+    cwd: PathBuf,
     to: Option<String>,
     applied: Option<String>,
     #[serde(default)]
     affected: Vec<String>,
+    #[serde(default)]
+    journal: Vec<NativeWrite>,
+}
+
+#[derive(Deserialize)]
+struct NativePending {
+    checkpoint: PendingCheckpoint,
+    recovery: NativeRecovery,
+}
+
+#[derive(Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum NativeRecovery {
+    Pending,
+    UnfinishedWrites,
+    Finished,
+}
+
+#[derive(Deserialize)]
+struct PendingCheckpoint {
+    uuid: String,
+    operation: Option<NativeOperation>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeWrite {
+    Note,
+    PathChanged {
+        path: PathBuf,
+        prior: NativePreimage,
+    },
+    Committed {
+        seq: usize,
+        after: NativeAfter,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum NativePreimage {
+    Missing,
+    File { mode: u32 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum NativeAfter {
+    Missing,
+    File { mode: u32, sha256: String },
+    Dir { mode: u32, identity: (u64, u64) },
+}
+
+impl NativeOperation {
+    fn written_paths(&self, attempt: &Attempt) -> Result<BTreeSet<PathBuf>, Fail> {
+        let mut paths = BTreeSet::new();
+        for write in &self.journal {
+            match write {
+                NativeWrite::Note => {}
+                NativeWrite::PathChanged { path, prior } => {
+                    let safe = match (attempt.live.get(path), prior) {
+                        (Some(None), NativePreimage::Missing) => true,
+                        (Some(Some(previous)), NativePreimage::File { mode }) => {
+                            previous.mode & 0o7777 == 0o600 && *mode == 0o600
+                        }
+                        (None, NativePreimage::Missing) => attempt.created.contains(path),
+                        _ => false,
+                    };
+                    if !safe || !paths.insert(path.clone()) {
+                        return Err(unresolved_restore());
+                    }
+                }
+                NativeWrite::Committed { seq, .. } => {
+                    if !matches!(
+                        self.journal.get(*seq),
+                        Some(NativeWrite::PathChanged { .. })
+                    ) {
+                        return Err(unresolved_restore());
+                    }
+                }
+            }
+        }
+        Ok(paths)
+    }
+
+    fn verify_completed_writes(&self) -> Result<(), Fail> {
+        for (index, write) in self.journal.iter().enumerate() {
+            let NativeWrite::PathChanged { path, .. } = write else {
+                continue;
+            };
+            let after = self.journal.iter().rev().find_map(|entry| match entry {
+                NativeWrite::Committed { seq, after } if *seq == index => Some(after),
+                _ => None,
+            });
+            let Some(after) = after else {
+                return Err(unresolved_restore());
+            };
+            if !after.still_matches(path)? {
+                return Err(unresolved_restore());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl NativeAfter {
+    fn still_matches(&self, path: &Path) -> Result<bool, Fail> {
+        match self {
+            Self::Missing => Ok(!exists(path)?),
+            Self::Dir { mode, identity } => Ok(fs::symlink_metadata(path).is_ok_and(|meta| {
+                meta.is_dir()
+                    && *mode == 0o700
+                    && meta.mode() & 0o7777 == *mode
+                    && (meta.dev(), meta.ino()) == *identity
+            })),
+            Self::File { mode, sha256 } => {
+                let version = file_version(path)?.ok_or_else(unresolved_restore)?;
+                if *mode != 0o600 || version.mode & 0o7777 != *mode {
+                    return Ok(false);
+                }
+                let mut digest = Sha256::new();
+                let mut input = read_private(path)?;
+                let mut buffer = [0; 8192];
+                loop {
+                    let count = input.read(&mut buffer).map_err(|_| unresolved_restore())?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                let hash = digest.finalize();
+                let matching = sha256.len() == 2 * hash.len()
+                    && hash.iter().enumerate().all(|(offset, byte)| {
+                        sha256
+                            .get(offset * 2..offset * 2 + 2)
+                            .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+                            == Some(*byte)
+                    });
+                Ok(matching && file_version(path)? == Some(version))
+            }
+        }
+    }
+}
+
+fn unresolved_restore() -> Fail {
+    blocked(
+        "the interrupted restore could not be verified; inspect the retained native operation with mise dot history --pending before retrying",
+    )
 }
 
 fn covered_path(home: &Path, path: &str) -> Option<PathBuf> {
@@ -605,7 +1153,7 @@ fn prepare(
     raw: &str,
     branch: &str,
     vars: &Vars,
-    paths: &[PathBuf],
+    paths: &tracked::TrackedPaths,
     old: Option<fs::Metadata>,
 ) -> Result<Journal, Fail> {
     let base = parent(store);
@@ -666,24 +1214,17 @@ fn prepare(
         }),
         _ => None,
     };
-    let staged_metadata =
-        existing_directory(&staged)?.ok_or_else(|| blocked("staged history store vanished"))?;
-    let root = native.ctx.root.path();
-    let root_metadata =
-        existing_directory(root)?.ok_or_else(|| blocked("configuration root vanished"))?;
-    let record = Journal {
-        root: native.ctx.root.path().to_owned(),
-        root_device: root_metadata.dev(),
-        root_inode: root_metadata.ino(),
-        home: physical_home(native)?,
-        origin: raw.to_owned(),
-        branch: branch.to_owned(),
-        device: staged_metadata.dev(),
-        inode: staged_metadata.ino(),
+    let record = new_journal(
+        native,
+        &staged,
+        raw,
+        branch,
+        paths,
         seed,
-        progress: Progress::Prepared,
+        true,
+        Progress::Prepared,
         previous,
-    };
+    )?;
     write_journal(&staged, &record)?;
     let staging = base.join(STAGING);
     fs::rename(temp.path(), &staging)
@@ -692,8 +1233,39 @@ fn prepare(
         let _ = backup.keep();
     }
     fsync_dir(base)?;
+    native.require_no_pending_operations()?;
+    paths.recheck(native)?;
     install(&staging, store, &record)?;
     Ok(record)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_journal(
+    native: &Native<'_, '_>,
+    store: &Path,
+    raw: &str,
+    branch: &str,
+    paths: &tracked::TrackedPaths,
+    seed: String,
+    initial: bool,
+    progress: Progress,
+    previous: Option<Previous>,
+) -> Result<Journal, Fail> {
+    let metadata = existing_directory(store)?.ok_or_else(|| blocked("history store vanished"))?;
+    Ok(Journal {
+        root: native.ctx.root.path().to_owned(),
+        home: physical_home(native)?,
+        paths: paths.binding().clone(),
+        origin: raw.to_owned(),
+        branch: branch.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        seed,
+        initial,
+        progress,
+        obsolete_scope: None,
+        previous,
+    })
 }
 
 fn install(staging: &Path, store: &Path, record: &Journal) -> Result<(), Fail> {
@@ -829,11 +1401,8 @@ fn match_request(
     branch: &str,
 ) -> Result<(), Fail> {
     let root = native.ctx.root.path();
-    let root_metadata =
-        existing_directory(root)?.ok_or_else(|| blocked("configuration root vanished"))?;
     if record.root != root
         || record.home != physical_home(native)?
-        || (record.root_device, record.root_inode) != (root_metadata.dev(), root_metadata.ino())
         || record.origin != origin
         || record.branch != branch
     {
@@ -905,16 +1474,27 @@ pub(super) fn ancestor(
 fn local_git(native: &Native<'_, '_>, store: &Path) -> Result<Command, Fail> {
     let mut command = native.git(Some(store))?;
     // Even a nominally local Git read can fetch missing partial-clone objects.
-    command
+    unmodified_git_graph(&mut command)
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0");
     Ok(command)
+}
+
+pub(super) fn unmodified_git_graph(command: &mut Command) -> &mut Command {
+    command
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
 }
 
 #[derive(Deserialize)]
 struct Manifest {
     enrollment: Vec<Enrollment>,
     permissions: BTreeMap<String, u32>,
+}
+
+struct VerifiedTree {
+    paths: BTreeSet<PathBuf>,
+    missing: BTreeSet<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -941,7 +1521,7 @@ fn verify_tree(
     commit: &str,
     branch: &str,
     paths: &[PathBuf],
-) -> Result<BTreeSet<PathBuf>, Fail> {
+) -> Result<VerifiedTree, Fail> {
     if !valid_oid(commit) {
         return Err(invalid("invalid private history checkpoint ID"));
     }
@@ -978,7 +1558,10 @@ fn verify_tree(
             }
         }
         if names.contains(branch)
-            && (!entry.encrypt || !paths.contains(&path) || !enrolled.insert(path))
+            && (!entry.encrypt
+                || path.starts_with(native.ctx.root.path())
+                || !paths.contains(&path)
+                || !enrolled.insert(path))
         {
             return Err(unsafe_tree());
         }
@@ -1028,13 +1611,18 @@ fn verify_tree(
         {
             return Err(unsafe_tree());
         }
-        let mut cmd = local_git(native, store)?;
-        cmd.args(["cat-file", "blob", oid]);
-        let blob = native.output(cmd, "could not inspect the encrypted checkpoint envelope")?;
-        if !blob.starts_with(b"mise-encrypted-file-v1\n") {
-            return Err(unsafe_tree());
+        check_envelope(native, store, oid, path)?;
+        for directory in live.ancestors().skip(1).take_while(|dir| *dir != home) {
+            if !exists(directory)? {
+                let relative = directory.strip_prefix(&home).map_err(|_| unsafe_tree())?;
+                let name = format!("home/{}", relative.display());
+                if manifest.permissions.get(&name) != Some(&0o700) {
+                    return Err(unsafe_tree());
+                }
+            }
         }
     }
+    let mut missing = BTreeSet::new();
     for (path, mode) in &manifest.permissions {
         let (stem, suffix) = path.split_once('/').ok_or_else(unsafe_tree)?;
         let live = home_path(&home, suffix).ok_or_else(unsafe_tree)?;
@@ -1053,7 +1641,9 @@ fn verify_tree(
             }
             match fs::symlink_metadata(&live) {
                 Ok(metadata) if metadata.is_dir() && metadata.mode() & 0o777 == *mode => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound && *mode == 0o700 => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && *mode == 0o700 => {
+                    missing.insert(live);
+                }
                 _ => {
                     return Err(invalid(
                         "history would change permissions of a containing directory",
@@ -1070,7 +1660,69 @@ fn verify_tree(
             }
         }
     }
-    Ok(enrolled)
+    Ok(VerifiedTree {
+        paths: enrolled,
+        missing,
+    })
+}
+
+fn check_envelope(
+    native: &Native<'_, '_>,
+    store: &Path,
+    oid: &str,
+    path: &str,
+) -> Result<(), Fail> {
+    if !valid_oid(oid) {
+        return Err(unsafe_tree());
+    }
+    let mut cmd = local_git(native, store)?;
+    cmd.args(["cat-file", "blob", oid]);
+    let blob = native.output(cmd, "could not inspect the encrypted checkpoint envelope")?;
+    if !regular_envelope(&blob, path) {
+        return Err(unsafe_tree());
+    }
+    Ok(())
+}
+
+fn regular_envelope(blob: &[u8], expected_path: &str) -> bool {
+    // Mise's v1 named MessagePack envelope exposes the path and Git mode.
+    // Native decrypt verifies these against the sealed fields before writing.
+    let Some(mut body) = blob.strip_prefix(b"mise-encrypted-file-v1\n\x84") else {
+        return false;
+    };
+    msgpack_string(&mut body) == Some("path")
+        && msgpack_string(&mut body) == Some(expected_path)
+        && msgpack_string(&mut body) == Some("mode")
+        && msgpack_string(&mut body) == Some("100644")
+        && msgpack_string(&mut body) == Some("scheme")
+        && msgpack_string(&mut body).is_some_and(|scheme| !scheme.is_empty())
+        && msgpack_string(&mut body) == Some("ciphertext")
+        && msgpack_bytes(&mut body, false).is_some_and(|bytes| !bytes.is_empty())
+        && body.is_empty()
+}
+
+fn msgpack_string<'a>(input: &mut &'a [u8]) -> Option<&'a str> {
+    std::str::from_utf8(msgpack_bytes(input, true)?).ok()
+}
+
+fn msgpack_bytes<'a>(input: &mut &'a [u8], string: bool) -> Option<&'a [u8]> {
+    let (marker, rest) = input.split_first()?;
+    let (length, remaining) = match (string, marker) {
+        (true, 0xa0..=0xbf) => (u32::from(marker & 0x1f), rest),
+        (true, 0xd9) | (false, 0xc4) => (u32::from(*rest.first()?), rest.get(1..)?),
+        (true, 0xda) | (false, 0xc5) => (
+            u32::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?)),
+            rest.get(2..)?,
+        ),
+        (true, 0xdb) | (false, 0xc6) => (
+            u32::from_be_bytes(rest.get(..4)?.try_into().ok()?),
+            rest.get(4..)?,
+        ),
+        _ => return None,
+    };
+    let (value, rest) = remaining.split_at_checked(length as usize)?;
+    *input = rest;
+    Some(value)
 }
 
 fn host_stream(profile: &str) -> bool {

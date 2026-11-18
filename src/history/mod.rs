@@ -80,6 +80,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     let store = native.store()?;
     let _lock = native::lock(&store)?;
     checkpoint::require_no_pending(&store)?;
+    native.require_no_pending_operations()?;
     let existing = exists(&store)?.then_some(store.as_path());
     if let Some(store) = existing {
         native.bare(store)?;
@@ -90,6 +91,8 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     let saved = recovery::revision(native, &store, recovery::MAIN_REF)?;
     native.require_origin(&origin, &branch)?;
     native.destinations(Some(&store), &origin, expected, &vars)?;
+    tracked::capture_paths(native, Some(&branch))?.check_binding(paths.binding(), false)?;
+    native.require_no_pending_operations()?;
     let policy = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
     let http = if publication::allows_plaintext(native.probe(
         policy,
@@ -100,12 +103,12 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         publication::preflight(
             |args, access| {
                 let mut git = native.git(Some(&store))?;
-                if let Some(parameters) = publication::git_parameters(access, git.get_envs())? {
+                if let Some(parameters) = publication::git_parameters(access, git.get_envs()) {
                     git.env("GIT_CONFIG_PARAMETERS", parameters);
                 }
                 git.envs(publication::git_environment(access)).args(args);
                 let diagnostic = "could not verify the history publication range";
-                if access == publication::GitAccess::Local {
+                if access.is_local() {
                     native.probe(git, diagnostic)
                 } else {
                     native
@@ -117,11 +120,14 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
             &branch,
             &origin,
             &saved,
+            publication::has_ssh_launcher(|name| ctx.env.get(name)),
         )?
     };
     let mut cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
-    publication::constrain_http(&mut cmd, http.as_deref());
+    recovery::unmodified_git_graph(&mut cmd)
+        .env_remove("__MISE_HISTORY_LOCAL")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    publication::constrain_http(&mut cmd, http.as_ref());
     // A native exit status does not prove whether its push reached the host ref.
     native.probe(
         cmd,
@@ -141,7 +147,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         .destinations(Some(&store), &origin, expected, &vars)
         .map_err(|_| unconfirmed())?;
     let reference = format!("refs/heads/{branch}");
-    let remote = remote_checkpoint(native, &store, &origin, &reference, http.as_deref())
+    let remote = remote_checkpoint(native, &store, &origin, &reference, http.as_ref())
         .map_err(|_| unconfirmed())?
         .ok_or_else(pending)?;
     if !recovery::ancestor(native, &store, &saved, &remote).map_err(|_| unconfirmed())? {
@@ -155,7 +161,7 @@ fn remote_checkpoint(
     store: &Path,
     origin: &str,
     reference: &str,
-    http: Option<&str>,
+    http: Option<&publication::HttpPolicy>,
 ) -> Result<Option<String>, Fail> {
     let diagnostic = "could not independently verify the private history branch";
     let mut cmd = native.git(Some(store))?;

@@ -34,6 +34,19 @@ pub(super) enum GitAccess<'a> {
     Remote,
     Ssh,
     Http(&'a str),
+    CheckHttp(&'a str),
+}
+
+impl GitAccess<'_> {
+    pub(super) fn is_local(self) -> bool {
+        matches!(self, Self::Local | Self::CheckHttp(_))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum HttpPolicy {
+    Exact(String),
+    Default,
 }
 
 pub(super) fn git_environment(
@@ -47,7 +60,7 @@ pub(super) fn git_environment(
         ("SSH_ASKPASS_REQUIRE", "never"),
         ("GCM_INTERACTIVE", "never"),
     ];
-    let settings = if access == GitAccess::Local {
+    let settings = if access.is_local() {
         LOCAL
     } else {
         NONINTERACTIVE
@@ -64,39 +77,30 @@ pub(super) fn git_environment(
     .chain((access == GitAccess::Ssh).then_some(("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")))
 }
 
-fn unsupported_ssh() -> Fail {
-    refusal(
-        "cannot verify history using a custom SSH launcher",
-        "Use standard OpenSSH configuration and provisioned authentication for history backup",
-    )
+pub(super) fn has_ssh_launcher<'a>(env: impl Fn(&str) -> Option<&'a OsStr>) -> bool {
+    env("GIT_SSH_COMMAND").is_some()
+        || env("GIT_SSH").is_some()
+        || env("GIT_SSH_VARIANT").is_some_and(|value| value != "ssh" && value != "auto")
 }
 
 pub(super) fn git_parameters<'a>(
     access: GitAccess<'_>,
-    env: impl Iterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
-) -> Result<Option<OsString>, Fail> {
+    mut env: impl Iterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
+) -> Option<OsString> {
     if access == GitAccess::Local {
-        return Ok(None);
+        return None;
     }
-    let mut parameters = OsString::new();
-    for (key, value) in env {
-        let Some(value) = value else { continue };
-        if access == GitAccess::Ssh
-            && (key == "GIT_SSH"
-                || key == "GIT_SSH_COMMAND"
-                || (key == "GIT_SSH_VARIANT" && value != "ssh" && value != "auto"))
-        {
-            return Err(unsupported_ssh());
-        }
-        if key == "GIT_CONFIG_PARAMETERS" {
-            parameters.push(value);
-        }
+    let mut parameters = env
+        .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten())
+        .unwrap_or_default()
+        .to_owned();
+    if !access.is_local() {
+        append_disabled_parameter(&mut parameters, "credential.interactive");
     }
-    append_disabled_parameter(&mut parameters, "credential.interactive");
-    if let GitAccess::Http(url) = access {
+    if let GitAccess::Http(url) | GitAccess::CheckHttp(url) = access {
         parameters = without_redirects(Some(&parameters), url);
     }
-    Ok(Some(parameters))
+    Some(parameters)
 }
 
 fn without_redirects(prior: Option<&OsStr>, url: &str) -> OsString {
@@ -115,12 +119,19 @@ fn append_disabled_parameter(parameters: &mut OsString, key: &str) {
     parameters.push(format!("'{key}'='false'"));
 }
 
-pub(super) fn constrain_http(command: &mut Command, url: Option<&str>) {
-    if let Some(url) = url {
+pub(super) fn constrain_http(command: &mut Command, policy: Option<&HttpPolicy>) {
+    if let Some(policy) = policy {
         let prior = command
             .get_envs()
             .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten());
-        let parameters = without_redirects(prior, url);
+        let parameters = match policy {
+            HttpPolicy::Exact(url) => without_redirects(prior, url),
+            HttpPolicy::Default => {
+                let mut parameters = prior.unwrap_or_default().to_owned();
+                append_disabled_parameter(&mut parameters, "http.followRedirects");
+                parameters
+            }
+        };
         command.env("GIT_CONFIG_PARAMETERS", parameters);
     }
 }
@@ -133,7 +144,8 @@ pub(super) fn preflight(
     branch: &str,
     origin: &str,
     local: &str,
-) -> Result<Option<String>, Fail> {
+    ssh_launcher: bool,
+) -> Result<Option<HttpPolicy>, Fail> {
     let blocked = || refusal("could not verify saved settings history", RECONCILE);
     let run_git = probe;
     let read = |args: &[&str]| {
@@ -217,34 +229,55 @@ pub(super) fn preflight(
     };
     let route = routes()?;
     let url = route.1.as_str();
+    let mut http = None;
     let access = if url.starts_with("http://") || url.starts_with("https://") {
-        GitAccess::Http(url)
-    } else if url.starts_with("ssh://") || !url.contains("://") {
-        let ssh = run_git(
-            &[
-                "config",
-                "--null",
-                "--get-regexp",
-                r"^(core\.sshcommand|ssh\.variant)$",
-            ],
-            GitAccess::Local,
+        let proof = run_git(
+            &["config", "--get-urlmatch", "http.followRedirects", url],
+            GitAccess::CheckHttp(url),
         )?;
-        match ssh.status.code() {
-            Some(1) if ssh.stdout.is_empty() && ssh.stderr.is_empty() => {}
-            Some(0)
-                if ssh.stdout.strip_suffix(b"\0").is_some_and(|records| {
+        // libcurl accepts some URLs that Git's URL matcher does not. A
+        // URL-specific setting is evidence only if Git resolves it here.
+        if proof.status.success() && line(&proof.stdout) == b"false" && proof.stderr.is_empty() {
+            http = Some(HttpPolicy::Exact(url.to_owned()));
+            Some(GitAccess::Http(url))
+        } else {
+            http = Some(HttpPolicy::Default);
+            None
+        }
+    } else if url.starts_with("ssh://") || !url.contains("://") {
+        if ssh_launcher {
+            None
+        } else {
+            let ssh = run_git(
+                &[
+                    "config",
+                    "--null",
+                    "--get-regexp",
+                    r"^(core\.sshcommand|ssh\.variant)$",
+                ],
+                GitAccess::Local,
+            )?;
+            let standard = match ssh.status.code() {
+                Some(1) => ssh.stdout.is_empty() && ssh.stderr.is_empty(),
+                Some(0) => ssh.stdout.strip_suffix(b"\0").is_some_and(|records| {
                     records
                         .split(|&b| b == 0)
                         .all(|record| matches!(record, b"ssh.variant\nssh" | b"ssh.variant\nauto"))
-                }) => {}
-            _ => return Err(unsupported_ssh()),
+                }),
+                _ => false,
+            };
+            // An explicit launcher may route service commands differently.
+            // Leave it to native sync after auditing the full local range.
+            standard.then_some(GitAccess::Ssh)
         }
-        GitAccess::Ssh
     } else {
-        GitAccess::Remote
+        Some(GitAccess::Remote)
     };
     let dest = format!("refs/heads/{branch}");
     let remote_tip = || -> Result<Option<String>, Fail> {
+        let Some(access) = access else {
+            return Ok(None);
+        };
         let output = run_git(
             &["ls-remote", "--refs", "--exit-code", "--", origin, &dest],
             access,
@@ -295,7 +328,7 @@ pub(super) fn preflight(
             "Retry backup",
         ));
     }
-    Ok(matches!(access, GitAccess::Http(_)).then_some(route.1))
+    Ok(http)
 }
 
 fn refusal(diagnostic: impl std::fmt::Display, next: &str) -> Fail {
@@ -639,26 +672,54 @@ pub(super) fn age_file(bytes: &[u8]) -> bool {
         {
             return false;
         }
-        let x25519 = args == b"X25519" || args.starts_with(b"X25519 ");
-        if x25519 && !args.strip_prefix(b"X25519 ").is_some_and(base64_32) {
-            return false;
+        let mut fields = args.split(|&b| b == b' ');
+        let kind = fields.next().unwrap_or_default();
+        match kind {
+            b"X25519" if !fields.next().is_some_and(base64_32) || fields.next().is_some() => {
+                return false;
+            }
+            b"ssh-ed25519"
+                if !fields.next().is_some_and(ssh_tag)
+                    || !fields.next().is_some_and(base64_32)
+                    || fields.next().is_some() =>
+            {
+                return false;
+            }
+            b"ssh-rsa" if !fields.next().is_some_and(ssh_tag) || fields.next().is_some() => {
+                return false;
+            }
+            _ => {}
         }
         stanzas += 1;
         bytes = rest;
+        let mut wrapped = 0;
         loop {
             let Some((body, rest)) = split_byte(bytes, b'\n') else {
                 return false;
             };
-            if body.len() > 64 || !raw_base64(body) || (x25519 && !base64_32(body)) {
+            if body.len() > 64 || !raw_base64(body) {
                 return false;
             }
+            wrapped += body.len() * 3 / 4;
             bytes = rest;
             if body.len() < 64 {
                 break;
             }
         }
+        // The RSA ciphertext is the size of its recipient modulus. The
+        // supported producers require at least 2048 bits, but this header
+        // has only the key tag and cannot prove the exact modulus size.
+        match kind {
+            b"X25519" | b"ssh-ed25519" if wrapped != 32 => return false,
+            b"ssh-rsa" if wrapped < 256 => return false,
+            _ => {}
+        }
     }
     false
+}
+
+fn ssh_tag(bytes: &[u8]) -> bool {
+    bytes.len() == 6 && raw_base64(bytes)
 }
 
 fn base64_32(bytes: &[u8]) -> bool {

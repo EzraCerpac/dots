@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use nix::libc;
+use serde::Deserialize;
 
 use crate::config::{
     RepoSetting, Vars,
@@ -21,6 +22,12 @@ pub(super) struct Native<'a, 'ctx> {
     pub ctx: &'ctx Ctx,
     pub run: &'a Run<'ctx>,
     selection: Option<Selection>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct PendingOperation {
+    pub uuid: String,
+    pub local: bool,
 }
 
 impl<'a, 'ctx> Native<'a, 'ctx> {
@@ -122,6 +129,59 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         Ok(self.state_dir()?.join("history/repo.git"))
     }
 
+    pub fn require_no_pending_operations(&self) -> Result<(), Fail> {
+        if !self.pending_operations()?.is_empty() {
+            return Err(blocked("mise has an unresolved settings history operation"));
+        }
+        Ok(())
+    }
+
+    /// The native operation lock resumes every pending record. Inspect the
+    /// journals without running mise, even before a bare store is installed.
+    pub fn pending_operations(&self) -> Result<Vec<PendingOperation>, Fail> {
+        let unknown = || invalid("could not validate pending mise history operations");
+        let mut operations = Vec::new();
+        for (history, local) in self.history_dirs()? {
+            let index = history.join("index");
+            let pending = index.join("pending");
+            if !existing_dir(&index).map_err(|_| unknown())?
+                || !existing_dir(&pending).map_err(|_| unknown())?
+            {
+                continue;
+            }
+            for entry in fs::read_dir(pending).map_err(|_| unknown())? {
+                let path = entry.map_err(|_| unknown())?.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    let uuid = pending_uuid(&path).map_err(|_| unknown())?;
+                    operations.push(PendingOperation { uuid, local });
+                }
+            }
+        }
+        operations.sort_unstable_by(|a, b| (a.local, &a.uuid).cmp(&(b.local, &b.uuid)));
+        Ok(operations)
+    }
+
+    pub fn history_dirs(&self) -> Result<Vec<(PathBuf, bool)>, Fail> {
+        let unknown = || invalid("could not inspect the native mise history stores");
+        let state = self.state_dir()?;
+        let local = state.join("history-local");
+        let mut stores = Vec::new();
+        let shared = state.join("history");
+        if existing_dir(&shared).map_err(|_| unknown())? {
+            stores.push((shared, false));
+        }
+        let local_history = local.join("history");
+        if existing_dir(&local).map_err(|_| unknown())?
+            && existing_dir(&local_history).map_err(|_| unknown())?
+        {
+            stores.push((local_history, true));
+        }
+        Ok(stores)
+    }
+
     pub fn local_origin(&self, store: &Path) -> Result<Option<String>, Fail> {
         let mut cmd = self.git(Some(store))?;
         cmd.args([
@@ -185,15 +245,11 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
                 "effective history destinations must match private dots_state_repo and differ from the source repository",
             )
         };
-        let source = self.source_urls()?;
+        let source = self.source_urls(vars.source_repo.as_ref())?;
         let root = self.ctx.root.path();
         let check = |url: &str| {
             if !concrete_url(url)
                 || !expected.matches(url)
-                || vars
-                    .source_repo
-                    .as_ref()
-                    .is_some_and(|repo| repo.matches(url))
                 || source
                     .iter()
                     .any(|source| same_transport(root, source, url))
@@ -208,38 +264,17 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         // Resolve global rewrites in a temporary bare repo in that case;
         // publication rechecks in the actual newly created repository.
         let temporary = if store.is_none() {
-            let temp = tempfile::tempdir()
-                .map_err(|_| blocked("could not stage history URL validation"))?;
-            let mut cmd = self.git(None)?;
-            cmd.args(["init", "--bare"]).arg(temp.path());
-            self.output(cmd, "could not stage history URL validation")?;
-            Some(temp)
+            Some(self.url_resolver()?)
         } else {
             None
         };
         let resolver = store.or_else(|| temporary.as_ref().map(|temp| temp.path()));
-        self.check_url_config(resolver)?;
-        let mut fetch = self.git(resolver)?;
-        fetch.args(["ls-remote", "--get-url", "--", raw]);
-        let fetch = self
-            .text(fetch, "could not resolve the history fetch URL")
-            .map_err(|_| invalid_destination())?;
-        check(fetch.strip_suffix('\n').ok_or_else(invalid_destination)?)?;
-
-        let mut cmd = self.git(resolver)?;
-        cmd.args(["remote", "show", "-n", "--", raw]);
-        let output = self
-            .text(cmd, "could not resolve effective history URLs")
-            .map_err(|_| invalid_destination())?;
-        let mut pushes = output
-            .lines()
-            .filter_map(|line| line.strip_prefix("  Push  URL: "))
-            .peekable();
-        if pushes.peek().is_none() {
-            return Err(invalid_destination());
-        }
-        for url in pushes {
-            check(url)?;
+        self.url_config(resolver)?;
+        for url in self
+            .operand_urls(raw, || self.git(resolver))
+            .map_err(|_| invalid_destination())?
+        {
+            check(&url)?;
         }
         if let Some(store) = store {
             for url in self.origin_urls(Some(store))? {
@@ -249,17 +284,89 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         Ok(())
     }
 
-    fn source_urls(&self) -> Result<Vec<String>, Fail> {
-        if !exists(&self.ctx.root.path().join(".git"))? {
+    fn source_urls(&self, configured: Option<&RepoSetting>) -> Result<Vec<String>, Fail> {
+        let checkout = exists(&self.ctx.root.path().join(".git"))?;
+        if !checkout && configured.is_none() {
             return Ok(Vec::new());
         }
-        self.check_url_config(None)?;
-        let urls = self.origin_urls(None)?;
+        let config = self.url_config(None)?;
+        let mut urls = if checkout {
+            self.origin_urls(None)?
+        } else {
+            Vec::new()
+        };
+        if let Some(repo) = configured {
+            let raw = repo.transport_url();
+            if !concrete_url(&raw) {
+                return Err(invalid(
+                    "could not validate the configured source repository",
+                ));
+            }
+            let effective = if checkout {
+                self.operand_urls(&raw, || self.git(None))?
+            } else {
+                // `git remote show -n` needs a repository. Without one, use
+                // exactly the URL rules read from the source directory.
+                let temp = self.url_resolver()?;
+                self.operand_urls(&raw, || {
+                    let mut cmd = self.git(Some(temp.path()))?;
+                    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env_remove("GIT_CONFIG_PARAMETERS")
+                        .env("GIT_CONFIG_COUNT", config.len().to_string());
+                    for (index, (key, value)) in config.iter().enumerate() {
+                        cmd.env(format!("GIT_CONFIG_KEY_{index}"), key)
+                            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
+                    }
+                    Ok(cmd)
+                })?
+            };
+            urls.push(raw.into_owned());
+            urls.extend(effective);
+        }
         if urls
             .iter()
             .any(|url| !concrete_url(url) && local_transport(url).is_none())
         {
             return Err(invalid("could not validate the configured source origin"));
+        }
+        Ok(urls)
+    }
+
+    fn url_resolver(&self) -> Result<tempfile::TempDir, Fail> {
+        let diagnostic = "could not stage history URL validation";
+        let temp = tempfile::tempdir().map_err(|_| blocked(diagnostic))?;
+        let mut cmd = self.git(None)?;
+        cmd.args(["init", "--bare", "--template="]).arg(temp.path());
+        self.output(cmd, diagnostic)?;
+        Ok(temp)
+    }
+
+    fn operand_urls(
+        &self,
+        raw: &str,
+        command: impl Fn() -> Result<Command, Fail>,
+    ) -> Result<Vec<String>, Fail> {
+        let diagnostic = "could not resolve effective repository URLs";
+        let mut fetch = command()?;
+        fetch.args(["ls-remote", "--get-url", "--", raw]);
+        let fetch = self.text(fetch, diagnostic)?;
+        let fetch = fetch
+            .strip_suffix('\n')
+            .ok_or_else(|| invalid(diagnostic))?;
+
+        let mut push = command()?;
+        push.args(["remote", "show", "-n", "--", raw]);
+        let result = self.text(push, diagnostic)?;
+        let pushes = result
+            .lines()
+            .filter_map(|line| line.strip_prefix("  Push  URL: "));
+        let urls: Vec<String> = std::iter::once(fetch)
+            .chain(pushes)
+            .map(str::to_owned)
+            .collect();
+        if urls.len() < 2 {
+            return Err(invalid(diagnostic));
         }
         Ok(urls)
     }
@@ -295,7 +402,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         Ok(urls)
     }
 
-    fn check_url_config(&self, store: Option<&Path>) -> Result<(), Fail> {
+    fn url_config(&self, store: Option<&Path>) -> Result<Vec<(String, String)>, Fail> {
         // Git's URL queries are line-oriented. A control character in a URL
         // or rewrite can make one actual operand look like several safe ones.
         let mut cmd = self.git(store)?;
@@ -305,9 +412,77 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
             "--get-regexp",
             r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof))$",
         ]);
-        config_records(self.probe(cmd, "could not inspect Git history URL configuration")?)?;
-        Ok(())
+        config_records(self.probe(cmd, "could not inspect Git history URL configuration")?)
     }
+}
+
+fn existing_dir(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(io::Error::other("expected a native history directory")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn pending_uuid(path: &Path) -> io::Result<String> {
+    #[derive(Deserialize)]
+    struct Record {
+        #[serde(rename = "id")]
+        _id: u64,
+        checkpoint: Checkpoint,
+        #[serde(rename = "recovery")]
+        _recovery: Recovery,
+    }
+
+    #[derive(Deserialize)]
+    struct Checkpoint {
+        uuid: String,
+        operation: Operation,
+    }
+
+    #[derive(Deserialize)]
+    struct Operation {
+        id: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Recovery {
+        Pending,
+        UnfinishedWrites,
+        Finished,
+    }
+
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid native recovery record");
+    let file = read_native_file(path)?;
+    let record: Record =
+        serde_json::from_reader(io::BufReader::new(file)).map_err(|_| invalid())?;
+    let Checkpoint { uuid, operation } = record.checkpoint;
+    // Native recover accepts UUID prefixes as well as numeric selectors.
+    // Only a full UUID matching the filename and operation ID is safe here.
+    if uuid.len() != 36
+        || !uuid.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
+        || path.file_stem().and_then(|stem| stem.to_str()) != Some(uuid.as_str())
+        || uuid != operation.id
+    {
+        return Err(invalid());
+    }
+    Ok(uuid)
+}
+
+pub(super) fn read_native_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("expected a regular native history file"));
+    }
+    Ok(file)
 }
 
 fn concrete_url(url: &str) -> bool {
@@ -459,14 +634,18 @@ fn clean_git_env(cmd: &mut Command) {
         "GIT_NAMESPACE",
         "GIT_PREFIX",
         "GIT_CONFIG",
-        "GIT_TRACE",
-        "GIT_TRACE_CURL",
         "GIT_CURL_VERBOSE",
-        "GIT_TRACE_PACKET",
-        "GIT_TRACE2",
-        "GIT_TRACE2_EVENT",
-        "GIT_TRACE2_PERF",
     ] {
+        cmd.env_remove(name);
+    }
+    // The launcher starts from env_clear(), so these are the inherited
+    // trace settings, including GIT_TRACE_PACKFILE and GIT_TRACE2 targets.
+    let traces = cmd
+        .get_envs()
+        .filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_TRACE"))
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>();
+    for name in traces {
         cmd.env_remove(name);
     }
 }
@@ -505,6 +684,10 @@ pub(super) mod tests {
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("GIT_CEILING_DIRECTORIES", world.clone().into()),
             ("GIT_ALLOW_PROTOCOL", "".into()),
+            ("GIT_TRACE_PACKFILE", world.join("trace-pack").into()),
+            ("GIT_TRACE2_EVENT", world.join("trace-event").into()),
+            ("GIT_TRACE_FSMONITOR", world.join("trace-fsmonitor").into()),
+            ("GIT_CURL_VERBOSE", "1".into()),
             ("JJ_CONFIG", home.join("jj.toml").into()),
             ("RUSTUP_HOME", home.join("rustup").into()),
             ("CARGO_HOME", home.join("cargo").into()),
@@ -580,6 +763,42 @@ pub(super) mod tests {
                 &["config", "--add", "remote.origin.pushurl", &state],
             );
             assert_eq!(check().unwrap_err().status, 2);
+        });
+    }
+
+    #[test]
+    fn resolves_configured_source_rewrites_with_and_without_a_live_origin() {
+        in_world(|native, world| {
+            let state = format!("file://{}", world.join("private.git").display());
+            let source = format!("file://{}", world.join("configured.git").display());
+            let distinct = format!("file://{}", world.join("distinct.git").display());
+            let mut vars = Vars::read(&native.ctx.root).unwrap();
+            vars.source_repo = Some(RepoSetting::parse(&source).unwrap());
+            let expected = RepoSetting::parse(&state).unwrap();
+            let check = || native.destinations(None, &state, &expected, &vars);
+            check().unwrap();
+
+            // A configured source still resolves global push rules when its
+            // checkout has never been initialized.
+            let global = native.home().unwrap().join("gitconfig");
+            fs::write(
+                &global,
+                format!("[url \"{state}\"]\n pushInsteadOf = {source}\n"),
+            )
+            .unwrap();
+            assert_eq!(check().unwrap_err().status, 2);
+            fs::remove_file(global).unwrap();
+
+            git(native, None, &["init"]);
+            git(native, None, &["remote", "add", "origin", &distinct]);
+            check().unwrap();
+            for rule in ["insteadOf", "pushInsteadOf"] {
+                let key = format!("url.{state}.{rule}");
+                git(native, None, &["config", &key, &source]);
+                assert_eq!(check().unwrap_err().status, 2);
+                git(native, None, &["config", "--unset", &key]);
+            }
+            check().unwrap();
         });
     }
 
@@ -666,6 +885,82 @@ pub(super) mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn inventories_both_native_scopes_without_creating_or_opening_a_repository() {
+        in_world(|native, _| {
+            let state = native.state_dir().unwrap();
+            native.require_no_pending_operations().unwrap();
+            assert!(!state.exists());
+
+            let shared_uuid = "01900000-0000-7000-8000-000000000001";
+            let local_uuid = "01900000-0000-7000-8000-000000000002";
+            let history = state.join("history");
+            fs::create_dir_all(&history).unwrap();
+            fs::write(history.join("operation.json"), b"{}").unwrap();
+            native.require_no_pending_operations().unwrap();
+            for (scope, uuid, recovery) in [
+                (state.clone(), shared_uuid, "pending"),
+                (state.join("history-local"), local_uuid, "finished"),
+            ] {
+                let pending = scope.join("history/index/pending");
+                fs::create_dir_all(&pending).unwrap();
+                fs::write(pending.join("native-write.tmp"), "not a pending record").unwrap();
+                let record = serde_json::json!({
+                    "id": 2,
+                    "recovery": recovery,
+                    "checkpoint": {"uuid": uuid, "operation": {"id": uuid}}
+                });
+                fs::write(pending.join(format!("{uuid}.json")), record.to_string()).unwrap();
+            }
+            assert_eq!(
+                native.pending_operations().unwrap(),
+                [
+                    PendingOperation {
+                        uuid: shared_uuid.into(),
+                        local: false
+                    },
+                    PendingOperation {
+                        uuid: local_uuid.into(),
+                        local: true
+                    },
+                ]
+            );
+            assert_eq!(
+                native.require_no_pending_operations().unwrap_err().status,
+                1
+            );
+            assert!(!native.store().unwrap().exists());
+
+            let path = state.join(format!("history/index/pending/{shared_uuid}.json"));
+            let wrong_name = path.with_file_name(format!("{local_uuid}.json"));
+            fs::rename(&path, &wrong_name).unwrap();
+            assert_eq!(native.pending_operations().unwrap_err().status, 2);
+            fs::remove_file(wrong_name).unwrap();
+            fs::write(path, "malformed private record").unwrap();
+            let error = native.pending_operations().unwrap_err();
+            assert_eq!(error.status, 2);
+            assert!(!error.diagnostic.contains("malformed private record"));
+        });
+    }
+
+    #[test]
+    fn removes_inherited_trace_outputs_for_direct_and_native_git() {
+        in_world(|native, _| {
+            for cmd in [
+                native.git(None).unwrap(),
+                native.mise(&["dot", "origin"]).unwrap(),
+            ] {
+                for (name, value) in cmd.get_envs() {
+                    if name.as_encoded_bytes().starts_with(b"GIT_TRACE")
+                        || name == "GIT_CURL_VERBOSE"
+                    {
+                        assert!(value.is_none());
+                    }
+                }
+            }
+        });
     }
 
     #[test]

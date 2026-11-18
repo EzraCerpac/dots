@@ -1,14 +1,16 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, Permissions};
 use std::io;
+use std::mem::MaybeUninit;
+use std::ops::Deref;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use nix::libc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use toml_edit::DocumentMut;
 
 use crate::Fail;
@@ -122,7 +124,7 @@ fn inactive_invalid_paths(
 pub(super) fn capture_paths(
     native: &Native<'_, '_>,
     host: Option<&str>,
-) -> Result<Vec<PathBuf>, Fail> {
+) -> Result<TrackedPaths, Fail> {
     let paths = paths(native, host)?;
     if let Some(entry) = inventory(native, true)?.entries.first() {
         // mise 2026.11.9's unqualified save dispatches to both scopes.
@@ -138,7 +140,22 @@ pub(super) fn capture_paths(
     Ok(paths)
 }
 
-pub(super) fn paths(native: &Native<'_, '_>, host: Option<&str>) -> Result<Vec<PathBuf>, Fail> {
+pub(super) fn paths(native: &Native<'_, '_>, host: Option<&str>) -> Result<TrackedPaths, Fail> {
+    discover(native, host, None)
+}
+
+pub(super) fn restore_paths(
+    native: &Native<'_, '_>,
+    host: Option<&str>,
+) -> Result<TrackedPaths, Fail> {
+    discover(native, host, Some(native.ctx.root.path()))
+}
+
+fn discover(
+    native: &Native<'_, '_>,
+    host: Option<&str>,
+    source: Option<&Path>,
+) -> Result<TrackedPaths, Fail> {
     let inventory = inventory(native, false)?;
     let home = native.home()?;
     let physical_home = physical_home(home)?;
@@ -149,7 +166,7 @@ pub(super) fn paths(native: &Native<'_, '_>, host: Option<&str>) -> Result<Vec<P
         if entry.mode != "track" {
             return Err(invalid("mise returned an unknown tracked history mode"));
         }
-        let target = target(home, &physical_home, &entry.path)?;
+        let target = lexical_target(home, &physical_home, &entry.path)?;
         let declared = entry.declared_in.ok_or_else(|| {
             invalid(format!(
                 "history path {} has no active encrypted declaration",
@@ -219,7 +236,9 @@ pub(super) fn paths(native: &Native<'_, '_>, host: Option<&str>) -> Result<Vec<P
         }
         paths.insert(target);
     }
-    Ok(paths.into_iter().collect())
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let (binding, _) = observe(physical_home, source, &paths, false)?;
+    Ok(TrackedPaths(binding))
 }
 
 #[derive(Deserialize)]
@@ -318,101 +337,272 @@ fn lexical_target(home: &Path, physical_home: &Path, path: &Path) -> Result<Path
     Ok(physical_home.join(relative))
 }
 
-fn target(home: &Path, physical_home: &Path, path: &Path) -> Result<PathBuf, Fail> {
-    let target = lexical_target(home, physical_home, path)?;
-    let mut cursor = target.as_path();
-    while cursor != physical_home {
-        match fs::symlink_metadata(cursor) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(invalid(format!(
-                    "refusing symlink in tracked history path {}",
-                    cursor.display()
-                )));
-            }
-            Ok(meta) if cursor == target && !meta.is_file() => {
-                return Err(invalid(format!(
-                    "tracked history path is not a regular file: {}",
-                    cursor.display()
-                )));
-            }
-            Ok(meta) if cursor != target && !meta.is_dir() => {
-                return Err(invalid(format!(
-                    "tracked history path has a non-directory parent: {}",
-                    cursor.display()
-                )));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Err(blocked("could not inspect a tracked history destination")),
-        }
-        cursor = cursor.parent().expect("validated HOME ancestry");
-    }
-    Ok(target)
-}
-
 fn physical_home(home: &Path) -> Result<PathBuf, Fail> {
     home.canonicalize()
         .map_err(|_| invalid("could not resolve HOME"))
 }
 
-pub(super) fn secure(native: &Native<'_, '_>, paths: &[PathBuf]) -> Result<(), Fail> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    secure_paths(&physical_home(native.home()?)?, paths)
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct PathBinding {
+    home: PathBuf,
+    source: Option<(PathBuf, DirectoryIdentity)>,
+    targets: Vec<PathBuf>,
+    directories: BTreeMap<PathBuf, DirectoryIdentity>,
 }
 
-fn secure_paths(home: &Path, paths: &[PathBuf]) -> Result<(), Fail> {
-    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let relative_home = home
-        .strip_prefix("/")
-        .map_err(|_| invalid("HOME must name an absolute directory"))?;
-    let root = open_at(libc::AT_FDCWD, c"/", flags)
-        .and_then(|root| open_directories(&root, relative_home))
-        .map_err(|_| blocked("could not safely open HOME to protect tracked history file modes"))?;
-    let opened = paths
-        .iter()
-        .filter_map(|path| {
-            let Ok(relative) = path.strip_prefix(home) else {
-                return Some(Err(invalid("a tracked history path lies outside HOME")));
-            };
-            match open_target(&root, relative) {
-                Ok(file) if file.metadata().is_ok_and(|meta| meta.is_file()) => Some(Ok(file)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                _ => Some(Err(blocked(
-                    "could not safely open a tracked history file to protect its mode",
-                ))),
-            }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn read(directory: &File) -> io::Result<Self> {
+        let metadata = directory.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    for file in opened {
+    }
+}
+
+impl PathBinding {
+    fn check(&self, previous: &Self, allow_created: bool) -> Result<(), Fail> {
+        let same = if allow_created {
+            self.home == previous.home
+                && self.source == previous.source
+                && self.targets == previous.targets
+                && previous
+                    .directories
+                    .iter()
+                    .all(|(path, identity)| self.directories.get(path) == Some(identity))
+        } else {
+            self == previous
+        };
+        if !same {
+            return Err(blocked(
+                "HOME or a tracked history destination changed since validation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct TrackedPaths(PathBinding);
+
+impl Deref for TrackedPaths {
+    type Target = [PathBuf];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.targets
+    }
+}
+
+impl TrackedPaths {
+    pub(super) fn binding(&self) -> &PathBinding {
+        &self.0
+    }
+
+    pub(super) fn check_binding(
+        &self,
+        previous: &PathBinding,
+        allow_created: bool,
+    ) -> Result<(), Fail> {
+        self.0.check(previous, allow_created)
+    }
+
+    pub(super) fn created_directories<'a>(
+        &'a self,
+        previous: &'a PathBinding,
+    ) -> impl Iterator<Item = &'a Path> {
+        self.0
+            .directories
+            .keys()
+            .filter(|path| !previous.directories.contains_key(*path))
+            .map(PathBuf::as_path)
+    }
+
+    pub(super) fn recheck(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
+        self.reopen(native, false).map(drop)
+    }
+
+    pub(super) fn secure(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
+        protect_modes(self.reopen(native, true)?)
+    }
+
+    fn reopen(&self, native: &Native<'_, '_>, open_files: bool) -> Result<Vec<File>, Fail> {
+        let home = physical_home(native.home()?)?;
+        let source = self.0.source.as_ref().map(|_| native.ctx.root.path());
+        reopen(home, source, self.binding(), open_files)
+    }
+}
+
+pub(super) fn secure(native: &Native<'_, '_>, paths: &TrackedPaths) -> Result<(), Fail> {
+    paths.secure(native)
+}
+
+fn reopen(
+    home: PathBuf,
+    source: Option<&Path>,
+    binding: &PathBinding,
+    open_files: bool,
+) -> Result<Vec<File>, Fail> {
+    let (observed, files) = observe(home, source, &binding.targets, open_files)?;
+    observed.check(binding, false)?;
+    Ok(files)
+}
+
+fn protect_modes(files: Vec<File>) -> Result<(), Fail> {
+    for file in files {
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|_| blocked("could not set tracked history file mode to 0600"))?;
     }
     Ok(())
 }
 
-fn open_target(root: &File, path: &Path) -> io::Result<File> {
-    let (parent, name) = path
-        .parent()
-        .zip(path.file_name())
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let directory = open_directories(root, parent)?;
-    let name = c_name(name)?;
-    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    open_at(directory.as_raw_fd(), &name, flags)
+const DIRECTORY_FLAGS: libc::c_int = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+fn observe(
+    home: PathBuf,
+    source: Option<&Path>,
+    targets: &[PathBuf],
+    open_files: bool,
+) -> Result<(PathBinding, Vec<File>), Fail> {
+    let root = Path::new("/");
+    let root_fd = open_at(libc::AT_FDCWD, c"/", DIRECTORY_FLAGS)
+        .map_err(|_| blocked("could not open filesystem root for history validation"))?;
+    let source = source
+        .map(|path| {
+            let fd = walk_directories(&root_fd, root, path, &mut BTreeMap::new())?
+                .ok_or_else(|| blocked("could not open source checkout for restore validation"))?;
+            let identity = DirectoryIdentity::read(&fd)
+                .map_err(|_| blocked("could not verify source checkout identity"))?;
+            Ok::<_, Fail>((path.to_owned(), identity))
+        })
+        .transpose()?;
+
+    let mut directories = BTreeMap::new();
+    let home_fd = walk_directories(&root_fd, root, &home, &mut directories)?
+        .ok_or_else(|| blocked("could not safely open HOME for history validation"))?;
+    let mut files = Vec::new();
+    for target in targets {
+        if !target.starts_with(&home) {
+            return Err(invalid("a tracked history path lies outside HOME"));
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| invalid("invalid tracked history destination"))?;
+        let Some(directory) = walk_directories(&home_fd, &home, parent, &mut directories)? else {
+            continue;
+        };
+        let name = target
+            .file_name()
+            .and_then(|name| c_name(name).ok())
+            .ok_or_else(|| invalid("invalid tracked history destination"))?;
+        if !regular_target(&directory, &name, target)? || !open_files {
+            continue;
+        }
+        let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let file = open_at(directory.as_raw_fd(), &name, flags).map_err(|_| {
+            blocked("could not safely open a tracked history file to protect its mode")
+        })?;
+        if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+            return Err(blocked(
+                "tracked history file changed before protecting its mode",
+            ));
+        }
+        files.push(file);
+    }
+    if let Some((root, identity)) = &source
+        && !targets.is_empty()
+        && (targets.iter().any(|path| path.starts_with(root))
+            || directories.values().any(|directory| directory == identity))
+    {
+        return Err(invalid(
+            "restore would write a tracked path inside the source checkout",
+        ));
+    }
+    let binding = PathBinding {
+        home,
+        source,
+        targets: targets.to_vec(),
+        directories,
+    };
+    Ok((binding, files))
 }
 
-fn open_directories(root: &File, path: &Path) -> io::Result<File> {
-    let flags = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mut directory = root.try_clone()?;
-    for component in path.components() {
-        let Component::Normal(name) = component else {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        };
-        directory = open_at(directory.as_raw_fd(), &c_name(name)?, flags)?;
+fn walk_directories(
+    root: &File,
+    base: &Path,
+    path: &Path,
+    directories: &mut BTreeMap<PathBuf, DirectoryIdentity>,
+) -> Result<Option<File>, Fail> {
+    let diagnostic = "could not verify a tracked history parent directory";
+    let relative = path.strip_prefix(base).map_err(|_| invalid(diagnostic))?;
+    let mut directory = root.try_clone().map_err(|_| blocked(diagnostic))?;
+    let mut current = base.to_owned();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            let Component::Normal(name) = component else {
+                return Err(invalid(diagnostic));
+            };
+            current.push(name);
+            let name = c_name(name).map_err(|_| invalid(diagnostic))?;
+            directory = match open_at(directory.as_raw_fd(), &name, DIRECTORY_FLAGS) {
+                Ok(next) => next,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                    return Err(invalid(format!(
+                        "refusing symlink or non-directory in tracked history path {}",
+                        current.display()
+                    )));
+                }
+                Err(_) => return Err(blocked(diagnostic)),
+            };
+        }
+        let identity = DirectoryIdentity::read(&directory).map_err(|_| blocked(diagnostic))?;
+        if directories
+            .insert(current.clone(), identity)
+            .is_some_and(|previous| previous != identity)
+        {
+            return Err(blocked(
+                "a tracked history parent directory changed during validation",
+            ));
+        }
     }
-    Ok(directory)
+    Ok(Some(directory))
+}
+
+fn regular_target(directory: &File, name: &CStr, path: &Path) -> Result<bool, Fail> {
+    let mut info = MaybeUninit::<libc::stat>::uninit();
+    // fstatat borrows the live parent descriptor and writes only to info.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            info.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        return match io::Error::last_os_error().kind() {
+            io::ErrorKind::NotFound => Ok(false),
+            _ => Err(blocked("could not inspect a tracked history destination")),
+        };
+    }
+    // Successful fstatat initialized the result.
+    match unsafe { info.assume_init() }.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok(true),
+        libc::S_IFLNK => Err(invalid(format!(
+            "refusing symlink in tracked history path {}",
+            path.display()
+        ))),
+        _ => Err(invalid(format!(
+            "tracked history path is not a regular file: {}",
+            path.display()
+        ))),
+    }
 }
 
 fn c_name(name: &OsStr) -> io::Result<CString> {
@@ -448,15 +638,87 @@ mod tests {
         fs::write(&other, "outside").unwrap();
         fs::set_permissions(&other, Permissions::from_mode(0o644)).unwrap();
 
-        let validated = target(&home, &home, Path::new("~/app/settings/data")).unwrap();
+        let path = home.join("app/settings/data");
+        let validated = observe(home.clone(), None, &[path], false).unwrap().0;
         fs::rename(home.join("app"), home.join("original")).unwrap();
         symlink(outside, home.join("app")).unwrap();
 
-        assert!(secure_paths(&home, &[validated]).is_err());
+        assert!(reopen(home, None, &validated, true).is_err());
         assert_eq!(
             fs::metadata(other).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[test]
+    fn securing_rejects_a_replacement_real_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().canonicalize().unwrap();
+        let parent = home.join("app");
+        let path = parent.join("data");
+        fs::create_dir(&parent).unwrap();
+        fs::write(&path, "original").unwrap();
+        let validated = observe(home.clone(), None, std::slice::from_ref(&path), false)
+            .unwrap()
+            .0;
+        fs::rename(&parent, home.join("original")).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+
+        assert!(reopen(home, None, &validated, true).is_err());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn restore_refuses_a_home_target_inside_the_source_checkout() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().canonicalize().unwrap();
+        let source = home.join("Source");
+        fs::create_dir(&source).unwrap();
+        let path = lexical_target(&home, &home, Path::new("~/Source/local/file")).unwrap();
+        let paths = [path];
+        let problem = observe(home.clone(), Some(&source), &paths, false).unwrap_err();
+        assert!(problem.to_string().contains("inside the source checkout"));
+        assert!(observe(home.clone(), None, &paths, false).is_ok());
+
+        // On a case-insensitive filesystem the alternate spelling doesn't
+        // start with the source path, but has the same directory identity.
+        if home.join("source").is_dir() {
+            let alias = home.join("source/file");
+            assert!(!alias.starts_with(&source));
+            assert!(observe(home, Some(&source), &[alias], false).is_err());
+        }
+    }
+
+    #[test]
+    fn journal_binding_identifies_created_parents_but_rejects_replaced_home() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().canonicalize().unwrap();
+        let home = directory.join("home");
+        let parent = home.join("new");
+        let paths = [parent.join("data")];
+        fs::create_dir(&home).unwrap();
+        let validated = observe(home.clone(), None, &paths, false).unwrap().0;
+        let saved = serde_json::to_vec(&validated).unwrap();
+        let prior: PathBinding = serde_json::from_slice(&saved).unwrap();
+
+        fs::create_dir(&parent).unwrap();
+        let after = TrackedPaths(observe(home.clone(), None, &paths, false).unwrap().0);
+        assert!(after.check_binding(&prior, false).is_err());
+        after.check_binding(&prior, true).unwrap();
+        assert_eq!(
+            after.created_directories(&prior).collect::<Vec<_>>(),
+            [parent.as_path()]
+        );
+
+        fs::rename(&home, directory.join("original")).unwrap();
+        fs::create_dir_all(&parent).unwrap();
+        let changed = TrackedPaths(observe(home, None, &paths, false).unwrap().0);
+        assert!(changed.check_binding(&prior, true).is_err());
     }
 
     #[test]
@@ -468,7 +730,9 @@ mod tests {
         fs::write(&path, "tracked").unwrap();
         fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
 
-        secure_paths(&home, &[home.join("missing/data"), path.clone()]).unwrap();
+        let paths = [home.join("missing/data"), path.clone()];
+        let validated = observe(home.clone(), None, &paths, false).unwrap().0;
+        protect_modes(reopen(home, None, &validated, true).unwrap()).unwrap();
 
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,

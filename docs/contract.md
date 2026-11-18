@@ -428,7 +428,7 @@ A missing optional program and a source diagnostic do not fail it.
 **Changed in 0.4.0:** it names the host and profile, prints each item once under its group with its status and summary, and puts any action the item supplies underneath, including for an item that is ok, such as a pending sync.
 Each of these fields is shown as one line without control characters.
 A selected profile that `dots_profiles` does not list gives one diagnostic on stderr and exit status 2, and the report keeps that diagnosis and its next action as a startup issue.
-**Changed from 0.3.5:** the Atuin section is gone.
+**Changed from 0.3.5:** the program list is new, and the Atuin section is gone.
 
 ### `dots plan`
 
@@ -755,7 +755,7 @@ dots publish [--all | --bookmark NAME]
 It runs in a colocated JJ workspace of the configuration repository, never in the live checkout.
 **Changed from 0.3.5:** invalid settings in the base file's `[vars]` make `dots publish` exit 2.
 With valid settings, it exits 1 before looking for JJ, `gh` or gitleaks when the source is outside GitHub or the raw `origin` is absent, malformed, credential-bearing or mismatched.
-It prints one diagnostic line and omits the rejected origin.
+It prints one line naming the GitHub requirement or repository mismatch and omits the rejected origin.
 By default it publishes exactly one unpublished working change directly above `main@origin`.
 `--bookmark NAME` publishes an existing private `wip/...` bookmark.
 `--all` publishes the current stack, offering to merge `main@origin` into it first.
@@ -1061,7 +1061,7 @@ Tracked files end at mode 0600.
 - A missing identity makes standalone `dots enroll-history` or `dots restore` exit 2.
 - **New in 1.0:** the diagnostic names the missing identity path and tells the user how to supply or generate it.
 - Another machine's private key, and the recovery identity's private key, are never copied.
-- Bootstrap enrollment adds this machine's public key, the recovery identity's public key and the bundle's recipients to `config.local.toml`.
+- Bootstrap enrollment adds this machine's public key, the recovery identity's public key and the bundle's recipients only to `config.local.toml`.
 - **Changed from 0.3.5:** 0.4.0 used the bundle identity to derive the recovery recipient when the bundle file existed, while 1.0 uses the recovery identity's public key.
 - A recipient refresh retains valid extra public recipients already recorded in `config.local.toml`.
 - Bootstrap enrolls only once private recovery is ready and the recovery identity file exists; otherwise the stage is deferred.
@@ -1097,7 +1097,9 @@ Then it saves a checkpoint, publishes it to the state repository, and says so.
 
 - It needs a history origin in machine-local configuration that matches `dots_state_repo`, and checks the effective fetch URL as in [Remotes](#remotes) before contacting it.
 - It never adopts private history into the public source checkout.
-- It checks the user's mise history watcher process and its launchd or systemd service before restoring and refuses to proceed when the watcher runs or its state cannot be confirmed.
+- Its first restore preflight checks the user's mise history watcher process and its launchd or systemd service, and refuses to proceed when the watcher runs or its state cannot be confirmed.
+- **Changed from 0.3.5:** when the watcher check and a pending-marker or local-store check would both fail, 1.0 reports the watcher failure first.
+  Version 0.4.0 checked the marker and store first.
 - Restore never activates, stops or restarts the watcher.
 - It requires an existing recovery identity and never generates one.
 - It never saves or publishes during restore; it fetches only, and publication stays a separate `dots backup`.

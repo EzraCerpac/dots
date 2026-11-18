@@ -6,6 +6,7 @@ Amended 2026-11-18 for the terminal output redesign: `dots up` writes ordinary s
 Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish origin and `dev` ancestry checks.
 Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
 Amended 2026-11-18: sync diagnostics and hook-generated inputs, backup publication verification and history format checks, diverged publish approval, and update report replay.
+Amended 2026-11-19: restore checkpoint encryption and validated sync pre-hook context.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -565,7 +566,8 @@ Package, tool and standalone mise changes come from comparing state before and a
 - When the deployed mode of a leaf cannot be verified, the leaf is updated only if its current mode can stay.
 - Recovery files stay on the same filesystem as the target; when that is impossible, sync reports the path and keeps both versions.
 - Other targets are applied in dependency order with the usual mise hooks, and matching reload commands run once, after the writes.
-- As in 0.4.0, a validated pre-hook runs in its normal checkout context, and public source or configuration edits it generates remain there for the next screened sync.
+- As in 0.4.0, a validated pre-hook runs with the real configuration checkout as its working directory and `DOTS_ROOT` pointing to that checkout.
+  Public source or configuration edits it generates stay there for the next ordinary screened sync.
   In the same run, already validated entries use the generated source bytes and permissions, honour `create_if_missing`, and can consume the output of a successful declared dependency.
   A kept or failed dependency blocks its dependent.
   The same write guards protect competing edits, and an omitted input, changed selector, target, source path or operation, or a newly introduced hook cannot authorize an additional write.
@@ -1214,9 +1216,16 @@ Backup uses one native sync and performs no publication retry or force push.
 - Restore never activates, stops or restarts the watcher.
 - It requires an existing recovery identity and never generates one.
 - Restore uses only fetch-side remote traffic. It never runs `dots backup`, pushes or publishes during restore.
+- **New in 1.0:** before any native restore operation that can capture a checkpoint, including fetch, `dots` requires a nonempty recipient configuration and `history.allow_plaintext_history = false`.
+  If either condition fails, restore exits 2 before capture or target installation.
+  The diagnostic names the failed condition and tells the user to configure history recipients or disable plaintext history, as applicable, without showing key material.
 - As in 0.4.0, native mise applies the fetched history to the actual targets and may save local undo checkpoints of their live contents before overwriting them.
-  The checkpoints are encrypted to the configured recipients.
-  A later explicit `dots backup` publishes them in the history branch's ancestry.
+  Every new undo checkpoint must be age-encrypted and decryptable by the identity in use for the restore.
+  Native mise chooses the recipients and may use either the seed's recipients or the current local list.
+  Historical recipient differences alone never block restore.
+  A restore that succeeded in 0.4.0 with an explicit replacement identity after the old private key was moved still succeeds when the 1.0 preflight passes.
+  `dots` leaves recipient selection to mise without writing private mise state to impose a choice or running a second decrypt or apply pass.
+  A later explicit `dots backup` publishes the undo checkpoints in the history branch's ancestry.
 - On an overlapping conflict, restore keeps the live file and exits 1 with a diagnostic saying that both sides changed the same lines.
 - A new store is staged and validated as a bare clone before it is installed.
   On first restore, mise applies the fetched remote state as the initial checkpoint, using its native conflict checks.
@@ -1278,6 +1287,8 @@ The v0.4.0 restore and backup probe used mise 2026.11.9, Git, age, a private bar
 The recovery identity and a configured recipient each decrypted the undo checkpoint, and an unrelated identity could not.
 The later explicit backup pushed the undo checkpoint in the history branch's ancestry.
 An overlapping conflict kept the live edit, exited 1 and made only fetch-side remote requests.
+These observations describe the 0.4.0 fixture outcomes.
+The strengthened recipient and plaintext-history preflight is a separate 1.0 requirement.
 
 The contract also relies on 0.3.5's use of other history save, sync and rollback paths, tracked-path listing, package bootstrap, services, `mise upgrade --no-prune`, `mise unuse`, tool pruning, `mise self-update` and real remote enrollment.
 

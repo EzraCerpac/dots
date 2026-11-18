@@ -26,6 +26,9 @@ pub(super) struct Bundle {
 
 impl Bundle {
     fn parse(bytes: &[u8]) -> Result<Self, Fail> {
+        if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'{') {
+            return Err(Fail::new(1, "the bootstrap bundle must be a JSON object"));
+        }
         // Do not expose serde's error text. It can include rejected secret values.
         let mut bundle: Self = serde_json::from_slice(bytes)
             .map_err(|_| Fail::new(1, "invalid bootstrap bundle document"))?;
@@ -208,6 +211,7 @@ mod tests {
         assert_eq!(bundle.secrets["nonstandard key"], "a\nb");
         assert_eq!(bundle.recipients, ["age1b", "age1a"]);
         for invalid in [
+            r#"[1, {"fixture-sensitive-marker":"value"}, []]"#,
             r#"{"version":"1","secrets":{}}"#,
             r#"{"version":1,"secrets":[]}"#,
             r#"{"version":1,"secrets":{"a":""}}"#,

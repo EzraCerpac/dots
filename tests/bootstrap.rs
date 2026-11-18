@@ -22,6 +22,108 @@ fn program(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_absolute() && path.is_file())
 }
 
+const MISE_DIRS: &[(&str, &str)] = &[
+    ("MISE_DATA_DIR", "data"),
+    ("MISE_CACHE_DIR", "cache"),
+    ("MISE_STATE_DIR", "state"),
+    ("MISE_TMP_DIR", "tmp"),
+    ("MISE_DOWNLOADS_DIR", "downloads"),
+    ("MISE_PLUGINS_DIR", "plugins"),
+    ("MISE_INSTALLS_DIR", "installs"),
+    ("MISE_INSTALL_STORE_DIR", "store"),
+    ("MISE_SHIMS_DIR", "shims"),
+    ("MISE_SYSTEM_CONFIG_DIR", "system-config"),
+    ("MISE_SYSTEM_DATA_DIR", "system-data"),
+    ("MISE_SYSTEM_PLUGINS_DIRS", "system-plugins"),
+    ("MISE_SYSTEM_INSTALLS_DIR", "system-installs"),
+    ("MISE_SHARED_INSTALL_DIRS", "shared-installs"),
+];
+
+fn isolate(world: &World, command: &mut Command) {
+    let base = world.root().parent().unwrap();
+    let private = world.home().join("mise-fixture");
+    for dir in ["codex", "claude", "tmp", "bin"] {
+        fs::create_dir_all(private.join(dir)).unwrap();
+    }
+    for (key, dir) in MISE_DIRS {
+        let dir = private.join(dir);
+        fs::create_dir_all(&dir).unwrap();
+        command.env(key, dir);
+    }
+    command
+        .env_remove("__MISE_DIFF")
+        .env("P05_FIXTURE_BASE", base)
+        .env("P05_MISE_DIRS", &private)
+        .env("MISE_CONFIG_DIR", world.root())
+        .env("MISE_CEILING_PATHS", base)
+        .env("CODEX_HOME", private.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", private.join("claude"))
+        .env("TMPDIR", private.join("tmp"));
+    let path = env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(private.join("bin")).chain(
+        env::split_paths(&path).filter(|path| path.is_absolute() && !path.ends_with("shims")),
+    );
+    command.env("PATH", env::join_paths(paths).unwrap());
+
+    if let Some(real) = program("mise") {
+        command.env("P05_REAL_MISE", real);
+    }
+    // Quiet selection validation reconstructs part of mise's environment. Check
+    // the remaining values at the executable boundary before running real mise.
+    let mut wrapper = String::from(
+        r#"#!/bin/sh
+set -eu
+unset __MISE_DIFF
+private_path() {
+    case "$1" in
+        "$P05_FIXTURE_BASE"/*) ;;
+        *) echo "bootstrap fixture directory escaped isolation" >&2; exit 97 ;;
+    esac
+}
+for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$TMPDIR"; do
+    private_path "$path"
+done
+"#,
+    );
+    for (key, dir) in MISE_DIRS {
+        use std::fmt::Write as _;
+        writeln!(
+            wrapper,
+            r#": "${{{key}:=$P05_MISE_DIRS/{dir}}}"
+export {key}
+private_path "${key}""#
+        )
+        .unwrap();
+    }
+    wrapper.push_str("exec \"$P05_REAL_MISE\" \"$@\"\n");
+    let mise = private.join("bin/mise");
+    write(&mise, &wrapper, 0o755);
+    command
+        .env("DOTS_MISE_BIN", &mise)
+        .env("SETUP_MISE_BIN", mise);
+}
+
+fn dots(world: &World) -> Command {
+    let mut command = world.dots();
+    isolate(world, &mut command);
+    command
+}
+
+fn age_keygen(world: &World, program: &Path) -> Command {
+    let mut command = Command::new(program);
+    let inherited = world.dots();
+    command
+        .env_clear()
+        .envs(
+            inherited
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .current_dir(world.root());
+    isolate(world, &mut command);
+    command
+}
+
 fn test_mise(world: &World) -> PathBuf {
     let fake = world.home().join("bin/mise");
     write(
@@ -37,6 +139,7 @@ case "$1 ${2-}" in
     "--quiet --no-config"|"config get"|"config set")
         exec "$REAL_MISE" "$@" ;;
     "exec --")
+        if [ "${FIXTURE_REAL_EXEC:-0}" = 1 ]; then exec "$REAL_MISE" "$@"; fi
         shift 2
         case "$*" in
           *lib/source-repo.mjs*) exit 0 ;;
@@ -68,12 +171,13 @@ exit 0
 }
 
 fn fake(world: &World) -> Command {
-    let mut command = world.dots();
+    let mut command = dots(world);
+    let base_mise = world.home().join("mise-fixture/bin/mise");
     let fake = test_mise(world);
     command
         .env("DOTS_MISE_BIN", &fake)
         .env("SETUP_MISE_BIN", fake)
-        .env("REAL_MISE", program("mise").expect("acceptance needs mise"))
+        .env("REAL_MISE", base_mise)
         .env("SETUP_PROFILE", "laptop")
         .env("SETUP_MACHINE_ID", "fixture-host")
         .env("MISE_CONFIG_DIR", world.root())
@@ -82,8 +186,7 @@ fn fake(world: &World) -> Command {
 }
 
 fn legacy(world: &World) -> bool {
-    world
-        .dots()
+    dots(world)
         .args(["internal", "home"])
         .output()
         .unwrap()
@@ -130,11 +233,10 @@ fn assert_success(output: &Output) {
 #[test]
 fn unchanged_configuration_command_and_help_use_the_fixture_profile() {
     let world = World::new();
-    let help = run(world.dots().arg("help"));
+    let help = run(dots(&world).arg("help"));
     assert_success(&help);
     assert!(stdout(&help).contains("hello [ARGS...]"), "{help:?}");
-    let output = run(world
-        .dots()
+    let output = run(dots(&world)
         .args(["hello", "there"])
         .env("SETUP_PROFILE", "server")
         .env("DOTS_PROFILE", "server"));
@@ -389,12 +491,17 @@ fn new_native_failure_says_complete_did_not_run() {
 fn new_remote_uses_literal_url_and_rejects_a_git_rewrite() {
     let world = World::new();
     minimal(&world);
+    let bin = world.home().join("bin");
+    write(&bin.join("ssh"), "#!/bin/sh\nexit 92\n", 0o755);
+    let mut paths = vec![bin];
+    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let path = env::join_paths(paths).unwrap();
     write(
         &world.root().join("config.toml"),
         &format!("{MINIMAL}dots_source_repo = \"https://example.invalid/dotfiles\"\n"),
         0o644,
     );
-    let output = run(fake(&world).args([
+    let output = run(fake(&world).env("PATH", &path).args([
         "remote",
         "fixture.invalid",
         "--profile",
@@ -420,7 +527,7 @@ fn new_remote_uses_literal_url_and_rejects_a_git_rewrite() {
         "https://example.invalid/",
     ]));
     assert_success(&rewrite);
-    let rejected = run(fake(&world).args([
+    let rejected = run(fake(&world).env("PATH", &path).args([
         "remote",
         "fixture.invalid",
         "--profile",
@@ -473,8 +580,7 @@ fn new_rootless_bundle_rejects_invalid_secret_without_printing_it() {
         r#"{"version":1,"secrets":{"fixture-sensitive-marker":[1]}}"#,
         0o600,
     );
-    let result = run(world
-        .dots()
+    let result = run(dots(&world)
         .args(["bundle", "create", "--input"])
         .arg(input)
         .arg("--output")
@@ -499,9 +605,9 @@ fn unchanged_bundle_round_trip_is_encrypted_and_exclusive() {
     };
     let world = World::new();
     let identity = world.home().join("age-keys");
-    let generated = run(Command::new(&keygen).arg("-o").arg(&identity));
+    let generated = run(age_keygen(&world, &keygen).arg("-o").arg(&identity));
     assert_success(&generated);
-    let public = run(Command::new(keygen).arg("-y").arg(&identity));
+    let public = run(age_keygen(&world, &keygen).arg("-y").arg(&identity));
     assert_success(&public);
     let recipient = stdout(&public).trim();
     let input = world.home().join("private.json");
@@ -586,6 +692,7 @@ printf '%s' '{"version":1,"secrets":{"github_token":"fixture-token\nsecond line"
     let mut child = fake(&world)
         .env("PATH", env::join_paths(paths).unwrap())
         .env("NATIVE_FIXTURE_CALLBACK", world.dots().get_program())
+        .env("FIXTURE_REAL_EXEC", "1")
         .current_dir(world.home())
         .args([
             "bootstrap",
@@ -635,17 +742,20 @@ fn new_pre_dotfiles_persists_selection_through_mise_x_before_tools() {
     let config = format!(
         r#"{MINIMAL}
 [bootstrap.hooks]
-pre-dotfiles = 'test ! -e "$HOME/applied"; SETUP_PROFILE=laptop "$DOTS_MISE_BIN" x -- dots bootstrap persist-selected'
+pre-dotfiles = 'test "$MISE_HISTORY_ENABLED" = 0 && test ! -e "$HOME/applied" && SETUP_PROFILE=laptop "$DOTS_MISE_BIN" x -- dots bootstrap persist-selected'
 [dotfiles]
 "~/applied" = {{ source = "input", mode = "copy" }}
+"~/tracked" = {{ mode = "track" }}
 "#
     );
     write(&world.root().join("config.toml"), &config, 0o644);
     write(&world.root().join("input"), "fixture dotfile\n", 0o644);
-    let mise = program("mise").expect("acceptance needs mise");
-    let output = run(world
-        .dots()
-        .env("DOTS_MISE_BIN", mise)
+    write(
+        &world.home().join("tracked"),
+        "synthetic unencrypted history input\n",
+        0o600,
+    );
+    let output = run(dots(&world)
         .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
         .env(
             "MISE_SYSTEM_CONFIG_FILE",
@@ -657,6 +767,12 @@ pre-dotfiles = 'test ! -e "$HOME/applied"; SETUP_PROFILE=laptop "$DOTS_MISE_BIN"
     assert_eq!(
         fs::read_to_string(world.home().join("applied")).unwrap(),
         "fixture dotfile\n"
+    );
+    assert!(
+        !world
+            .home()
+            .join("mise-fixture/state/history/repo.git")
+            .exists()
     );
     let selection = fs::read_to_string(world.root().join("miserc.toml")).unwrap();
     assert!(
@@ -824,4 +940,46 @@ esac
         fs::read_to_string(recovery).unwrap(),
         "fixture recovery identity"
     );
+}
+
+#[test]
+fn unchanged_remote_delegates_native_adoption_and_connection_options() {
+    let world = World::new();
+    minimal(&world);
+    write(
+        &world.root().join("config.toml"),
+        &format!("{MINIMAL}dots_source_repo = \"https://example.invalid/config\"\n"),
+        0o644,
+    );
+    let fixture_bin = world.home().join("mise-fixture/bin");
+    write(&fixture_bin.join("ssh"), "#!/bin/sh\nexit 92\n", 0o755);
+    let output = run(fake(&world).args([
+        "remote",
+        "fixture.invalid",
+        "--profile",
+        "server",
+        "--dry-run",
+        "--yes",
+        "--port",
+        "8022",
+        "--connect-timeout",
+        "17",
+    ]));
+    assert_success(&output);
+    let argv = stdout(&output);
+    for expected in [
+        "--host\nfixture.invalid\n",
+        "--adopt\nhttps://example.invalid/config\n",
+        "--remote-env\nserver\n",
+        "--install-mise\n",
+        "--dry-run\n",
+        "--yes\n",
+        "--port\n8022\n",
+        "--connect-timeout\n17\n",
+    ] {
+        assert!(
+            argv.contains(expected),
+            "{expected:?} missing from {argv:?}"
+        );
+    }
 }

@@ -161,7 +161,9 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     // mise x to install the pinned dots before the rest of the declared tools.
     command
         .env_remove("MISE_AUTO_INSTALL")
-        .env_remove("MISE_EXEC_AUTO_INSTALL");
+        .env_remove("MISE_EXEC_AUTO_INSTALL")
+        // Native checkpoints do not enforce dots' encrypted-history contract.
+        .env("MISE_HISTORY_ENABLED", "0");
     let restore = args.get_one::<String>("restore");
     if let Some(machine) = restore {
         command.env("SETUP_MACHINE_ID", machine);
@@ -415,13 +417,14 @@ fn defer(run: &Run<'_>, id: StageId, message: &str, next: &str) -> Outcome {
 }
 
 fn print_summary(run: &Run<'_>) -> u8 {
-    let mut counts = [0; 4];
+    let mut counts = [0; 5];
     for stage in run.snapshot().stages {
         let (index, label) = match stage.outcome {
             Some(Outcome::Completed) => (0, "completed"),
             Some(Outcome::Deferred) => (1, "deferred"),
             Some(Outcome::Skipped) => (2, "skipped"),
             Some(Outcome::Failed) => (3, "failed"),
+            Some(Outcome::Cancelled) => (4, "cancelled"),
             None => continue,
         };
         counts[index] += 1;
@@ -434,9 +437,14 @@ fn print_summary(run: &Run<'_>) -> u8 {
             println!("{label}: {}", stage.label);
         }
     }
-    let [completed, deferred, skipped, failed] = counts;
+    let [completed, deferred, skipped, failed, cancelled] = counts;
+    let cancellation = if cancelled > 0 {
+        format!(", {cancelled} cancelled")
+    } else {
+        String::new()
+    };
     println!(
-        "Bootstrap result: {completed} completed, {deferred} deferred, {skipped} skipped, {failed} failed."
+        "Bootstrap result: {completed} completed, {deferred} deferred, {skipped} skipped, {failed} failed{cancellation}."
     );
     u8::from(failed > 0)
 }

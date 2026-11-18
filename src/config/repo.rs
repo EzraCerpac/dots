@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::Fail;
 
 #[derive(Debug)]
@@ -88,6 +90,14 @@ impl RepoSetting {
             (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
             (None, None) => self.value == other.value,
             _ => false,
+        }
+    }
+
+    pub fn transport_url(&self) -> Cow<'_, str> {
+        if self.value.contains(':') {
+            Cow::Borrowed(&self.value)
+        } else {
+            Cow::Owned(format!("https://github.com/{}", self.value))
         }
     }
 }

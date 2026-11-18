@@ -146,9 +146,15 @@ exit 2
 			useTextRunner(t, tc.script)
 			state := t.TempDir()
 			code, output := captureRun(t, Options{Command: tc.command, StateDir: state})
-			if code != tc.code || strings.Count(output, tc.diagnostic) != 1 ||
-				!strings.Contains(output, "Next:") || !strings.Contains(output, "Log:") {
+			if code != tc.code || strings.Count(output, tc.diagnostic) != 1 {
 				t.Fatalf("exit %d, expected %d and one actionable diagnostic:\n%s", code, tc.code, output)
+			}
+			if tc.command == "up" && (!strings.Contains(output, "Next:") || !strings.Contains(output, "Log:")) {
+				t.Fatalf("up lost its startup issue details:\n%s", output)
+			}
+			if tc.command == "status" && output != "dots status · invalid · fixture\n"+tc.diagnostic+"\n" &&
+				output != tc.diagnostic+"\ndots status · invalid · fixture\n" {
+				t.Fatalf("status added unnecessary output:\n%s", output)
 			}
 			report, dir, err := latestReport(state)
 			if err != nil {
@@ -263,59 +269,27 @@ exit 1
 	}
 }
 
-func TestStatusDashboardFallbackPrintsEarlierAndLaterInventoryOnce(t *testing.T) {
-	t.Run("during inventory", func(t *testing.T) { testStatusDashboardFallback(t, false) })
-	t.Run("at completion", func(t *testing.T) { testStatusDashboardFallback(t, true) })
-}
-
-func testStatusDashboardFallback(t *testing.T, failAtEnd bool) {
-	t.Helper()
-	script := runnerEvents + `
+func TestInteractiveStatusPrintsInventoryWithoutDashboard(t *testing.T) {
+	useTextRunner(t, runnerEvents+`
 emit '{"v":1,"kind":"run_start","profile":"laptop","host":"fixture-nas"}'
 emit '{"v":1,"kind":"item_upsert","id":"first","label":"earlier-tool","group":"Tools","status":"missing"}'
-`
-	if !failAtEnd {
-		script += `
-tries=0
-until grep -Fq 'continuing in concise mode' "$DOTS_TEST_CAPTURE"; do
-	tries=$((tries + 1))
-	[ "$tries" -lt 150 ] || exit 9
-	sleep 0.02
-done
-`
-	}
-	useTextRunner(t, script+`
 emit '{"v":1,"kind":"item_upsert","id":"later","label":"later-package","group":"Packages","status":"ok"}'
 `)
 	oldInteractive, oldSize := hasInteractiveTerminal, currentTerminalSize
-	oldStart, oldDashboard := startUpdaterBackend, runDashboard
+	oldDashboard := runDashboard
 	t.Cleanup(func() {
 		hasInteractiveTerminal, currentTerminalSize = oldInteractive, oldSize
-		startUpdaterBackend, runDashboard = oldStart, oldDashboard
+		runDashboard = oldDashboard
 	})
 	hasInteractiveTerminal = func() bool { return true }
 	currentTerminalSize = func() (int, int) { return 100, 30 }
-	startUpdaterBackend = func(opts Options, files *runFiles, _ bool) (*backend, *os.File, io.Reader, error) {
-		child, events, output, err := startBackend(opts, files, false)
-		if err == nil {
-			child.pty = true
-		}
-		return child, events, output, err
+	runDashboard = func(<-chan ui.Event, io.Writer, string, bool) error {
+		t.Error("status started a dashboard")
+		return nil
 	}
-	runDashboard = func(events <-chan ui.Event, _ io.Writer, _ string, _ bool) error {
-		for event := range events {
-			if (!failAtEnd && event.ID == "first") || (failAtEnd && event.Kind == "run_end") {
-				return errors.New("injected renderer failure after receiving inventory")
-			}
-		}
-		return errors.New("fixture never received inventory")
-	}
-	code, output := captureOutput(t, func() int {
-		t.Setenv("DOTS_TEST_CAPTURE", os.Stdout.Name())
-		return Run(Options{Command: "status", StateDir: t.TempDir()})
-	})
-	if code != 0 || !strings.Contains(output, "injected renderer failure after receiving inventory") {
-		t.Fatalf("expected dashboard fallback and exit 0, got %d:\n%s", code, output)
+	code, output := captureRun(t, Options{Command: "status", StateDir: t.TempDir()})
+	if code != 0 {
+		t.Fatalf("status exited %d:\n%s", code, output)
 	}
 	assertStatusInventory(t, output, "laptop · fixture-nas", "earlier-tool  missing", "later-package  ok")
 }
@@ -330,7 +304,13 @@ func assertStatusInventory(t *testing.T, output string, expected ...string) {
 }
 
 const runnerEvents = `
-emit() { printf '\036dots-up/1:%s:%s\037' "$DOTS_UP_STREAM_NONCE" "$1"; }
+emit() {
+    if [ -n "$DOTS_UP_EVENT_FD" ]; then
+        printf '%s\n' "$1" >&3
+    else
+        printf '\036dots-up/1:%s:%s\037' "$DOTS_UP_STREAM_NONCE" "$1"
+    fi
+}
 `
 
 func useTextRunner(t *testing.T, script string) {

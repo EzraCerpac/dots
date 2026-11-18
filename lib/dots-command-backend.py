@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structured status and progress bridge for the dots dashboard."""
+"""Structured status and progress bridge for dots reports."""
 import json
 import os
 import shlex
@@ -219,15 +219,18 @@ def main():
             code = status()
         else:
             stage_start(command, "Command", command, handoff=command not in ("sync", "backup", "test", "add", "remove"))
-            event_fd = os.environ.get("DOTS_UP_EVENT_FD")
             pass_fds = tuple(int(os.environ[key]) for key in ("DOTS_UP_EVENT_FD", "DOTS_UP_ACK_FD") if os.environ.get(key, "").isdecimal())
             argv, env = [home + "/bin/dots", "--backend", command, *arguments], {**os.environ, "DOTS_ROOT": root, "DOTS_HOME": home, "DOTS_MISE_BIN": mise}
             code = subprocess.call(argv, env=env, pass_fds=pass_fds)
+            if code < 0:
+                code = 128 - code
             if command == "sync" and code in (0, 3):
                 # The producer emitted its own stage result and typed issues.
                 state, code = ("attention" if code == 3 else "ok"), 0
             else:
                 stage_end(command, command, code)
+    except KeyboardInterrupt:
+        code, state = 130, "cancelled"
     except (OSError, RuntimeError) as error:
         print(f"dots: {error}", file=sys.stderr)
         code, state = 1, None

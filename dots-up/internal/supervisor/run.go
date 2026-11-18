@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/EzraCerpac/dots/dots-up/internal/commands"
 	"github.com/EzraCerpac/dots/dots-up/internal/ui"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/ansi/parser"
@@ -38,6 +39,11 @@ type Options struct {
 	Last                        bool
 }
 
+func (opts Options) scrollback() bool {
+	spec, _ := commands.Lookup(opts.Command)
+	return spec.Mode == "scrollback"
+}
+
 type controlRecord struct {
 	V    int    `json:"v"`
 	Kind string `json:"kind"`
@@ -49,6 +55,7 @@ type backend struct {
 	master         *os.File
 	tty            *os.File
 	ack            *os.File
+	scrollbackLog  *os.File
 	streamNonce    string
 	pty            bool
 	processGroup   bool
@@ -98,9 +105,10 @@ func Run(opts Options) int {
 	if opts.StateDir == "" {
 		opts.StateDir = commandStateDir(opts.Command)
 	}
+	scrollback := opts.scrollback()
 	started := time.Now()
 	files, err := newRunFiles(started, opts.StateDir)
-	if err != nil {
+	if err != nil && !scrollback {
 		fmt.Fprintf(os.Stderr, "dots up: reports unavailable: %v\nContinuing without saved logs.\n", err)
 	}
 	if files != nil {
@@ -112,12 +120,9 @@ func Run(opts Options) int {
 		}()
 	}
 
-	stateRoot := stateDir()
-	if opts.StateDir != "" {
-		stateRoot = opts.StateDir
-	}
-	interactive := hasInteractiveTerminal()
-	dashboard := interactive && !opts.Plain && !opts.Verbose && !opts.Concise
+	interactive := !scrollback && hasInteractiveTerminal()
+	dashboardEligible := !scrollback && !opts.Plain && !opts.Verbose && !opts.Concise
+	dashboard := interactive && dashboardEligible
 	if dashboard {
 		width, height := currentTerminalSize()
 		if width < 64 || height < 16 {
@@ -125,10 +130,7 @@ func Run(opts Options) int {
 		}
 	}
 	plain := !dashboard
-	if opts.Verbose {
-		plain = true
-	}
-	if interactive && !dashboard && !opts.Verbose && !opts.Plain && !opts.Concise {
+	if interactive && dashboardEligible && !dashboard {
 		fmt.Fprintln(os.Stderr, "dots up: terminal is too small for the dashboard; using concise output")
 	}
 
@@ -140,7 +142,7 @@ func Run(opts Options) int {
 	defer signal.Stop(resizes)
 
 	var globalLog *os.File
-	if !opts.Sensitive {
+	if !opts.Sensitive && !scrollback {
 		globalLog = openLog(files, "backend.log")
 		if globalLog != nil {
 			defer globalLog.Close()
@@ -162,7 +164,9 @@ func Run(opts Options) int {
 			}
 			saved = files.finish(code, "", "", time.Now()) == nil
 		}
-		if opts.Command == "up" {
+		if scrollback {
+			fmt.Fprintf(os.Stderr, "dots %s: %s\n", opts.Command, detail)
+		} else if opts.Command == "up" {
 			printUpReport(os.Stderr, Report{ExitCode: code, Events: startupEvents}, dir, saved)
 		} else {
 			printFailedStage(os.Stderr, issue)
@@ -187,14 +191,13 @@ func Run(opts Options) int {
 		controlReader, controlWriter = io.Pipe()
 		uiDone = make(chan error, 1)
 		go func() {
-			err := runDashboard(events, controlWriter, stateRoot, opts.NoWait)
+			err := runDashboard(events, controlWriter, opts.StateDir, opts.NoWait)
 			_ = controlWriter.Close()
 			uiDone <- err
 		}()
 		go readControls(controlReader, controls)
 	}
 	terminalSync := opts.Command == "sync" && interactive && files != nil && !opts.Verbose && !backend.directTerminal
-	dashboardStarted := dashboard
 	defer func() {
 		if originalTerminalState != nil && backend.tty != nil {
 			_ = term.Restore(backend.tty.Fd(), originalTerminalState)
@@ -225,7 +228,21 @@ func Run(opts Options) int {
 		go readOutput(outputReader, backend.streamNonce, backendOutput)
 	}
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- backend.command.Wait() }()
+	go func() {
+		err := backend.command.Wait()
+		if scrollback {
+			if errors.Is(err, exec.ErrWaitDelay) {
+				err = nil // The command succeeded and only inherited output pipes remained open.
+			}
+			// A background descendant can inherit the event descriptor.
+			// Leave time to drain any queued events without waiting for its exit.
+			_ = eventReader.SetReadDeadline(time.Now().Add(scrollbackDrain))
+		}
+		waitCh <- err
+	}()
+	if backend.scrollbackLog != nil {
+		defer backend.scrollbackLog.Close()
+	}
 
 	var stageLog *os.File
 	var stageID, profile, host string
@@ -278,14 +295,13 @@ func Run(opts Options) int {
 	}()
 
 	labels := map[string]string{} // a stage_end may name its stage only by ID
-	var dashboardStatus []ui.Event
-	flushDashboardStatus := func() {
-		for _, event := range dashboardStatus {
-			printStatusEvent(event)
-		}
-		dashboardStatus = nil
-	}
 	deliver := func(e ui.Event) {
+		if scrollback {
+			if opts.Command == "status" {
+				printStatusEvent(e)
+			}
+			return
+		}
 		if e.Kind == "stage_start" {
 			labels[e.ID] = e.Label
 		} else if e.Kind == "stage_end" && e.Label == "" {
@@ -299,25 +315,9 @@ func Run(opts Options) int {
 				fmt.Fprintln(os.Stderr, "dots up: dashboard stopped responding; continuing in concise mode")
 			}
 		}
-		if !plain {
-			if opts.Command == "status" && (e.Kind == "run_start" || e.Kind == "item_upsert") {
-				dashboardStatus = append(dashboardStatus, e)
-			}
-			return
-		}
-		// On fallback, print the status rows that only the dashboard saw.
-		flushDashboardStatus()
-		if opts.Command == "status" && printStatusEvent(e) {
-			return
-		}
-		if !opts.Verbose && opts.Command != "sync" && e.ID != startupStage {
-			if opts.Command == "up" {
-				if e.Kind == "stage_start" || e.Kind == "app_store_start" {
-					fmt.Printf("→ %s · %s\n", e.Label, time.Since(started).Truncate(time.Second))
-				}
-			} else {
-				printProgress(e)
-			}
+		if plain && !opts.Verbose && opts.Command == "up" && e.ID != startupStage &&
+			(e.Kind == "stage_start" || e.Kind == "app_store_start") {
+			fmt.Printf("→ %s · %s\n", e.Label, time.Since(started).Truncate(time.Second))
 		}
 	}
 	var unsavedUpEvents []ui.Event
@@ -330,6 +330,8 @@ func Run(opts Options) int {
 		}
 		if opts.Sensitive {
 			e.LogPath = ""
+		} else if scrollback && e.LogPath == "" && backend.scrollbackLog != nil && e.ID == opts.Command {
+			e.LogPath = backend.scrollbackLog.Name()
 		}
 		if files != nil {
 			if err := files.record(e); err != nil {
@@ -432,7 +434,7 @@ func Run(opts Options) int {
 				issue.Detail = string(diagnosticOutput)
 				consoleFailure = &issue
 			}
-		} else if e.LogPath == "" && files != nil {
+		} else if e.LogPath == "" && files != nil && !scrollback {
 			e.LogPath = files.logPath(e.ID)
 		}
 		if stageLog != nil && stageID == e.ID {
@@ -496,7 +498,7 @@ func Run(opts Options) int {
 				stageLog = nil
 			}
 			stageID = e.ID
-			if files != nil && !opts.Sensitive {
+			if files != nil && !opts.Sensitive && !scrollback {
 				e.LogPath = files.logPath(e.ID)
 				stageLog = openStageLog(e.LogPath)
 				if e.ID == updateConfigStage && stageLog == nil {
@@ -522,7 +524,7 @@ func Run(opts Options) int {
 			}
 		case "stage_end":
 			workReported = true
-			if e.LogPath == "" && files != nil {
+			if e.LogPath == "" && files != nil && !scrollback {
 				e.LogPath = files.logPath(e.ID)
 			}
 			if pendingHandoff == e.ID {
@@ -693,9 +695,6 @@ func Run(opts Options) int {
 			}
 			if cancelRequested {
 				exitCode = 130
-				if opts.Command == "remote" {
-					emit(ui.Event{V: 1, Kind: "notice", Severity: "attention", Summary: "Remote execution status is unknown after local cancellation; inspect the host before retrying.", Action: "Check the remote host before retrying; local cancellation does not confirm remote termination."})
-				}
 			}
 			if relayKind != "" {
 				_ = stopRelay()
@@ -770,14 +769,25 @@ func Run(opts Options) int {
 	if backendError != nil && exitCode == 0 {
 		exitCode = 1
 	}
+	if exitCode == 130 && opts.Command == "remote" {
+		const message = "Remote execution status is unknown after local cancellation; inspect the host before retrying."
+		emit(ui.Event{V: 1, Kind: "notice", Severity: "attention", Summary: message,
+			Action: "Check the remote host before retrying; local cancellation does not confirm remote termination."})
+		fmt.Fprintln(os.Stderr, "dots remote: "+message)
+	}
 	if exitCode != 0 && !cancelRequested && !workReported {
 		if !runStarted && opts.Command != "up" {
 			emit(ui.Event{V: 1, Kind: "run_start"})
 		}
-		start, issue := startupFailure(opts.Command, exitCode, string(diagnosticOutput), globalLog)
+		log, detail := globalLog, string(diagnosticOutput)
+		if backend.scrollbackLog != nil {
+			log = backend.scrollbackLog
+			detail = ui.LogTail(log.Name())
+		}
+		start, issue := startupFailure(opts.Command, exitCode, detail, log)
 		emit(start)
 		emit(issue)
-		if files == nil || opts.Verbose {
+		if !scrollback && (files == nil || opts.Verbose) {
 			if opts.Verbose {
 				issue.Detail = "" // verbose output already showed the diagnostic
 			}
@@ -803,16 +813,14 @@ func Run(opts Options) int {
 	}
 	if uiErr != nil {
 		fmt.Fprintf(os.Stderr, "dots up: dashboard ended with an error: %v\n", uiErr)
-		plain = true
-		flushDashboardStatus()
 	}
-	if opts.Command != "sync" && ((plain && !opts.Verbose) || dashboardStarted) {
+	if opts.Command == "up" && !opts.Verbose {
 		report := Report{Command: opts.Command, ExitCode: exitCode, Events: unsavedUpEvents}
 		dir := ""
 		if files != nil {
 			report, dir = files.report, files.runDir
 		}
-		if consoleFailure != nil && (consoleFailure.ID == updateConfigStage || opts.Command == "up") {
+		if consoleFailure != nil {
 			report.Events = slices.Clone(report.Events)
 			for i, event := range report.Events {
 				if event.Kind == "stage_end" && event.ID == consoleFailure.ID {
@@ -822,20 +830,13 @@ func Run(opts Options) int {
 				}
 			}
 		}
-		if opts.Command == "up" {
-			printUpReport(os.Stdout, report, dir, reportSaved)
-		} else if files != nil {
-			fmt.Println(summary(report, dir))
-			printReportHighlights(os.Stdout, report, plain)
-		} else {
-			fmt.Printf("Update completed with exit code %d.\n", exitCode)
-		}
+		printUpReport(os.Stdout, report, dir, reportSaved)
 	}
 	if consoleFailure != nil {
 		printFailedStage(os.Stdout, *consoleFailure)
 	}
 	if backendError != nil {
-		fmt.Fprintf(os.Stderr, "dots up: supervisor warning: %v\n", backendError)
+		fmt.Fprintf(os.Stderr, "dots %s: supervisor warning: %v\n", opts.Command, backendError)
 	}
 	// The captured output includes startup diagnostics and stage output in order.
 	// Only the original terminal receives patch text, after that stream drains.
@@ -860,12 +861,6 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	ackR, ackW, err := os.Pipe()
-	if err != nil {
-		_ = eventR.Close()
-		_ = eventW.Close()
-		return nil, nil, nil, err
-	}
 	if opts.MAS {
 		cmd.Args = append(cmd.Args, "--mas")
 	}
@@ -874,6 +869,7 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 	childEnv = setEnv(childEnv, "DOTS_HOME", opts.Home)
 	childEnv = setEnv(childEnv, "DOTS_UP_EVENT_FD", "3")
 	childEnv = setEnv(childEnv, "DOTS_UP_ACK_FD", "")
+	childEnv = setEnv(childEnv, "DOTS_UP_STREAM_NONCE", "")
 	childEnv = setEnv(childEnv, "DOTS_UP_RUN_STARTED", "")
 	childEnv = setEnv(childEnv, "DOTS_UP_RUN_DIR", "")
 	childEnv = setEnv(childEnv, "DOTS_UP_PLAIN", "")
@@ -888,6 +884,23 @@ func startBackend(opts Options, files *runFiles, interactive bool) (*backend, *o
 		childEnv = setEnv(childEnv, "DOTS_UP_RUN_DIR", files.runDir)
 	}
 
+	if opts.scrollback() {
+		cmd.Env, cmd.ExtraFiles = childEnv, []*os.File{eventW}
+		child, err := startScrollback(cmd, files, opts.Sensitive)
+		_ = eventW.Close()
+		if err != nil {
+			_ = eventR.Close()
+			return nil, nil, nil, err
+		}
+		return child, eventR, nil, nil
+	}
+
+	ackR, ackW, err := os.Pipe()
+	if err != nil {
+		_ = eventR.Close()
+		_ = eventW.Close()
+		return nil, nil, nil, err
+	}
 	var tty *os.File
 	ptyMode := interactive
 	if ptyMode {
@@ -1075,7 +1088,7 @@ func readEvents(r *os.File, out chan<- ui.Event, errorsOut chan<- error) {
 		}
 		out <- event
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
 		errorsOut <- fmt.Errorf("read updater events: %w", err)
 	}
 }
@@ -1168,39 +1181,6 @@ func cleanTerminalOutput(data []byte) []byte {
 	clean = strings.ReplaceAll(clean, "\r\n", "\n")
 	clean = strings.ReplaceAll(clean, "\r", "\n")
 	return []byte(clean)
-}
-
-func printProgress(e ui.Event) {
-	switch e.Kind {
-	case "run_start":
-		name := e.Command
-		if name == "" {
-			name = "up"
-		}
-		fmt.Printf("dots %s · %s · %s\n", name, e.Profile, e.Host)
-	case "stage_start":
-		fmt.Printf("→ %s\n", e.Label)
-	case "stage_end":
-		glyph := "✓"
-		if e.Status == "failed" {
-			glyph = "×"
-		} else if e.Status == "attention" {
-			glyph = "!"
-		}
-		fmt.Printf("%s %s", glyph, e.Label)
-		if e.Summary != "" {
-			fmt.Printf(" — %s", e.Summary)
-		}
-		fmt.Println()
-	case "notice":
-		fmt.Printf("Attention: %s\n", e.Summary)
-	case "change":
-		fmt.Println(ui.ChangeLine(e.Action, e.Item, e.Before, e.After))
-	case "app_store_start":
-		fmt.Println("Mac App Store updates · running in the background")
-	case "app_store_end":
-		fmt.Printf("Mac App Store updates · %s\n", e.Summary)
-	}
 }
 
 func interactiveTerminal() bool {
@@ -1369,7 +1349,7 @@ func cancelBackend(b *backend) {
 			if syscall.Kill(-pid, 0) != nil {
 				return
 			}
-		} else if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		} else if cmd.Process.Signal(syscall.Signal(0)) != nil {
 			return
 		}
 		_ = kill(syscall.SIGTERM)

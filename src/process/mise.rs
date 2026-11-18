@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{Cwd, is_executable, stage_argv};
+use super::{Cwd, HOOK_ENV, is_executable, stage_argv};
 use crate::config::selection::{self, Selection};
 use crate::{Ctx, Env, Fail};
 
@@ -71,7 +71,31 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.exec_with_env(program, args, |_| Ok(()))
+    }
+
+    /// Configure a dots-owned child after mise applies its environment. The
+    /// callback may also attach an inherited descriptor to the launcher.
+    pub fn exec_with_env<I, S>(
+        &self,
+        program: impl AsRef<OsStr>,
+        args: I,
+        configure: impl FnOnce(&mut Command) -> Result<(), Fail>,
+    ) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = self.raw_command()?;
+        configure(&mut command)?;
+        command
+            .env("DOTS_ROOT", self.ctx.root.path())
+            .env(
+                "DOTS_PROFILE",
+                self.selected.profile.as_deref().unwrap_or_default(),
+            )
+            .env_remove("DOTS_HOME")
+            .env_remove("DOTS_STAGES");
         let bin = self
             .ctx
             .root
@@ -80,7 +104,10 @@ impl<'a> Mise<'a> {
             .and_then(|bin| bin.as_ref().ok())
             .expect("prepared child PATH")
             .path();
-        let filename = stage_argv(bin, program.as_ref(), args)?;
+        let filename = stage_argv(bin, &command, program.as_ref(), args)?;
+        for key in HOOK_ENV {
+            command.env_remove(key);
+        }
         command
             .env("MISE_ENV", self.selected.active_environments())
             .args(["exec", "--"])

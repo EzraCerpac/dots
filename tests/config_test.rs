@@ -136,6 +136,7 @@ fn new_test_runs_executable_files_directly_without_a_shell_fallback() {
 fn new_test_preserves_dots_context_after_mise_applies_config_environment() {
     let world = setup(
         r#"#!/bin/sh
+test -z "${DOTS_BUNDLE_FD+x}" && test -z "${DOTS_CHANGES+x}" || exit 91
 printf '%s\n' "$DOTS_ROOT" "$DOTS_PROFILE" "$SYNTHETIC"
 dots root
 "#,
@@ -143,7 +144,10 @@ dots root
     );
     fs::write(
         world.root().join("config.laptop.toml"),
-        "[env]\nDOTS_ROOT='/synthetic/wrong'\nDOTS_PROFILE='wrong'\nSYNTHETIC='configured'\n",
+        format!(
+            "[env]\nDOTS_ROOT='{}'\nDOTS_PROFILE='wrong'\nSYNTHETIC='configured'\nDOTS_BUNDLE_FD='987'\nDOTS_CHANGES='wrong'\n",
+            world.home().join("wrong-root").display(),
+        ),
     )
     .unwrap();
     let output = world

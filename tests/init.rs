@@ -33,7 +33,7 @@ fn seed_push(output: &str, seed: &str) -> bool {
     output.lines().any(|line| {
         line.starts_with("git -C ")
             && line.ends_with(&format!(
-                " push origin {seed}:refs/heads/main {seed}:refs/heads/dev"
+                " push --no-follow-tags --recurse-submodules=no origin {seed}:refs/heads/main {seed}:refs/heads/dev"
             ))
     })
 }
@@ -184,7 +184,7 @@ fn new_existing_nonempty_index_is_untouched() {
     assert!(git(&world, root, &["rev-list", "--all"]).is_empty());
     assert!(output.contains("HEAD has no commit"), "{output}");
     assert!(output.contains(" dots sync"), "{output}");
-    assert!(!output.contains(" push origin "), "{output}");
+    assert!(!output.contains(" push "), "{output}");
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn new_older_committed_template_requires_sync_even_with_current_working_bytes() 
             .any(|line| line.starts_with("DOTS_ROOT=") && line.ends_with(" dots sync")),
         "{later}"
     );
-    assert!(!later.contains(" push origin "), "{later}");
+    assert!(!later.contains(" push "), "{later}");
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn new_interactive_push_failure_prints_verified_seed_retry_only_once() {
         "{output}"
     );
     assert!(output.contains("added remote origin"), "{output}");
-    assert!(output.contains("Could not push"), "{output}");
+    assert!(output.contains("Could not finish pushing"), "{output}");
     assert!(!output.contains(" remote add origin "), "{output}");
     assert!(seed_push(&output, &seed), "{output}");
     let push = fs::read_to_string(world.home().join("push-calls")).unwrap();
@@ -310,7 +310,7 @@ fn new_interactive_push_failure_prints_verified_seed_retry_only_once() {
     let rerun = success(terminal(cmd.arg("init").arg(&root), b"yes\n"));
     assert!(rerun.contains("kept remote origin"), "{rerun}");
     assert!(!rerun.contains("Create a private"), "{rerun}");
-    assert!(!rerun.contains(" push origin "), "{rerun}");
+    assert!(!rerun.contains(" push "), "{rerun}");
     assert_eq!(fs::read(world.home().join("gh-calls")).unwrap(), calls);
     assert_eq!(
         fs::read_to_string(world.home().join("push-calls")).unwrap(),
@@ -421,11 +421,95 @@ fn new_clean_main_gets_the_branch_fix_without_moving_head() {
     let head = git(&world, &root, &["rev-parse", "HEAD"]);
     let output = success(init(&world, &root));
     assert!(output.contains(" switch -c dev"), "{output}");
-    assert!(!output.contains(" push origin "), "{output}");
+    assert!(!output.contains(" push "), "{output}");
     assert_eq!(git(&world, &root, &["branch", "--show-current"]), "main");
     assert_eq!(git(&world, &root, &["rev-parse", "HEAD"]), head);
 
     fs::write(root.join("fixture-edit"), "uncommitted\n").unwrap();
     let output = success(init(&world, &root));
     assert!(!output.contains(" switch -c dev"), "{output}");
+}
+
+#[test]
+fn new_invalid_lone_selection_uses_defaults_and_keeps_other_selectors() {
+    let world = World::new();
+    let root = fresh(&world);
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("config.toml"),
+        "[vars]\ndots_profiles = \"laptop server\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("config.local.toml"),
+        "[env]\nSETUP_PROFILE = \"removed\"\nSETUP_MACHINE_ID = 17\n",
+    )
+    .unwrap();
+    fs::write(root.join("miserc.toml"), "env = ['extra']\n").unwrap();
+
+    success(
+        world
+            .dots()
+            .env("SETUP_PROFILE", "server")
+            .env("SETUP_MACHINE_ID", "caller-id")
+            .arg("init")
+            .arg(&root)
+            .output()
+            .unwrap(),
+    );
+    let selector = fs::read_to_string(root.join("miserc.toml")).unwrap();
+    assert!(
+        selector.starts_with("env = [\"laptop\", \"host-"),
+        "{selector}"
+    );
+    assert!(selector.contains("\"extra\""), "{selector}");
+    assert!(!selector.contains("caller-id"));
+}
+
+#[test]
+fn new_printed_seed_push_does_not_publish_annotated_tags() {
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    let seed = git(&world, &root, &["rev-parse", "HEAD"]);
+    git(&world, &root, &["config", "push.followTags", "true"]);
+    git(
+        &world,
+        &root,
+        &["tag", "-a", "fixture-tag", "-m", "Synthetic tag annotation"],
+    );
+    let output = success(init(&world, &root));
+    assert!(seed_push(&output, &seed), "{output}");
+    let push = output
+        .lines()
+        .find(|line| line.starts_with("git -C ") && line.contains(" push "))
+        .unwrap();
+
+    let remote = world.bare_remote("origin");
+    success(
+        world
+            .git()
+            .current_dir(&root)
+            .args(["remote", "add", "origin"])
+            .arg(&remote)
+            .output()
+            .unwrap(),
+    );
+    let environment = world.git();
+    success(
+        Command::new("/bin/sh")
+            .env_clear()
+            .envs(
+                environment
+                    .get_envs()
+                    .filter_map(|(key, value)| Some((key, value?))),
+            )
+            .args(["-c", push])
+            .output()
+            .unwrap(),
+    );
+    for branch in ["main", "dev"] {
+        assert_eq!(git(&world, &remote, &["rev-parse", branch]), seed);
+    }
+    assert!(git(&world, &remote, &["tag", "--list"]).is_empty());
 }

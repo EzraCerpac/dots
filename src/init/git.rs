@@ -1,9 +1,9 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use crate::process::Cwd;
@@ -95,7 +95,7 @@ impl Git<'_> {
             )));
         }
         let refs = self.checked(
-            &["rev-list", "--all", "--max-count=1"],
+            &["rev-list", "--all", "--reflog", "--max-count=1"],
             "inspect commit history",
         )?;
         let index = self.checked(&["ls-files", "--stage", "-z"], "inspect the index")?;
@@ -112,6 +112,9 @@ impl Git<'_> {
                 &["init", "--initial-branch=dev"],
                 "initialize the repository",
             )?;
+            println!("created Git repository");
+        } else {
+            println!("kept empty Git repository");
         }
 
         let scratch = tempfile::tempdir().map_err(|_| git_error("create a scratch index"))?;
@@ -325,16 +328,6 @@ impl Git<'_> {
             "-q",
             name,
         ])?)
-    }
-
-    pub fn git_path(&self, name: &str) -> Result<PathBuf, Fail> {
-        let path = self.checked(
-            &["rev-parse", "--git-path", name],
-            "locate repository metadata",
-        )?;
-        Ok(self
-            .root
-            .join(OsString::from_vec(trim_line(&path.stdout).to_vec())))
     }
 
     pub fn has_origin(&self) -> Result<bool, Fail> {

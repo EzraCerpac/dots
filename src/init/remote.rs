@@ -127,22 +127,38 @@ fn create_and_push(
     }
     println!("created private GitHub repository {repo}");
 
-    if !git
+    let added = git
         .output(&["remote", "add", "origin", url])
-        .is_ok_and(|out| out.status.success())
-    {
-        println!("Could not add origin. Add the repository and push the seed with");
-        command_line("git -C ", git.root, &format!(" remote add origin '{url}'"))?;
-        print_push(git, seed)?;
-        explain_seed();
-        return Ok(());
+        .is_ok_and(|out| out.status.success());
+    if !added {
+        match git.has_origin() {
+            Ok(false) => {
+                println!("Could not add origin. Add the repository and push the seed with");
+                command_line("git -C ", git.root, &format!(" remote add origin '{url}'"))?;
+                print_push(git, seed)?;
+                explain_seed();
+                return Ok(());
+            }
+            Ok(true) => {
+                println!("Git reported a failure while adding origin, but origin exists.");
+            }
+            Err(_) => {
+                println!(
+                    "Git reported a failure while adding origin. Check the local remote configuration."
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        println!("added remote origin");
     }
-    println!("added remote origin");
 
     if !effective_urls_match(git, expected) {
         println!(
             "Git resolves origin to a different or invalid repository. Correct its URL or your Git URL rewrites before running"
         );
+    } else if !added {
+        println!("The seed push still needs to run");
     } else if git
         .output(&[
             "push",
@@ -157,7 +173,7 @@ fn create_and_push(
         println!("pushed seed commit {seed} to origin/main and origin/dev");
         return Ok(());
     } else {
-        println!("Could not push the seed to origin. Retry with");
+        println!("Could not finish pushing the seed to origin. Retry with");
     }
     print_push(git, seed)?;
     explain_seed();
@@ -185,7 +201,9 @@ fn print_push(git: &Git<'_>, seed: &str) -> Result<(), Fail> {
     command_line(
         "git -C ",
         git.root,
-        &format!(" push origin {seed}:refs/heads/main {seed}:refs/heads/dev"),
+        &format!(
+            " push --no-follow-tags --recurse-submodules=no origin {seed}:refs/heads/main {seed}:refs/heads/dev"
+        ),
     )
 }
 

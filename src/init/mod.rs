@@ -17,19 +17,17 @@ use crate::{Args, Ctx, Env, Fail};
 use git::{Git, Shape};
 
 pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
+    let root = match args.get_one::<OsString>("DIR") {
+        Some(dir) => Root::from_dir(&ctx.env, Path::new(dir))?,
+        None => Root::resolve(&ctx.env)?,
+    };
     let mut env = Env {
         vars: ctx.env.vars.clone(),
         cwd: ctx.env.cwd.clone(),
     };
-    if let Some(dir) = args.get_one::<OsString>("DIR") {
-        env.vars.insert("DOTS_ROOT".into(), dir.clone());
-    }
-    // init selects this machine's persisted identity. Caller overrides
-    // belong to ordinary runs, not the machine configuration it saves.
-    env.vars.remove(std::ffi::OsStr::new("SETUP_PROFILE"));
-    env.vars.remove(std::ffi::OsStr::new("SETUP_MACHINE_ID"));
+    env.vars.insert("DOTS_ROOT".into(), root.path().into());
     let target = Ctx {
-        root: Root::resolve(&env)?,
+        root,
         env,
         flags: ctx.flags,
     };
@@ -54,7 +52,7 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     files::scaffold(root)?;
 
     let vars = Vars::read(&target.root)?;
-    let result = selection::read(&target.root, &target.env);
+    let result = selection::read_for_init(&target.root);
     let selected = match result {
         Ok(selected) => selected,
         Err(error) if error.status == 2 => {
@@ -185,7 +183,7 @@ fn repair_commands(root: &Path) -> Result<(), Fail> {
 
 fn command_line(before: &str, root: &Path, after: &str) -> Result<(), Fail> {
     let mut stdout = io::stdout().lock();
-    let write = || -> io::Result<()> {
+    let mut write = || -> io::Result<()> {
         stdout.write_all(before.as_bytes())?;
         stdout.write_all(b"'")?;
         for (index, chunk) in root
@@ -202,7 +200,6 @@ fn command_line(before: &str, root: &Path, after: &str) -> Result<(), Fail> {
         stdout.write_all(b"'")?;
         writeln!(stdout, "{after}")
     };
-    let mut write = write;
     write().map_err(|err| Fail::new(1, format!("could not print init guidance: {err}")))
 }
 

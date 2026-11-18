@@ -81,12 +81,12 @@ The exit status is the outcome:
 | 4 | skipped |
 | other | failed |
 
-A hook can prompt.
-With `--plain`, or without a terminal for the `dots up` dashboard, the hook reads the caller's stdin.
-While the dashboard is shown, it tells you how to open the running stage's terminal and how to return.
-`dots` does not detect prompts inside a hook, so prefer hooks that do not need one.
-
-> TODO(P-12): The dashboard is being redesigned; add how to answer a prompt from it only after the design is approved and checked against the integrated binary.
+A hook or recipe can prompt using the caller's stdin, stdout, stderr and controlling terminal from the start of its step.
+If stdin is redirected, the child receives that input.
+Answer prompts directly. Only the child reads the reply.
+`dots up` prints the step and its result in scrollback.
+If a step that had the terminal fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
+The step’s output stays in scrollback. Ordinary captured steps have private logs.
 
 ### Update hooks
 
@@ -117,7 +117,8 @@ Bootstrap hooks also get:
 - `DOTS_BUNDLE_FD`: the number of a read-only file descriptor holding the bundle's `secrets` object as UTF-8 JSON.
 
 Each hook gets its own descriptor, readable from the start.
-The object is `{}` when no bundle was requested and when private recovery is not ready, so `{}` with `DOTS_PRIVATE_READY=1` means nothing was requested.
+The object is `{}` when recovery is not ready, when no bundle was requested, or when a valid bundle has no secrets.
+Check `DOTS_PRIVATE_READY` for readiness and check the object for each secret your hook needs.
 `dots` never writes a value to a plaintext file, an environment variable or an argument, and never prints one.
 The hook is responsible for what it prints, where it writes values, keeping files that already exist, and closing the descriptor before it starts long-lived children.
 
@@ -144,6 +145,7 @@ Writing app files, credential helpers or service enrollment from bundle values b
 ## Commands
 
 `dots NAME ARGS...` runs `commands/NAME` when `NAME` is not a built-in command, starts with a letter or digit and continues with letters, digits, `.`, `_` or `-`, and the file is a regular executable.
+The name `internal` is reserved even when an executable has that name.
 Built-in commands win, so a command named `root`, `profile`, `mise` or `brew`, for example, is never reached.
 
 - The arguments reach it unchanged, `--help` included.
@@ -152,7 +154,7 @@ Built-in commands win, so a command named `root`, `profile`, `mise` or `brew`, f
 - It runs before mise loads the configuration: no sync, tool installs or package updates happen first.
 - Global flags such as `--plain` before a configuration command exit 2.
 
-`dots help` and the `dots` menu list the configuration's commands.
+Both `dots` and `dots help` list the configuration's commands alongside the built-ins.
 
 ## Installer exceptions
 
@@ -187,10 +189,11 @@ A recipe can prompt, as a hook can.
 | `hold-formula TOKEN VERSION [REASON]` | Succeeds when exactly that version is installed, else refuses with exit 1 |
 | `hold-cask TOKEN VERSION APP_PATH [REASON]` | The same, reading the version from the app bundle at `APP_PATH` |
 | `path`, `version formula\|cask TOKEN` | Print the Homebrew executable, or a package's installed version |
-| `admin-available` | Exits 0 when administrator access is available without a prompt, else 1 |
+| `admin-available` | Exits 0 for root, cached sudo access, or terminal stdin and stdout where authorization can prompt. Otherwise exits 1 |
 | `defer-for-admin TOKEN` | Says `TOKEN` needs interactive administrator access and exits 3 |
 | `record formula\|cask TOKEN installed\|updated [BEFORE]` | Appends a change line to `DOTS_CHANGES` |
 
+`--auto-updates` opts into upgrading a self-updating cask.
 `update-cask` and `update-formula` record each verified installation or upgrade themselves.
 On a system other than macOS, the first four print that the package is macOS-only and exit 4, which reports the recipe as skipped.
 Hold commands never install, upgrade or remove anything.

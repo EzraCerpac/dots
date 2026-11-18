@@ -120,8 +120,14 @@ fn ensure_profiles(path: &Path) -> Result<bool, Fail> {
             path.display()
         )));
     }
-    let original = fs::read_to_string(&target).map_err(|err| super::file_error(path, err))?;
     let invalid = |why: &str| Fail::usage(format!("{}: {why}", path.display()));
+    let original = fs::read_to_string(&target).map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidData {
+            invalid("config.toml must be UTF-8 TOML")
+        } else {
+            super::file_error(path, err)
+        }
+    })?;
     let Some(changed) = insert_profiles(&original).map_err(invalid)? else {
         return Ok(false);
     };

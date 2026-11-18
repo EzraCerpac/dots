@@ -61,6 +61,10 @@ case "${1-}" in
                 printf '{"entries":[]}\n'
                 ;;
             dotfiles:save) printf 'checkpoint save\n' >> calls ;;
+            packages:where)
+                [ "${4-}" = brew:mas ] && [ -x fixture-brew-prefix/bin/mas ] || exit 1
+                printf '%s\n' "$DOTS_ROOT/fixture-brew-prefix"
+                ;;
             packages:status)
                 scope=${MISE_SYSTEM_PACKAGES_MANAGERS-}
                 if [ "$scope" = apt ] && [ -f fail-apt-status ]; then
@@ -85,6 +89,15 @@ case "${1-}" in
                 shift 2
                 printf 'packages %s\n' "$*" >> calls
                 printf '%s\t%s\n' "$3" "${MISE_SYSTEM_PACKAGES_MANAGERS-}" >> package-scopes
+                if [ -f prepare-brew-mas ]; then
+                    if [ "$3" = brew ] && [ "${5-}" = brew:mas ] && [ "$1" = apply ]; then
+                        mkdir -p fixture-brew-prefix/bin
+                        printf '#!/bin/sh\nexit 0\n' > fixture-brew-prefix/bin/mas
+                        chmod 700 fixture-brew-prefix/bin/mas
+                    elif [ "$3" = mas ]; then
+                        [ "$(command -v mas)" = "$DOTS_ROOT/fixture-brew-prefix/bin/mas" ] || exit 78
+                    fi
+                fi
                 if [ -f expect-store-overlap ] && [ "$3" = mas ]; then
                     if [ "$1" = apply ]; then
                         : > store-started
@@ -104,7 +117,8 @@ case "${1-}" in
         ;;
     --version)
         [ ! -f fail-version ] || exit 8
-        if [ -f updated ]; then printf '2026.11.9 macos-x64\n'; else printf '2026.11.8 macos-x64\n'; fi
+        if [ -f prepare-brew-mas ]; then arch=arm64; else arch=x64; fi
+        if [ -f updated ]; then printf '2026.11.9 macos-%s\n' "$arch"; else printf '2026.11.8 macos-%s\n' "$arch"; fi
         ;;
     self-update)
         if [ "$2" != "--help" ]; then

@@ -192,7 +192,7 @@ fn manager_tool(name: &str) -> bool {
             .is_some_and(|(_, repository)| repository.eq_ignore_ascii_case("EzraCerpac/dots"))
 }
 
-fn path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
+pub(super) fn probe_path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
     let mut bytes = probe(run, mise_command(run, mise, args.iter().copied())).ok()?;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
@@ -225,9 +225,11 @@ pub(super) fn manager_version(
     source: &ManagerSource,
 ) -> Option<ManagerVersion> {
     let executable = match source {
-        ManagerSource::Tool => path(run, mise, &["which", "dots"]),
-        ManagerSource::Formula(name) => path(run, mise, &["bootstrap", "packages", "where", name])
-            .map(|prefix| prefix.join("bin/dots")),
+        ManagerSource::Tool => probe_path(run, mise, &["which", "dots"]),
+        ManagerSource::Formula(name) => {
+            probe_path(run, mise, &["bootstrap", "packages", "where", name])
+                .map(|prefix| prefix.join("bin/dots"))
+        }
     }?;
     let cmd = ctx.command(executable, Cwd::Root).map(|mut cmd| {
         cmd.arg("--version");

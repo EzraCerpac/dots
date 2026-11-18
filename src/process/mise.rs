@@ -181,12 +181,13 @@ impl<'a> Mise<'a> {
         use std::os::unix::ffi::OsStrExt;
 
         let mut probe = self.raw_command()?;
+        if let Some((_, Some(selected))) = command.get_envs().find(|(key, _)| *key == "MISE_ENV") {
+            probe.env("MISE_ENV", selected);
+        }
         probe.args(["which", "ruby"]);
         let result = match run {
             Some(run) => {
-                probe
-                    .env("MISE_SELF_UPDATE_AUTO", "false")
-                    .env("MISE_ENV", self.selected.active_environments());
+                probe.env("MISE_SELF_UPDATE_AUTO", "false");
                 run.probe(probe)
             }
             None => probe.output(),

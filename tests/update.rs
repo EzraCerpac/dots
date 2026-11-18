@@ -461,13 +461,18 @@ fn store_fixture() -> Fixture {
     fixture.executable(
         &fixture.bin.join("sudo"),
         r#"#!/bin/sh
-[ "$*" = "-n -v" ] || { touch "$DOTS_ROOT/authorization-prompt"; exit 74; }
+case "$*" in
+    "-n -v"|"-n true") ;;
+    *) touch "$DOTS_ROOT/authorization-prompt"; exit 74 ;;
+esac
+printf 'cached authorization\n' >> "$DOTS_ROOT/calls"
 if [ -f "$DOTS_ROOT/expire-authorization" ]; then
     [ ! -f "$DOTS_ROOT/authorization-used" ] || exit 1
     touch "$DOTS_ROOT/authorization-used"
 fi
 "#,
     );
+    fixture.executable(&fixture.bin.join("mas"), "#!/bin/sh\nexit 0\n");
     fixture
 }
 
@@ -592,4 +597,45 @@ fn new_unresolved_bare_blocks_filtering_but_keeps_unfiltered_managers() {
                     .contains("unqualified package names")
             })
     }));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "P-11"]
+fn unchanged_app_store_tool_preparation_replaces_a_stale_shim_in_scope() {
+    let fixture = store_fixture();
+    let shim = fixture.bin.join("mas");
+    fs::remove_file(&shim).unwrap();
+    symlink(fixture.bin.join("mise"), &shim).unwrap();
+    fixture.write("prepare-brew-mas", "");
+    fixture.run_args(&["--plain", "up", "--mas"], 0);
+    let calls = fixture.calls();
+    let authorization = calls.find("cached authorization").unwrap();
+    let install = calls
+        .find("packages apply --manager brew --yes brew:mas")
+        .unwrap();
+    let upgrade = calls
+        .find("packages upgrade --manager brew --yes brew:mas")
+        .unwrap();
+    let store = calls.find("packages apply --manager mas --yes").unwrap();
+    assert!(
+        authorization < install && install < upgrade && upgrade < store,
+        "{calls}"
+    );
+    assert!(fs::symlink_metadata(shim).unwrap().file_type().is_symlink());
+    assert!(!fixture.world.root().join("authorization-prompt").exists());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "P-06"]
+fn unchanged_app_store_with_missing_tool_and_x64_mise_defers() {
+    let fixture = store_fixture();
+    fs::remove_file(fixture.bin.join("mas")).unwrap();
+    fixture.run_args(&["--plain", "up", "--mas"], 0);
+    let calls = fixture.calls();
+    assert!(!calls.contains("cached authorization"));
+    assert!(!calls.contains("packages apply --manager brew"));
+    assert!(!calls.contains("packages apply --manager mas"));
+    assert!(calls.contains("install tools"));
 }

@@ -1,3 +1,4 @@
+mod app_store;
 mod packages;
 mod tools;
 
@@ -111,7 +112,7 @@ fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
             && !run.cancelled()
         {
             let id = run.start_alongside("Mac App Store updates");
-            scope.spawn(move || finish(run, id, packages.update_store(id, &store)));
+            scope.spawn(move || finish(run, id, packages.update_store(id, store)));
         }
 
         let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise);
@@ -220,7 +221,8 @@ fn step(run: &Run<'_>, label: &str, f: impl FnOnce(StageId) -> Step) -> Option<O
 fn finish(run: &Run<'_>, id: StageId, result: Step) -> Option<Outcome> {
     if run.cancelled() {
         // Run owns the interrupted stage and derives the exit status at end.
-        return None;
+        run.finish(id, Outcome::Cancelled);
+        return Some(Outcome::Cancelled);
     }
     let outcome = result.unwrap_or_else(|error| {
         run.issue(id, error);
@@ -251,6 +253,9 @@ fn child(
     cmd: Result<Command, Fail>,
     policy: Policy,
 ) -> Result<(), Issue> {
+    if run.cancelled() {
+        return Err(issue("Update cancelled."));
+    }
     let status = run.run(id, cmd.map_err(issue)?, policy).map_err(issue)?;
     if status.success() {
         Ok(())

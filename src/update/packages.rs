@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde::Deserialize;
 
@@ -9,7 +9,8 @@ use crate::config::Exceptions;
 use crate::process::{Cwd, Mise};
 use crate::run::{Issue, Outcome, Policy, Run, StageId};
 
-use super::{Config, Step, Versions, child, json, mise_command, record_changes, step};
+use super::app_store::{self, Tool};
+use super::{Config, Step, Versions, child, issue, json, mise_command, record_changes, step};
 
 type Status = BTreeMap<String, Manager>;
 type PackageNames = BTreeSet<String>;
@@ -113,11 +114,11 @@ impl Scope {
             .is_some_and(|entry| entry.packages.iter().any(|row| row.package == package))
     }
 
-    fn status(&self, run: &Run<'_>, mise: &Mise<'_>, include_mas: bool) -> Result<Status, Issue> {
-        json(
-            run,
-            self.command_in_run(run, mise, include_mas, ["status", "--json"]),
-        )
+    fn status(&self, run: &Run<'_>, mise: &Mise<'_>, mas: Option<&Tool>) -> Result<Status, Issue> {
+        let command = self
+            .command_in_run(run, mise, mas.is_some(), ["status", "--json"])
+            .map_err(issue)?;
+        json(run, expose_mas(command, mas))
     }
 
     fn status_for(
@@ -126,12 +127,19 @@ impl Scope {
         mise: &Mise<'_>,
         manager: &str,
     ) -> Result<Option<Manager>, Issue> {
-        let cmd = command(run, mise, manager, ["status", "--json"]).map(|mut command| {
-            command.env("MISE_SYSTEM_PACKAGES_PREFER", manager);
-            command
-        });
-        let mut status: Status = json(run, cmd)?;
+        let mut status: Status = json(run, self.status_command_for(run, mise, manager))?;
         Ok(status.remove(manager))
+    }
+
+    fn status_command_for(
+        &self,
+        run: &Run<'_>,
+        mise: &Mise<'_>,
+        manager: &str,
+    ) -> Result<Command, crate::Fail> {
+        let mut cmd = command(run, mise, manager, ["status", "--json"])?;
+        cmd.env("MISE_SYSTEM_PACKAGES_PREFER", manager);
+        Ok(cmd)
     }
 
     fn command_in_run<I, S>(
@@ -188,7 +196,9 @@ pub(super) struct Update<'a, 'ctx> {
 }
 
 pub(super) struct Store {
-    specs: Specs,
+    apply: Command,
+    upgrade: Command,
+    status: Command,
     before: Versions,
     unremovable: Vec<String>,
     tracked: Option<PackageNames>,
@@ -216,22 +226,22 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         if self.scope.managers().next().is_none() || self.run.cancelled() {
             return None;
         }
-        let include_mas = self.authorize_store();
+        let mas = self.prepare_store_tool();
         // Only bare keys need a grouped probe to discover mise's assignment.
         // Native actions still use the full preference scope if that probe fails.
         let resolved = self
             .scope
             .has_bare()
-            .then(|| self.scope.status(self.run, self.mise, include_mas).ok())
+            .then(|| self.scope.status(self.run, self.mise, mas.as_ref()).ok())
             .flatten();
 
         for name in self.scope.managers().filter(|name| *name != "mas") {
             if self.run.cancelled() {
                 break;
             }
-            match self.inspect_manager(name, resolved.as_ref()) {
+            match self.inspect_manager(name, resolved.as_ref(), None) {
                 Ok(Some(manager)) if manager.available && !manager.packages.is_empty() => {
-                    self.update_manager(name, &manager, include_mas, resolved.as_ref());
+                    self.update_manager(name, &manager, mas.as_ref(), resolved.as_ref());
                 }
                 Err(error) => {
                     step(self.run, &format!("Inspect {name} packages"), |_| {
@@ -241,14 +251,11 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 _ => (),
             }
         }
-        if !include_mas || self.run.cancelled() {
-            return None;
-        }
-
+        let mas = mas.as_ref().filter(|_| !self.run.cancelled())?;
         let mut store = None;
         step(self.run, "Prepare Mac App Store updates", |id| {
             let Some(manager) = self
-                .inspect_manager("mas", resolved.as_ref())?
+                .inspect_manager("mas", resolved.as_ref(), Some(mas))?
                 .filter(|manager| !manager.packages.is_empty())
             else {
                 return Ok(Outcome::Skipped);
@@ -269,7 +276,17 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             };
             let tracked = self.tracked_names("mas", &manager, resolved.is_some());
             store = Some(Store {
-                specs,
+                apply: self
+                    .package_command("mas", "apply", &specs, Some(mas))
+                    .map_err(issue)?,
+                upgrade: self
+                    .package_command("mas", "upgrade", &specs, Some(mas))
+                    .map_err(issue)?,
+                status: self
+                    .scope
+                    .status_command_for(self.run, self.mise, "mas")
+                    .and_then(|command| mas.expose(command))
+                    .map_err(issue)?,
                 before: versions("mas", &manager, tracked.as_ref()),
                 tracked,
                 unremovable: manager
@@ -290,8 +307,18 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         &self,
         name: &str,
         resolved: Option<&Status>,
+        mas: Option<&Tool>,
     ) -> Result<Option<Manager>, Issue> {
-        let mut status = self.scope.status_for(self.run, self.mise, name)?;
+        let mut status = if let Some(mas) = mas {
+            let command = self
+                .scope
+                .status_command_for(self.run, self.mise, name)
+                .and_then(|command| mas.expose(command));
+            let mut status: Status = json(self.run, command)?;
+            status.remove(name)
+        } else {
+            self.scope.status_for(self.run, self.mise, name)?
+        };
         if let Some(resolved) = resolved {
             let Some(known) = resolved.get(name) else {
                 return Ok(None);
@@ -352,10 +379,80 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         Ok(specs)
     }
 
-    fn authorize_store(&self) -> bool {
+    fn prepare_store_tool(&self) -> Option<Tool> {
         if !cfg!(target_os = "macos") || !self.scope.includes("mas") || !self.mas {
-            return false;
+            return None;
         }
+        let mut tool = app_store::locate(self.ctx, self.run, self.mise);
+        if tool.is_none() {
+            let can_prepare = self.brew_can_prepare_store_tool();
+            match can_prepare {
+                Ok(true) => (),
+                Ok(false) => {
+                    step(self.run, "Mac App Store tool", |id| {
+                        Ok(self.defer_store_tool(id))
+                    });
+                    return None;
+                }
+                Err(error) => {
+                    step(self.run, "Mac App Store tool", |_| Err(error));
+                    return None;
+                }
+            }
+        }
+        if !self.authorize_store() {
+            return None;
+        }
+        if tool.is_none() {
+            step(self.run, "Mac App Store tool", |id| {
+                app_store::prepare(self.run, id, self.mise)?;
+                tool = app_store::locate(self.ctx, self.run, self.mise);
+                Ok(if tool.is_some() {
+                    Outcome::Completed
+                } else {
+                    self.defer_store_tool(id)
+                })
+            });
+        }
+        tool
+    }
+
+    fn brew_can_prepare_store_tool(&self) -> Result<bool, Issue> {
+        if self
+            .config
+            .exceptions
+            .held_by_for("brew:mas", &self.config.profile)
+            .is_some()
+            || !app_store::brew_can_prepare(self.run, self.mise)?
+        {
+            return Ok(false);
+        }
+        if self.scope.includes("brew")
+            && let Some(manager) = self.scope.status_for(self.run, self.mise, "brew")?
+            && manager.packages.iter().any(|pkg| {
+                pkg.package.rsplit('/').next() == Some("mas")
+                    && (pkg.desired_state != "present" || pkg.requested_version != "latest")
+            })
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn defer_store_tool(&self, id: StageId) -> Outcome {
+        if !self.run.cancelled() {
+            self.run.issue(
+                id,
+                Issue::new(
+                    "Mac App Store updates need an available mas tool.",
+                    "Install or repair mas, then rerun dots up --mas.",
+                ),
+            );
+        }
+        Outcome::Deferred
+    }
+
+    fn authorize_store(&self) -> bool {
         step(self.run, "Mac App Store authorization", |id| {
             if self.cached_authorization()
                 || (io::stdin().is_terminal()
@@ -364,13 +461,15 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             {
                 return Ok(Outcome::Completed);
             }
-            self.run.issue(
-                id,
-                Issue::new(
-                    "Mac App Store updates need administrator authorization.",
-                    "Run dots up --mas in an interactive terminal.",
-                ),
-            );
+            if !self.run.cancelled() {
+                self.run.issue(
+                    id,
+                    Issue::new(
+                        "Mac App Store updates need administrator authorization.",
+                        "Run dots up --mas in an interactive terminal.",
+                    ),
+                );
+            }
             Ok(Outcome::Deferred)
         }) == Some(Outcome::Completed)
     }
@@ -390,7 +489,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         &self,
         name: &str,
         manager: &Manager,
-        include_mas: bool,
+        mas: Option<&Tool>,
         resolved: Option<&Status>,
     ) {
         let packages: Vec<_> = manager.packages.iter().collect();
@@ -406,7 +505,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         for action in ["apply", "upgrade"] {
             let outcome = step(self.run, &format!("{name} packages: {action}"), |id| {
                 let Some(manager) = self
-                    .inspect_manager(name, resolved)?
+                    .inspect_manager(name, resolved, None)?
                     .filter(|manager| manager.available)
                 else {
                     return Ok(Outcome::Skipped);
@@ -442,7 +541,12 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 } else {
                     Policy::Ordinary
                 };
-                let result = self.run_packages(id, name, action, specs, include_mas, policy);
+                let result = child(
+                    self.run,
+                    id,
+                    self.package_command(name, action, specs, mas),
+                    policy,
+                );
                 self.record(id, name, before, tracked.as_ref());
                 result.map(|()| Outcome::Completed)
             });
@@ -452,67 +556,95 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         }
     }
 
-    fn run_packages(
+    fn package_command(
         &self,
-        id: StageId,
         name: &str,
         action: &str,
         specs: &Specs,
-        include_mas: bool,
-        policy: Policy,
-    ) -> Result<(), Issue> {
+        mas: Option<&Tool>,
+    ) -> Result<Command, crate::Fail> {
         let args = [action, "--manager", name, "--yes"]
             .into_iter()
             .chain(specs.0.iter().map(String::as_str));
-        child(
-            self.run,
-            id,
-            self.scope
-                .command_in_run(self.run, self.mise, include_mas, args),
-            policy,
-        )
+        let cmd = self
+            .scope
+            .command_in_run(self.run, self.mise, mas.is_some(), args)?;
+        expose_mas(cmd, mas)
     }
 
-    pub(super) fn update_store(&self, id: StageId, store: &Store) -> Step {
-        for action in ["apply", "upgrade"] {
-            if !self.cached_authorization() {
-                if !self.run.cancelled() {
-                    self.run.issue(id, Issue::new(
-                        "Administrator authorization expired before the App Store update finished.",
-                        "Run sudo -v, then rerun dots up --mas.",
-                    ));
-                    self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
-                }
-                return Ok(Outcome::Deferred);
+    pub(super) fn update_store(&self, id: StageId, store: Store) -> Step {
+        let Store {
+            apply,
+            upgrade,
+            status,
+            before,
+            unremovable,
+            tracked,
+        } = store;
+        let result = self.update_store_packages(id, apply, upgrade, &unremovable);
+        if !self.run.cancelled()
+            && let Ok(output) = self.run.probe_for(id, status)
+            && output.status.success()
+            && let Ok(mut state) = serde_json::from_slice::<Status>(&output.stdout)
+            && let Some(manager) = state.remove("mas").filter(|manager| manager.available)
+        {
+            record_changes(
+                self.run,
+                id,
+                before,
+                versions("mas", &manager, tracked.as_ref()),
+            );
+        }
+        result
+    }
+
+    fn update_store_packages(
+        &self,
+        id: StageId,
+        apply: Command,
+        upgrade: Command,
+        unremovable: &[String],
+    ) -> Step {
+        for (action, command) in [("apply", apply), ("upgrade", upgrade)] {
+            if !self.worker_authorized(id) {
+                return Ok(self.defer_store_authorization(id));
             }
-            if let Err(error) =
-                self.run_packages(id, "mas", action, &store.specs, true, Policy::Ordinary)
-            {
-                self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
-                if action == "apply" && !store.unremovable.is_empty() {
+            if let Err(error) = child(self.run, id, Ok(command), Policy::Ordinary) {
+                if action == "apply" && !unremovable.is_empty() {
                     return Err(Issue::new(
                         format!(
                             "mise could not apply the App Store declarations. mas cannot remove {}.",
-                            store.unremovable.join(", ")
+                            unremovable.join(", ")
                         ),
                         "Remove the apps by hand or delete their absent declarations, then rerun dots up --mas.",
                     ));
                 }
-                if !self.run.cancelled() && !self.cached_authorization() {
-                    self.run.issue(
-                        id,
-                        Issue::new(
-                            "Administrator authorization expired during the App Store update.",
-                            "Run sudo -v, then rerun dots up --mas.",
-                        ),
-                    );
-                    return Ok(Outcome::Deferred);
+                if !self.worker_authorized(id) {
+                    return Ok(self.defer_store_authorization(id));
                 }
                 return Err(error);
             }
         }
-        self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
         Ok(Outcome::Completed)
+    }
+
+    fn worker_authorized(&self, id: StageId) -> bool {
+        !self.run.cancelled()
+            && self.sudo(&["-n", "-v"]).is_ok_and(|command| {
+                self.run
+                    .probe_for(id, command)
+                    .is_ok_and(|output| output.status.success())
+            })
+    }
+
+    fn defer_store_authorization(&self, id: StageId) -> Outcome {
+        if !self.run.cancelled() {
+            self.run.issue(id, Issue::new(
+                "Cached administrator authorization is unavailable in the App Store worker.",
+                "Run sudo -v and retry dots up --mas. If authorization is limited to your terminal, update the declared apps in the App Store.",
+            ));
+        }
+        Outcome::Deferred
     }
 
     fn record(&self, id: StageId, name: &str, before: Versions, tracked: Option<&PackageNames>) {
@@ -522,6 +654,28 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         {
             record_changes(self.run, id, before, versions(name, &manager, tracked));
         }
+    }
+}
+
+fn expose_mas(command: Command, mas: Option<&Tool>) -> Result<Command, crate::Fail> {
+    match mas {
+        Some(tool) => tool.expose(command),
+        None => Ok(command),
+    }
+}
+
+// P-11 owns detached stage sessions. Until its native probe_for lands,
+// withhold authorization rather than launch a worker with the caller's tty.
+trait PendingWorkerProbe {
+    fn probe_for(&self, id: StageId, command: Command) -> io::Result<Output>;
+}
+
+impl PendingWorkerProbe for Run<'_> {
+    fn probe_for(&self, _id: StageId, _command: Command) -> io::Result<Output> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "P-11 detached stage probe is pending",
+        ))
     }
 }
 

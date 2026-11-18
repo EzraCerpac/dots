@@ -1,0 +1,14 @@
+[tools]
+rust = "1.100.0"
+
+[tasks.check]
+run = ".mise/rust-cargo check --locked --all-targets"
+
+[tasks.test]
+run = ".mise/rust-cargo test --locked"
+
+[tasks.build]
+run = ".mise/rust-cargo build --locked"
+
+[tasks.clippy]
+run = ".mise/rust-cargo clippy --locked --all-targets -- -D warnings"

@@ -421,7 +421,7 @@ For these commands, `dots` adds no banner, footer or second copy of a diagnostic
 When such a command is marked "report", its report keeps its stages' outcomes and its exit status, but not the child's raw output or a log path that does not exist.
 
 A report for a failure or an issue that needs attention gives the command to rerun; a report of a success need not.
-`dots sync` shows file contents only as [Receipt](#receipt) allows.
+`dots sync` may log its backends' output privately, and shows file contents only as [Receipt](#receipt) allows.
 When any report cannot be written or finished, `dots` says so on stderr, naming the command, and still exits with the command's own result.
 
 During interactive scrollback, hooks, recipes and steps that `dots` knows are interactive, such as its own `sudo` authorization, run in the foreground and may prompt.
@@ -578,9 +578,6 @@ Each issue carries a diagnostic and a recovery action.
 - Piped output, `--plain` output and saved reports contain metadata only.
 - **New in 1.0:** live and saved sync receipts exclude raw child stderr and may include vetted scanner metadata such as rule, path and line.
 - A missing gitleaks gives a receipt such as `dots sync: kept 2 files on disk · pulled dev +1, main +0 · not pushed`, led by the issue `NOT SHARED: gitleaks not found; local edits kept on disk, nothing pushed` and the action to install it.
-
-`dots sync` omits Git trace and mise log-file overrides from child environments to keep its output and saved reports clean.
-Native mise owns the `history/sync.json` health record, whose `last_error` may contain verbatim transport errors, and `dots` leaves it untouched.
 
 `dots sync --last` replays the latest receipt for this checkout from the recorded Git revisions, without the network and without mise.
 It spends up to three seconds screening patches and keeps up to 1 MiB for the pager.
@@ -827,7 +824,7 @@ A successful scan with no reported skip proceeds to normal confirmation.
 **New in 1.0:** only diverged `publish --all` needs JJ 0.41's detached operation (`--no-integrate-operation`) to screen the exact proposed merge before preview or approval.
 If the capability is unavailable, it exits 1 naming JJ 0.41 before mutation, preview or approval.
 A screening refusal or declined first approval leaves `@` and bookmarks untouched.
-The first approval materializes the pinned local merge after rechecking its inputs.
+As in 0.4.0, the first approval applies the local merge after rechecking the pinned inputs.
 If it conflicts, the merge stays in `@` and the command exits 3 without pushing.
 Declining final approval keeps the approved local merge without creating or moving a publication bookmark, pushing or opening a pull request.
 
@@ -1138,6 +1135,10 @@ On a target bootstrapped by [`dots remote`](#dots-remote), native mise stores a 
 Tracked files end at mode 0600.
 `dots_state_repo` is required for backup, restore and enrollment, and follows [Remotes](#remotes).
 
+When running history operations, `dots` keeps verbatim transport errors out of its output and saved reports and does not forward Git trace or mise log-file overrides.
+Native mise owns its `history/sync.json` health record, whose `last_error` may contain a verbatim transport error.
+`dots` leaves this record untouched.
+
 ### Enrollment
 
 `dots enroll-history`, and stage 6 of `dots bootstrap complete`, prepare a machine for encrypted history:
@@ -1191,8 +1192,8 @@ Backup reads the effective `[settings.history]` setting with `mise settings get 
 Only a successful `true` skips this audit; native sync still applies its own checks.
 If the setting cannot be read as a boolean, backup stops before sync.
 Only native `mise bootstrap dotfiles sync` publishes to the state repository.
-**Changed from 0.4.0:** backup printed `Settings backup published.` on native exit 0 even when conflicts still awaited reconciliation.
-In 1.0, after a successful native sync, backup reads back the validated remote host branch once and reports publication only if the saved checkpoint equals its tip or is an ancestor of it.
+Version 0.4.0 printed `Settings backup published.` on native exit 0 even when conflicts still awaited reconciliation.
+**New in 1.0:** after a successful native sync, backup reads back the validated remote host branch once and reports publication only if the saved checkpoint equals its tip or is an ancestor of it.
 If reconciliation is pending and the checkpoint is absent, backup exits 1, says the checkpoint was kept locally and directs the user to `mise dot status`.
 If the readback cannot verify either outcome, backup exits 1 and reports only that publication could not be confirmed.
 Backup uses one native sync and performs no publication retry or force push.

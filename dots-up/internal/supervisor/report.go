@@ -404,7 +404,7 @@ func printStatusEvent(e ui.Event) {
 		fmt.Printf("dots %s · %s · %s\n", ui.CleanLine(name), ui.CleanLine(e.Profile), ui.CleanLine(e.Host))
 	case "item_upsert":
 		fmt.Printf("  %s · %s  %s — %s\n", ui.CleanLine(e.Group), ui.CleanLine(e.Label), ui.CleanLine(e.Status), ui.CleanLine(e.Summary))
-		if e.Action != "" && e.Status != "ok" && e.Status != "skipped" {
+		if e.Action != "" {
 			fmt.Printf("    %s\n", ui.CleanLine(e.Action))
 		}
 	}

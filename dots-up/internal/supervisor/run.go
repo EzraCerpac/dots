@@ -1339,11 +1339,20 @@ func relayTerminalInput(tty, master *os.File, state *relayState, start <-chan st
 // cancelBackend starts escalation and returns a function to wait for it after the leader exits.
 func cancelBackend(b *backend) func() {
 	process := b.command.Process
+	warnPermission := sync.OnceFunc(func() {
+		fmt.Fprintln(os.Stderr, "dots: permission denied signalling the command; its processes may still be running")
+	})
 	kill := func(signal syscall.Signal) error {
+		var err error
 		if b.processGroup {
-			return syscall.Kill(-process.Pid, signal)
+			err = syscall.Kill(-process.Pid, signal)
+		} else {
+			err = process.Signal(signal)
 		}
-		return process.Signal(signal)
+		if signal != 0 && errors.Is(err, syscall.EPERM) {
+			warnPermission()
+		}
+		return err
 	}
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -1355,9 +1364,7 @@ func cancelBackend(b *backend) func() {
 			return true
 		}
 	}
-	if err := kill(syscall.SIGINT); errors.Is(err, syscall.EPERM) {
-		fmt.Fprintln(os.Stderr, "dots: permission denied signalling the command; its processes may still be running")
-	}
+	_ = kill(syscall.SIGINT)
 	go func() {
 		defer close(done)
 		if graceElapsed(150*time.Millisecond) && kill(syscall.SIGTERM) == nil && graceElapsed(500*time.Millisecond) {

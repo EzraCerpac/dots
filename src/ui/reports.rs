@@ -40,12 +40,12 @@ pub(super) fn list(env: &Env, command: Option<Command>, out: &mut impl Write) ->
     Ok(0)
 }
 
-fn display_path(path: &Path) -> String {
+pub(super) fn display_path(path: &Path) -> String {
     let bytes = path.as_os_str().as_bytes();
     let mut display = String::with_capacity(bytes.len());
     for chunk in bytes.utf8_chunks() {
         for ch in chunk.valid().chars() {
-            if ch == '\\' || ch.is_control() {
+            if ch == '\\' || needs_terminal_escape(ch) {
                 display.extend(ch.escape_default());
             } else {
                 display.push(ch);
@@ -56,6 +56,12 @@ fn display_path(path: &Path) -> String {
         }
     }
     display
+}
+
+pub(super) fn needs_terminal_escape(ch: char) -> bool {
+    // Line separators and bidi controls can change the presentation of adjacent text.
+    ch.is_control()
+        || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 fn outcome(report: &Report) -> &'static str {

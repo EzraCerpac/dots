@@ -53,7 +53,6 @@ fn unchanged_homebrew_prefix_link_launches_dots_without_dots_on_path() {
 }
 
 #[test]
-#[ignore = "P-01"]
 fn unchanged_rejects_a_github_release_page_as_a_repository() {
     let world = World::new();
     let config = world.root().join("config.toml");

@@ -772,7 +772,7 @@ The source is `dots_source_repo`, else the `origin` URL; without either it exits
 
 As in 0.4.0, `dots remote` leaves the target's history settings alone.
 If history is enabled on the target, mise stores tracked files without encryption in plaintext in the target's local history.
-Declaring the file with `encrypt = true` or disabling history on the target avoids that plaintext storage.
+Declaring the file with `encrypt = true` or disabling history on the target prevents new plaintext checkpoints of that file.
 The new [backup publication audit](#dots-backup) checks outgoing history separately and honours mise's `allow_plaintext_history` opt-in.
 
 ### `dots bundle`
@@ -1111,7 +1111,7 @@ Each such file is a native track entry with one `host-ID` profile variant per ma
 The variant names that machine's stream in history, so another machine never applies it.
 A variant that has history must never be renamed or removed.
 When `dots` checks declarations before saving a checkpoint, every spelling of the tracked entry must declare `encrypt = true`.
-Native mise can still save plaintext locally, including on a target bootstrapped by [`dots remote`](#dots-remote).
+On a target bootstrapped by [`dots remote`](#dots-remote), native mise stores a tracked file in plaintext locally when target history is enabled and the file is tracked without encryption.
 Tracked files end at mode 0600.
 `dots_state_repo` is required for backup, restore and enrollment, and follows [Remotes](#remotes).
 

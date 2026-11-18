@@ -258,7 +258,7 @@ chmod +x "$ASDF_INSTALL_PATH/bin/fixture-tool"
         self.succeeded(self.dots("a", "add", "--base", tool, package))
         self.assertEqual((a / "config.toml").read_bytes(), before)
 
-        self.assertRegex(self.succeeded(self.dots("a", "sync")), r"pushed [0-9a-f]{7}")
+        self.assertIn("Shared on dev · 1 file\n  edited config.toml", self.succeeded(self.dots("a", "sync")))
         self.assertEqual(self.installed("b"), set())
         self.assertFalse(self.tool("b").exists())
         self.succeeded(self.dots("b", "up", "--verbose"))

@@ -588,6 +588,25 @@ test('an invalid merged config is neither pushed nor applied', available, t => {
   assert.equal(read(f.a, 'remote'), 'from b\n'); assert.equal(f.remote(), f.dev(f.a));
 });
 
+test('a rejected TOML reports its location without copying source to the receipt or logs', requires('git', 'jq', 'mise'), t => {
+  const f = fixture(t);
+  f.write(f.b, 'config.toml', 'value = "PRIVATE_FIXTURE_LINE" stray\n');
+  git(f.b, 'commit', '-qam', 'Incoming config');
+  git(f.b, 'push', '-q', 'origin', 'dev');
+  const validator = path.join(f.dir, 'validate-with-mise');
+  process.env.FIXTURE_MISE_PARSER = miseBinary();
+  process.env.FIXTURE_MISE_STUB = path.join(f.dir, 'mise');
+  fs.writeFileSync(validator, '#!/bin/sh\ncase "$*" in *"config ls"*) exec "$FIXTURE_MISE_PARSER" "$@" ;; esac\nexec "$FIXTURE_MISE_STUB" "$@"\n', { mode: 0o755 });
+  for (const verbose of [false, true]) {
+    const { text } = f.sync(f.a, { miseBin: validator, stage: 'source-sync', verbose });
+    const saved = read(f.a, '.git/dots-sync-receipt.json');
+    for (const output of [text, saved]) {
+      assert.match(output, /Invalid TOML in config\.toml at line 1, column \d+/);
+      assert.doesNotMatch(output, /PRIVATE_FIXTURE_LINE/);
+    }
+  }
+});
+
 test('a file edited during advancement is not overwritten', available, t => {
   const f = fixture(t);
   f.write(f.b, 'text', 'incoming remote edit\n'); f.sync(f.b);

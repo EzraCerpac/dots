@@ -128,10 +128,22 @@ if [[ "$#" -eq 2 && "$1" == sync && "$2" == --last ]] ||
     if [[ "$1" == internal ]]; then action=sync-present; fi
     shift 2
     if [[ "$action" == sync-last && " $frontend_flags " == *' --plain '* ]]; then set -- --plain; fi
-    if command -v node >/dev/null 2>&1; then exec node "$DOTS_HOME/lib/source-repo.mjs" "$action" "$root" "$@"; fi
     mise_bin="${DOTS_MISE_BIN:-$HOME/.local/bin/mise}"
     [[ -x "$mise_bin" ]] || mise_bin=mise
-    MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 MISE_NO_HOOKS=1 exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/lib/source-repo.mjs" "$action" "$root" "$@"
+    receipt_tool() {
+        local tool
+        tool="$(type -P "$1")" || tool=''
+        if [[ -z "$tool" || "$tool" == */shims/* ]]; then
+            tool="$(MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 "$mise_bin" --no-config which "$1" --tool "$1@latest" 2>/dev/null)" || return 1
+        fi
+        [[ -f "$tool" && -x "$tool" ]] && printf '%s\n' "$tool"
+    }
+    node_bin="$(receipt_tool node)" || { echo 'dots: an installed Node.js is required to read a sync receipt' >&2; exit 1; }
+    if [[ -t 0 && -t 1 && "${1:-}" != --plain ]]; then
+        DOTS_RECEIPT_GITLEAKS="$(receipt_tool gitleaks)" || DOTS_RECEIPT_GITLEAKS=''
+        export DOTS_RECEIPT_GITLEAKS
+    fi
+    exec "$node_bin" "$DOTS_HOME/lib/source-repo.mjs" "$action" "$root" "$@"
 fi
 # A normal invocation refreshes the bundled skill for this installation.
 if [[ -f "$own_home/lib/dots-manager.sh" ]]; then

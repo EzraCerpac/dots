@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { onPath } from './lib/prereq.mjs';
 import { buildReceipt, formatReceipt, inlinePatch, receiptChangeRows, saveReceipt } from '../lib/sync-receipt.mjs';
 
 const modulePath = fileURLToPath(new URL('../lib/sync-receipt.mjs', import.meta.url));
@@ -347,8 +348,20 @@ finally:
         except ProcessLookupError:
             pass
 `;
-  const result = spawnSync('python3', ['-c', driver, process.execPath, ...show, f.root], {
-    env: { ...f.env, TERM: 'xterm', PATH: f.bin + path.delimiter + f.env.PATH, LESS: '-F',
+  // Replay works even when the config is broken and its tools are absent from PATH.
+  f.write('config.toml', 'broken = ???\n');
+  const system = path.join(f.dir, 'system');
+  fs.mkdirSync(system);
+  for (const tool of ['bash', 'dirname', 'git', 'less']) fs.symlinkSync(onPath(tool), path.join(system, tool));
+  const mise = path.join(f.dir, 'mise');
+  fs.writeFileSync(mise, '#!/bin/sh\ncase "$*" in\n' +
+    '  "--no-config which node --tool node@latest") echo "$FIXTURE_NODE" ;;\n' +
+    '  "--no-config which gitleaks --tool gitleaks@latest") echo "$FIXTURE_SCANNER" ;;\n' +
+    '  *) exit 1 ;;\nesac\n', { mode: 0o700 });
+  const dots = fileURLToPath(new URL('../bin/dots', import.meta.url));
+  const result = spawnSync(onPath('python3'), ['-c', driver, dots, 'sync', '--last'], {
+    env: { ...f.env, TERM: 'xterm', PATH: system, LESS: '-F', DOTS_HOME: path.dirname(path.dirname(dots)),
+      DOTS_ROOT: f.root, DOTS_MISE_BIN: mise, FIXTURE_NODE: process.execPath, FIXTURE_SCANNER: f.scanner,
       LESSSECURE_ALLOW: 'shell', LESSOPEN: '|touch ' + stamp },
     encoding: 'utf8', timeout: 20000,
   });

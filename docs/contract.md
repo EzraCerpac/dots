@@ -48,7 +48,8 @@ The configuration is a mise config directory.
 
 `dots` resolves the result to its physical path and exports it to every child as `DOTS_ROOT`.
 A command that needs the configuration stops with exit status 2 and a line naming the path when `config.toml` does not exist there.
-The exceptions are `init`, `help`, `menu`, `--version`, `completions`, `status` (which prints its program list first), and `sync` (which always exits 0).
+The exceptions are `init`, `help`, `menu`, `--version`, `completions`, `bundle`, `brew`, `install-release-app`, `status` (which prints its program list first), and `sync` (which always exits 0).
+Every other built-in command, helper subcommand and configuration command needs the configuration.
 mise children run rooted in the configuration, with `MISE_CONFIG_DIR` set to the root.
 **Changed from 0.3.5:** every command except `dots bootstrap persist-selected` ignores the caller's `MISE_ENV`, so a project's environment selector never leaks in; the machine's own selection comes from its persisted files.
 
@@ -101,7 +102,9 @@ A machine persists its selection in two ignored files, both mode 0600:
 - `config.local.toml` records the profile as `env.SETUP_PROFILE`, the machine ID as `env.SETUP_MACHINE_ID`, and `settings.history.sync = "manual"`; with a history origin it also records that origin and the branch `host-ID`.
 
 Both files are validated with mise before either changes, and each is replaced atomically.
-A `miserc.toml` that selects two profiles or two `host-` IDs is ambiguous, and `dots` stops with exit status 2 until it is fixed by hand.
+A `miserc.toml` that selects two profiles or two `host-` IDs is ambiguous.
+`dots` never chooses between them: every command that reads the selection stops with exit status 2 and names `dots profile --profile PROFILE --machine-id ID` as the fix.
+That command is the one exception: it replaces every profile and `host-` selector with the given pair and keeps the other selectors, under the same validation and atomic replacement.
 Commands take the profile and machine ID from `SETUP_PROFILE` and `SETUP_MACHINE_ID` in the environment when set, else from the persisted selection.
 
 ## First run
@@ -129,14 +132,17 @@ dots init
 dots up
 ```
 
-On a fresh configuration, `dots up` skips the checkpoint because nothing is tracked, skips the sync stage with one line because there is no remote, finds no packages, exceptions or hooks, and exits 0 with nothing under "Needs attention".
-The sync stage makes no network call in local-only mode; the update stages behave as they do on any machine.
+On a fresh configuration, `dots up` skips the checkpoint because nothing is tracked, skips the sync stage with one line because there is no remote, and finds no packages, exceptions or hooks.
+When its ordinary update stages succeed, including the standalone mise update, which needs the network, it exits 0 with nothing under "Needs attention".
+The skipped sync stage makes no network call and is never a reason for attention or failure; a failure of another stage is reported and makes `dots up` exit 1 as on any machine.
 
 ### `dots init [DIR]`
 
 `DIR` defaults to the configuration root, and `init` creates it when missing.
 Each output line names an item and whether `init` created, added or kept it.
 Running `init` again changes nothing it made before.
+Every command `init` prints names `DIR` quoted for the shell.
+When `DIR` is not the configuration root that `dots` would select, `init` says so and prints each later `dots` command with `DOTS_ROOT` set, for example `DOTS_ROOT='/path/to/dotfiles' dots up`.
 
 Git shape comes first.
 `init` inspects the repository around `DIR` before it writes anything:
@@ -155,19 +161,19 @@ Then, in order:
 3. **Machine ID.** A valid persisted machine ID is kept.
    Otherwise `init` takes the hostname up to its first `.`, lowercases it, replaces each run of characters outside `a-z0-9` with one `-`, and trims `-` from both ends.
 4. When the hostname is unavailable, the result is empty, or the persisted selection is ambiguous, `init` stops with exit status 2.
-   It keeps the files it wrote and says to run `dots profile --profile PROFILE --machine-id ID` and then `dots init` again, which finishes the remaining steps.
+   It keeps the files it wrote and prints `dots profile --profile PROFILE --machine-id ID` and `dots init DIR`, both aimed at `DIR`; the second run finishes the remaining steps.
 5. **Selection.** `init` persists the profile and machine ID as `dots profile` does.
 6. **Repository.** For a new repository, `init` creates the seed commit described below.
    For an existing repository, `init` commits nothing, stages nothing, keeps every branch and all history, and reports each problem that sync would stop on (see [Checkout shape](#checkout-shape)), with its fix.
+   When `HEAD` is on `main` with commits and no uncommitted changes, and neither a local `dev` nor an `origin/dev` exists, the fix it prints is `git -C DIR switch -c dev`; otherwise it prints no branch command.
 7. **Remote.** See below.
 
 `init` exits 0 when every step it attempted succeeded, apart from the optional remote step.
 
 The seed commit:
 
-- It contains only files that this run of `init` wrote from embedded templates, byte-identical to them.
-- It never contains a file that existed before `init`, a file whose path the repository or the user ignores, or anything already in the index.
-- A `config.toml` that existed before `init` is therefore not in it, even when `init` added a setting.
+- It contains exactly the files at embedded template paths that are regular files, not ignored by the repository or the user, whose bytes and file mode equal the embedded template, whichever run of `init` wrote them.
+- Every other file stays out of it and on disk as it is, including a `config.toml` that differs from its template because it existed before `init` or was edited since.
 - Without a configured Git identity, `init` supplies a synthetic author for that one commit only, on the command line; it never writes Git configuration.
 - `main` and `dev` both point at it, and `HEAD` is on `dev`.
 
@@ -189,7 +195,8 @@ The remote step:
    ```
 
 7. It says that these publish only the seed, and that later changes are shared with `dots sync`, which scans them first.
-8. For any other repository it prints neither command, so a new remote is never seeded with unscanned local files.
+8. For any other repository without `origin`, it prints only `git -C DIR remote add origin URL`, followed by `dots sync` on `dev`, which scans every local commit before it pushes `dev`.
+   It never prints a push for such a repository, so a new remote is never seeded with unscanned files, and `main` on the remote stays as the user leaves it.
 
 ### Remotes
 
@@ -206,6 +213,8 @@ The remote step:
 In local-only mode, the sync stage of `dots up` is skipped with one line, and `dots sync` prints a one-line receipt saying how to add a remote, then exits 0.
 Local-only sync makes no network call, runs no scan and makes no commit.
 A configuration that names a remote, or has an `origin`, is never local-only: an unreachable remote is reported as offline and work waits for the next run.
+A reachable `origin` without `dev` or `main` is online, not offline.
+Sync then scans every local commit that no published branch contains, creates `dev` with an ordinary push, and treats a missing `main` as empty; sync never creates or moves `main`.
 
 A repository setting is GitHub `OWNER/NAME`, a GitHub URL, or another Git URL.
 
@@ -214,14 +223,17 @@ A repository setting is GitHub `OWNER/NAME`, a GitHub URL, or another Git URL.
 - A GitHub repository matches an `origin` spelled as any of those six URLs.
   **Changed from 0.3.5:** the source repository accepted five `origin` spellings, without `ssh://git@github.com/OWNER/NAME`.
 - Any other Git URL matches only an `origin` with exactly the same string.
-- Accepted URL forms are `ssh://`, scp-like `user@host:path`, `https://` and `file://`.
+  The comparison is literal: `dots` does not recognize another spelling or alias of the same repository.
+- Accepted URL forms are `ssh://`, scp-like `[user@]host:path`, `git://`, `http://`, `https://` and `file://`.
 - `dots` refuses a URL that carries a password or token, a `TRANSPORT::ADDRESS` remote-helper form such as `ext::`, and a value starting with `-`.
 - Credentials come from the user's normal Git setup: SSH keys, or a configured credential helper.
 
 `dots` passes a URL to Git as one argument and never through a shell.
-Before any push, `dots` resolves the effective fetch URL and every effective push URL after Git's URL rewrites, and refuses the push unless each one matches the expected repository.
+Before it fetches, clones, adopts or pushes, `dots` resolves the effective fetch URL and every effective push URL after Git's URL rewrites on this machine, and stops before contacting the remote unless each one matches the expected repository.
+For the source repository that is `dots_source_repo` when set, else the `origin` URL as configured; for history it is `dots_state_repo`.
 No URL that `dots` prints, logs or stores carries credentials.
 The source and state repositories are independent, and must not resolve to the same repository; `dots` refuses a history push whose destination is the source repository.
+For URLs other than GitHub's, that check is the same literal comparison, so an alias of the source repository is not detected.
 A local-only configuration may keep settings history in a state repository.
 `dots publish` works only with a GitHub repository.
 
@@ -315,7 +327,7 @@ Built-in names win over configuration commands of the same name.
 | 0 | Success, including a run whose only problems are deferred or skipped stages |
 | 1 | A failure, including a missing program for the requested action |
 | 2 | A usage or configuration error: unknown command or option, invalid arguments, missing configuration, invalid `[vars]`, missing mise |
-| 3 | Deferred: `dots publish` stopped by conflicts; `dots enroll-history` with no tracked file for this machine; `dots brew defer-for-admin`; a deferral in `dots brew update-cask` |
+| 3 | Deferred: `dots publish` stopped by conflicts; `dots enroll-history` with no tracked file for this machine, or with no recipient other than this machine's own key; `dots brew defer-for-admin`; a deferral in `dots brew update-cask` |
 | 4 | Skipped: a `dots brew` install, update or hold command on a system other than macOS |
 
 Configuration commands, `dots test` and `dots mise` exit with their child's status.
@@ -383,8 +395,9 @@ The stages run in this order:
 1. **Pre-update checkpoint.** Saves tracked settings, after checking that every tracked entry is encrypted.
    With nothing tracked, it is skipped without attention.
    When it fails, no update starts and `dots up` exits 1.
-2. **Sync**, as `dots sync`; skipped with one line in local-only mode.
-   A sync problem is an issue; later stages still run.
+2. **Sync**, as `dots sync`.
+   In local-only mode it is skipped with one line and needs no attention.
+   A sync problem makes the stage deferred: it is listed under "Needs attention", later stages still run, and on its own it never makes `dots up` exit 1.
 3. **Reload.** Later stages use the configuration as sync left it.
 4. **Packages.** Each available package manager with declarations for this profile and machine gets its own pass.
    Missing declared casks are installed; installed casks are upgraded unless their metadata marks them auto-updating or `dots_self_updating_casks` lists them.
@@ -424,18 +437,18 @@ Package, tool and standalone mise changes come from comparing state before and a
 1. Saves tracked history, refusing any tracked entry that is not `encrypt = true`.
 2. Captures edits to copied dotfiles: when the deployed copy changed and its source still matches the last common version, the deployed bytes become the source.
    When both the copy and the source changed, both stay as they are and sync reports it.
-3. Commits every tracked or unignored public file onto `dev`, leaving machine-local files out.
-4. Scans that commit with gitleaks.
-   A flagged file stays on disk and out of `dev`; the rest is shared.
-   A flagged commit already in `origin/dev..dev`, or one that ever tracked a machine-local file, blocks the push.
-   Without a working gitleaks nothing is shared or pushed.
+3. Stages every tracked or unignored public edit as a candidate commit, leaving machine-local files out, without moving `dev` or the index.
+4. Scans the candidate with gitleaks before `dev` or the index advances.
+   A flagged file stays on disk and out of the candidate, and the remaining candidate is scanned again; only a clean candidate becomes `dev`.
+   Without a working gitleaks, or when a scan fails, the candidate is dropped, the edits stay on disk, and nothing is shared or pushed.
+   A flagged commit already in local history that no published branch contains, or one that ever tracked a machine-local file, blocks the push; sync never rewrites the branch to remove it.
 5. Fetches `dev` and `main`, or continues offline.
 6. Merges local work with `origin/dev`, then with `origin/main`, outside the live files.
    On a conflicting hunk, `main` wins over `dev` and `dev` wins over local work.
    Binary, file-type and delete conflicts take the published file whole.
    Both parents stay in history, so the losing version is recoverable.
 7. Validates the merged configuration with this machine's local files; an invalid result is neither pushed nor applied.
-8. Pushes by fast-forwarding `origin/dev` only, conditional on the remote tip it validated, and retries a lost race up to three times.
+8. Pushes by creating or fast-forwarding `origin/dev` only, conditional on the remote tip it validated, and retries a lost race up to three times.
    If published history disappears during a retry, sync keeps local work and applies nothing from the withdrawn history.
    A push that takes longer than 60 seconds is stopped, and Git never prompts for credentials.
 9. Updates the checkout and applies dotfiles under the guarded rules below.
@@ -481,6 +494,7 @@ A bare name is software even when it starts with a dot, so adopt `~/.zshrc` from
 A relative file request is resolved against the caller's directory.
 The selectors are `--base` (`config.toml`), `--profile P` (`config.P.toml`) and `--path FILE`; at most one may be given.
 Without a selector, `dots add` writes to the selected profile's file, and stops with exit status 2 when no profile is selected.
+A selected file that does not exist, such as a new `config.PROFILE.toml`, is created only once a request succeeds; a failed request leaves no new or empty file.
 `--asset` or `--keep-installed` with a file request exits 2.
 
 ### `dots add SOFTWARE...`
@@ -536,11 +550,18 @@ Settings and app data stay where they are.
 `--keep-installed` deletes only the declaration.
 `--dry-run` prints the plan and changes nothing.
 
-**New in 1.0:** a file target is an adopted dotfile when the target is a symlink to `ROOT/dotfiles/REL`, and exactly one declaration in all of `ROOT`'s configuration files, for any profile or machine, uses that source, with `mode = "symlink"`.
+**New in 1.0:** a file target is an adopted dotfile when all of these hold, with paths compared after normalization:
+
+- the target is a symlink whose destination is exactly `ROOT/dotfiles/REL`, where `REL` is the target's path relative to `HOME`;
+- the source is a regular file, and no parent directory below `ROOT` is a symlink or a non-directory;
+- exactly one declaration in all of `ROOT`'s configuration files, for any profile or machine, is `"~/REL" = { source = "dotfiles/REL", mode = "symlink" }`, in the selected file when a selector is given;
+- no other declaration names that target or uses that source.
+
 For such a target, `dots remove` replaces the link with a regular file holding the source's current bytes and mode, then removes the declaration and the source.
 Edits made through the link are therefore kept.
 It refuses, with exit status 2 and nothing changed, any other file target, and any target whose uniqueness it cannot prove, for example because a configuration file does not parse.
-If the link, the source or the configuration file changes while this happens, or a step fails, it puts back the link, the source with its mode, and the configuration file, never overwrites a file it did not create, and exits 1.
+If the link, the source or the configuration file changes while this happens, or a step fails, it stops with exit status 1.
+It then puts back the link, the source with its mode, and the configuration file only where nothing changed them since; a later edit is kept, and `dots` never overwrites a file or an edit it did not make.
 A rerun after an interruption either finishes the removal or reports exactly what is left to reconcile.
 No record of earlier adoptions is needed.
 
@@ -550,10 +571,14 @@ No record of earlier adoptions is needed.
 dots bootstrap [--bundle FILE] [--identity KEY] [--restore ID] [MISE-BOOTSTRAP-ARGS...]
 ```
 
-It runs mise's native bootstrap for the whole declared setup, skipping dirty dotfiles, with `DOTS_ROOT` exported.
+It runs mise's native bootstrap for the whole declared setup with `--skip-dirty`, with `DOTS_ROOT` exported.
+On mise 2026.11.9, a dotfile target that already held other bytes made the native bootstrap exit 1 despite `--skip-dirty`, so not every collision is skipped.
+`dots bootstrap` then reports the native failure, exits 1, and leaves the target's bytes as they are.
+When the native bootstrap stops before its final task, `dots bootstrap complete` does not run, and `dots bootstrap` says so instead of running it separately.
 Relative `--bundle` and `--identity` paths are resolved against the caller's directory.
 `--identity` names the external age identity for both the bundle and recovery.
-`--restore ID` restores that machine's settings history; `ID` must be a valid machine ID, it cannot be combined with `--only`, and mise's services step waits for the completion step.
+`--restore ID` restores that machine's settings history; `ID` must be a valid machine ID, and it cannot be combined with `--only`.
+With `--restore`, `dots` skips mise's services step in the native bootstrap, so no history watcher runs before the restore; the completion stage restores first, and enrollment then activates the watcher.
 
 A configuration connects bootstrap to `dots` in two places:
 
@@ -563,6 +588,9 @@ A configuration connects bootstrap to `dots` in two places:
 pre-dotfiles = 'SETUP_PROFILE=laptop "$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots bootstrap persist-selected'
 
 # config.toml
+[tools]
+"github:EzraCerpac/dots" = "1.0.0"
+
 [tasks.bootstrap]
 description = "Finish the dots bootstrap"
 run = 'dots bootstrap complete'
@@ -570,8 +598,9 @@ raw = true
 ```
 
 On mise 2026.11.9, with only `/usr/bin:/bin` on `PATH`, a native bootstrap ran the `pre-dotfiles` hook before dotfiles were applied and without `mise` on `PATH`, then applied dotfiles, ran the `post-dotfiles` hook, ran the tools step, and ran the `bootstrap` task last.
-So the `pre-dotfiles` hook locates the standalone mise itself and runs a pinned `dots` through `mise x`.
-Unverified: that `mise x` fetches a pinned `dots` that is not yet installed.
+So the `pre-dotfiles` hook locates the standalone mise itself and runs `dots` through `mise x github:EzraCerpac/dots`, which uses the version that `[tools]` in `config.toml` pins, here 1.0.0.
+On mise 2026.11.9 on macOS, with an empty temporary `HOME` and data, state and cache directories, and `"github:EzraCerpac/dots" = "0.3.5"` in `[tools]`, a `pre-dotfiles` hook running `mise x github:EzraCerpac/dots -- dots --version` through the standalone mise fetched and installed the pinned 0.3.5 before it existed and printed its version; dotfiles were then applied, the tools step found `dots` already installed, and the bootstrap exited 0.
+That verifies resolving the pin and launching it from the hook, not the 1.0 callback itself.
 
 `dots bootstrap persist-selected` persists the profile and machine ID as `dots profile` does.
 It keeps an existing persisted profile and machine ID.
@@ -584,7 +613,11 @@ It never runs a full bootstrap.
 
 1. **Private inputs.** Selects, decrypts and validates a bundle as in [Bootstrap bundle](#bootstrap-bundle), and remembers the identity path in `config.local.toml`.
 2. **Source repository.** Moves a fresh clone that is still on `main`, with no edits, to `dev`.
-3. **Restore private settings**, only with `--restore`: as `dots restore --initialize-history`, with the recovery identity.
+3. **Restore private settings**, only with `--restore`.
+   The history origin is the one recorded in `config.local.toml` when it matches `dots_state_repo`; otherwise it comes from `dots_state_repo`, where `OWNER/NAME` becomes `https://github.com/OWNER/NAME` and a URL is used as written.
+   Before restoring, bootstrap records that origin, the branch `host-ID` and the recovery identity in `config.local.toml`.
+   A recorded origin that does not match `dots_state_repo`, or a recorded recovery identity other than the one in use, stops the stage with nothing changed; a recorded value is never replaced by a default.
+   It then restores as `dots restore --initialize-history`, with the recovery identity and the user's normal Git credentials.
 4. **Installer exceptions**, as `dots exceptions`.
 5. **Bootstrap hooks**, in name order, each its own stage.
 6. **Encrypted local history**, only when `dots_state_repo` or `SETUP_HISTORY_ORIGIN` is set; see [Enrollment](#enrollment).
@@ -817,7 +850,7 @@ Selection:
 - The bundle is `--bundle FILE` when given, else `encrypted/bootstrap.PROFILE.json.age` when it exists.
 - A bundle is requested when that profile file exists, or when a bundle or bundle identity was given now or remembered from an earlier run.
 - The identity is `--identity KEY`, else the remembered bundle identity, else, for a requested bundle, the recovery identity.
-- The recovery identity is `SETUP_AGE_IDENTITY`, else the one recorded in `config.local.toml`, else `~/.config/age/keys.txt`.
+- The recovery identity is `--identity KEY`, else `SETUP_AGE_IDENTITY`, else the one recorded in `config.local.toml`, else `~/.config/age/keys.txt`.
 - A requested bundle whose file or identity is missing makes the private inputs stage deferred, with `dots bootstrap --bundle FILE --identity FILE` as the next step.
 
 **New in 1.0:** bundle values reach bootstrap hooks through `DOTS_BUNDLE_FD`.
@@ -877,6 +910,10 @@ Tracked files end at mode 0600.
 - Each machine has its own age identity at `~/.config/age/keys.txt`; when it is missing, bootstrap generates one, creating it exclusively with mode 0600 in a mode-0700 directory.
 - Another machine's private key, and the recovery identity's private key, are never copied.
 - The recipients are this machine's public key, the recovery identity's public key and the bundle's recipients; they are stored only in `config.local.toml`, never in shared files.
+- Bootstrap enrolls only once private recovery is ready and the recovery identity file exists; otherwise the stage is deferred.
+- Enrollment needs at least one recipient other than this machine's own public key: a recovery identity with a different key, a bundle recipient or a `--recipient`.
+  The default recovery identity is the machine identity's own path, so it alone never qualifies.
+  Without such a recipient, enrollment exits 3 and the bootstrap stage is deferred, naming `--identity` or `SETUP_AGE_IDENTITY` as the way to supply a separate recovery identity; the machine's own key is never described as a recovery backup.
 - The identity is a readable regular file outside the configuration root, named by an absolute path or one starting with `~/`.
 - Every tracked file this machine keeps is set to mode 0600; a tracked path that is a symlink or lies outside `HOME` is refused.
 - When no tracked file names this machine's `host-ID` profile yet, enrollment exits 3 and the bootstrap stage is deferred.
@@ -892,7 +929,8 @@ It stops with exit status 2 at the first failed check:
 1. History sync is `manual`.
 2. The machine ID is set, and the branch is `host-ID`.
 3. `dots_state_repo` is valid.
-4. Every tracked entry is encrypted and uses this machine's `host-ID` variant.
+4. Every tracked entry active on this machine is encrypted and active only through this machine's `host-ID` variant.
+   Entries whose variants name only other machines are not active here, are never saved here, and are not checked.
 5. mise's effective history origin branch is `host-ID`.
 6. Every effective push URL of the history store, after Git's URL rewrites, matches `dots_state_repo` and is not the source repository.
 
@@ -900,7 +938,7 @@ Then it saves a checkpoint, publishes it to the state repository, and says so.
 
 ### `dots restore [--initialize-history]`
 
-- It needs a history origin in machine-local configuration that matches `dots_state_repo`.
+- It needs a history origin in machine-local configuration that matches `dots_state_repo`, and checks the effective fetch URL as in [Remotes](#remotes) before contacting it.
 - It never adopts private history into the public source checkout.
 - Before anything else it checks the user's mise history watcher process and its launchd or systemd service, and stops when the watcher runs or its state cannot be confirmed; it never stops services itself.
 - It never saves or publishes during restore; it fetches only, and publication stays a separate `dots backup`.
@@ -953,10 +991,11 @@ A directory, a file or any other link at those paths belongs to the user; `dots`
 
 ## mise behaviour this contract relies on
 
+The supported minimum stays mise 2026.11.8; the probes below ran on 2026.11.9, and 2026.11.8 was not exercised separately.
 Run on mise 2026.11.9 with an isolated configuration:
-`mise config get`; `mise -E default,host-example exec`; `mise x -- COMMAND` without a tool; `mise bootstrap dotfiles apply` creating a link; `mise bootstrap plan`; `mise bootstrap dotfiles status --json`; `mise bootstrap --skip-dirty --yes` with its hook, dotfile, tools and task order as described under [`dots bootstrap`](#dots-bootstrap); the `--adopt URL` syntax in `mise bootstrap remote --help`.
+`mise config get`; `mise -E default,host-example exec`; `mise x -- COMMAND` without a tool; `mise bootstrap dotfiles apply` creating a link; `mise bootstrap plan`; `mise bootstrap dotfiles status --json`; `mise bootstrap --skip-dirty --yes` with its hook, dotfile, tools and task order as described under [`dots bootstrap`](#dots-bootstrap), and its exit 1 on a conflicting target; `mise x github:EzraCerpac/dots -- COMMAND` from a `pre-dotfiles` hook fetching the pinned version before it was installed, on macOS; the `--adopt URL` syntax in `mise bootstrap remote --help`.
 Relied on as 0.3.5 uses them, not run again for this document:
-`mise x TOOL -- COMMAND` fetching a missing pinned tool; history save, sync, rollback and tracked-path listing; package bootstrap; services; `mise upgrade --no-prune`; `mise unuse`; tool pruning; `mise self-update`; a real remote enrollment.
+history save, sync, rollback and tracked-path listing; package bootstrap; services; `mise upgrade --no-prune`; `mise unuse`; tool pruning; `mise self-update`; a real remote enrollment.
 
 ## Internal and subject to change
 
@@ -979,7 +1018,7 @@ An implementation may choose and change these freely; nothing outside `dots` may
 | `DOTS_HOME` and `dots internal home` | One executable has no manager directory |
 | The `dots internal` namespace | Replaced by public commands; see [Replacing 0.3.5 interfaces](#replacing-035-interfaces) |
 | The sourced libraries in `lib/` | Replaced by subcommands, so hooks need no Bash |
-| The separate `dots-up` renderer, its capability handshake, `DOTS_UP_BIN`, `--backend` and its event protocol | The dashboard is part of the one executable |
+| The separate `dots-up` renderer, its `--capabilities` handshake (`dots-shared-cli/3`), `DOTS_UP_BIN`, `--backend` and its event protocol | The dashboard is part of the one executable |
 | The Bash updater fallback and its logs | There is nothing to fall back from |
 | Bash, Node.js, uv and jq as requirements | The executable needs none of them |
 | `dots atuin-bundle`, `dots atuin-login`, `dots_atuin_username`, `encrypted/atuin.json.age`, the Atuin status section and bootstrap stage | App enrollment belongs to configurations, as hooks and commands |

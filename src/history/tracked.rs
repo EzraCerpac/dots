@@ -91,8 +91,13 @@ fn inactive_invalid_paths(
         .env("MISE_HISTORY_ENABLED", "false")
         .env("MISE_HISTORY_SYNC", "manual")
         .env("GIT_ALLOW_PROTOCOL", "");
-    let status: Status = serde_json::from_slice(&native.output(cmd, diagnostic)?)
-        .map_err(|_| invalid(diagnostic))?;
+    let output = native.probe(cmd, diagnostic)?;
+    if !output.status.success() {
+        // A malformed declaration can be absent from status completely.
+        // Keep the paths command's configuration error in that case.
+        return Ok(BTreeSet::new());
+    }
+    let status: Status = serde_json::from_slice(&output.stdout).map_err(|_| invalid(diagnostic))?;
     Ok(status
         .files
         .into_iter()

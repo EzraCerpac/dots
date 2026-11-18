@@ -733,28 +733,22 @@ fn rust_owned_launch_restores_pinned_dots_after_mise_preserving_exec_contract() 
             shadow.parent().unwrap().parent().unwrap().display()
         ),
     );
-    let pinned = f.base.join("owned-bin/dots");
-    fs::create_dir(pinned.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_dots"), &pinned).unwrap();
-    let hook = f.script(
-        "hook",
+    let executable = dots_bin();
+    let pinned_snapshot = f.base.join("pinned-executable");
+    f.script(
+        "config/tests/run",
         r#"
 set -eu
 printf '[%s]\n' "$@"
-printf '%s\n' "$PWD" "$FROM_MISE" "${REMOVED-unset}" "$(command -v dots)"
+pinned=$(command -v dots)
+cat "$pinned" > "$FIXTURE_PINNED_SNAPSHOT"
+printf '%s\n' "$PWD" "$FROM_MISE" "${REMOVED-unset}" "$pinned"
 cat
 cat <&9
 printf 'hook stderr\n' >&2
 exit 39
 "#,
     );
-    // Mise sees only UTF-8 paths. The private argument file carries the
-    // program and its exact argv, including a raw byte and an empty argument.
-    let mut arguments = hook.as_os_str().as_bytes().to_vec();
-    arguments.extend_from_slice(b"\0--help\0one two\0\0\xff\0");
-    let args_file = pinned.parent().unwrap().join("argv-test");
-    fs::write(&args_file, arguments).unwrap();
-    fs::set_permissions(&args_file, fs::Permissions::from_mode(0o600)).unwrap();
     let fd = f.base.join("fd");
     fs::write(&fd, "inherited fd\n").unwrap();
     let input = f.base.join("input");
@@ -764,25 +758,17 @@ exit 39
         r#"
 exec 9<"$1"
 shift
-exec mise exec -- "$@"
+exec "$@"
 "#,
     );
     let output = f
         .command(launcher)
         .current_dir(&f.config)
         .env("REMOVED", "from caller")
-        .env(
-            "PATH",
-            std::env::join_paths(
-                [pinned.parent().unwrap().to_path_buf()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-            )
-            .unwrap(),
-        )
-        .args([fd, pinned.clone()])
-        .arg("__exec")
-        .arg("argv-test")
+        .env("FIXTURE_PINNED_SNAPSHOT", &pinned_snapshot)
+        .args([&fd, &executable])
+        .args(["test", "--help", "one two", ""])
+        .arg(OsString::from_vec(vec![0xff]))
         .stdin(Stdio::from(fs::File::open(input).unwrap()))
         .output()
         .unwrap();
@@ -793,15 +779,31 @@ exec mise exec -- "$@"
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stderr, b"hook stderr\n");
+    assert!(
+        fs::read(pinned_snapshot).unwrap() == fs::read(executable).unwrap(),
+        "the pinned executable differs from the running dots binary"
+    );
     let prefix = b"[--help]\n[one two]\n[]\n[\xff]\n";
     assert_eq!(&output.stdout[..prefix.len()], prefix);
-    assert_eq!(
-        &output.stdout[prefix.len()..],
-        format!(
-            "{}\nresolved\nunset\n{}\ninherited stdin\ninherited fd\n",
-            f.config.display(),
-            pinned.display()
-        )
-        .as_bytes()
+    let tail = std::str::from_utf8(&output.stdout[prefix.len()..]).unwrap();
+    let lines: Vec<_> = tail.lines().collect();
+    let [cwd, resolved, removed, pinned, stdin, fd] = lines.as_slice() else {
+        panic!("unexpected hook output: {tail:?}");
+    };
+    assert_eq!(Path::new(cwd), f.config);
+    assert_eq!((*resolved, *removed), ("resolved", "unset"));
+    assert_eq!((*stdin, *fd), ("inherited stdin", "inherited fd"));
+    let pinned = Path::new(pinned);
+    assert!(pinned.starts_with(&f.base), "pinned path: {pinned:?}");
+    assert_eq!(pinned.file_name(), Some(OsStr::new("dots")));
+    assert!(
+        pinned
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .as_bytes()
+            .starts_with(b"dots-run-"),
+        "pinned path: {pinned:?}"
     );
 }

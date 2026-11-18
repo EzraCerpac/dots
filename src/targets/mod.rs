@@ -10,6 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
 
+pub(crate) use names::{github_repo, safe_text};
+#[cfg(target_os = "macos")]
+pub(crate) use ownership::{AppInstallation, marker_filename};
 pub use ownership::{OwnedApp, OwnershipError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

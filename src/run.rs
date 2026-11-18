@@ -35,6 +35,10 @@ pub struct Run<'a> {
 }
 
 impl<'a> Run<'a> {
+    pub fn ctx(&self) -> &'a Ctx {
+        self.ctx
+    }
+
     pub fn begin(ctx: &'a Ctx, sink: Sink) -> Self {
         Self {
             ctx,
@@ -180,6 +184,7 @@ impl<'a> Run<'a> {
                 command,
                 finished_at_ms: report::timestamp(),
                 status,
+                cancelled: false,
                 next,
                 stages,
             };

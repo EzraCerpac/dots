@@ -83,6 +83,8 @@ pub struct Issue {
     pub next: String,
     pub tail: Option<String>,
     pub log: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_exit: Option<u8>,
 }
 
 impl Issue {
@@ -92,6 +94,7 @@ impl Issue {
             next: next.into(),
             tail: None,
             log: None,
+            terminal_exit: None,
         }
     }
 }
@@ -103,6 +106,7 @@ pub enum Outcome {
     Deferred,
     Skipped,
     Failed,
+    Cancelled,
 }
 
 impl Outcome {
@@ -131,6 +135,8 @@ pub struct Report {
     pub command: Command,
     pub finished_at_ms: u64,
     pub status: u8,
+    #[serde(default)]
+    pub cancelled: bool,
     pub next: Option<String>,
     pub stages: Vec<Stage>,
 }
@@ -267,6 +273,11 @@ pub fn load(env: &Env, id: &Id) -> io::Result<Report> {
     let dir = state.join("reports");
     check_directory(&dir, 0o077)?;
     read_json(&dir.join(&id.0))
+}
+
+/// The saved file identified by an entry returned from `list`.
+pub(crate) fn path(env: &Env, id: &Id) -> io::Result<PathBuf> {
+    Ok(env.state_dir()?.join("reports").join(&id.0))
 }
 
 fn fragment_dir(path: &Path) -> io::Result<&Path> {

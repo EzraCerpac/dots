@@ -1,5 +1,6 @@
 mod version;
 
+pub(crate) use version::installer;
 pub use version::version;
 
 use std::ffi::OsString;

@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+root=$PWD
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -C|--cd) root=$2; shift 2 ;;
+        -E|--env) shift 2 ;;
+        -q|--quiet|--no-config) shift ;;
+        *) break ;;
+    esac
+done
+printf '%s\n' "$*" >> "$HOME/mise-calls"
+
+case "${1:-} ${2:-} ${3:-}" in
+    '--version  ') printf '%s\n' '2026.11.9' ;;
+    'config get --file')
+        # Read only the string settings used by these fixtures.
+        case "$5" in
+            vars.*)
+                key=${5#vars.}
+                value=$(sed -n "s/^$key = \"\([^\"]*\)\"$/\1/p" "$4")
+                [ -n "$value" ] || exit 1
+                printf '%s\n' "$value" ;;
+            *) exit 1 ;;
+        esac ;;
+    'config ls '*)
+        if [ "${FIXTURE_CONFIG_FAILURE:-0}" = 1 ]; then
+            printf '%s\n' 'mise: invalid fixture setting' >&2
+            exit 1
+        fi
+        if [ "${3:-}" = --json ]; then
+            printf '[{"path":"%s/config.toml"}]\n' "$root"
+        fi ;;
+    'exec -- '*)
+        shift 2
+        if [ -n "${FIXTURE_MISE_PATH:-}" ]; then
+            PATH="$FIXTURE_MISE_PATH:$PATH"
+            export PATH FIXTURE_MISE_PATH_APPLIED=1
+        fi
+        exec "$@" ;;
+    'which dots ')
+        [ -f "$HOME/manager-installed" ] || exit 1
+        printf '%s\n' "$HOME/new-manager/bin/dots" ;;
+    'which '*|'settings get '*) exit 1 ;;
+    'settings ls '*) printf '{}\n' ;;
+    'ls '*) printf '{}\n' ;;
+    'bootstrap packages status') printf '{}\n' ;;
+    'bootstrap dotfiles paths') printf '{"entries":[]}\n' ;;
+    'bootstrap dotfiles status') printf '{"files":[],"edits":[]}\n' ;;
+    'install  ') exit "${FIXTURE_INSTALL_STATUS:-0}" ;;
+    'upgrade '*)
+        if [ -x "$HOME/new-manager/bin/dots" ]; then
+            : > "$HOME/manager-installed"
+        fi ;;
+    'self-update '*)
+        if [ -f "$HOME/.local/lib/.disable-self-update" ]; then
+            printf '%s\n' 'mise: self-update is disabled' >&2
+            exit 1
+        fi ;;
+esac

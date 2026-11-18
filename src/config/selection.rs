@@ -119,7 +119,45 @@ pub fn for_bootstrap(root: &Root, env: &Env, restore: Option<&str>) -> Result<Se
     Ok(selected)
 }
 
+/// Init keeps valid persisted components and defaults only the missing or
+/// invalid ones. Conflicting persisted choices still require explicit repair.
+pub(crate) fn read_for_init(root: &Root) -> Result<Selection, Fail> {
+    let profiles = passive::profiles(root)?;
+    let mut selected = persisted_components(root, &profiles, true)?;
+    selected.profile = selected
+        .profile
+        .filter(|profile| profiles.contains(profile));
+    selected.machine_id = selected.machine_id.filter(|id| valid_id(id));
+    Ok(selected)
+}
+
 fn persisted(root: &Root, profiles: &[String]) -> Result<Selection, Fail> {
+    let selected = persisted_components(root, profiles, false)?;
+    let profile = selected.profile.as_deref();
+    if let Some(profile) = profile
+        && !profiles.iter().any(|name| name == profile)
+    {
+        return Err(Fail::usage(format!(
+            "selected profile '{profile}' is not in dots_profiles ({}); fix it with {REPAIR}",
+            profiles.join(", ")
+        )));
+    }
+    let machine = selected.machine_id.as_deref();
+    if let Some(machine) = machine
+        && !valid_id(machine)
+    {
+        return Err(Fail::usage(format!(
+            "selected machine ID '{machine}' is invalid; fix it with {REPAIR}"
+        )));
+    }
+    Ok(selected)
+}
+
+fn persisted_components(
+    root: &Root,
+    profiles: &[String],
+    allow_invalid_components: bool,
+) -> Result<Selection, Fail> {
     let early_path = root.path().join("miserc.toml");
     let local_path = root.path().join("config.local.toml");
     let early = passive::optional_toml(&early_path)?;
@@ -150,8 +188,18 @@ fn persisted(root: &Root, profiles: &[String]) -> Result<Selection, Fail> {
     }
     let role = roles.first().map(|value| value.as_str());
     let host = host_ids.first().copied();
-    let local_role = local_value(&local, &local_path, "SETUP_PROFILE")?;
-    let local_host = local_value(&local, &local_path, "SETUP_MACHINE_ID")?;
+    let local_role = local_value(
+        &local,
+        &local_path,
+        "SETUP_PROFILE",
+        allow_invalid_components,
+    )?;
+    let local_host = local_value(
+        &local,
+        &local_path,
+        "SETUP_MACHINE_ID",
+        allow_invalid_components,
+    )?;
     for (kind, early, local) in [
         ("profile", role, local_role),
         ("machine ID", host, local_host),
@@ -168,31 +216,14 @@ fn persisted(root: &Root, profiles: &[String]) -> Result<Selection, Fail> {
             )));
         }
     }
-    let profile = role.or(local_role);
-    if let Some(profile) = profile
-        && !profiles.iter().any(|name| name == profile)
-    {
-        return Err(Fail::usage(format!(
-            "selected profile '{profile}' is not in dots_profiles ({}); fix it with {REPAIR}",
-            profiles.join(", ")
-        )));
-    }
-    let machine = host.or(local_host);
-    if let Some(machine) = machine
-        && !valid_id(machine)
-    {
-        return Err(Fail::usage(format!(
-            "selected machine ID '{machine}' is invalid; fix it with {REPAIR}"
-        )));
-    }
     let extras = selectors
         .iter()
         .filter(|selector| !selector.starts_with("host-") && !profiles.contains(selector))
         .cloned()
         .collect();
     Ok(Selection {
-        profile: profile.map(str::to_owned),
-        machine_id: machine.map(str::to_owned),
+        profile: role.or(local_role).map(str::to_owned),
+        machine_id: host.or(local_host).map(str::to_owned),
         selectors: extras,
     })
 }
@@ -201,6 +232,7 @@ fn local_value<'a>(
     local: &'a DocumentMut,
     path: &Path,
     key: &str,
+    allow_invalid: bool,
 ) -> Result<Option<&'a str>, Fail> {
     let Some(item) = local
         .get("env")
@@ -209,14 +241,14 @@ fn local_value<'a>(
     else {
         return Ok(None);
     };
-    item.as_str()
-        .map(|value| (!value.is_empty()).then_some(value))
-        .ok_or_else(|| {
-            file_error(
-                path,
-                format_args!("env.{key} must be a string; fix it with {REPAIR}"),
-            )
-        })
+    match item.as_str() {
+        Some(value) => Ok((!value.is_empty()).then_some(value)),
+        None if allow_invalid => Ok(None),
+        None => Err(file_error(
+            path,
+            format_args!("env.{key} must be a string; fix it with {REPAIR}"),
+        )),
+    }
 }
 
 fn selectors(early: &DocumentMut, path: &Path) -> Result<Vec<String>, Fail> {

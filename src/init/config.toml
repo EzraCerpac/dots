@@ -1,0 +1,9 @@
+[vars]
+# List profile names separated by spaces. Put profile-specific settings in config.PROFILE.toml.
+dots_profiles = "default"
+
+# Optional settings
+# dots_source_repo = "OWNER/NAME"          # Pin the Git repository for this configuration.
+# dots_state_repo = "OWNER/NAME"           # Store encrypted settings history in a private repository.
+# dots_self_updating_casks = "APP"          # Install these Homebrew casks only when missing.
+# dots_publish_on_behalf_of = "NAME"        # Credit this person in AI-written pull request text.

@@ -128,7 +128,6 @@ impl Env {
 pub struct Flags {
     pub plain: bool,
     pub verbose: bool,
-    pub no_wait: bool,
 }
 
 pub struct Ctx {

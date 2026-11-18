@@ -178,11 +178,12 @@ impl<'a> Brew<'a> {
         command
             .env("HOMEBREW_NO_AUTO_UPDATE", "1")
             .env("HOMEBREW_NO_AUTOREMOVE", "1")
-            .env("HOMEBREW_NO_INSTALL_CLEANUP", "1");
+            .env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
+            .env("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1");
         Ok(command)
     }
 
-    fn installed(&self, kind: Kind, token: &str) -> Result<bool, Fail> {
+    fn list_installed(&self, kind: Kind, token: &str) -> Result<bool, Fail> {
         let status = self
             .command()?
             .args(["list", kind.flag(), token])
@@ -206,7 +207,7 @@ impl<'a> Brew<'a> {
         }
     }
 
-    fn version(&self, kind: Kind, token: &str) -> Result<Option<String>, Fail> {
+    fn list_version(&self, kind: Kind, token: &str) -> Result<Option<(String, String)>, Fail> {
         let output = self
             .command()?
             .args(["list", "--versions", kind.flag(), token])
@@ -220,9 +221,93 @@ impl<'a> Brew<'a> {
         Ok(output
             .status
             .success()
-            .then(|| listed_version(&output.stdout))
+            .then(|| listed_package(&output.stdout))
             .flatten()
-            .map(str::to_owned))
+            .map(|(name, version)| (name.to_owned(), version.to_owned())))
+    }
+
+    fn inventory_root(&self, flag: &str) -> Result<PathBuf, Fail> {
+        let output = self
+            .command()?
+            .arg(flag)
+            .output()
+            .map_err(|error| Fail::new(1, format!("could not run brew {flag}: {error}")))?;
+        let path = std::str::from_utf8(&output.stdout)
+            .ok()
+            .map(|text| text.trim_end_matches('\n'))
+            .filter(|text| !text.chars().any(char::is_control))
+            .map(PathBuf::from);
+        match path {
+            Some(path) if output.status.success() && path.is_absolute() => Ok(path),
+            _ => Err(Fail::new(
+                1,
+                format!("brew {flag} did not return an absolute path"),
+            )),
+        }
+    }
+
+    fn inspect(&self, kind: Kind, token: &str) -> Result<Installation, Fail> {
+        let Some((tap, name)) = token.rsplit_once('/') else {
+            return if self.list_installed(kind, token)? {
+                let version = self.list_version(kind, token)?.map(|(_, version)| version);
+                Ok(Installation::Present(version))
+            } else {
+                Ok(Installation::Missing)
+            };
+        };
+
+        match kind {
+            Kind::Cask => {
+                // Caskroom uses the short token. Its install receipt records the tap and version.
+                let name = name.to_ascii_lowercase();
+                if !self.list_installed(kind, &name)? {
+                    return Ok(Installation::Missing);
+                }
+                let metadata = self
+                    .inventory_root("--caskroom")?
+                    .join(name)
+                    .join(".metadata");
+                let Some(source) = receipt_source(&metadata, tap) else {
+                    return Ok(Installation::Unverified);
+                };
+                let version = source["version"]
+                    .as_str()
+                    .filter(|version| known_version(version));
+                Ok(Installation::Present(version.map(str::to_owned)))
+            }
+            Kind::Formula => {
+                let Some((rack, versions)) = self.list_version(kind, token)? else {
+                    return if self.list_installed(kind, name)? {
+                        Ok(Installation::Unverified)
+                    } else {
+                        Ok(Installation::Missing)
+                    };
+                };
+                // A Cellar rack is named by basename, even for a tap-qualified request.
+                let rack = self
+                    .inventory_root("--cellar")?
+                    .join(rack.rsplit('/').next().unwrap());
+                if versions.split_whitespace().all(|version| {
+                    !version.contains('/')
+                        && !matches!(version, "." | "..")
+                        && receipt_source(&rack.join(version), tap).is_some()
+                }) {
+                    Ok(Installation::Present(Some(versions)))
+                } else {
+                    Ok(Installation::Unverified)
+                }
+            }
+        }
+    }
+
+    fn version(&self, kind: Kind, token: &str) -> Result<Option<String>, Fail> {
+        if !token.contains('/') {
+            return Ok(self.list_version(kind, token)?.map(|(_, version)| version));
+        }
+        Ok(match self.inspect(kind, token)? {
+            Installation::Present(version) => version,
+            Installation::Missing | Installation::Unverified => None,
+        })
     }
 
     fn outdated(&self, kind: Kind, token: &str, greedy: bool) -> Result<bool, Fail> {
@@ -260,10 +345,9 @@ impl<'a> Brew<'a> {
         let Some(path) = changes_path(self.ctx) else {
             return Ok(());
         };
-        if !self.installed(kind, token)? {
+        let Installation::Present(after) = self.inspect(kind, token)? else {
             return Ok(());
-        }
-        let after = self.version(kind, token)?;
+        };
         let before = match change {
             Change::Installed => "not installed",
             Change::Updated(Some(before))
@@ -311,13 +395,42 @@ fn standard_prefix(output: &[u8]) -> bool {
     })
 }
 
-fn listed_version(output: &[u8]) -> Option<&str> {
+fn listed_package(output: &[u8]) -> Option<(&str, &str)> {
     let (name, version) = std::str::from_utf8(output)
         .ok()?
         .trim_end_matches('\n')
         .split_once(' ')?;
     let version = version.trim_matches(' ');
-    (named_package(name) && known_version(version)).then_some(version)
+    (named_package(name) && known_version(version)).then_some((name, version))
+}
+
+fn receipt_source(directory: &Path, tap: &str) -> Option<serde_json::Value> {
+    let receipt = fs::read(directory.join("INSTALL_RECEIPT.json")).ok()?;
+    let mut receipt: serde_json::Value = serde_json::from_slice(&receipt).ok()?;
+    let source = receipt.get_mut("source")?;
+    let recorded_tap = source.get("tap")?.as_str()?;
+    same_tap(tap, recorded_tap).then(|| source.take())
+}
+
+fn same_tap(requested: &str, recorded: &str) -> bool {
+    fn normalized(tap: &str) -> Option<(String, String)> {
+        let (owner, repository) = tap.split_once('/')?;
+        let owner = owner.to_ascii_lowercase();
+        let repository = repository.to_ascii_lowercase();
+        let repository = repository
+            .strip_prefix("homebrew-")
+            .or_else(|| repository.strip_prefix("linuxbrew-"))
+            .unwrap_or(&repository);
+        Some((owner, repository.to_owned()))
+    }
+
+    normalized(requested).is_some_and(|tap| normalized(recorded).as_ref() == Some(&tap))
+}
+
+enum Installation {
+    Missing,
+    Unverified,
+    Present(Option<String>),
 }
 
 fn known_version(version: &str) -> bool {
@@ -351,7 +464,16 @@ fn update(
             format!("a standard-prefix Homebrew installation is required for {token}"),
         )
     })?;
-    let installed = brew.installed(kind, token)?;
+    let (installed, before) = match brew.inspect(kind, token)? {
+        Installation::Missing => (false, None),
+        Installation::Present(version) => (true, version),
+        Installation::Unverified => {
+            return Err(Fail::new(
+                1,
+                format!("could not verify the installed tap for {token}. Refusing to change it."),
+            ));
+        }
+    };
     let (action, activity) = if installed {
         if install_only {
             println!("Already installed: {token}");
@@ -376,11 +498,6 @@ fn update(
         return Ok(defer_for_admin(token));
     }
 
-    let before = if installed && changes_path(ctx).is_some() {
-        brew.version(kind, token)?
-    } else {
-        None
-    };
     let mut command = brew.command()?;
     command.args([action, kind.flag()]);
     if installed && greedy {
@@ -539,15 +656,18 @@ mod tests {
 
     #[test]
     fn parses_one_package_with_known_versions() {
-        assert_eq!(listed_version(b"widget 1.2_1 1.3\n"), Some("1.2_1 1.3"));
         assert_eq!(
-            listed_version(b"test/tap/widget 3.0,123\n"),
-            Some("3.0,123")
+            listed_package(b"widget 1.2_1 1.3\n"),
+            Some(("widget", "1.2_1 1.3"))
         );
-        assert_eq!(listed_version(b"widget\n"), None);
-        assert_eq!(listed_version(b"widget  \n"), None);
-        assert_eq!(listed_version(b"widget 1\nother 2\n"), None);
-        assert_eq!(listed_version(b"widget 1\t2\n"), None);
+        assert_eq!(
+            listed_package(b"test/tap/widget 3.0,123\n"),
+            Some(("test/tap/widget", "3.0,123"))
+        );
+        assert_eq!(listed_package(b"widget\n"), None);
+        assert_eq!(listed_package(b"widget  \n"), None);
+        assert_eq!(listed_package(b"widget 1\nother 2\n"), None);
+        assert_eq!(listed_package(b"widget 1\t2\n"), None);
     }
 
     #[test]

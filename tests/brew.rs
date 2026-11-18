@@ -10,6 +10,7 @@ use support::World;
 
 const TOKEN: &str = "fixture/tools/widget";
 const CASK: &str = "widget";
+const QUALIFIED_CASK: &str = "fixture/apps/widget";
 const RECIPE: &str = r#"#!/bin/sh
 if [ "$1" = --prefix ]; then
     printf '/opt/homebrew\n'
@@ -22,9 +23,18 @@ fi
 [ "$HOMEBREW_NO_AUTO_UPDATE:$HOMEBREW_NO_AUTOREMOVE:$HOMEBREW_NO_INSTALL_CLEANUP" = 1:1:1 ] || exit 70
 printf '%s\n' "$*" >> "$FIXTURE/calls"
 case "$1" in
+    --cellar) printf '%s/Cellar\n' "$FIXTURE" ;;
+    --caskroom) printf '%s/Caskroom\n' "$FIXTURE" ;;
     list)
-        [ -f "$FIXTURE/version" ] || exit 1
         if [ "$2" = --versions ]; then
+            shift
+            versions=1
+        fi
+        if [ "$2" = --cask ]; then
+            [ "$3" = widget ] || exit 1
+        fi
+        [ -f "$FIXTURE/version" ] || exit 1
+        if [ "${versions:-}" = 1 ]; then
             [ ! -f "$FIXTURE/unknown" ] || exit 1
             printf 'widget %s\n' "$(/bin/cat "$FIXTURE/version")"
         fi
@@ -37,12 +47,20 @@ case "$1" in
         [ ! -f "$FIXTURE/probe-fails" ] || exit 1
         ;;
     install|upgrade)
+        [ "$HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" = 1 ] || exit 71
         [ ! -f "$FIXTURE/fail" ] || exit 3
-        if [ "$1" = install ]; then
-            printf 1 > "$FIXTURE/version"
+        version=1
+        if [ "$1" = upgrade ]; then version=2; fi
+        printf '%s' "$version" > "$FIXTURE/version"
+        if [ "$2" = --formula ]; then
+            directory="$FIXTURE/Cellar/widget/$version"
+            tap=fixture/tools
         else
-            printf 2 > "$FIXTURE/version"
+            directory="$FIXTURE/Caskroom/widget/.metadata"
+            tap=fixture/apps
         fi
+        /bin/mkdir -p "$directory"
+        printf '{"source":{"tap":"%s","version":"%s"}}\n' "$tap" "$version" > "$directory/INSTALL_RECEIPT.json"
         ;;
     *) exit 70 ;;
 esac
@@ -99,6 +117,28 @@ impl Fixture {
 
     fn write(&self, file: &str, value: &str) {
         fs::write(self.directory.join(file), value).unwrap();
+    }
+
+    fn receipt(&self, directory: &Path, tap: &str, version: &str) {
+        let directory = self.directory.join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("INSTALL_RECEIPT.json"),
+            serde_json::json!({"source": {"tap": tap, "version": version}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn formula_versions(&self, tap: &str, versions: &str) {
+        self.write("version", versions);
+        for version in versions.split_whitespace() {
+            self.receipt(&Path::new("Cellar/widget").join(version), tap, version);
+        }
+    }
+
+    fn cask_version(&self, tap: &str, version: &str) {
+        self.write("version", version);
+        self.receipt(Path::new("Caskroom/widget/.metadata"), tap, version);
     }
 
     fn remove(&self, file: &str) {
@@ -178,14 +218,20 @@ fn new_brew_path() {
 #[test]
 fn new_brew_version() {
     let fixture = Fixture::new();
-    fixture.write("version", "1.2_1");
+    fixture.formula_versions("fixture/tools", "1.2_1");
     let output = fixture.run(&["version", "formula", TOKEN]);
     status(&output, 0);
     assert_eq!(stdout(&output), "1.2_1\n");
-    fixture.write("version", "3.1,245");
-    let output = fixture.run(&["version", "cask", CASK]);
-    status(&output, 0);
-    assert_eq!(stdout(&output), "3.1,245\n");
+    fixture.cask_version("fixture/other", "3.1,245");
+    status(&fixture.run(&["version", "cask", QUALIFIED_CASK]), 1);
+    fixture.cask_version("fixture/apps", "3.1,245");
+    for token in [CASK, QUALIFIED_CASK] {
+        let output = fixture.run(&["version", "cask", token]);
+        status(&output, 0);
+        assert_eq!(stdout(&output), "3.1,245\n");
+    }
+    let calls = fixture.read("calls");
+    assert!(!calls.contains(QUALIFIED_CASK), "{calls}");
     fixture.write("unknown", "");
     let output = fixture.run(&["version", "cask", CASK]);
     status(&output, 1);
@@ -216,7 +262,7 @@ fn new_brew_record() {
     let fixture = Fixture::new();
     status(&fixture.run(&["record", "formula", TOKEN, "installed"]), 0);
     assert!(fixture.read("changes").is_empty());
-    fixture.write("version", "1");
+    fixture.formula_versions("fixture/tools", "1");
     status(&fixture.run(&["record", "formula", TOKEN, "installed"]), 0);
     status(
         &fixture.run(&["record", "formula", TOKEN, "updated", "1"]),
@@ -227,7 +273,7 @@ fn new_brew_record() {
         fixture.read("changes"),
         format!("brew-formula:{TOKEN}\tnot installed\t1\n")
     );
-    fixture.write("version", "2");
+    fixture.formula_versions("fixture/tools", "2");
     fixture.write("unknown", "");
     status(
         &fixture.run(&["record", "formula", TOKEN, "updated", "1"]),
@@ -247,9 +293,23 @@ fn new_brew_record() {
             .unwrap(),
         0,
     );
+    let formula_report =
+        format!("brew-formula:{TOKEN}\tnot installed\t1\nbrew-formula:{TOKEN}\t1\t2\n");
+    assert_eq!(fixture.read("changes"), formula_report);
+    fixture.cask_version("fixture/other", "2");
+    status(
+        &fixture.run(&["record", "cask", QUALIFIED_CASK, "installed"]),
+        0,
+    );
+    assert_eq!(fixture.read("changes"), formula_report);
+    fixture.cask_version("fixture/apps", "2");
+    status(
+        &fixture.run(&["record", "cask", QUALIFIED_CASK, "updated", "1"]),
+        0,
+    );
     assert_eq!(
         fixture.read("changes"),
-        format!("brew-formula:{TOKEN}\tnot installed\t1\nbrew-formula:{TOKEN}\t1\t2\n")
+        format!("{formula_report}brew-cask:{QUALIFIED_CASK}\t1\t2\n"),
     );
 }
 
@@ -260,12 +320,17 @@ fn new_brew_update_cask() {
         "update-cask",
         "--auto-updates",
         "--admin",
-        CASK,
+        QUALIFIED_CASK,
         "Widget.Helper",
     ];
-    if skipped(&fixture, &update, CASK) {
+    if skipped(&fixture, &update, QUALIFIED_CASK) {
         return;
     }
+    fixture.cask_version("fixture/other", "1");
+    status(&fixture.run(&update), 1);
+    assert!(!fixture.read("calls").contains("install "));
+    fixture.remove("version");
+
     fixture.write("running", "");
     let output = fixture.run(&update);
     status(&output, 3);
@@ -282,9 +347,17 @@ fn new_brew_update_cask() {
     status(&fixture.run(&update), 0);
     fixture.write("outdated", "");
     fixture.write("running", "");
-    let output = fixture.run(&["update-cask", CASK, "Widget.Helper", "--install-only"]);
+    let output = fixture.run(&[
+        "update-cask",
+        QUALIFIED_CASK,
+        "Widget.Helper",
+        "--install-only",
+    ]);
     status(&output, 0);
-    assert_eq!(stdout(&output), "Already installed: widget\n");
+    assert_eq!(
+        stdout(&output),
+        format!("Already installed: {QUALIFIED_CASK}\n")
+    );
     assert!(!fixture.read("calls").contains("outdated"));
     let output = fixture.run(&update);
     status(&output, 3);
@@ -292,20 +365,24 @@ fn new_brew_update_cask() {
     fixture.remove("running");
     status(&fixture.run(&update), 0);
     let calls = fixture.read("calls");
-    assert!(calls.lines().any(|line| line == "install --cask widget"));
     assert!(
         calls
             .lines()
-            .any(|line| line == "outdated --cask --quiet --greedy widget")
+            .any(|line| line == format!("install --cask {QUALIFIED_CASK}"))
     );
     assert!(
         calls
             .lines()
-            .any(|line| line == "upgrade --cask --greedy widget")
+            .any(|line| line == format!("outdated --cask --quiet --greedy {QUALIFIED_CASK}"))
+    );
+    assert!(
+        calls
+            .lines()
+            .any(|line| line == format!("upgrade --cask --greedy {QUALIFIED_CASK}"))
     );
     assert_eq!(
         fixture.read("changes"),
-        "brew-cask:widget\tnot installed\t1\nbrew-cask:widget\t1\t2\n"
+        format!("brew-cask:{QUALIFIED_CASK}\tnot installed\t1\nbrew-cask:{QUALIFIED_CASK}\t1\t2\n")
     );
 }
 
@@ -319,6 +396,13 @@ fn new_brew_update_formula() {
     let invalid = fixture.run(&["update-formula", "--", "--all"]);
     status(&invalid, 2);
     assert!(fixture.read("calls").is_empty());
+
+    fixture.formula_versions("fixture/other", "1");
+    let output = fixture.run(&update);
+    status(&output, 1);
+    assert!(stderr(&output).contains("could not verify the installed tap"));
+    assert!(!fixture.read("calls").contains("install "));
+    fixture.remove("version");
 
     status(
         &fixture.run(&["update-formula", TOKEN, "--install-only"]),
@@ -365,12 +449,16 @@ fn new_brew_hold_formula() {
     let output = fixture.run(&hold);
     status(&output, 1);
     assert!(stderr(&output).contains("Refusing"));
-    fixture.write("version", "1 2");
+    fixture.formula_versions("fixture/tools", "1 2");
     let output = fixture.run(&hold);
     status(&output, 1);
     assert!(stderr(&output).contains("multiple installed versions (1 2)"));
     status(&fixture.run(&["hold-formula", TOKEN, "1 2"]), 1);
-    fixture.write("version", "2");
+    fixture.formula_versions("fixture/other", "2");
+    let output = fixture.run(&hold);
+    status(&output, 1);
+    assert!(stderr(&output).contains("Refusing"));
+    fixture.formula_versions("fixture/tools", "2");
     let output = fixture.run(&["hold-formula", TOKEN, "2", "fixture hold"]);
     status(&output, 0);
     assert_eq!(
@@ -381,7 +469,7 @@ fn new_brew_hold_formula() {
         fixture
             .read("calls")
             .lines()
-            .all(|line| line.starts_with("list --versions --formula "))
+            .all(|line| line == "--cellar" || line.starts_with("list "))
     );
     assert!(fixture.read("changes").is_empty());
 }

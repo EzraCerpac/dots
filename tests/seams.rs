@@ -41,6 +41,7 @@ fn seams_cli_grammar_and_config_boundary() {
     let help = invoke(cwd, &["--help"]);
     assert!(help.status.success());
     let stdout = String::from_utf8(help.stdout).unwrap();
+    assert!(!stdout.contains("--no-wait"));
     for command in grammar.get_subcommands() {
         assert!(
             stdout.lines().any(|line| line
@@ -50,7 +51,9 @@ fn seams_cli_grammar_and_config_boundary() {
             command.get_name()
         );
     }
-    assert_eq!(invoke(cwd, &[]).stdout, stdout.as_bytes());
+    let bare = invoke(cwd, &[]);
+    assert!(bare.status.success());
+    assert_eq!(bare.stdout, stdout.as_bytes());
     assert!(
         invoke(cwd, &["bootstrap", "complete", "--help"])
             .status
@@ -80,7 +83,6 @@ fn seams_cli_grammar_and_config_boundary() {
         "dots help",
     );
     assert_diagnostic(invoke(cwd, &["help", "status"]), 2, "dots COMMAND --help");
-    assert_diagnostic(invoke(cwd, &["reports", "update"]), 2, "needs a terminal");
     assert_diagnostic(invoke(cwd, &["missing", "--help"]), 2, "unknown command");
     assert_diagnostic(
         invoke(cwd, &["--plain", "update", "--verbose"]),
@@ -101,6 +103,9 @@ fn seams_cli_grammar_and_config_boundary() {
         2,
         "cannot be combined",
     );
+    for args in [&["--no-wait", "up"][..], &["update", "--no-wait"]] {
+        assert_diagnostic(invoke(cwd, args), 2, "unknown option '--no-wait'");
+    }
 
     for args in [
         &["root"][..],
@@ -158,6 +163,86 @@ fn seams_cli_grammar_and_config_boundary() {
         invoke(cwd, &["add", "--asset", "example", "npm:example"]),
         2,
         "one GitHub repository URL",
+    );
+}
+
+#[test]
+fn seams_cli_leading_dash_is_not_short_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+    assert_diagnostic(invoke(cwd, &["-hello"]), 2, "use dots help");
+
+    let commands = cwd.join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let hello = commands.join("hello");
+    fs::write(&hello, "#!/bin/sh\nprintf '[%s]\\n' \"$@\"\n").unwrap();
+    fs::set_permissions(&hello, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_diagnostic(invoke(cwd, &["-hello"]), 2, "use dots help");
+
+    let short = invoke(cwd, &["-h"]);
+    let long = invoke(cwd, &["--help"]);
+    assert!(short.status.success() && long.status.success());
+    assert_eq!(short.stdout, long.stdout);
+    assert!(
+        String::from_utf8(short.stdout)
+            .unwrap()
+            .contains("  hello [ARGS...]")
+    );
+
+    let output = invoke(cwd, &["hello", "-hello", "--help", "--"]);
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"[-hello]\n[--help]\n[--]\n");
+}
+
+#[test]
+fn seams_cli_menu_is_an_ordinary_configuration_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+    let commands = cwd.join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let menu = commands.join("menu");
+    fs::write(&menu, "#!/bin/sh\nprintf '[%s]\\n' \"$@\"\nexit 23\n").unwrap();
+    assert_diagnostic(invoke(cwd, &["menu"]), 2, "unknown command 'menu'");
+    fs::set_permissions(&menu, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bare = invoke(cwd, &[]);
+    assert!(bare.status.success());
+    let help = String::from_utf8(bare.stdout).unwrap();
+    let (_, config_commands) = help.split_once("Configuration commands").unwrap();
+    assert!(config_commands.contains("  menu [ARGS...]\n"));
+
+    let output = invoke(cwd, &["menu", "--help", "two words", "", "--", "--no-wait"]);
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(
+        output.stdout,
+        b"[--help]\n[two words]\n[]\n[--]\n[--no-wait]\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn seams_cli_reaches_report_handlers_with_redirected_stdio() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    fs::write(cwd.join("config.toml"), "").unwrap();
+
+    // P-12 provides the listing and replay behind these entrypoints.
+    assert_diagnostic(
+        invoke(cwd, &["reports"]),
+        1,
+        "dots reports is not implemented",
+    );
+    assert_diagnostic(
+        invoke(cwd, &["reports", "update"]),
+        1,
+        "dots reports is not implemented",
+    );
+    assert_diagnostic(
+        invoke(cwd, &["up", "--last"]),
+        1,
+        "dots up --last is not implemented",
     );
 }
 

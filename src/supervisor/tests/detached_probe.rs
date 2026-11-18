@@ -43,7 +43,7 @@ fn detached_probe_rejects_custom_sigchld_before_spawn() {
         let path = Path::new(&path);
         let marker = path.join("spawned");
         let ctx = fixture_context(path, false);
-        let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+        let supervisor = Supervisor::new(&ctx, Mode::Direct);
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = caught as *const () as libc::sighandler_t;
         assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
@@ -77,13 +77,13 @@ fn detached_probe_rejects_custom_sigchld_before_spawn() {
 fn detached_probe_never_signals_a_group_without_its_waitable_leader() {
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
-    let unrelated = Supervisor::new(&ctx.env, Mode::Direct);
+    let unrelated = Supervisor::new(&ctx, Mode::Direct);
     let sentinel = unrelated
         .spawn(shell("exec sleep 10", &[]), Placement::Detached, false)
         .unwrap();
 
     for route in ["poll", "cancel", "drop"] {
-        let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+        let supervisor = Supervisor::new(&ctx, Mode::Direct);
         let mut probe = supervisor
             .spawn(
                 shell("exit 0", &[]),
@@ -120,7 +120,7 @@ fn detached_probe_never_signals_a_group_without_its_waitable_leader() {
 fn detached_capture_limit_covers_both_streams_and_retires_the_child() {
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
-    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut probe = supervisor
         .spawn(
@@ -149,7 +149,7 @@ fn detached_capture_limit_covers_both_streams_and_retires_the_child() {
 fn detached_success_requires_confirmed_group_retirement() {
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
-    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut probe = supervisor
         .spawn(
@@ -161,7 +161,7 @@ fn detached_success_requires_confirmed_group_retirement() {
     probe.budget = Some(ProbeBudget::new(deadline));
     assert!(wait_until(|| matches!(
         observe(probe.entry.pid, false),
-        Ok(Observed::Exited { .. })
+        Ok(Observed::Exited)
     )));
     probe.membership = Some((Instant::now(), Ok(false)));
     assert!(probe.poll(true, false).unwrap().is_none());
@@ -193,7 +193,7 @@ fn detached_success_requires_confirmed_group_retirement() {
 fn detached_spawn_rechecks_deadline_after_waiting_for_admission() {
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
-    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let marker = fixture.path().join("spawned");
     let guard = supervisor.state.lock().unwrap();
     let deadline = Instant::now() + Duration::from_millis(80);
@@ -224,7 +224,7 @@ fn detached_exec_wait_does_not_hold_admission_and_rechecks_deadline() {
 
     let fixture = tempfile::tempdir().unwrap();
     let ctx = fixture_context(fixture.path(), false);
-    let supervisor = Supervisor::new(&ctx.env, Mode::Direct);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
     let marker = fixture.path().join("spawned");
     let (ready, ready_write) = io::pipe().unwrap();
     let (release, mut release_write) = io::pipe().unwrap();

@@ -554,7 +554,7 @@ fn context_at(flags: Flags, directory: Option<&Path>) -> Result<Ctx, Fail> {
     Ok(ctx)
 }
 
-fn require_config(root: &Root) -> Result<(), Fail> {
+pub(crate) fn require_config(root: &Root) -> Result<(), Fail> {
     if !root.path().join("config.toml").is_file() {
         return Err(Fail::usage(format!(
             "no configuration at {} (config.toml not found); create one with dots init or set DOTS_ROOT",
@@ -680,26 +680,17 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         None
     };
     let ctx = context_at(flags, directory)?;
-    let report = match name {
-        "plan" => Some(crate::report::Command::Plan),
-        "apply" => Some(crate::report::Command::Apply),
-        "test" => Some(crate::report::Command::Test),
-        _ => None,
-    };
-    if let Some(command) = report {
-        let run = crate::run::Run::begin(&ctx, crate::run::Sink::Report(command));
-        if let Err(error) = require_config(&ctx.root) {
-            return Ok(inspect::startup_error(
-                run,
-                error,
-                &format!(
-                    "Create a configuration with dots init or set DOTS_ROOT, then rerun dots {name}."
-                ),
-            ));
-        }
-    } else if !matches!(
+    if !matches!(
         name,
-        "init" | "bundle" | "brew" | "install-release-app" | "status" | "sync"
+        "init"
+            | "bundle"
+            | "brew"
+            | "install-release-app"
+            | "status"
+            | "sync"
+            | "plan"
+            | "apply"
+            | "test"
     ) {
         require_config(&ctx.root)?;
     }

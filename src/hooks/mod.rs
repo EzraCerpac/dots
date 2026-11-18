@@ -187,47 +187,66 @@ fn run_child(
     args: &[&str],
     env: ChildEnv<'_>,
 ) -> Result<u8, Fail> {
-    let mut child = Mise::new(run.ctx())?.exec(path, args.iter().map(OsStr::new))?;
-
+    let mise = Mise::new(run.ctx())?;
     let changes = if matches!(
         env,
         ChildEnv::Hook(HookEnv::Update { .. }) | ChildEnv::Recipe(Mode::Update)
     ) {
-        let file = NamedTempFile::new().map_err(|error| {
+        Some(NamedTempFile::new().map_err(|error| {
             Fail::new(
                 1,
                 format!("cannot create a private DOTS_CHANGES file: {error}"),
             )
-        })?;
-        child.env("DOTS_CHANGES", file.path());
-        child.env("HOMEBREW_NO_INSTALL_CLEANUP", "1");
-        Some(file)
+        })?)
     } else {
         None
     };
 
-    let _bundle = match env {
-        ChildEnv::Hook(HookEnv::Update {
-            tools_ok,
-            tools_upgraded,
-        }) => {
-            child.env("DOTS_TOOLS_OK", flag(tools_ok));
-            child.env("DOTS_TOOLS_UPGRADED", flag(tools_ok && tools_upgraded));
-            None
-        }
-        ChildEnv::Hook(HookEnv::Bootstrap {
-            private_ready,
-            restored,
-            bundle_json,
-        }) => {
-            child.env("DOTS_PRIVATE_READY", flag(private_ready));
-            child.env("DOTS_RESTORED", flag(restored));
-            let pipe = BundlePipe::new(if private_ready { bundle_json } else { b"{}" })?;
-            pipe.attach(&mut child)?;
-            Some(pipe)
-        }
-        ChildEnv::Recipe(_) => None,
+    // Keep the pipe's writer alive through the supervised child run.
+    let bundle = if let ChildEnv::Hook(HookEnv::Bootstrap {
+        private_ready,
+        bundle_json,
+        ..
+    }) = env
+    {
+        Some(BundlePipe::new(if private_ready {
+            bundle_json
+        } else {
+            b"{}"
+        })?)
+    } else {
+        None
     };
+
+    let child = mise.exec_with_env(path, args.iter().map(OsStr::new), |child| {
+        if let Some(file) = &changes {
+            child
+                .env("DOTS_CHANGES", file.path())
+                .env("HOMEBREW_NO_INSTALL_CLEANUP", "1");
+        }
+        match env {
+            ChildEnv::Hook(HookEnv::Update {
+                tools_ok,
+                tools_upgraded,
+            }) => {
+                child.env("DOTS_TOOLS_OK", flag(tools_ok));
+                child.env("DOTS_TOOLS_UPGRADED", flag(tools_ok && tools_upgraded));
+            }
+            ChildEnv::Hook(HookEnv::Bootstrap {
+                private_ready,
+                restored,
+                ..
+            }) => {
+                child.env("DOTS_PRIVATE_READY", flag(private_ready));
+                child.env("DOTS_RESTORED", flag(restored));
+            }
+            ChildEnv::Recipe(_) => {}
+        }
+        if let Some(pipe) = &bundle {
+            pipe.attach(child)?;
+        }
+        Ok(())
+    })?;
 
     let result = run.run(stage, child, Policy::Interactive);
     if let Some(file) = changes {

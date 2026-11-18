@@ -18,14 +18,15 @@ pub use status::status;
 pub use test_command::test;
 
 pub fn plan(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
-    let run = Run::begin(ctx, Sink::Report(Report::Plan));
-    let result = stage(&run, "Bootstrap plan", "dots plan", |stage| {
-        let mise = Mise::new(ctx)?;
-        let scope = packages::Scope::read(&run, &mise)?;
-        let command = scope.scoped(mise.command_active(["bootstrap", "plan"])?, false);
-        run_command(&run, stage, command, "mise bootstrap plan")
-    });
-    Ok(run.end(result))
+    Ok(with_report(ctx, Report::Plan, |run| {
+        let result = stage(&run, "Bootstrap plan", "dots plan", |stage| {
+            let mise = Mise::new(ctx)?;
+            let scope = packages::Scope::read(&run, &mise)?;
+            let command = scope.scoped(mise.command_active(["bootstrap", "plan"])?, false);
+            run_command(&run, stage, command, "mise bootstrap plan")
+        });
+        run.end(result)
+    }))
 }
 
 pub fn apply(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
@@ -41,27 +42,27 @@ pub fn apply(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         arguments.extend(targets.cloned());
     }
     let rerun = apply_rerun(&arguments, target_offset);
-    let run = Run::begin(ctx, Sink::Report(Report::Apply)).with_rerun(
-        if rerun.starts_with("dots apply") {
+    Ok(with_report(ctx, Report::Apply, |run| {
+        let run = run.with_rerun(if rerun.starts_with("dots apply") {
             rerun.clone()
         } else {
             "Rerun your original dots apply command with the same arguments.".into()
-        },
-    );
-    let result = stage(&run, "Apply dotfiles", &rerun, |stage| {
-        let mise = Mise::new(ctx)?;
-        let native = ["bootstrap", "dotfiles", "apply"]
-            .map(OsString::from)
-            .into_iter()
-            .chain(arguments);
-        run_command(
-            &run,
-            stage,
-            mise.command_active(native)?,
-            "mise bootstrap dotfiles apply",
-        )
-    });
-    Ok(run.end(result))
+        });
+        let result = stage(&run, "Apply dotfiles", &rerun, |stage| {
+            let mise = Mise::new(ctx)?;
+            let native = ["bootstrap", "dotfiles", "apply"]
+                .map(OsString::from)
+                .into_iter()
+                .chain(arguments);
+            run_command(
+                &run,
+                stage,
+                mise.command_active(native)?,
+                "mise bootstrap dotfiles apply",
+            )
+        });
+        run.end(result)
+    }))
 }
 
 fn apply_rerun(arguments: &[OsString], target_offset: usize) -> String {
@@ -97,7 +98,22 @@ fn shell_operand(arg: &OsStr) -> Option<String> {
     }
 }
 
-pub(crate) fn startup_error(run: Run<'_>, error: Fail, next: &str) -> u8 {
+fn with_report(ctx: &Ctx, command: Report, action: impl FnOnce(Run<'_>) -> u8) -> u8 {
+    let run = Run::begin(ctx, Sink::Report(command));
+    if let Err(error) = crate::cli::require_config(&ctx.root) {
+        return startup_error(
+            run,
+            error,
+            &format!(
+                "Create a configuration with dots init or set DOTS_ROOT, then rerun dots {}.",
+                command.name()
+            ),
+        );
+    }
+    action(run)
+}
+
+fn startup_error(run: Run<'_>, error: Fail, next: &str) -> u8 {
     if run.cancelled() {
         return run.end(130);
     }

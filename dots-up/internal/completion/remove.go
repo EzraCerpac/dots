@@ -39,14 +39,15 @@ type target struct {
 	aliases   map[string]bool
 }
 
-func (t *target) description() string {
+func (t *target) description(id string) string {
+	manager, _, _ := strings.Cut(id, ":")
 	switch {
 	case t.app:
 		return "Managed GitHub app"
 	case t.tool:
 		return "Declared mise tool"
 	default:
-		return "Declared native package"
+		return manager + " package"
 	}
 }
 
@@ -161,13 +162,27 @@ func removalTargets(root, prefix string, used map[string]bool, values map[string
 	}
 
 	taken := make(map[string]bool)
+	holds := make(map[string]bool)
+	for line := range strings.SplitSeq(string(readRegular(filepath.Join(root, "dots", "exceptions.tsv"), 1<<20)), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) >= 3 && !strings.HasPrefix(line, "#") {
+			for flag := range strings.SplitSeq(strings.TrimSpace(fields[2]), ",") {
+				if key, ok := strings.CutPrefix(flag, "hold="); ok {
+					holds[key] = true
+				}
+			}
+		}
+	}
 	for _, word := range args {
 		taken[resolve(word)] = true
 	}
 	result := candidates{}
 	prefix = strings.ToLower(prefix)
 	for id, t := range all {
-		if taken[id] {
+		manager, tail, _ := strings.Cut(id, ":")
+		name := path.Base(tail)
+		base, _, _ := strings.Cut(name, "@")
+		if taken[id] || holds[manager+":"+name] || holds[manager+":"+base] {
 			continue
 		}
 		matched, ambiguous := false, false
@@ -176,7 +191,7 @@ func removalTargets(root, prefix string, used map[string]bool, values map[string
 				continue
 			}
 			if resolve(alias) == id {
-				result[alias] = t.description()
+				result[alias] = t.description(id)
 				matched = true
 			} else {
 				ambiguous = true
@@ -187,7 +202,7 @@ func removalTargets(root, prefix string, used map[string]bool, values map[string
 			qualified = "mise:" + id
 		}
 		if (ambiguous || (!matched && strings.HasPrefix(strings.ToLower(qualified), prefix))) && resolve(qualified) == id {
-			result[qualified] = t.description()
+			result[qualified] = t.description(id)
 		}
 	}
 	return result

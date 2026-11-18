@@ -61,6 +61,8 @@ func TestCommandGrammar(t *testing.T) {
 	fixture(t, root, "dots/commands/hello\nworld", "", 0700)
 	for _, tc := range []struct{ words, want []string }{
 		{[]string{"he"}, []string{"hello", "help"}},
+		{[]string{"compl"}, []string{"completions"}},
+		{[]string{"completions", ""}, []string{"bash", "fish", "zsh"}},
 		{[]string{"--plain", "he"}, []string{"help"}},
 		{[]string{"hi"}, nil},
 		{[]string{"hello", "--"}, nil},
@@ -127,6 +129,8 @@ ignored = "latest"
 	expect(t, root, []string{"remove", "--base", "--profile", "server", ""}, nil)
 	expect(t, root, []string{"remove", "--path", "chosen.toml", ""}, []string{"chosen"})
 	expect(t, root, []string{"remove", "--path=broken.toml", ""}, nil)
+	fixture(t, root, "dots/exceptions.tsv", "server\tmanual\thold=brew:fd\n", 0600)
+	expect(t, root, []string{"remove", "--base", "fd"}, []string{"mise:fd"})
 	if _, err := os.Stat(os.Getenv("COMPLETION_PROBE_LOG")); !os.IsNotExist(err) {
 		t.Fatal("explicit selectors ran the active config probe")
 	}

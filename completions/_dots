@@ -7,10 +7,12 @@ _dots() {
     local -a args values descriptions prefixes prefix_descriptions
     args=( "${(@Q)words[2,CURRENT-1]}" "${(Q)PREFIX}" )
     local reply
-    reply=$(command dots internal shell-complete "${args[@]}") || return 1
+    reply=$(MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 command dots internal shell-complete "${args[@]}" 2>/dev/null) || return 1
     case $reply in
-        (:files) _files; return ;;
-        (:dirs) _directories; return ;;
+        (:files|:dirs)
+            [[ $PREFIX == -*=* ]] && compset -P '*='
+            if [[ $reply == :dirs ]]; then _directories; else _files; fi
+            return ;;
     esac
 
     for line in "${(@f)reply}"; do
@@ -30,10 +32,10 @@ _dots() {
         fi
     done
     if (( $#prefixes )); then
-        compadd -S '' -d prefix_descriptions -a prefixes
+        compadd -U -S '' -d prefix_descriptions -a prefixes
     fi
     if (( $#values )); then
-        compadd -d descriptions -a values
+        compadd -U -d descriptions -a values
     fi
 }
 

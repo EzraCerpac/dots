@@ -79,7 +79,7 @@ class ShellCompletions(unittest.TestCase):
             }
             if shell == "bash":
                 flags = ["--noprofile", "--norc", "-i"]
-                setup = "dots completions bash > adapter && source adapter"
+                setup = 'eval "$(dots completions bash)"'
             elif shell == "fish":
                 flags = ["--no-config", "-i"]
                 setup = "dots completions fish | source"
@@ -129,8 +129,8 @@ class ShellCompletions(unittest.TestCase):
                 wait_for(b"DONE_DOTS")
             finally:
                 process.kill()
-                process.wait(timeout=5)
                 os.close(master)
+                process.wait(timeout=5)
             self.assertTrue(log.exists(), bytes(output))
             return [json.loads(line) for line in log.read_text().splitlines()]
 

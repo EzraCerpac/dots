@@ -59,7 +59,7 @@ With mise or a release archive, add the line for your shell to its interactive c
 | --- | --- | --- |
 | Fish | `~/.config/fish/config.fish` | `dots completions fish \| source` |
 | Zsh | `~/.zshrc`, after `compinit` | `source <(dots completions zsh)` |
-| Bash | `~/.bashrc` | `source <(dots completions bash)` |
+| Bash | `~/.bashrc` | `eval "$(dots completions bash)"` |
 
 Each new shell loads completions from the active release.
 From a source checkout, build `bin/dots-up` as shown above.

@@ -56,9 +56,10 @@ var helpOptions = []option{
 }
 
 var extras = candidates{
-	"menu": "Open the command menu",
-	"help": "Show commands and usage",
-	"init": "Create a minimal dots configuration",
+	"completions": "Print shell completions",
+	"menu":        "Open the command menu",
+	"help":        "Show commands and usage",
+	"init":        "Create a minimal dots configuration",
 }
 
 var commandName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -138,6 +139,9 @@ func suggest(words []string, root string) (string, candidates) {
 	}
 
 	name := commands.Canonical(words[0])
+	if name == "completions" && len(words) == 1 {
+		return "", matching(candidates{"bash": "Bash", "fish": "Fish", "zsh": "Zsh"}, prefix)
+	}
 	if _, ok := commands.Lookup(name); !ok && name != "init" {
 		return "", nil
 	}

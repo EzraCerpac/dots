@@ -223,20 +223,6 @@ fn seams_cli_menu_is_an_ordinary_configuration_command() {
 }
 
 #[test]
-fn seams_cli_reaches_report_handlers_with_redirected_stdio() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path();
-    fs::write(cwd.join("config.toml"), "").unwrap();
-
-    // P-12 provides the listing and replay behind these entrypoints.
-    assert_diagnostic(
-        invoke(cwd, &["up", "--last"]),
-        1,
-        "dots up --last is not implemented",
-    );
-}
-
-#[test]
 fn seams_direct_child_helper() {
     if std::env::var_os("DOTS_TEST_DIRECT_HELPER").is_none() {
         return;

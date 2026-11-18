@@ -12,9 +12,7 @@ mod validation;
 mod tests;
 
 use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{CheckoutShape, Vars, checkout_shape};
@@ -162,11 +160,7 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
     let ctx = execution.ctx();
     let mut receipt = Receipt::new(Some(ctx.root.path().to_owned()), "not pushed");
     match loaded {
-        Loaded::LocalOnly => {
-            receipt.local_only = true;
-            receipt.outcome = "local-only; add a remote with git remote add origin URL".into();
-            receipt.stage_outcome = Outcome::Skipped;
-        }
+        Loaded::LocalOnly => local_only(&mut receipt),
         Loaded::Problem(problem) => {
             receipt.issues.push(Issue {
                 diagnostic: problem.diagnostic,
@@ -201,6 +195,12 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
         );
     }
     receipt
+}
+
+fn local_only(receipt: &mut Receipt) {
+    receipt.local_only = true;
+    receipt.outcome = "local-only; add a remote with git remote add origin URL".into();
+    receipt.stage_outcome = Outcome::Skipped;
 }
 
 #[derive(Debug)]
@@ -334,8 +334,7 @@ fn synchronize(
     )?;
     let Some(origin) = read_origin(ctx, &git)? else {
         if receipt.recovered.is_empty() && receipt.recovery_files.is_empty() {
-            receipt.local_only = true;
-            receipt.outcome = "local-only; add a remote with git remote add origin URL".into();
+            local_only(receipt);
         } else {
             receipt.outcome =
                 "finished pending writes; add a remote with git remote add origin URL".into();

@@ -373,6 +373,9 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
     }
 
     pub(super) fn gitleaks(&self, root: &Path, target: &OsStr, rules: &Path) -> Result<(), Fail> {
+        // The rules sandbox supplies a cwd for repository-relative data
+        // paths. Active rules and all transitive extensions are absolute
+        // snapshots outside its scanned subtree.
         let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(root))?;
         cmd.args(["dir", "--no-banner", "--redact=100", "--exit-code=20"]);
         cmd.arg("--config")

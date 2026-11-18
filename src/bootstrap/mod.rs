@@ -5,25 +5,28 @@ mod source;
 
 pub use bundle::bundle;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, Permissions};
 use std::io::{self, Read as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Exceptions, Vars, selection};
+use crate::config::{Exceptions, Root, Vars, selection};
 use crate::exceptions;
 use crate::history::{self, Restore};
 use crate::hooks::{self, HookEnv};
 use crate::process::Mise;
 use crate::report::{self, Command as ReportCommand};
 use crate::run::{Issue, Outcome, Policy, Run, Sink, StageId};
-use crate::{Args, Ctx, Fail};
+use crate::{Args, Ctx, Env, Fail};
 
 const BUNDLE: &str = "DOTS_BOOTSTRAP_BUNDLE";
 const IDENTITY: &str = "DOTS_BOOTSTRAP_IDENTITY";
 const RESTORE: &str = "DOTS_BOOTSTRAP_RESTORE";
 const STAGES: &str = "DOTS_STAGES";
+const HISTORY_ENABLED: &str = "MISE_HISTORY_ENABLED";
+const PARENT_HISTORY_ENABLED: &str = "DOTS_BOOTSTRAP_PARENT_HISTORY_ENABLED";
 const FRAGMENT: &str = "stages.json";
 const RETRY: &str = "Resolve the issue and rerun dots bootstrap.";
 
@@ -113,7 +116,7 @@ fn append_flags(native: &mut Vec<OsString>, args: &Args, keys: &[&str]) {
     );
 }
 
-fn native_args(args: &Args) -> Vec<OsString> {
+fn native_args(args: &Args, restore: Option<&str>) -> Vec<OsString> {
     let mut native = vec!["bootstrap".into(), "--skip-dirty".into()];
     append_flags(
         &mut native,
@@ -132,13 +135,22 @@ fn native_args(args: &Args) -> Vec<OsString> {
             "upgrade",
         ],
     );
-    for key in ["from", "adopt", "config-dir", "env", "only", "skip"] {
+    for key in ["config-dir", "only", "skip"] {
         append_strings(&mut native, args, key);
     }
     if let Some(path) = args.get_one::<OsString>("from-dir") {
         native.extend(["--from-dir".into(), path.clone()]);
     }
-    if args.contains_id("restore")
+    match (restore, args.get_many::<String>("env")) {
+        (Some(machine), Some(environments)) => {
+            for environment in environments.filter(|name| !name.starts_with("host-")) {
+                native.extend(["--env".into(), environment.into()]);
+            }
+            native.extend(["--env".into(), format!("host-{machine}").into()]);
+        }
+        _ => append_strings(&mut native, args, "env"),
+    }
+    if restore.is_some()
         && !args
             .get_many::<String>("skip")
             .is_some_and(|mut parts| parts.any(|part| part == "services"))
@@ -150,7 +162,8 @@ fn native_args(args: &Args) -> Vec<OsString> {
 
 fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let run = Run::begin(ctx, Sink::Report(ReportCommand::Bootstrap));
-    let mut native = native_args(args);
+    let restore = args.get_one::<String>("restore").map(String::as_str);
+    let mut native = native_args(args, restore);
     let vars = Vars::read(&ctx.root)?;
     let from = args.get_one::<String>("from");
     let adopt = args.get_one::<String>("adopt");
@@ -178,18 +191,42 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         native.extend([format!("--{key}").into(), url.into()]);
     }
 
+    let restore_selection = restore
+        .map(|machine| {
+            let mut vars = ctx.env.vars.clone();
+            vars.remove(std::ffi::OsStr::new("MISE_ENV"));
+            let env = Env {
+                vars,
+                cwd: ctx.env.cwd().to_owned(),
+            };
+            selection::for_bootstrap(&ctx.root, &env, Some(machine))
+        })
+        .transpose()?;
     let mut command = Mise::new(ctx)?.command(native)?;
     source::clear_git_checkout_override(&mut command);
+    let mut parent_history_enabled = OsString::new();
+    if let Some(value) = ctx.env.get(HISTORY_ENABLED) {
+        parent_history_enabled.push("=");
+        parent_history_enabled.push(value);
+    }
     // Native bootstrap owns installation. Its pre-dotfiles callback may use
     // mise x to install the pinned dots before the rest of the declared tools.
     command
         .env_remove("MISE_AUTO_INSTALL")
         .env_remove("MISE_EXEC_AUTO_INSTALL")
         // Native checkpoints do not enforce dots' encrypted-history contract.
-        .env("MISE_HISTORY_ENABLED", "0");
-    let restore = args.get_one::<String>("restore");
-    if let Some(machine) = restore {
-        command.env("SETUP_MACHINE_ID", machine);
+        .env(HISTORY_ENABLED, "0")
+        .env(PARENT_HISTORY_ENABLED, parent_history_enabled);
+    if let Some(selection) = restore_selection {
+        // Use Mise::with_selection once P-06's launcher seam lands.
+        command.env("MISE_ENV", selection.environments());
+        command.env(
+            "SETUP_MACHINE_ID",
+            selection.machine_id.expect("restore machine"),
+        );
+        if let Some(profile) = selection.profile {
+            command.env("SETUP_PROFILE", profile);
+        }
     }
     for (key, value) in [
         (
@@ -223,7 +260,9 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         eprintln!("dots: could not prepare stage metadata for dots bootstrap: {error}");
     }
     let stage = run.start("Native mise bootstrap");
-    let outcome = match run.run(stage, command, Policy::Ordinary) {
+    let result = run.run(stage, command, Policy::Ordinary);
+    let outcome = match result {
+        _ if run.cancelled() => Outcome::Cancelled,
         Ok(status) if status.success() => Outcome::Completed,
         Ok(status) => {
             run.issue(
@@ -257,6 +296,29 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
 }
 
 fn complete(ctx: &Ctx) -> Result<u8, Fail> {
+    // Native bootstrap disables its own checkpoint. Explicit history commands
+    // in this callback must inherit the caller's original setting.
+    let callback;
+    let ctx = if let Some(previous) = ctx.env.get(PARENT_HISTORY_ENABLED) {
+        let mut vars = ctx.env.vars.clone();
+        vars.remove(OsStr::new(PARENT_HISTORY_ENABLED));
+        vars.remove(OsStr::new(HISTORY_ENABLED));
+        if let Some(value) = previous.as_bytes().strip_prefix(b"=") {
+            vars.insert(HISTORY_ENABLED.into(), OsStr::from_bytes(value).into());
+        }
+        let env = Env {
+            vars,
+            cwd: ctx.env.cwd().to_owned(),
+        };
+        callback = Ctx {
+            root: Root::from_dir(&env, ctx.root.path())?,
+            flags: ctx.flags,
+            env,
+        };
+        &callback
+    } else {
+        ctx
+    };
     let sink = match ctx.env.get(STAGES) {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -427,7 +489,9 @@ fn stage<T>(
             Some(result)
         }
         Err(error) => {
-            run.issue(id, Issue::new(error.to_string(), RETRY));
+            if !run.cancelled() {
+                run.issue(id, Issue::new(error.to_string(), RETRY));
+            }
             run.finish(id, Outcome::Failed);
             None
         }
@@ -537,17 +601,13 @@ pub fn remote(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let status = match run.run(stage, command, Policy::Ordinary) {
         Ok(status) if status.success() => 0,
         Ok(_) => 1,
+        Err(_) if run.cancelled() => 1,
         Err(error) => {
             eprintln!("dots: could not run mise for dots remote: {error}");
             1
         }
     };
-    if run.cancelled() {
-        let message = "The remote host's state is unknown after cancellation.";
-        let next = "Inspect the remote host before retrying dots remote.";
-        eprintln!("dots: {message} {next}");
-        run.issue(stage, Issue::new(message, next));
-    } else if status != 0 {
+    if status != 0 && !run.cancelled() {
         run.issue(
             stage,
             Issue::new(

@@ -18,6 +18,7 @@ fn write(path: &Path, text: &str, mode: u32) {
 
 fn program(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| !directory.ends_with("shims"))
         .map(|directory| directory.join(name))
         .find(|path| path.is_absolute() && path.is_file())
 }
@@ -36,6 +37,7 @@ const MISE_DIRS: &[(&str, &str)] = &[
     ("MISE_SYSTEM_DATA_DIR", "system-data"),
     ("MISE_SYSTEM_PLUGINS_DIRS", "system-plugins"),
     ("MISE_SYSTEM_INSTALLS_DIR", "system-installs"),
+    ("MISE_SYSTEM_SHIMS_DIR", "system-shims"),
     ("MISE_SHARED_INSTALL_DIRS", "shared-installs"),
 ];
 
@@ -1024,4 +1026,535 @@ fn new_bootstrap_update_checks_the_effective_upstream_before_running_mise() {
     let output = run(fake(&world).args(["bootstrap", "--update"]));
     assert_success(&output);
     assert!(stdout(&output).contains("--update"), "{output:?}");
+}
+
+#[test]
+fn new_native_restore_keeps_the_restore_id_and_skips_services() {
+    let world = World::new();
+    minimal(&world);
+    let output = run(fake(&world)
+        .env("MISE_ENV", "laptop,server")
+        .env("SETUP_PROFILE", "laptop")
+        .env("SETUP_MACHINE_ID", "other-host")
+        .args([
+            "bootstrap",
+            "--restore",
+            "target-host",
+            "-E",
+            "laptop,host-other-host",
+        ]));
+    assert_success(&output);
+    let child = stdout(&output);
+    assert!(child.contains("--skip\nservices\n"), "{child}");
+    assert!(child.contains("--env\nhost-target-host\n"), "{child}");
+    assert!(!child.contains("host-other-host"), "{child}");
+    assert!(!child.contains("--restore"), "{child}");
+
+    write(
+        &world.root().join("config.local.toml"),
+        "[env]\nSETUP_PROFILE = \"laptop\"\nSETUP_MACHINE_ID = \"enrolled-host\"\n",
+        0o600,
+    );
+    let output = run(fake(&world).args(["bootstrap", "--restore", "target-host"]));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("differs from this enrolled machine"));
+}
+
+#[test]
+fn new_cancelled_bundle_probe_keeps_its_streams_private() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let world = World::new();
+    let key = world.home().join("identity");
+    let input = world.home().join("bundle.age");
+    let ready = world.home().join("probe-ready");
+    write(&key, "fixture identity", 0o600);
+    write(&input, "fixture ciphertext", 0o600);
+    let mut command = dots(&world);
+    write(
+        &world.home().join("mise-fixture/bin/age"),
+        r#"#!/bin/sh
+printf "synthetic-capture-sensitive-marker\n"
+printf "synthetic-capture-sensitive-marker\n" >&2
+touch "$HOME/probe-ready"
+exec sleep 30
+"#,
+        0o755,
+    );
+    let mut child = command
+        .args(["bundle", "check", "--bundle"])
+        .arg(input)
+        .arg("--identity")
+        .arg(key)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        panic!("age probe did not start: {output:?}");
+    }
+    // SAFETY: this PID is the live, unreaped dots child from this fixture.
+    assert_eq!(
+        unsafe { nix::libc::kill(child.id() as i32, nix::libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let marker = "synthetic-capture-sensitive-marker";
+    assert!(!stdout(&output).contains(marker));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+    let reports = world.home().join(".local/state/dots/reports");
+    let report = fs::read_dir(reports)
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension()? == "json").then(|| fs::read_to_string(path).unwrap())
+        })
+        .unwrap();
+    assert!(!report.contains(marker));
+    let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(parsed["cancelled"], true);
+}
+
+#[test]
+#[ignore = "requires the P-02 hook and P-06 history implementations"]
+fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
+    use std::collections::BTreeSet;
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    const PAYLOAD: &[u8] = b"synthetic history input for bootstrap\n";
+    let age = program("age").expect("age on PATH");
+    let keygen = program("age-keygen").expect("age-keygen on PATH");
+    let seed = World::new();
+    let world = World::new();
+    let remote = world.bare_remote("encrypted-history");
+    let origin = format!("file://{}", remote.display());
+    let tracked = format!(
+        "{MINIMAL}dots_state_repo = {origin:?}\n\n[dotfiles]\n\
+        \"~/recovered-setting\" = {{ mode = \"track\", encrypt = true, variants = [{{ profile = \"host-fixture-host\" }}] }}\n"
+    );
+    for fixture in [&seed, &world] {
+        minimal(fixture);
+        write(&fixture.root().join("config.toml"), &tracked, 0o644);
+        write(&fixture.root().join("config.laptop.toml"), "", 0o644);
+        for program in ["ssh", "curl", "launchctl", "systemctl"] {
+            write(
+                &fixture.home().join("mise-fixture/bin").join(program),
+                "#!/bin/sh\necho unexpected fixture transport or live service call >&2\nexit 99\n",
+                0o755,
+            );
+        }
+    }
+    let key = |name: &str| {
+        let path = world.home().join(name);
+        assert_success(&run(age_keygen(&world, &keygen).arg("-o").arg(&path)));
+        let recipient = run(age_keygen(&world, &keygen).arg("-y").arg(&path));
+        assert_success(&recipient);
+        (path, stdout(&recipient).trim().to_owned())
+    };
+    let (recovery, recovery_recipient) = key("recovery.key");
+    let (bundle_identity, bundle_key) = key("bundle.key");
+    let (_, extra_recipient) = key("existing.key");
+    let (_, bundle_recipient) = key("bundle-recipient.key");
+    let recovery_before = fs::read(&recovery).unwrap();
+    let bundle_before = fs::read(&bundle_identity).unwrap();
+
+    write(
+        &seed.root().join("config.local.toml"),
+        &format!(
+            "[settings.history]\nsync = \"manual\"\n\n[history.encryption]\nrecipients = [{recovery_recipient:?}]\n"
+        ),
+        0o600,
+    );
+    write(
+        &seed.home().join("recovered-setting"),
+        std::str::from_utf8(PAYLOAD).unwrap(),
+        0o640,
+    );
+    let seed_mise = seed.home().join("mise-fixture/bin/mise");
+    assert_success(&run(age_keygen(&seed, &seed_mise)
+        .env("MISE_TRUSTED_CONFIG_PATHS", seed.root())
+        .env("MISE_ENV", "laptop,host-fixture-host")
+        .args(["bootstrap", "dotfiles", "save"])));
+    let store = seed.home().join("mise-fixture/state/history/repo.git");
+    assert_success(&run(seed
+        .git()
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .arg("--git-dir")
+        .arg(&store)
+        .args(["push", "--"])
+        .arg(&remote)
+        .arg("HEAD:refs/heads/host-fixture-host")));
+    let refs = || {
+        let output = run(world.git().arg("--git-dir").arg(&remote).arg("show-ref"));
+        assert_success(&output);
+        output.stdout
+    };
+    let before = refs();
+    let remote_objects = run(world.git().arg("--git-dir").arg(&remote).args([
+        "cat-file",
+        "--batch-all-objects",
+        "--batch",
+    ]));
+    assert_success(&remote_objects);
+    assert!(
+        remote_objects
+            .stdout
+            .windows(b"mise-encrypted-file-v1".len())
+            .any(|bytes| bytes == b"mise-encrypted-file-v1")
+    );
+    assert!(
+        !remote_objects
+            .stdout
+            .windows(PAYLOAD.len())
+            .any(|bytes| bytes == PAYLOAD)
+    );
+
+    let ciphertext = world.home().join("bootstrap.age");
+    let mut encrypt = age_keygen(&world, &age)
+        .args(["-r", &bundle_key, "-o"])
+        .arg(&ciphertext)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    encrypt
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({
+                "version": 1,
+                "secrets": {"TEST": "synthetic-bundle-value"},
+                "recipients": [&bundle_recipient],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(encrypt.wait().unwrap().success());
+
+    write(
+        &world.root().join("config.local.toml"),
+        &format!(
+            r#"
+[env]
+SETUP_HISTORY_ORIGIN = {origin:?}
+SETUP_AGE_IDENTITY = {recovery:?}
+
+[vars]
+bootstrap_bundle_identity = {bundle_identity:?}
+
+[history.encryption]
+recipients = [{extra_recipient:?}]
+
+[bootstrap.services.unrelated-fixture]
+command = "false"
+"#
+        ),
+        0o600,
+    );
+    let base = world.root().parent().unwrap();
+    let bin = world.home().join("mise-fixture/bin");
+    write(&bin.join("pgrep"), "#!/bin/sh\nexit 1\n", 0o755);
+    let wrapper = world.home().join("watcher-fixture-mise");
+    write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+unset __MISE_DIFF
+for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR"; do
+    case "$path" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
+done
+printf '%s\n' "$*" >> "$HOME/native-calls"
+case "$1 ${2-} ${3-}" in
+    'bootstrap services apply')
+        [ "$#" -eq 4 ] && [ "$4" = '--yes' ] && [ "$MISE_HISTORY_ENABLED" = 0 ] || exit 95
+        case "$MISE_GLOBAL_CONFIG_FILE" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
+        test ! -s "$MISE_SYSTEM_CONFIG_FILE"
+        cp "$MISE_GLOBAL_CONFIG_FILE" "$HOME/scoped-services.toml"
+        exit 0
+        ;;
+    'dot status --json')
+        test -f "$HOME/scoped-services.toml"
+        printf '%s\n' '{"history":{"watcher":"running"}}'
+        exit 0
+        ;;
+    'bootstrap services '*|'bootstrap dotfiles watch')
+        echo unexpected watcher or services invocation >&2
+        exit 97
+        ;;
+esac
+if [ "$1" = bootstrap ] && [ "${2-}" = --skip-dirty ]; then
+    case " $* " in *" --skip services "*) ;; *) exit 95 ;; esac
+    [ "$MISE_HISTORY_ENABLED" = 0 ] || exit 95
+fi
+if [ "$1 ${2-} ${3-} ${4-}" = '--yes bootstrap dotfiles origin' ]; then
+    printf 'override=%s\n' "${MISE_HISTORY_ENABLED-unset}" >> "$HOME/native-origin.stderr"
+    "$P05_MISE_DIRS/bin/mise" "$@" 2>> "$HOME/native-origin.stderr"
+    exit $?
+fi
+exec "$P05_MISE_DIRS/bin/mise" "$@"
+"#,
+        0o755,
+    );
+
+    let mut command = dots(&world);
+    let target_dots = command.get_program().to_owned();
+    let callback = base.join("guarded-callback");
+    write(
+        &callback,
+        r#"#!/bin/sh
+set -eu
+unset __MISE_DIFF
+for path in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$TMPDIR" "$MISE_STATE_DIR"; do
+    case "$path" in "$P05_FIXTURE_BASE"/*) ;; *) exit 98 ;; esac
+done
+test ! -d "$MISE_STATE_DIR/history/repo.git"
+exec "$P05_DOTS" bootstrap complete
+"#,
+        0o755,
+    );
+    write(
+        &world.root().join("config.toml"),
+        &format!("{tracked}\n[tasks.bootstrap]\nrun = {callback:?}\nraw = true\n"),
+        0o644,
+    );
+    let output = run(command
+        .env("DOTS_MISE_BIN", &wrapper)
+        .env("SETUP_MISE_BIN", &wrapper)
+        .env("P05_DOTS", target_dots)
+        .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
+        .env("MISE_AUTO_INSTALL", "0")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SETUP_PROFILE", "laptop")
+        .env("SETUP_MACHINE_ID", "fixture-host")
+        .args([
+            "bootstrap",
+            "--yes",
+            "--restore",
+            "fixture-host",
+            "--bundle",
+        ])
+        .arg(&ciphertext));
+    assert!(
+        output.status.success(),
+        "{output:?}\n{}\n{}",
+        fs::read_to_string(world.home().join("native-origin.stderr")).unwrap_or_default(),
+        fs::read_to_string(world.home().join("native-calls")).unwrap_or_default(),
+    );
+    assert!(
+        stdout(&output).contains("completed: Restore private settings"),
+        "{output:?}"
+    );
+    assert!(
+        stdout(&output).contains("completed: Encrypted local history"),
+        "{output:?}"
+    );
+    assert!(!stdout(&output).contains("synthetic-bundle-value"));
+    let restored = world.home().join("recovered-setting");
+    assert_eq!(fs::read(&restored).unwrap(), PAYLOAD);
+    assert_eq!(
+        fs::metadata(restored).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let machine = world.home().join(".config/age/keys.txt");
+    assert_eq!(
+        fs::metadata(&machine).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(machine.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(fs::read(&recovery).unwrap(), recovery_before);
+    assert_eq!(fs::read(&bundle_identity).unwrap(), bundle_before);
+    let machine_recipient = run(age_keygen(&world, &keygen).arg("-y").arg(&machine));
+    assert_success(&machine_recipient);
+    let local = fs::read_to_string(world.root().join("config.local.toml")).unwrap();
+    let config = local.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        config["env"]["SETUP_AGE_IDENTITY"].as_str(),
+        recovery.to_str()
+    );
+    assert_eq!(
+        config["vars"]["bootstrap_bundle_identity"].as_str(),
+        bundle_identity.to_str()
+    );
+    assert_eq!(
+        config["settings"]["age"]["identity_files"]
+            .as_array()
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .as_str(),
+        machine.to_str()
+    );
+    assert_eq!(
+        config["settings"]["history"]["sync"].as_str(),
+        Some("manual")
+    );
+    assert_eq!(
+        config["history"]["origin"]["branch"].as_str(),
+        Some("host-fixture-host")
+    );
+    assert_eq!(
+        config["history"]["origin"]["url"].as_str(),
+        Some(origin.as_str())
+    );
+    let recipients: BTreeSet<_> = config["history"]["encryption"]["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        recipients,
+        [
+            &*recovery_recipient,
+            &*bundle_recipient,
+            &*extra_recipient,
+            stdout(&machine_recipient).trim(),
+        ]
+        .into_iter()
+        .collect()
+    );
+    let scoped = fs::read_to_string(world.home().join("scoped-services.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let services = scoped["bootstrap"]["services"].as_table().unwrap();
+    assert_eq!(services.len(), 1);
+    assert_eq!(
+        services["mise-history"]["builtin"].as_str(),
+        Some("history-watch")
+    );
+    assert_eq!(
+        services["mise-history"]["environment"]["MISE_CONFIG_DIR"].as_str(),
+        world.root().to_str()
+    );
+    assert!(
+        config["bootstrap"]["services"]
+            .as_table()
+            .unwrap()
+            .contains_key("unrelated-fixture")
+    );
+    let trace = fs::read_to_string(world.home().join("native-calls")).unwrap();
+    let restore = trace.find("bootstrap dotfiles pull").unwrap();
+    let activate = trace.find("bootstrap services apply --yes").unwrap();
+    let verify = trace.find("dot status --json").unwrap();
+    assert!(restore < activate && activate < verify);
+    assert_eq!(trace.matches("bootstrap services apply").count(), 1);
+    assert_eq!(refs(), before);
+
+    let command = || {
+        let mut cmd = dots(&world);
+        cmd.env("DOTS_MISE_BIN", &wrapper)
+            .env("SETUP_MISE_BIN", &wrapper)
+            .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
+            .env("MISE_AUTO_INSTALL", "0")
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("SETUP_PROFILE", "laptop")
+            .env("SETUP_MACHINE_ID", "fixture-host");
+        cmd
+    };
+    let machine_before = fs::read(&machine).unwrap();
+    let standalone = run(command()
+        .args([
+            "enroll-history",
+            "--profile",
+            "laptop",
+            "--machine-id",
+            "fixture-host",
+            "--identity",
+        ])
+        .arg(&machine));
+    assert_success(&standalone);
+    let trace = fs::read_to_string(world.home().join("native-calls")).unwrap();
+    assert_eq!(trace.matches("bootstrap services apply").count(), 1);
+    assert_eq!(trace.matches("dot status --json").count(), 1);
+
+    let path = world.root().join("config.local.toml");
+    let mut config = fs::read_to_string(&path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    config["env"]
+        .as_table_mut()
+        .unwrap()
+        .remove("SETUP_AGE_IDENTITY");
+    write(&path, &config.to_string(), 0o600);
+    let enroll = run(command()
+        .env("SETUP_AGE_IDENTITY", &recovery)
+        .env("DOTS_BOOTSTRAP_BUNDLE", &ciphertext)
+        .args(["bootstrap", "complete"]));
+    assert_success(&enroll);
+    assert!(
+        stdout(&enroll).contains("completed: Encrypted local history"),
+        "{enroll:?}"
+    );
+    let config = fs::read_to_string(path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        config["env"]["SETUP_AGE_IDENTITY"].as_str(),
+        recovery.to_str()
+    );
+    assert_eq!(fs::read(&machine).unwrap(), machine_before);
+    let trace = fs::read_to_string(world.home().join("native-calls")).unwrap();
+    assert_eq!(trace.matches("bootstrap services apply").count(), 2);
+    assert_eq!(trace.matches("dot status --json").count(), 2);
+    assert_eq!(refs(), before);
+}
+
+#[test]
+fn new_local_native_bootstrap_does_not_checkpoint_a_plaintext_track() {
+    let world = World::new();
+    minimal(&world);
+    let secret = world.home().join("plaintext-fixture");
+    write(&secret, "synthetic pre-bootstrap content\n", 0o600);
+    write(
+        &world.root().join("config.toml"),
+        &format!("{MINIMAL}\n[dotfiles]\n\"~/plaintext-fixture\" = {{ mode = \"track\" }}\n"),
+        0o644,
+    );
+    write(&world.root().join("config.laptop.toml"), "", 0o644);
+    for program in ["ssh", "curl", "launchctl", "systemctl"] {
+        write(
+            &world.home().join("mise-fixture/bin").join(program),
+            "#!/bin/sh\nexit 99\n",
+            0o755,
+        );
+    }
+    let output = run(dots(&world)
+        .env("MISE_TRUSTED_CONFIG_PATHS", world.root())
+        .env("SETUP_PROFILE", "laptop")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args(["bootstrap", "--yes", "--only", "dotfiles"]));
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(secret).unwrap(),
+        "synthetic pre-bootstrap content\n"
+    );
+    assert!(
+        !world
+            .home()
+            .join("mise-fixture/state/history/repo.git")
+            .exists()
+    );
 }

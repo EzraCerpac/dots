@@ -3,7 +3,7 @@ use std::fs::{self, Permissions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::process::Cwd;
 
@@ -66,21 +66,24 @@ pub(super) fn recipient(value: &str) -> bool {
 
 fn age(ctx: &Ctx) -> Result<Command, Fail> {
     // Bundle check and create work without a configuration or mise.
-    let mut command = ctx.command_with_profile("age", Cwd::Caller, "".as_ref())?;
-    command.stderr(Stdio::null());
-    Ok(command)
+    ctx.command_with_profile("age", Cwd::Caller, "".as_ref())
 }
 
-pub(super) fn decrypt(ctx: &Ctx, file: &Path, identity: &Path) -> Result<Bundle, Fail> {
-    let output = age(ctx)?
+pub(super) fn decrypt(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    file: &Path,
+    identity: &Path,
+) -> Result<Bundle, Fail> {
+    let mut command = age(ctx)?;
+    command
         .arg("--decrypt")
         .arg("--identity")
         .arg(identity)
         .arg("--")
-        .arg(file)
-        .output()
-        .map_err(age_error)?;
-    if !output.status.success() {
+        .arg(file);
+    let output = run.probe(command).map_err(age_error)?;
+    if run.cancelled() || !output.status.success() {
         return Err(Fail::new(
             1,
             "cannot decrypt the bootstrap bundle with the selected age identity",
@@ -89,7 +92,13 @@ pub(super) fn decrypt(ctx: &Ctx, file: &Path, identity: &Path) -> Result<Bundle,
     Bundle::parse(&output.stdout)
 }
 
-fn create(ctx: &Ctx, input: &Path, output: &Path, recipients: &[&str]) -> Result<(), Fail> {
+fn create(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    input: &Path,
+    output: &Path,
+    recipients: &[&str],
+) -> Result<(), Fail> {
     if recipients.is_empty() || recipients.iter().any(|key| !recipient(key)) {
         return Err(Fail::usage("supply at least one age public recipient"));
     }
@@ -110,8 +119,10 @@ fn create(ctx: &Ctx, input: &Path, output: &Path, recipients: &[&str]) -> Result
     for key in recipients {
         command.args(["--recipient", key]);
     }
-    let encrypted = command.stdin(pipe.stdin()?).output().map_err(age_error)?;
-    if !encrypted.status.success() || encrypted.stdout.is_empty() {
+    let encrypted = run
+        .probe_with_stdin(command, pipe.stdin()?)
+        .map_err(age_error)?;
+    if run.cancelled() || !encrypted.status.success() || encrypted.stdout.is_empty() {
         return Err(Fail::new(1, "could not encrypt the bootstrap bundle"));
     }
 
@@ -164,15 +175,18 @@ pub fn bundle(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
                 .flatten()
                 .map(String::as_str)
                 .collect();
-            create(ctx, &input, &output, &recipients)
+            create(ctx, &run, &input, &output, &recipients)
         }
         "check" => {
             let bundle = arg_path(ctx, args, "bundle").expect("required by CLI");
             let identity = arg_path(ctx, args, "identity").expect("required by CLI");
-            decrypt(ctx, &bundle, &identity).map(|_| ())
+            decrypt(ctx, &run, &bundle, &identity).map(|_| ())
         }
         _ => unreachable!("selected by CLI"),
     };
+    if run.cancelled() {
+        return Ok(run.end(1));
+    }
     match result {
         Ok(()) => {
             run.finish(stage, Outcome::Completed);

@@ -143,7 +143,7 @@ pub(super) fn open_bundle(
         recovery_identity(ctx, &local.document, request)?
     };
     if exists && let Some(identity) = readable_identity(ctx, &identity)? {
-        let bundle = bundle::decrypt(ctx, file, &identity)?;
+        let bundle = bundle::decrypt(ctx, run, file, &identity)?;
         if remembered.is_none_or(|value| Path::new(value) != identity) {
             let identity = identity.to_str().ok_or_else(|| {
                 Fail::usage(
@@ -350,6 +350,7 @@ pub(super) fn enroll(
         ));
     }
     let identity = machine_identity(ctx, run)?;
+    let had_recovery = string(&local(ctx)?.document, RECOVERY_IDENTITY)?.is_some();
     let outcome = history::enroll(
         run,
         stage,
@@ -366,7 +367,10 @@ pub(super) fn enroll(
     }
 
     let mut local = local(ctx)?;
-    if find(&local.document, RECOVERY_IDENTITY).is_none() {
+    // History preparation can fill an absent recovery setting with the machine key.
+    let recorded = string(&local.document, RECOVERY_IDENTITY)?;
+    if recorded.is_none() || (!had_recovery && recorded.map(Path::new) == Some(identity.as_path()))
+    {
         let recovery = resolved.identity.to_str().ok_or_else(|| {
             Fail::usage("the recovery identity path must be UTF-8 to save it in config.local.toml")
         })?;
@@ -440,7 +444,17 @@ pub(super) fn enroll(
     {
         return Err(Fail::new(1, "could not activate mise's history watcher"));
     }
-    let state = mise.json(["dot", "status", "--json"])?;
+    let selected = crate::config::selection::read(&ctx.root, &ctx.env)?;
+    let mut status = mise.command(["dot", "status", "--json"])?;
+    status.env("MISE_ENV", selected.active_environments());
+    let output = run
+        .probe_for(stage, status)
+        .map_err(|_| Fail::new(1, "could not query mise's history watcher state"))?;
+    if !output.status.success() {
+        return Err(Fail::new(1, "could not query mise's history watcher state"));
+    }
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| Fail::new(1, "mise returned an invalid history watcher status"))?;
     if state
         .pointer("/history/watcher")
         .and_then(serde_json::Value::as_str)

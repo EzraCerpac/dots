@@ -20,3 +20,5 @@ pub fn reports(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
 pub fn last(_ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     Err(Fail::unported("P-12", "dots up --last"))
 }
+
+pub mod transcript;

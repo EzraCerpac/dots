@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -6,12 +6,12 @@ use plist::Value;
 
 use crate::Fail;
 
-use super::native::Native;
+use super::native::{Native, read_native_file};
 use super::{blocked, invalid};
 
 // Native bootstrap installs its built-in history service as `mise dot watch`.
 // Standalone mise also accepts the long forms and the bootstrap alias.
-const WATCH_PROCESS: &str = r"^([^[:space:]]*/)?mise([.-][^[:space:]/]+)?[[:space:]]+([^[:space:]]+[[:space:]]+)*((bootstrap|bs)[[:space:]]+)?(dot|dotfiles)[[:space:]]+watch([[:space:]]|$)";
+const WATCH_PROCESS: &str = r"^([^[:space:]]*/)?mise([.-][^[:space:]/]+)?[[:space:]]+([^[:space:]]+[[:space:]]+)*((bootstrap|bs)[[:space:]]+)?(dot|dotfiles)([[:space:]]+-[^[:space:]]+)*[[:space:]]+watch([[:space:]]|$)";
 
 pub(super) fn require_stopped(native: &Native<'_, '_>) -> Result<(), Fail> {
     let unknown = || invalid("could not confirm that the mise history watcher is stopped");
@@ -20,6 +20,21 @@ pub(super) fn require_stopped(native: &Native<'_, '_>) -> Result<(), Fail> {
             "mise history watcher is running; stop it through its service owner before restoring",
         )
     };
+    // The store lock identifies watchers even when mise was renamed. Mise
+    // takes an exclusive flock, so a shared try-lock suffices to observe it.
+    for (history, _) in native.history_dirs().map_err(|_| unknown())? {
+        let file = match read_native_file(&history.join("watch.lock")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(unknown()),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(running()),
+            Err(TryLockError::Error(_)) => return Err(unknown()),
+        }
+    }
+
     let uid = nix::unistd::geteuid().to_string();
     let mut processes = native.command("pgrep")?;
     processes.args(["-u", &uid, "-f", WATCH_PROCESS]);
@@ -129,8 +144,13 @@ fn watch_words<'a>(words: impl IntoIterator<Item = &'a str>) -> bool {
     let mut dotfiles = false;
     for word in words {
         let word = word.trim_matches(['\'', '"', ';']);
-        if dotfiles && word == "watch" {
-            return true;
+        if dotfiles {
+            if word == "watch" {
+                return true;
+            }
+            if word.starts_with('-') {
+                continue;
+            }
         }
         dotfiles = seen_mise && matches!(word, "dot" | "dotfiles");
         let executable = word.rsplit('/').next().unwrap_or_default();
@@ -205,11 +225,11 @@ mod tests {
             let samples = native.home().unwrap().join("commands");
             fs::write(
                 &samples,
-                "/bin/mise dot watch\n/bin/mise -E host-fixture dotfiles watch --once\n/bin/mise bs dotfiles watch\n/bin/mise bootstrap dotfiles watch\n/bin/mise dot status\n",
+                "/bin/mise dot watch\n/bin/mise -E host-fixture dotfiles watch --once\n/bin/mise bs dotfiles watch\n/bin/mise bootstrap dotfiles watch\n/bin/mise dot --local watch\n/bin/mise dot --local status\n",
             ).unwrap();
             grep.arg(samples);
             let matches = native.text(grep, "could not match fixture argv").unwrap();
-            assert_eq!(matches.lines().count(), 4);
+            assert_eq!(matches.lines().count(), 5);
             assert!(!matches.contains("status"));
         });
     }
@@ -230,6 +250,7 @@ mod tests {
                         Value::Array(vec![
                             "/tmp/a space/mise".into(),
                             "dot".into(),
+                            "--local".into(),
                             "watch".into(),
                         ]),
                     );
@@ -247,7 +268,7 @@ mod tests {
                     fs::create_dir_all(&dir).unwrap();
                     fs::write(
                         dir.join("dev.mise.custom-agent.service"),
-                        "[Service]\nExecStart=\"/tmp/a space/mise\" dot watch\n",
+                        "[Service]\nExecStart=\"/tmp/a space/mise\" dot --local watch\n",
                     )
                     .unwrap();
                     ("systemctl", "exit 99", "printf 'inactive\n'; exit 3")
@@ -270,6 +291,48 @@ mod tests {
             );
             script(home, manager, inactive);
             require_stopped(native).unwrap();
+        });
+    }
+
+    #[test]
+    fn observes_held_native_watch_locks_without_creating_files_or_inspecting_processes_first() {
+        in_world(|native, _| {
+            let home = native.home().unwrap();
+            script(home, "pgrep", "exit 1");
+            let shared = native.store().unwrap().parent().unwrap().to_path_buf();
+            let local = shared.with_file_name("history-local").join("history");
+            require_stopped(native).unwrap();
+            assert!(!shared.exists());
+            assert!(!local.exists());
+
+            for dir in [shared, local] {
+                fs::create_dir_all(&dir).unwrap();
+                let path = dir.join("watch.lock");
+                let holder = fs::File::create(&path).unwrap();
+                require_stopped(native).unwrap();
+                holder.try_lock().unwrap();
+                script(home, "pgrep", "exit 99");
+                assert!(
+                    require_stopped(native)
+                        .unwrap_err()
+                        .diagnostic
+                        .contains("is running")
+                );
+                drop(holder);
+                script(home, "pgrep", "exit 1");
+                require_stopped(native).unwrap();
+                assert!(path.is_file());
+
+                fs::remove_file(&path).unwrap();
+                fs::create_dir(&path).unwrap();
+                assert!(
+                    require_stopped(native)
+                        .unwrap_err()
+                        .diagnostic
+                        .contains("could not confirm")
+                );
+                fs::remove_dir(&path).unwrap();
+            }
         });
     }
 }

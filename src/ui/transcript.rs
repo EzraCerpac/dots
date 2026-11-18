@@ -5,7 +5,7 @@ use std::io::{self, Write};
 
 use crate::report::{Outcome, Report, Stage};
 
-use super::reports::{display_path, needs_terminal_escape};
+use super::reports::{attention_disposition, display_path, needs_attention, needs_terminal_escape};
 
 /// Flush the boundary before the caller gives a native child the foreground.
 pub fn write_stage_start(out: &mut impl Write, stage: &Stage) -> io::Result<()> {
@@ -30,10 +30,10 @@ pub fn write_stage_end(out: &mut impl Write, stage: &Stage) -> io::Result<()> {
 /// Write the same report at the end of a run and for a saved replay.
 /// Set `saved` after a successful save or when replaying a saved report.
 pub fn write_report(out: &mut impl Write, report: &Report, saved: bool) -> io::Result<()> {
-    let has_issues = report.stages.iter().any(|stage| !stage.issues.is_empty());
+    let attention = needs_attention(report);
     let result = match (report.cancelled, report.status) {
         (true, _) => "Cancelled",
-        (false, 0) if has_issues => "Completed with issues",
+        (false, 0) if attention => "Completed with issues",
         (false, 0) => "Complete",
         _ => "Failed",
     };
@@ -60,9 +60,14 @@ pub fn write_report(out: &mut impl Write, report: &Report, saved: bool) -> io::R
         }
     }
 
-    if has_issues {
+    if attention {
         writeln!(out, "Needs attention")?;
         for stage in &report.stages {
+            if stage.issues.is_empty()
+                && let Some(disposition) = attention_disposition(stage)
+            {
+                writeln!(out, "  {} [{disposition}]", stage_label(stage))?;
+            }
             for issue in &stage.issues {
                 writeln!(
                     out,

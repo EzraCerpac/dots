@@ -204,6 +204,62 @@ fn new_native_failure_looks_the_same_on_replay() {
 }
 
 #[test]
+fn new_live_and_saved_reports_keep_unexplained_stage_dispositions() {
+    let mut report = example_report();
+    report.stages.truncate(1);
+    for (outcome, disposition, status, result) in [
+        (
+            report::Outcome::Deferred,
+            "deferred",
+            0,
+            "Completed with issues",
+        ),
+        (
+            report::Outcome::Failed,
+            "failed",
+            0,
+            "Completed with issues",
+        ),
+        (report::Outcome::Failed, "failed", 23, "Failed"),
+    ] {
+        report.status = status;
+        report.stages[0].outcome = Some(outcome);
+        report.stages[0].issues.clear();
+
+        let expected = format!(
+            "dots up: {result} (exit {status})\nNeeds attention\n  App Store (alongside) [{disposition}]\nDetails and logs · dots up --last\n"
+        );
+        let mut live = Vec::new();
+        transcript::write_stage_end(&mut live, &report.stages[0]).unwrap();
+        transcript::write_report(&mut live, &report, true).unwrap();
+        assert_eq!(
+            live,
+            format!("App Store (alongside): {disposition}\n{expected}").as_bytes(),
+        );
+
+        let stored = serde_json::to_vec(&report).unwrap();
+        let loaded = serde_json::from_slice(&stored).unwrap();
+        let mut replay = Vec::new();
+        transcript::write_report(&mut replay, &loaded, true).unwrap();
+        assert_eq!(replay, expected.as_bytes());
+
+        report.stages[0].issues.push(report::Issue::new(
+            "The App Store is unavailable.",
+            "Try dots up --mas again later.",
+        ));
+        let mut explained = Vec::new();
+        transcript::write_report(&mut explained, &report, true).unwrap();
+        assert_eq!(
+            explained,
+            format!(
+                "dots up: {result} (exit {status})\nNeeds attention\n  App Store (alongside): The App Store is unavailable.\n    Next: Try dots up --mas again later.\nDetails and logs · dots up --last\n"
+            )
+            .as_bytes(),
+        );
+    }
+}
+
+#[test]
 fn new_report_cancellation_is_independent_of_exit_status() {
     let mut report = example_report();
     report.stages[0].outcome = Some(report::Outcome::Cancelled);

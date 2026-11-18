@@ -6,7 +6,7 @@ use std::path::Path;
 
 use nix::libc;
 
-use crate::report::{self, Command, Outcome, Report};
+use crate::report::{self, Command, Outcome, Report, Stage};
 use crate::{Env, Fail};
 
 pub(super) fn list(env: &Env, command: Option<Command>, out: &mut impl Write) -> Result<u8, Fail> {
@@ -64,18 +64,27 @@ pub(super) fn needs_terminal_escape(ch: char) -> bool {
         || matches!(ch, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
+pub(super) fn attention_disposition(stage: &Stage) -> Option<&'static str> {
+    match stage.outcome {
+        Some(Outcome::Deferred) => Some("deferred"),
+        Some(Outcome::Failed) => Some("failed"),
+        _ => None,
+    }
+}
+
+pub(super) fn needs_attention(report: &Report) -> bool {
+    report
+        .stages
+        .iter()
+        .any(|stage| !stage.issues.is_empty() || attention_disposition(stage).is_some())
+}
+
 fn outcome(report: &Report) -> &'static str {
     if report.cancelled {
         return "cancelled";
     }
     match report.status {
-        0 if report.stages.iter().any(|stage| {
-            !stage.issues.is_empty()
-                || matches!(stage.outcome, Some(Outcome::Failed | Outcome::Deferred))
-        }) =>
-        {
-            "needs attention"
-        }
+        0 if needs_attention(report) => "needs attention",
         0 => "completed",
         _ => "failed",
     }

@@ -10,7 +10,7 @@ use crate::process::{Cwd, Mise};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId};
 use crate::targets::{Kind, Scope, Targets};
 
-use super::{Config, Step, Versions, child, json, mise_command, probe, record_changes, step};
+use super::{Step, Versions, child, json, mise_command, probe, record_changes, step};
 
 type ToolList = BTreeMap<String, Vec<Tool>>;
 
@@ -26,7 +26,7 @@ struct Tool {
 }
 
 fn list(run: &Run<'_>, mise: &Mise<'_>) -> Result<ToolList, Issue> {
-    json(run, mise_command(mise, ["ls", "--current", "--json"]))
+    json(run, mise_command(run, mise, ["ls", "--current", "--json"]))
 }
 
 fn snapshot(tools: &ToolList) -> Versions {
@@ -77,7 +77,7 @@ pub(super) fn update(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> (bool, bool) 
             hints.push(",");
         }
         hints.push("system_packages_missing");
-        let cmd = mise_command(mise, ["install"]).map(|mut cmd| {
+        let cmd = mise_command(run, mise, ["install"]).map(|mut cmd| {
             cmd.env("MISE_DISABLE_HINTS", hints);
             cmd
         });
@@ -88,7 +88,7 @@ pub(super) fn update(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> (bool, bool) 
         && step(run, "Upgrade declared mise tools", |id| {
             let before = list(run, mise)?;
             let args = upgrade_args(&before);
-            run_and_record(run, id, mise, Some(before), mise_command(mise, &args))
+            run_and_record(run, id, mise, Some(before), mise_command(run, mise, &args))
         }) == Some(Outcome::Completed);
     (installed, upgraded)
 }
@@ -141,10 +141,10 @@ fn self_update_enabled(ctx: &Ctx, path: &Path) -> bool {
 }
 
 pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
-    let cmd = mise_command(mise, ["self-update", "--yes", "--no-plugins"]);
+    let cmd = mise_command(run, mise, ["self-update", "--yes", "--no-plugins"]);
     let package_managed = cmd.as_ref().is_ok_and(|cmd| {
         !self_update_enabled(ctx, Path::new(cmd.get_program()))
-            || text(run, mise_command(mise, ["self-update", "--help"]))
+            || text(run, mise_command(run, mise, ["self-update", "--help"]))
                 .is_some_and(|help| help.contains("This build of mise has self-update disabled."))
     });
     if package_managed {
@@ -157,11 +157,11 @@ pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
     }
 
     step(run, "Standalone mise", |id| {
-        let before = text(run, mise_command(mise, ["--version"]));
+        let before = text(run, mise_command(run, mise, ["--version"]));
         let result = child(run, id, cmd, Policy::Ordinary);
         if !run.cancelled()
             && let Some(before) = before
-            && let Some(after) = text(run, mise_command(mise, ["--version"]))
+            && let Some(after) = text(run, mise_command(run, mise, ["--version"]))
             && before != after
         {
             run.change(
@@ -193,7 +193,7 @@ fn manager_tool(name: &str) -> bool {
 }
 
 fn path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
-    let mut bytes = probe(run, mise_command(mise, args.iter().copied())).ok()?;
+    let mut bytes = probe(run, mise_command(run, mise, args.iter().copied())).ok()?;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
@@ -201,12 +201,7 @@ fn path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-pub(super) fn manager_source(
-    ctx: &Ctx,
-    run: &Run<'_>,
-    mise: &Mise<'_>,
-    config: &Config,
-) -> Option<ManagerSource> {
+pub(super) fn manager_source(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> Option<ManagerSource> {
     if run.cancelled() {
         return None;
     }
@@ -220,7 +215,7 @@ pub(super) fn manager_source(
     if declared_tool {
         return Some(ManagerSource::Tool);
     }
-    super::packages::declared_dots_formula(run, mise, config).map(ManagerSource::Formula)
+    super::packages::declared_dots_formula(run, mise).map(ManagerSource::Formula)
 }
 
 pub(super) fn manager_version(

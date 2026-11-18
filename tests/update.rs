@@ -58,6 +58,21 @@ impl Fixture {
 
     fn command(&self, mut command: Command) -> Command {
         let paths = [self.bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")];
+        let home = self.world.home();
+        for (key, dir) in [
+            ("CODEX_HOME", ".codex"),
+            ("CLAUDE_CONFIG_DIR", ".claude"),
+            ("MISE_DATA_DIR", "mise/data"),
+            ("MISE_STATE_DIR", "mise/state"),
+            ("MISE_CACHE_DIR", "mise/cache"),
+            ("MISE_TMP_DIR", "mise/tmp"),
+            ("MISE_SYSTEM_CONFIG_DIR", "mise/system"),
+            ("TMPDIR", "tmp"),
+        ] {
+            let dir = home.join(dir);
+            fs::create_dir_all(&dir).unwrap();
+            command.env(key, dir);
+        }
         command
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("GIT_ALLOW_PROTOCOL", "file")
@@ -65,8 +80,25 @@ impl Fixture {
             .env("SETUP_MACHINE_ID", "fixture")
             .env("DOTS_MISE_BIN", self.bin.join("mise"))
             .env("SETUP_MISE_BIN", self.bin.join("mise"))
+            .env("MISE_CONFIG_DIR", self.world.root())
+            .env("MISE_GLOBAL_CONFIG_FILE", home.join("mise/global.toml"))
+            .env("MISE_TRUSTED_CONFIG_PATHS", self.world.root())
             .env("DOTS_UP_STATE_DIR", self.world.home().join("old-reports"))
             .env("MISE_SELF_UPDATE_AVAILABLE", "true");
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ] {
+            assert!(
+                command.get_envs().any(|(name, value)| {
+                    name == key && value.is_some_and(|path| Path::new(path).starts_with(home))
+                }),
+                "{key} must point inside this fixture's HOME"
+            );
+        }
         command
     }
 
@@ -149,6 +181,7 @@ fn changes(report: &Value) -> Vec<(&str, &str, &str)> {
     rows
 }
 
+#[cfg(target_os = "macos")]
 const BREW_RECIPE: &str = r#"#!/bin/bash
 set -euo pipefail
 if [ -n "${DOTS_HOME:-}" ]; then
@@ -159,6 +192,7 @@ else
 fi
 "#;
 
+#[cfg(target_os = "macos")]
 fn brew_up(fixture: &Fixture, kind: &str, expected: i32) -> Value {
     fixture.write("fail-version", "");
     fixture.run_command(
@@ -354,8 +388,8 @@ fn unchanged_mixed_hold_and_pin_preserves_the_manager_state() {
     fixture.recipe("held-package", "#!/bin/sh\nexit 0\n");
     fixture.write("dots/exceptions.tsv", "base\theld-package\thold=apt:held\n");
     fixture.write("packages.json", r#"{"apt":{"available":true,"packages":[
-        {"package":"held","requested_version":"latest","desired_state":"present","state":"installed"},
-        {"package":"pinned","requested_version":"2","desired_state":"present","state":"missing"}
+        {"package":"held","requested_version":"latest","desired_state":"present","state":"installed","installed_version":"1"},
+        {"package":"pinned","requested_version":"2","desired_state":"present","state":"missing","installed_version":""}
     ]}}"#);
     let report = fixture.run(1);
     assert!(!fixture.calls().contains("packages apply"));
@@ -480,4 +514,82 @@ fn new_app_store_defers_expired_authorization_without_reprompting() {
     assert!(!fixture.calls().contains("packages apply --manager mas"));
     assert!(fixture.calls().contains("self-update"));
     assert!(!fixture.world.root().join("authorization-prompt").exists());
+}
+
+#[test]
+#[ignore = "P-06"]
+fn unchanged_failed_manager_does_not_block_healthy_packages() {
+    let fixture = Fixture::new();
+    fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'apt:bad' = 'latest'\n'pacman:good' = 'latest'\n");
+    fixture.write(
+        "packages.json",
+        r#"{
+        "apt":{"available":true,"packages":[
+            {"package":"bad","requested_version":"latest","desired_state":"present",
+             "state":"missing","installed_version":""}]},
+        "pacman":{"available":true,"packages":[
+            {"package":"good","requested_version":"latest","desired_state":"present",
+             "state":"missing","installed_version":""}]}
+    }"#,
+    );
+    fixture.write("fail-apt-status", "");
+    fixture.run(1);
+    let calls = fixture.calls();
+    assert!(calls.contains("packages apply --manager pacman --yes"));
+    assert!(!calls.contains("packages apply --manager apt"));
+    assert!(calls.contains("install tools"));
+}
+
+#[test]
+#[ignore = "P-06"]
+fn new_unresolved_bare_blocks_filtering_but_keeps_unfiltered_managers() {
+    let fixture = Fixture::new();
+    fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'bare' = 'latest'\n'apt:held' = 'latest'\n'pacman:good' = 'latest'\n");
+    fixture.recipe("held-package", "#!/bin/sh\nexit 0\n");
+    fixture.write("dots/exceptions.tsv", "base\theld-package\thold=apt:held\n");
+    fixture.write(
+        "packages.json",
+        r#"{
+        "apt":{"available":true,"packages":[
+            {"package":"held","requested_version":"latest","desired_state":"present",
+             "state":"installed","installed_version":"1"}]},
+        "unprefixed":{"available":false,"packages":[
+            {"package":"bare","requested_version":"latest","desired_state":"present",
+             "state":"skipped","installed_version":""}]},
+        "pacman":{"available":true,"packages":[
+            {"package":"good","requested_version":"latest","desired_state":"present",
+             "state":"missing","installed_version":""}]}
+    }"#,
+    );
+    fixture.write(
+        "apt-packages.json",
+        r#"{"apt":{"available":true,"packages":[
+        {"package":"held","requested_version":"latest","desired_state":"present",
+         "state":"installed","installed_version":"1"},
+        {"package":"bare","requested_version":"latest","desired_state":"present",
+         "state":"missing","installed_version":""}
+    ]}}"#,
+    );
+    fixture.write("fail-bare-assignment", "");
+    let report = fixture.run(1);
+    let calls = fixture.calls();
+    assert!(!calls.contains("packages apply --manager apt"));
+    assert!(calls.contains("packages apply --manager pacman --yes"));
+    let scopes = fs::read_to_string(fixture.world.root().join("package-scopes")).unwrap();
+    assert!(
+        scopes.lines().any(|line| {
+            let (manager, scope) = line.split_once('\t').unwrap();
+            manager == "pacman" && scope.split(',').any(|candidate| candidate == "apt")
+        }),
+        "{scopes}"
+    );
+    assert!(report["stages"].as_array().unwrap().iter().any(|stage| {
+        stage["label"] == "apt packages"
+            && stage["issues"].as_array().unwrap().iter().any(|issue| {
+                issue["diagnostic"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unqualified package names")
+            })
+    }));
 }

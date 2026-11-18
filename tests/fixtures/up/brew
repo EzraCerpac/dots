@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+for directory in "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"; do
+    case "$directory" in "$HOME"/*) ;; *) exit 75 ;; esac
+done
 cd "$DOTS_ROOT"
 case "$1" in
     --prefix) printf '/usr/local\n' ;;

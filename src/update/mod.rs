@@ -58,7 +58,7 @@ impl Config {
     fn reload<'a>(ctx: &'a Ctx, run: &Run<'_>) -> Result<(Self, Mise<'a>), Issue> {
         let config = Self::read(ctx).map_err(issue)?;
         let mise = Mise::new(ctx).map_err(issue)?;
-        probe(run, mise_command(&mise, ["config", "ls", "--json"]))?;
+        probe(run, mise_command(run, &mise, ["config", "ls", "--json"]))?;
         Ok((config, mise))
     }
 }
@@ -92,7 +92,7 @@ fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
     });
     let Some((config, mise)) = loaded else { return };
 
-    let manager = tools::manager_source(ctx, run, &mise, &config);
+    let manager = tools::manager_source(ctx, run, &mise);
     let manager_before = manager
         .as_ref()
         .and_then(|source| tools::manager_version(ctx, run, &mise, source));
@@ -234,12 +234,12 @@ fn issue(error: impl std::fmt::Display) -> Issue {
     Issue::new(error.to_string(), NEXT)
 }
 
-fn mise_command<I, S>(mise: &Mise<'_>, args: I) -> Result<Command, Fail>
+fn mise_command<I, S>(run: &Run<'_>, mise: &Mise<'_>, args: I) -> Result<Command, Fail>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = mise.command(args)?;
+    let mut cmd = mise.command_in_run(run, args)?;
     cmd.env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
         .env("MISE_SELF_UPDATE_AUTO", "false");
     Ok(cmd)

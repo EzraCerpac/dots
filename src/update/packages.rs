@@ -12,6 +12,7 @@ use crate::run::{Issue, Outcome, Policy, Run, StageId};
 use super::{Config, Step, Versions, child, json, mise_command, record_changes, step};
 
 type Status = BTreeMap<String, Manager>;
+type PackageNames = BTreeSet<String>;
 
 #[derive(Deserialize)]
 struct Manager {
@@ -45,17 +46,24 @@ struct Managers {
 
 // P-02 owns the effective package scope. This keeps the status and command
 // adapter local until inspect::packages::Scope is published.
-struct Scope(BTreeSet<String>);
+struct Scope {
+    managers: BTreeSet<String>,
+    inventory: Status,
+}
 
 impl Scope {
     fn read(run: &Run<'_>, mise: &Mise<'_>) -> Result<Self, Issue> {
-        let inventory: Status = json(run, command(mise, "", ["status", "--json"]))?;
+        let inventory: Status = json(run, command(run, mise, "", ["status", "--json"]))?;
         if inventory.is_empty() {
-            return Ok(Self(BTreeSet::new()));
+            return Ok(Self {
+                managers: BTreeSet::new(),
+                inventory,
+            });
         }
         let settings: Settings = json(
             run,
             mise_command(
+                run,
                 mise,
                 ["settings", "ls", "--all", "--json", "system_packages"],
             ),
@@ -81,15 +89,54 @@ impl Scope {
         if !cfg!(target_os = "macos") {
             names.remove("mas");
         }
-        Ok(Self(names))
+        Ok(Self {
+            managers: names,
+            inventory,
+        })
+    }
+
+    fn includes(&self, manager: &str) -> bool {
+        self.managers.contains(manager)
+    }
+
+    fn managers(&self) -> impl Iterator<Item = &str> {
+        self.managers.iter().map(String::as_str)
+    }
+
+    fn has_bare(&self) -> bool {
+        self.inventory.contains_key("unprefixed")
+    }
+
+    fn declares(&self, manager: &str, package: &str) -> bool {
+        self.inventory
+            .get(manager)
+            .is_some_and(|entry| entry.packages.iter().any(|row| row.package == package))
     }
 
     fn status(&self, run: &Run<'_>, mise: &Mise<'_>, include_mas: bool) -> Result<Status, Issue> {
-        json(run, self.command(mise, include_mas, ["status", "--json"]))
+        json(
+            run,
+            self.command_in_run(run, mise, include_mas, ["status", "--json"]),
+        )
     }
 
-    fn command<I, S>(
+    fn status_for(
         &self,
+        run: &Run<'_>,
+        mise: &Mise<'_>,
+        manager: &str,
+    ) -> Result<Option<Manager>, Issue> {
+        let cmd = command(run, mise, manager, ["status", "--json"]).map(|mut command| {
+            command.env("MISE_SYSTEM_PACKAGES_PREFER", manager);
+            command
+        });
+        let mut status: Status = json(run, cmd)?;
+        Ok(status.remove(manager))
+    }
+
+    fn command_in_run<I, S>(
+        &self,
+        run: &Run<'_>,
         mise: &Mise<'_>,
         include_mas: bool,
         args: I,
@@ -99,17 +146,20 @@ impl Scope {
         S: AsRef<std::ffi::OsStr>,
     {
         let managers = self
-            .0
-            .iter()
+            .managers()
             .filter(|name| include_mas || *name != "mas")
-            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(",");
-        command(mise, &managers, args)
+        command(run, mise, &managers, args)
     }
 }
 
-fn command<I, S>(mise: &Mise<'_>, managers: &str, args: I) -> Result<Command, crate::Fail>
+fn command<I, S>(
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    managers: &str,
+    args: I,
+) -> Result<Command, crate::Fail>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -120,6 +170,7 @@ where
     ];
     let args: Vec<_> = args.into_iter().collect();
     let mut cmd = mise_command(
+        run,
         mise,
         prefix.into_iter().chain(args.iter().map(AsRef::as_ref)),
     )?;
@@ -140,6 +191,7 @@ pub(super) struct Store {
     specs: Specs,
     before: Versions,
     unremovable: Vec<String>,
+    tracked: Option<PackageNames>,
 }
 
 impl<'a, 'ctx> Update<'a, 'ctx> {
@@ -161,32 +213,33 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
     }
 
     pub(super) fn update_routine(&self) -> Option<Store> {
-        if self.scope.0.is_empty() || self.run.cancelled() {
+        if self.scope.managers().next().is_none() || self.run.cancelled() {
             return None;
         }
-        let mut status = None;
-        step(self.run, "Inspect package managers", |_| {
-            status = Some(self.scope.status(self.run, self.mise, false)?);
-            Ok(Outcome::Completed)
-        });
-        let mut status = status?;
-        let include_mas = self.authorize_store(&status);
-        if include_mas {
-            step(self.run, "Inspect App Store package declarations", |_| {
-                status = self.scope.status(self.run, self.mise, true)?;
-                Ok(Outcome::Completed)
-            });
-        }
+        let include_mas = self.authorize_store();
+        // Only bare keys need a grouped probe to discover mise's assignment.
+        // Native actions still use the full preference scope if that probe fails.
+        let resolved = self
+            .scope
+            .has_bare()
+            .then(|| self.scope.status(self.run, self.mise, include_mas).ok())
+            .flatten();
 
-        for (name, manager) in &status {
-            if name == "mas"
-                || !manager.available
-                || manager.packages.is_empty()
-                || self.run.cancelled()
-            {
-                continue;
+        for name in self.scope.managers().filter(|name| *name != "mas") {
+            if self.run.cancelled() {
+                break;
             }
-            self.update_manager(name, manager, include_mas);
+            match self.inspect_manager(name, resolved.as_ref()) {
+                Ok(Some(manager)) if manager.available && !manager.packages.is_empty() => {
+                    self.update_manager(name, &manager, include_mas, resolved.as_ref());
+                }
+                Err(error) => {
+                    step(self.run, &format!("Inspect {name} packages"), |_| {
+                        Err(error)
+                    });
+                }
+                _ => (),
+            }
         }
         if !include_mas || self.run.cancelled() {
             return None;
@@ -194,9 +247,8 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
 
         let mut store = None;
         step(self.run, "Prepare Mac App Store updates", |id| {
-            let status = self.scope.status(self.run, self.mise, true)?;
-            let Some(manager) = status
-                .get("mas")
+            let Some(manager) = self
+                .inspect_manager("mas", resolved.as_ref())?
                 .filter(|manager| !manager.packages.is_empty())
             else {
                 return Ok(Outcome::Skipped);
@@ -211,38 +263,97 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 );
                 return Ok(Outcome::Deferred);
             }
-            store =
-                select(&manager.packages, &self.config.exceptions, "mas", false)?.map(|specs| {
-                    Store {
-                        specs,
-                        before: versions("mas", manager),
-                        unremovable: manager
-                            .packages
-                            .iter()
-                            .filter(|pkg| {
-                                pkg.desired_state == "absent"
-                                    && pkg.state == "unexpectedly_installed"
-                            })
-                            .map(|pkg| format!("mas:{}", pkg.package))
-                            .collect(),
-                    }
-                });
-            Ok(if store.is_some() {
-                Outcome::Completed
-            } else {
-                Outcome::Skipped
-            })
+            let packages: Vec<_> = manager.packages.iter().collect();
+            let Some(specs) = self.selection("mas", &packages, false, resolved.is_some())? else {
+                return Ok(Outcome::Skipped);
+            };
+            let tracked = self.tracked_names("mas", &manager, resolved.is_some());
+            store = Some(Store {
+                specs,
+                before: versions("mas", &manager, tracked.as_ref()),
+                tracked,
+                unremovable: manager
+                    .packages
+                    .iter()
+                    .filter(|pkg| {
+                        pkg.desired_state == "absent" && pkg.state == "unexpectedly_installed"
+                    })
+                    .map(|pkg| format!("mas:{}", pkg.package))
+                    .collect(),
+            });
+            Ok(Outcome::Completed)
         });
         store
     }
 
-    fn authorize_store(&self, status: &Status) -> bool {
-        if !self.scope.0.contains("mas")
-            || !self.mas
-            || !status
-                .get("mas")
-                .is_some_and(|manager| !manager.packages.is_empty())
+    fn inspect_manager(
+        &self,
+        name: &str,
+        resolved: Option<&Status>,
+    ) -> Result<Option<Manager>, Issue> {
+        let mut status = self.scope.status_for(self.run, self.mise, name)?;
+        if let Some(resolved) = resolved {
+            let Some(known) = resolved.get(name) else {
+                return Ok(None);
+            };
+            if let Some(status) = &mut status {
+                status
+                    .packages
+                    .retain(|pkg| known.packages.iter().any(|row| row.package == pkg.package));
+            }
+        }
+        Ok(status)
+    }
+
+    fn tracked_names(
+        &self,
+        manager: &str,
+        status: &Manager,
+        resolved: bool,
+    ) -> Option<PackageNames> {
+        self.scope.has_bare().then(|| {
+            status
+                .packages
+                .iter()
+                .filter(|pkg| resolved || self.scope.declares(manager, &pkg.package))
+                .map(|pkg| pkg.package.clone())
+                .collect()
+        })
+    }
+
+    fn selection(
+        &self,
+        manager: &str,
+        packages: &[&Package],
+        filtered: bool,
+        resolved: bool,
+    ) -> Result<Option<Specs>, Issue> {
+        let specs = select_rows(
+            packages,
+            &self.config.exceptions,
+            &self.config.profile,
+            manager,
+            filtered,
+        )?;
+        if self.scope.has_bare()
+            && !resolved
+            && specs.as_ref().is_some_and(|specs| !specs.0.is_empty())
+            && packages
+                .iter()
+                .any(|pkg| !self.scope.declares(manager, &pkg.package))
         {
+            return Err(Issue::new(
+                format!(
+                    "Cannot filter the {manager} pass because mise could not resolve unqualified package names."
+                ),
+                "Qualify the package declarations with manager names or fix the manager status error, then rerun dots up.",
+            ));
+        }
+        Ok(specs)
+    }
+
+    fn authorize_store(&self) -> bool {
+        if !cfg!(target_os = "macos") || !self.scope.includes("mas") || !self.mas {
             return false;
         }
         step(self.run, "Mac App Store authorization", |id| {
@@ -275,8 +386,15 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         super::probe(self.run, self.sudo(&["-n", "-v"])).is_ok()
     }
 
-    fn update_manager(&self, name: &str, manager: &Manager, include_mas: bool) {
-        let specs = match select(&manager.packages, &self.config.exceptions, name, false) {
+    fn update_manager(
+        &self,
+        name: &str,
+        manager: &Manager,
+        include_mas: bool,
+        resolved: Option<&Status>,
+    ) {
+        let packages: Vec<_> = manager.packages.iter().collect();
+        let specs = match self.selection(name, &packages, false, resolved.is_some()) {
             Ok(Some(specs)) => specs,
             Ok(None) => return,
             Err(error) => {
@@ -284,13 +402,16 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 return;
             }
         };
+        let tracked = self.tracked_names(name, manager, resolved.is_some());
         for action in ["apply", "upgrade"] {
             let outcome = step(self.run, &format!("{name} packages: {action}"), |id| {
-                let status = self.scope.status(self.run, self.mise, include_mas)?;
-                let Some(manager) = status.get(name).filter(|manager| manager.available) else {
+                let Some(manager) = self
+                    .inspect_manager(name, resolved)?
+                    .filter(|manager| manager.available)
+                else {
                     return Ok(Outcome::Skipped);
                 };
-                let before = versions(name, manager);
+                let before = versions(name, &manager, tracked.as_ref());
                 let casks;
                 let specs = if action == "upgrade" && name == "brew-cask" {
                     let eligible = manager
@@ -302,11 +423,11 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                                 && !self.config.vars.self_updating_casks.contains(&pkg.package)
                         })
                         .collect::<Vec<_>>();
-                    let Some(selected) = select_rows(
-                        &eligible,
-                        &self.config.exceptions,
+                    let Some(selected) = self.selection(
                         name,
+                        &eligible,
                         eligible.len() != manager.packages.len(),
+                        resolved.is_some(),
                     )?
                     else {
                         return Ok(Outcome::Skipped);
@@ -322,7 +443,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                     Policy::Ordinary
                 };
                 let result = self.run_packages(id, name, action, specs, include_mas, policy);
-                self.record(id, name, include_mas, before);
+                self.record(id, name, before, tracked.as_ref());
                 result.map(|()| Outcome::Completed)
             });
             if outcome != Some(Outcome::Completed) {
@@ -346,7 +467,8 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         child(
             self.run,
             id,
-            self.scope.command(self.mise, include_mas, args),
+            self.scope
+                .command_in_run(self.run, self.mise, include_mas, args),
             policy,
         )
     }
@@ -359,14 +481,14 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                         "Administrator authorization expired before the App Store update finished.",
                         "Run sudo -v, then rerun dots up --mas.",
                     ));
-                    self.record(id, "mas", true, store.before.clone());
+                    self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
                 }
                 return Ok(Outcome::Deferred);
             }
             if let Err(error) =
                 self.run_packages(id, "mas", action, &store.specs, true, Policy::Ordinary)
             {
-                self.record(id, "mas", true, store.before.clone());
+                self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
                 if action == "apply" && !store.unremovable.is_empty() {
                     return Err(Issue::new(
                         format!(
@@ -389,16 +511,16 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 return Err(error);
             }
         }
-        self.record(id, "mas", true, store.before.clone());
+        self.record(id, "mas", store.before.clone(), store.tracked.as_ref());
         Ok(Outcome::Completed)
     }
 
-    fn record(&self, id: StageId, name: &str, include_mas: bool, before: Versions) {
+    fn record(&self, id: StageId, name: &str, before: Versions, tracked: Option<&PackageNames>) {
         if !self.run.cancelled()
-            && let Ok(status) = self.scope.status(self.run, self.mise, include_mas)
-            && let Some(manager) = status.get(name).filter(|manager| manager.available)
+            && let Ok(Some(manager)) = self.scope.status_for(self.run, self.mise, name)
+            && manager.available
         {
-            record_changes(self.run, id, before, versions(name, manager));
+            record_changes(self.run, id, before, versions(name, &manager, tracked));
         }
     }
 }
@@ -406,15 +528,18 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
 #[derive(Debug)]
 struct Specs(Vec<String>);
 
+#[cfg(test)]
 fn select(
     packages: &[Package],
     exceptions: &Exceptions,
+    profile: &str,
     manager: &str,
     filtered: bool,
 ) -> Result<Option<Specs>, Issue> {
     select_rows(
         &packages.iter().collect::<Vec<_>>(),
         exceptions,
+        profile,
         manager,
         filtered,
     )
@@ -423,6 +548,7 @@ fn select(
 fn select_rows(
     packages: &[&Package],
     exceptions: &Exceptions,
+    profile: &str,
     manager: &str,
     filtered: bool,
 ) -> Result<Option<Specs>, Issue> {
@@ -430,7 +556,7 @@ fn select_rows(
     let mut requested = Vec::new();
     for pkg in packages {
         let spec = format!("{manager}:{}", pkg.package);
-        if exceptions.held_by(&spec).is_some() {
+        if exceptions.held_by_for(&spec, profile).is_some() {
             excluded = true;
         } else {
             requested.push((pkg, spec));
@@ -460,11 +586,14 @@ fn select_rows(
     )))
 }
 
-fn versions(name: &str, manager: &Manager) -> Versions {
+fn versions(name: &str, manager: &Manager, tracked: Option<&PackageNames>) -> Versions {
     manager
         .packages
         .iter()
-        .filter(|pkg| !pkg.installed_version.is_empty())
+        .filter(|pkg| {
+            !pkg.installed_version.is_empty()
+                && tracked.is_none_or(|names| names.contains(&pkg.package))
+        })
         .map(|pkg| {
             (
                 format!("{name}:{}", pkg.package),
@@ -474,22 +603,22 @@ fn versions(name: &str, manager: &Manager) -> Versions {
         .collect()
 }
 
-pub(super) fn declared_dots_formula(
-    run: &Run<'_>,
-    mise: &Mise<'_>,
-    config: &Config,
-) -> Option<String> {
+pub(super) fn declared_dots_formula(run: &Run<'_>, mise: &Mise<'_>) -> Option<String> {
     let scope = Scope::read(run, mise).ok()?;
-    if !scope.0.contains("brew") {
+    if !scope.includes("brew") {
         return None;
     }
-    let status = scope.status(run, mise, false).ok()?;
-    let manager = status.get("brew").filter(|manager| manager.available)?;
+    let manager = scope
+        .status_for(run, mise, "brew")
+        .ok()
+        .flatten()
+        .filter(|manager| manager.available)?;
     let pkg = manager.packages.iter().find(|pkg| {
-        pkg.package.rsplit('/').next() == Some("dots") && pkg.desired_state == "present"
+        pkg.package.rsplit('/').next() == Some("dots")
+            && pkg.desired_state == "present"
+            && scope.declares("brew", &pkg.package)
     })?;
-    let spec = format!("brew:{}", pkg.package);
-    config.exceptions.held_by(&spec).is_none().then_some(spec)
+    Some(format!("brew:{}", pkg.package))
 }
 
 #[cfg(test)]
@@ -506,7 +635,7 @@ mod tests {
         };
         fs::write(
             temp.path().join("config.toml"),
-            "[vars]\ndots_profiles = 'test'\n",
+            "[vars]\ndots_profiles = 'test other'\n",
         )
         .unwrap();
         let config = Root::resolve(&env).unwrap();
@@ -533,7 +662,7 @@ mod tests {
         let exceptions = exceptions("");
         for packages in [vec![absent], vec![pinned]] {
             assert!(
-                select(&packages, &exceptions, "pacman", false)
+                select(&packages, &exceptions, "test", "pacman", false)
                     .unwrap()
                     .unwrap()
                     .0
@@ -548,7 +677,7 @@ mod tests {
         let held = package("held", "latest", "present");
         let ordinary = package("ordinary", "latest", "present");
         assert_eq!(
-            select_rows(&[&held, &ordinary], &exceptions, "pacman", false)
+            select_rows(&[&held, &ordinary], &exceptions, "test", "pacman", false)
                 .unwrap()
                 .unwrap()
                 .0,
@@ -558,13 +687,30 @@ mod tests {
             package("pinned", "2", "present"),
             package("absent", "latest", "absent"),
         ] {
-            let rejected =
-                select_rows(&[&held, &unsafe_explicit], &exceptions, "pacman", false).unwrap_err();
+            let rejected = select_rows(
+                &[&held, &unsafe_explicit],
+                &exceptions,
+                "test",
+                "pacman",
+                false,
+            )
+            .unwrap_err();
             assert!(
                 rejected
                     .diagnostic
                     .contains(&format!("pacman:{}", unsafe_explicit.package))
             );
         }
+    }
+    #[test]
+    fn holds_from_another_profile_do_not_filter_the_manager() {
+        let exceptions = exceptions("other\thold\thold=pacman:held\n");
+        let held = package("held", "latest", "present");
+        let pinned = package("pinned", "2", "present");
+        let specs = select_rows(&[&held, &pinned], &exceptions, "test", "pacman", false)
+            .unwrap()
+            .unwrap();
+        assert!(specs.0.is_empty());
+        assert!(select_rows(&[&held, &pinned], &exceptions, "other", "pacman", false).is_err());
     }
 }

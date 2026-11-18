@@ -19,6 +19,7 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
         &["rev-list", "--parents", &format!("{base}..{head}")],
         "list the outgoing commits for screening",
     )?;
+    let mut screened = false;
     for revision in stdout(&history)?.lines() {
         let mut ids = revision.split_ascii_whitespace();
         let commit = object_id(ids.next().ok_or_else(stage_error)?)?;
@@ -66,7 +67,13 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
             write_blob(workspace, &root, pathname, object_id(id)?)?;
         }
         workspace.gitleaks(&root, &rules)?;
+        screened = true;
         fs::remove_dir_all(&root).map_err(|_| stage_error())?;
+    }
+    if !screened {
+        let empty = staging.path().join("empty");
+        fs::create_dir(&empty).map_err(|_| stage_error())?;
+        workspace.gitleaks(&empty, &rules)?;
     }
     Ok(())
 }

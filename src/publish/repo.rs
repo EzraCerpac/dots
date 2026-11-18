@@ -19,8 +19,6 @@ pub(super) struct Workspace<'a, 'ctx> {
 }
 
 pub(super) struct Origin {
-    raw_push: Vec<String>,
-    explicit_push: bool,
     preferred_push: String,
 }
 
@@ -47,17 +45,11 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         .ok_or_else(|| {
             failure("dots publish requires a GitHub repository; configure a GitHub origin")
         })?;
-        let root = git_path(ctx, run, ctx.env.cwd(), "--show-toplevel")?
-            .filter(|path| path.join(".jj").is_dir())
-            .ok_or_else(workspace_required)?;
+        let root =
+            git_path(ctx, run, ctx.env.cwd(), "--show-toplevel")?.ok_or_else(workspace_required)?;
         let live = git_path(ctx, run, config, "--show-toplevel")?
             .filter(|path| path == config)
             .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
-        if root == live {
-            return Err(failure(
-                "use a separate colocated JJ workspace to publish from this configuration",
-            ));
-        }
         let workspace = Self {
             ctx,
             run,
@@ -66,6 +58,14 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             slug,
         };
         workspace.validate_origin()?;
+        if workspace.root == workspace.live {
+            return Err(failure(
+                "use a separate colocated JJ workspace to publish from this configuration",
+            ));
+        }
+        if !workspace.root.join(".jj").is_dir() {
+            return Err(workspace_required());
+        }
         let git_root = workspace.git(
             &["rev-parse", "--absolute-git-dir"],
             "locate the workspace Git directory",
@@ -116,13 +116,12 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
                 .ok_or_else(|| failure("the configuration repository has no origin remote"))?;
             self.check_urls(stdout(&raw)?.split_terminator('\0'))?;
         }
-        let raw_push = configured_urls(self.ctx, self.run, &self.root, "remote.origin.pushurl")?;
-        let explicit_push = raw_push.is_some();
-        let raw_push: Vec<_> = stdout(raw_push.as_ref().unwrap_or(&raw))?
-            .split_terminator('\0')
-            .map(str::to_owned)
-            .collect();
-        if !raw_push.iter().all(|url| RepoSetting::parse(url).is_ok()) {
+        if let Some(raw_push) =
+            configured_urls(self.ctx, self.run, &self.root, "remote.origin.pushurl")?
+            && !stdout(&raw_push)?
+                .split_terminator('\0')
+                .all(|url| RepoSetting::parse(url).is_ok())
+        {
             return Err(failure(
                 "origin has an invalid push URL; check Git configuration",
             ));
@@ -139,11 +138,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             .next()
             .ok_or_else(|| failure("origin has no push URL"))?
             .to_owned();
-        Ok(Origin {
-            raw_push,
-            explicit_push,
-            preferred_push,
-        })
+        Ok(Origin { preferred_push })
     }
 
     fn check_urls<'s>(&self, mut urls: impl Iterator<Item = &'s str>) -> Result<(), Fail> {
@@ -405,7 +400,8 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
 
     pub(super) fn push(&self, origin: &Origin, name: &str, commit: &str) -> Result<(), Fail> {
         // A command-local remote has one destination and no fetch mapping.
-        // Start with the raw URL so Git applies its rewrite exactly once.
+        // Its unique alias spends Git's one rewrite on the verified URL, so
+        // a rule matching that effective URL cannot redirect the transport.
         let token = tempfile::Builder::new()
             .prefix("dots-publish-")
             .tempdir()
@@ -415,45 +411,34 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| failure("could not name the private push target"))?;
-        for raw in &origin.raw_push {
-            let url = format!("remote.{remote}.url={raw}");
-            let push_url = format!("remote.{remote}.pushurl={raw}");
-            let mut config = vec!["-c", url.as_str()];
-            if origin.explicit_push {
-                config.extend(["-c", push_url.as_str()]);
-            }
-            let target = self.git(
-                &[
-                    &config[..],
-                    &["remote", "get-url", "--push", "--all", remote],
-                ]
-                .concat(),
-                "verify the private push target",
-            )?;
-            if !stdout(&target)?
-                .split_terminator('\n')
-                .eq([origin.preferred_push.as_str()])
-            {
-                continue;
-            }
-            let refspec = format!("{commit}:refs/heads/{name}");
-            self.git(
-                &[
-                    &config[..],
-                    &[
-                        "push",
-                        "--no-follow-tags",
-                        "--recurse-submodules=no",
-                        remote,
-                        &refspec,
-                    ],
-                ]
-                .concat(),
-                "push the scanned commit without force; check origin and the remote bookmark",
-            )?;
-            return Ok(());
+        let alias = format!("https://dots-publish.invalid/{remote}");
+        let rewrite = format!("url.{}.insteadOf={alias}", origin.preferred_push);
+        let url = format!("remote.{remote}.url={alias}");
+        let push_url = format!("remote.{remote}.pushurl={alias}");
+        let config = ["-c", &rewrite, "-c", &url, "-c", &push_url];
+        let target = self.git(
+            &[config.as_slice(), &["ls-remote", "--get-url", remote]].concat(),
+            "verify the private push target",
+        )?;
+        if stdout(&target)?.strip_suffix('\n') != Some(origin.preferred_push.as_str()) {
+            return Err(failure("could not verify a single push URL for origin"));
         }
-        Err(failure("could not verify a single push URL for origin"))
+        let refspec = format!("{commit}:refs/heads/{name}");
+        self.git(
+            &[
+                config.as_slice(),
+                &[
+                    "push",
+                    "--no-follow-tags",
+                    "--recurse-submodules=no",
+                    remote,
+                    &refspec,
+                ],
+            ]
+            .concat(),
+            "push the scanned commit without force; check origin and the remote bookmark",
+        )?;
+        Ok(())
     }
 
     pub(super) fn gh(&self, operation: &str, args: &[&str], action: &str) -> Result<Output, Fail> {

@@ -1,0 +1,9 @@
+legacy_case	reason
+ManagerInstallTests.test_version_names_the_release_and_installer	1.0 embeds the build version and reports other for an unpacked executable. r01_config checks the version and the Homebrew, mise, Cargo and other layouts.
+ManagerInstallTests.test_a_checkout_reports_git_describe_or_dev	1.0 removes the checkout installer label and Git-derived dev version.
+ManagerInstallTests.test_a_mise_upgrade_moves_the_links_to_the_new_version	The link no longer moves into a versioned mise tree or reads a release marker. The persisted skill remains available when the installation is pruned.
+ManagerInstallTests.test_a_brew_upgrade_keeps_the_links_working_through_opt	The link no longer points into opt/libexec and cannot read the next keg's bytes before dots runs. The persisted skill remains available when the keg is removed.
+ManagerInstallTests.test_a_link_created_after_the_absence_check_is_not_clobbered	The sourced dots_skill_link step is gone. Its forced interleaving has no public seam. CLI tests cover preservation of an occupied link path.
+ManagerInstallTests.test_a_link_repointed_after_the_ownership_check_is_not_clobbered	The sourced dots_skill_link step is gone. Its forced interleaving has no public seam. r01_config covers a previously recorded link that the user has repointed.
+ManagerInstallTests.test_a_development_home_leaves_the_links_alone	1.0 removes DOTS_HOME and has no alternate manager tree to activate. r01_config checks that a child does not receive the old override.
+ManagerInstallTests.test_status_lines_name_each_link	1.0 removes the sourced dots_skill_status function and its exact line format. A public status case checks both links and their targets on the new missing-mise path.

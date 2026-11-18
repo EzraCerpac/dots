@@ -6,13 +6,12 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Output};
 use std::time::{Duration, Instant};
 
 use nix::libc;
-use support::World;
+use support::{FixtureCommand, World};
 
 const SHELLS: &[&str] = &["bash", "zsh", "fish"];
 
@@ -28,21 +27,24 @@ struct CompletionWorld {
 impl CompletionWorld {
     fn new() -> Self {
         let world = World::new();
-        let scratch = tempfile::tempdir().unwrap();
-        let dots = world.dots();
-        let env = |key: &str| {
-            dots.get_envs()
-                .find_map(|(name, value)| (name == key).then_some(value).flatten())
-                .unwrap_or_else(|| panic!("fixture does not set {key}"))
+        let scratch = tempfile::tempdir_in(world.base()).unwrap();
+        let (path, state) = {
+            let dots = world.dots();
+            let env = |key: &str| {
+                dots.get_envs()
+                    .find_map(|(name, value)| (name == key).then_some(value).flatten())
+                    .unwrap_or_else(|| panic!("fixture does not set {key}"))
+            };
+            symlink(dots.get_program(), scratch.path().join("dots")).unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(scratch.path().to_owned())
+                    .chain(std::env::split_paths(env("PATH"))),
+            )
+            .unwrap();
+            (path, PathBuf::from(env("XDG_STATE_HOME")))
         };
-        symlink(dots.get_program(), scratch.path().join("dots")).unwrap();
-        let path = std::env::join_paths(
-            std::iter::once(scratch.path().to_owned()).chain(std::env::split_paths(env("PATH"))),
-        )
-        .unwrap();
-        let home = PathBuf::from(env("HOME"));
-        let root = PathBuf::from(env("DOTS_ROOT")).canonicalize().unwrap();
-        let state = PathBuf::from(env("XDG_STATE_HOME"));
+        let home = world.home().to_owned();
+        let root = world.root().to_owned();
         let exceptions = root.join("dots/exceptions.tsv");
         if exceptions.exists() {
             fs::remove_file(exceptions).unwrap();
@@ -61,16 +63,9 @@ impl CompletionWorld {
         self.scratch.path()
     }
 
-    fn shell(&self, shell: impl AsRef<OsStr>) -> Command {
-        let mut command = Command::new(shell);
+    fn shell(&self, shell: impl AsRef<OsStr>) -> FixtureCommand<'_> {
+        let mut command = self.world.command(shell);
         command
-            .env_clear()
-            .envs(
-                self.world
-                    .dots()
-                    .get_envs()
-                    .filter_map(|(name, value)| Some((name, value?))),
-            )
             .env("PATH", &self.path)
             .env("ZDOTDIR", &self.home)
             .env("TERM", "dumb")
@@ -79,7 +74,7 @@ impl CompletionWorld {
         command
     }
 
-    fn static_mise_trap(&self, command: &mut Command) {
+    fn static_mise_trap(&self, command: &mut FixtureCommand<'_>) {
         let probe = self.cwd().join("unexpected-mise");
         fixture(&probe, "#!/bin/sh\ntouch \"$PROBE_LOG\"\nexit 1\n", 0o700);
         command
@@ -91,7 +86,11 @@ impl CompletionWorld {
         self.candidates_with(line, |_| {})
     }
 
-    fn candidates_with(&self, line: &str, setup: impl FnOnce(&mut Command)) -> Vec<String> {
+    fn candidates_with(
+        &self,
+        line: &str,
+        setup: impl FnOnce(&mut FixtureCommand<'_>),
+    ) -> Vec<String> {
         let mut command = self.shell("bash");
         self.static_mise_trap(&mut command);
         setup(&mut command);
@@ -358,9 +357,10 @@ fn new_completion_skips_unavailable_inputs() {
     world.expect("dots --pl", &["--plain"]);
     assert_eq!(
         world.candidates_with("dots compl", |command| {
+            let absent = world.cwd().join("no-config");
             command
-                .env_remove("MISE_CONFIG_DIR")
-                .env_remove("DOTS_ROOT");
+                .env("MISE_CONFIG_DIR", &absent)
+                .env("DOTS_ROOT", absent);
         }),
         ["completions"]
     );
@@ -482,7 +482,7 @@ printf '%s\n' "$PROBE_OUTPUT"
         .into_iter()
         .map(|name| serde_json::json!({"path": root.join(name)}))
         .collect();
-    let setup = |command: &mut Command| {
+    let setup = |command: &mut FixtureCommand<'_>| {
         command
             .env("DOTS_MISE_BIN", &probe)
             .env("MISE_ENV", "inactive")
@@ -739,7 +739,7 @@ struct Session {
 }
 
 impl Session {
-    fn start(mut command: Command, shell: &str) -> Self {
+    fn start(mut command: FixtureCommand<'_>, shell: &str) -> Self {
         let (master, tty) = terminal().expect("open completion test terminal");
         command
             .stdin(tty.try_clone().unwrap())

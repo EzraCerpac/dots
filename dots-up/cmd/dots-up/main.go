@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/EzraCerpac/dots/dots-up/internal/commands"
+	"github.com/EzraCerpac/dots/dots-up/internal/completion"
 	"github.com/EzraCerpac/dots/dots-up/internal/launcher"
 	"github.com/EzraCerpac/dots/dots-up/internal/supervisor"
 	"github.com/charmbracelet/x/term"
@@ -17,6 +18,10 @@ import (
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "complete" {
+		completion.Run(os.Stdout, args[1:], defaultRoot())
+		return 0
+	}
 	fs := flag.NewFlagSet("dots-up", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var opts supervisor.Options

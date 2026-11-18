@@ -1,6 +1,7 @@
 mod checkpoint;
 mod keys;
 mod native;
+mod publication;
 mod recovery;
 mod tracked;
 mod watcher;

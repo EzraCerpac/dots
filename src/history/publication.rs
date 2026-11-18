@@ -2,7 +2,8 @@
 //! inspection. Current enrollment cannot account for a path removed from it.
 
 use std::collections::{HashMap, HashSet};
-use std::process::Output;
+use std::ffi::{OsStr, OsString};
+use std::process::{Command, Output};
 use std::str;
 
 use serde::Deserialize;
@@ -28,38 +29,106 @@ pub(super) fn allows_plaintext(output: Output) -> Result<bool, Fail> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum GitAccess {
+pub(super) enum GitAccess<'a> {
     Local,
     Remote,
+    Ssh,
+    Http(&'a str),
 }
 
-pub(super) fn git_environment(access: GitAccess) -> [(&'static str, &'static str); 6] {
+pub(super) fn git_environment(
+    access: GitAccess<'_>,
+) -> impl Iterator<Item = (&'static str, &'static str)> {
+    const LOCAL: &[(&str, &str)] = &[("GIT_ALLOW_PROTOCOL", "")];
+    const NONINTERACTIVE: &[(&str, &str)] = &[
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_ASKPASS", ""),
+        ("SSH_ASKPASS", ""),
+        ("SSH_ASKPASS_REQUIRE", "never"),
+        ("GCM_INTERACTIVE", "never"),
+    ];
+    let settings = if access == GitAccess::Local {
+        LOCAL
+    } else {
+        NONINTERACTIVE
+    };
     [
         ("LC_ALL", "C"),
         ("GIT_NO_REPLACE_OBJECTS", "1"),
         ("GIT_GRAFT_FILE", "/dev/null"),
         ("GIT_NO_LAZY_FETCH", "1"),
         ("GIT_OPTIONAL_LOCKS", "0"),
-        match access {
-            GitAccess::Remote => ("GIT_TERMINAL_PROMPT", "0"),
-            // Even Git without GIT_NO_LAZY_FETCH must fail on missing
-            // promisor objects without contacting the promisor.
-            GitAccess::Local => ("GIT_ALLOW_PROTOCOL", ""),
-        },
     ]
+    .into_iter()
+    .chain(settings.iter().copied())
+    .chain((access == GitAccess::Ssh).then_some(("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")))
+}
+
+fn unsupported_ssh() -> Fail {
+    refusal(
+        "cannot verify history using a custom SSH launcher",
+        "Use standard OpenSSH configuration and provisioned authentication for history backup",
+    )
+}
+
+pub(super) fn git_parameters<'a>(
+    access: GitAccess<'_>,
+    env: impl Iterator<Item = (&'a OsStr, Option<&'a OsStr>)>,
+) -> Result<Option<OsString>, Fail> {
+    if access == GitAccess::Local {
+        return Ok(None);
+    }
+    let mut parameters = OsString::new();
+    for (key, value) in env {
+        let Some(value) = value else { continue };
+        if access == GitAccess::Ssh
+            && (key == "GIT_SSH"
+                || key == "GIT_SSH_COMMAND"
+                || (key == "GIT_SSH_VARIANT" && value != "ssh" && value != "auto"))
+        {
+            return Err(unsupported_ssh());
+        }
+        if key == "GIT_CONFIG_PARAMETERS" {
+            parameters.push(value);
+        }
+    }
+    parameters.push(" 'credential.interactive'='false'");
+    if let GitAccess::Http(url) = access {
+        parameters = without_redirects(Some(&parameters), url);
+    }
+    Ok(Some(parameters))
+}
+
+pub(super) fn without_redirects(prior: Option<&OsStr>, url: &str) -> OsString {
+    let mut parameters = prior.unwrap_or_default().to_owned();
+    // Match Git's quoted key/value representation for process-local -c
+    // settings. A URL-specific setting wins over a generic Git config value.
+    let url = url.replace('\'', "'\\''");
+    parameters.push(format!(" 'http.{url}.followRedirects'='false'"));
+    parameters
+}
+
+pub(super) fn constrain_http(command: &mut Command, url: Option<&str>) {
+    if let Some(url) = url {
+        let prior = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten());
+        let parameters = without_redirects(prior, url);
+        command.env("GIT_CONFIG_PARAMETERS", parameters);
+    }
 }
 
 /// Read-only preflight for native sync. The launcher is bound to the native
 /// bare store and applies git_environment. The origin and branch have already
 /// passed backup's checks, and local is the resulting saved checkpoint.
 pub(super) fn preflight(
-    probe: impl Fn(&[&str], GitAccess) -> Result<Output, Fail>,
+    probe: impl Fn(&[&str], GitAccess<'_>) -> Result<Output, Fail>,
     branch: &str,
     origin: &str,
     local: &str,
-) -> Result<(), Fail> {
+) -> Result<Option<String>, Fail> {
     let blocked = || refusal("could not verify saved settings history", RECONCILE);
-    let run_git = |args: &[&str], access| probe(args, access).map_err(|_| blocked());
+    let run_git = probe;
     let read = |args: &[&str]| {
         let output = run_git(args, GitAccess::Local)?;
         output
@@ -92,14 +161,14 @@ pub(super) fn preflight(
             "Configure one verified route for fetching and pushing this private history, then retry backup",
         )
     };
-    let routes = || -> Result<Vec<u8>, Fail> {
+    let routes = || -> Result<(Vec<u8>, String), Fail> {
         let commands = run_git(
             &[
                 "config",
                 "--null",
                 "--name-only",
                 "--get-regexp",
-                r"^remote\..*\.(uploadpack|receivepack)$",
+                r"^remote\..*\.(uploadpack|receivepack|vcs)$",
             ],
             GitAccess::Local,
         )?;
@@ -136,14 +205,42 @@ pub(super) fn preflight(
         if push.peek().is_none() || push.any(|route| route != url) {
             return Err(split_routes());
         }
-        Ok(routes)
+        let url = url.to_owned();
+        Ok((routes, url))
     };
     let route = routes()?;
+    let url = route.1.as_str();
+    let access = if url.starts_with("http://") || url.starts_with("https://") {
+        GitAccess::Http(url)
+    } else if url.starts_with("ssh://") || !url.contains("://") {
+        let ssh = run_git(
+            &[
+                "config",
+                "--null",
+                "--get-regexp",
+                r"^(core\.sshcommand|ssh\.variant)$",
+            ],
+            GitAccess::Local,
+        )?;
+        match ssh.status.code() {
+            Some(1) if ssh.stdout.is_empty() && ssh.stderr.is_empty() => {}
+            Some(0)
+                if ssh.stdout.strip_suffix(b"\0").is_some_and(|records| {
+                    records
+                        .split(|&b| b == 0)
+                        .all(|record| matches!(record, b"ssh.variant\nssh" | b"ssh.variant\nauto"))
+                }) => {}
+            _ => return Err(unsupported_ssh()),
+        }
+        GitAccess::Ssh
+    } else {
+        GitAccess::Remote
+    };
     let dest = format!("refs/heads/{branch}");
     let remote_tip = || -> Result<Option<String>, Fail> {
         let output = run_git(
             &["ls-remote", "--refs", "--exit-code", "--", origin, &dest],
-            GitAccess::Remote,
+            access,
         )?;
         match output.status.code() {
             Some(2) if output.stdout.is_empty() && output.stderr.is_empty() => Ok(None),
@@ -191,7 +288,7 @@ pub(super) fn preflight(
             "Retry backup",
         ));
     }
-    Ok(())
+    Ok(matches!(access, GitAccess::Http(_)).then_some(route.1))
 }
 
 fn refusal(diagnostic: impl std::fmt::Display, next: &str) -> Fail {
@@ -509,7 +606,7 @@ fn messagepack<'a>(input: &mut &'a [u8], binary: bool) -> Option<&'a [u8]> {
 
 // Structural validation only. Without the recipient keys we cannot
 // authenticate the header, verify the payload or prove who can decrypt it.
-fn age_file(bytes: &[u8]) -> bool {
+pub(super) fn age_file(bytes: &[u8]) -> bool {
     let Some(mut bytes) = bytes.strip_prefix(b"age-encryption.org/v1\n") else {
         return false;
     };
@@ -535,13 +632,17 @@ fn age_file(bytes: &[u8]) -> bool {
         {
             return false;
         }
+        let x25519 = args == b"X25519" || args.starts_with(b"X25519 ");
+        if x25519 && !args.strip_prefix(b"X25519 ").is_some_and(base64_32) {
+            return false;
+        }
         stanzas += 1;
         bytes = rest;
         loop {
             let Some((body, rest)) = split_byte(bytes, b'\n') else {
                 return false;
             };
-            if body.len() > 64 || !raw_base64(body) {
+            if body.len() > 64 || !raw_base64(body) || (x25519 && !base64_32(body)) {
                 return false;
             }
             bytes = rest;
@@ -551,6 +652,10 @@ fn age_file(bytes: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn base64_32(bytes: &[u8]) -> bool {
+    bytes.len() == 43 && raw_base64(bytes)
 }
 
 fn raw_base64(bytes: &[u8]) -> bool {

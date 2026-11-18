@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
 use dots_cli::{Fail, config};
-use publication::{GitAccess, git_environment};
+use publication::{GitAccess, git_environment, git_parameters};
 use support::{FixtureCommand, World};
 
 const BRANCH: &str = "host-fixture";
@@ -184,11 +184,15 @@ exec "$FIXTURE_REAL_GIT" "$@"
             &self.origin,
             &self.tip(&self.store, "refs/heads/main"),
         )
+        .map(|_| ())
     }
 
-    fn probe(&self, args: &[&str], access: GitAccess) -> Result<Output, Fail> {
-        self.git(&self.store)
-            .envs(git_environment(access))
+    fn probe(&self, args: &[&str], access: GitAccess<'_>) -> Result<Output, Fail> {
+        let mut cmd = self.git(&self.store);
+        if let Some(parameters) = git_parameters(access, cmd.get_envs())? {
+            cmd.env("GIT_CONFIG_PARAMETERS", parameters);
+        }
+        cmd.envs(git_environment(access))
             .args(args)
             .output()
             .map_err(|_| Fail::new(1, "fixture Git did not run"))
@@ -816,31 +820,181 @@ fn new_per_origin_git_service_override_is_ambiguous() {
     let history = History::new();
     history.configure(Some(true), true);
     let tip = history.save();
-    let refusal = publication::preflight(
+    for key in ["receivepack", "vcs"] {
+        let refusal = publication::preflight(
+            |args, access| {
+                assert!(access == GitAccess::Local);
+                history
+                    .git(&history.store)
+                    .envs(git_environment(access))
+                    .env("GIT_CONFIG_COUNT", "1")
+                    .env(
+                        "GIT_CONFIG_KEY_0",
+                        format!("remote.{}.{key}", history.origin),
+                    )
+                    .env("GIT_CONFIG_VALUE_0", "synthetic-custom-backend")
+                    .args(args)
+                    .output()
+                    .map_err(|_| Fail::new(1, "fixture Git did not run"))
+            },
+            BRANCH,
+            &history.origin,
+            &tip,
+        )
+        .unwrap_err();
+        assert!(
+            refusal
+                .diagnostic
+                .contains("different fetch and push routes")
+        );
+    }
+    history.empty_remote(&tip);
+}
+
+#[test]
+fn new_x25519_requires_canonical_share_and_wrapped_key() {
+    let valid = "A".repeat(43);
+    let noncanonical = format!("{}B", "A".repeat(42));
+    let age = |args: &str, body: &str| {
+        let mut bytes =
+            format!("age-encryption.org/v1\n-> {args}\n{body}\n--- {valid}\n").into_bytes();
+        bytes.extend([0; 33]);
+        bytes
+    };
+    assert!(publication::age_file(&age(
+        &format!("X25519 {valid}"),
+        &valid
+    )));
+    for (args, body) in [
+        ("X25519".to_owned(), valid.as_str()),
+        (format!("X25519 {valid} extra"), valid.as_str()),
+        (format!("X25519 {noncanonical}"), valid.as_str()),
+        (format!("X25519 {}", "A".repeat(42)), valid.as_str()),
+        (format!("X25519 {valid}"), ""),
+        (format!("X25519 {valid}"), &valid[..42]),
+        (format!("X25519 {valid}"), noncanonical.as_str()),
+    ] {
+        assert!(!publication::age_file(&age(&args, body)));
+    }
+    assert!(publication::age_file(&age(
+        "plugin-fixture arbitrary arguments",
+        ""
+    )));
+    assert!(publication::age_file(&age(
+        "fixture-grease arbitrary",
+        &format!("{}\n{valid}", "A".repeat(64))
+    )));
+}
+
+#[test]
+fn new_http_exact_scope_disables_redirects_without_changing_other_git_config() {
+    let history = History::new();
+    let url = "https://fixture.invalid/repo=fixture'with-quote.git";
+    let prior =
+        std::ffi::OsStr::new(" 'http.followRedirects'='true' 'credential.helper'='fixture-helper'");
+    let parameters = publication::without_redirects(Some(prior), url);
+    let value = |key: &str, target: &str| {
+        text(ok(history
+            .git(&history.remote)
+            .env("GIT_CONFIG_PARAMETERS", &parameters)
+            .args(["config", "--get-urlmatch", key, target])))
+    };
+    assert_eq!(value("http.followRedirects", url), "false");
+    assert_eq!(
+        value("http.followRedirects", "https://elsewhere.invalid/other"),
+        "true"
+    );
+    assert_eq!(value("credential.helper", url), "fixture-helper");
+}
+
+#[test]
+fn new_git_askpass_is_suppressed_and_provisioned_helpers_still_work() {
+    let history = History::new();
+    let file = history.world.base().join("credential-input");
+    let sent = history.world.base().join("askpass-ran");
+    let askpass = history.world.base().join("askpass");
+    let helper = history.world.base().join("credential-helper");
+    fs::write(&file, b"protocol=https\nhost=fixture.invalid\n\n").unwrap();
+    fs::write(&askpass, "#!/bin/sh\n: > \"$FIXTURE_ASKPASS_LOG\"\n").unwrap();
+    fs::write(
+        &helper,
+        "#!/bin/sh\nprintf 'username=fixture\npassword=synthetic-credential\n'\n",
+    )
+    .unwrap();
+    for program in [&askpass, &helper] {
+        fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let run = |helper: Option<&Path>| {
+        let mut cmd = history.git(&history.remote);
+        cmd.env("GIT_ASKPASS", &askpass)
+            .env("SSH_ASKPASS", &askpass)
+            .env("FIXTURE_ASKPASS_LOG", &sent)
+            .args(["-c", &format!("core.askPass={}", askpass.display())]);
+        if let Some(helper) = helper {
+            cmd.args(["-c", &format!("credential.helper={}", helper.display())]);
+        }
+        let params = git_parameters(GitAccess::Remote, cmd.get_envs())
+            .unwrap()
+            .unwrap();
+        cmd.envs(git_environment(GitAccess::Remote))
+            .env("GIT_CONFIG_PARAMETERS", params)
+            .stdin(Stdio::from(fs::File::open(&file).unwrap()))
+            .args(["credential", "fill"])
+            .output()
+            .unwrap()
+    };
+    assert!(!run(None).status.success());
+    assert!(!sent.exists());
+    let authenticated = run(Some(&helper));
+    assert!(authenticated.status.success());
+    assert!(!sent.exists());
+}
+
+#[test]
+fn new_ssh_uses_batch_mode_and_rejects_custom_launchers() {
+    let history = History::new();
+    let mut cmd = history.git(&history.remote);
+    let provisioned = history.world.base().join("fixture-agent");
+    cmd.env("SSH_AUTH_SOCK", &provisioned);
+    assert!(git_parameters(GitAccess::Ssh, cmd.get_envs()).is_ok());
+    cmd.envs(git_environment(GitAccess::Ssh));
+    let env = |name| {
+        cmd.get_envs()
+            .find_map(|(key, value)| (key == name).then_some(value))
+            .flatten()
+    };
+    assert_eq!(env("GIT_SSH_COMMAND").unwrap(), "ssh -oBatchMode=yes");
+    assert_eq!(env("SSH_ASKPASS_REQUIRE").unwrap(), "never");
+    assert_eq!(env("SSH_AUTH_SOCK").unwrap(), provisioned.as_os_str());
+
+    let origin = "ssh://git@fixture.invalid/state.git";
+    history.configure(Some(true), true);
+    let tip = history.save();
+    let err = publication::preflight(
         |args, access| {
             assert!(access == GitAccess::Local);
             history
                 .git(&history.store)
                 .envs(git_environment(access))
                 .env("GIT_CONFIG_COUNT", "1")
-                .env(
-                    "GIT_CONFIG_KEY_0",
-                    format!("remote.{}.receivepack", history.origin),
-                )
-                .env("GIT_CONFIG_VALUE_0", "synthetic-receive-pack")
+                .env("GIT_CONFIG_KEY_0", "core.sshCommand")
+                .env("GIT_CONFIG_VALUE_0", "synthetic-wrapper")
                 .args(args)
                 .output()
                 .map_err(|_| Fail::new(1, "fixture Git did not run"))
         },
         BRANCH,
-        &history.origin,
+        origin,
         &tip,
     )
     .unwrap_err();
-    assert!(
-        refusal
-            .diagnostic
-            .contains("different fetch and push routes")
-    );
-    history.empty_remote(&tip);
+    assert!(err.diagnostic.contains("custom SSH launcher"));
+    assert!(!err.diagnostic.contains("synthetic-wrapper"));
+    for key in ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT"] {
+        let mut custom = history.git(&history.store);
+        custom.env(key, "synthetic-alternate");
+        let err = git_parameters(GitAccess::Ssh, custom.get_envs()).unwrap_err();
+        assert!(err.diagnostic.contains("custom SSH launcher"));
+        assert!(!err.diagnostic.contains("synthetic-alternate"));
+    }
 }

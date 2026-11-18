@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use super::{ChangeGroup, Issue, Receipt, metadata, patch, store};
+use super::{ChangeGroup, Issue, Receipt, metadata, page, pager, patch, store};
 use crate::Env;
 
 struct Fixture {
@@ -104,7 +104,14 @@ impl Fixture {
     }
 
     fn render(&self, receipt: &Receipt, replay: bool) -> String {
-        patch::render(&self.env, &self.root, receipt, replay, patch::MAX_BYTES)
+        patch::render_until(
+            &self.env,
+            &self.root,
+            receipt,
+            replay,
+            patch::MAX_BYTES,
+            Instant::now() + Duration::from_secs(15),
+        )
     }
 
     fn stored_file(&self) -> PathBuf {
@@ -214,9 +221,16 @@ fn patch_uses_verified_objects_and_screens_both_versions_and_exact_display() {
     let quoted = log.to_string_lossy().replace('\'', "'\"'\"'");
     fixture.scanner(&format!(
         r#"
-        for file do :; done
-        /bin/cat "$file" >> '{quoted}'
-        printf '\n--end--\n' >> '{quoted}'
+        if [ "$1" = stdin ]; then
+            /bin/cat > '{quoted}.display'
+        else
+            for file do :; done
+            case "$(/bin/cat "$file")" in
+                'before body') /bin/cat "$file" > '{quoted}.before' ;;
+                'after body') /bin/cat "$file" > '{quoted}.after' ;;
+                *) exit 2 ;;
+            esac
+        fi
         printf '[]\n'
     "#
     ));
@@ -226,14 +240,25 @@ fn patch_uses_verified_objects_and_screens_both_versions_and_exact_display() {
     let after = fixture.commit("newer");
     fixture.git(&["push", "-q", "origin", "dev"]);
     fs::write(fixture.root.join("file"), "uncommitted content\n").unwrap();
+    fs::write(fixture.root.join(".gitattributes"), "* -diff\n").unwrap();
+    fixture.git(&["config", "diff.external", "/does-not-exist"]);
     let receipt = fixture.receipt(before, after, &["file"]);
     let output = fixture.render(&receipt, false);
     assert_eq!(output, "\n  file\n    -before body\n    +after body\n");
-    let inputs = fs::read_to_string(log).unwrap();
     assert_eq!(
-        inputs,
-        format!("before body\n\n--end--\nafter body\n\n--end--\n{output}\n--end--\n")
+        fs::read_to_string(log.with_extension("before")).unwrap(),
+        "before body\n"
     );
+    assert_eq!(
+        fs::read_to_string(log.with_extension("after")).unwrap(),
+        "after body\n"
+    );
+    assert_eq!(
+        fs::read_to_string(log.with_extension("display")).unwrap(),
+        output
+    );
+    fixture.scanner("if [ \"$1\" = stdin ]; then printf '[{}]\\n'; else printf '[]\\n'; fi");
+    assert!(fixture.render(&receipt, false).is_empty());
 }
 
 #[test]
@@ -243,37 +268,53 @@ fn invalid_or_unavailable_patches_leave_metadata() {
     fs::write(fixture.root.join("binary"), [0]).unwrap();
     fs::write(fixture.root.join("sealed.age"), "old sealed\n").unwrap();
     fs::write(fixture.root.join("regular"), "old\n").unwrap();
+    fs::write(
+        fixture.root.join("config.local.toml"),
+        "old private bytes\n",
+    )
+    .unwrap();
     let before = fixture.commit("older");
     fs::write(fixture.root.join("binary"), [1]).unwrap();
     fs::write(fixture.root.join("sealed.age"), "new sealed\n").unwrap();
     fs::write(fixture.root.join("regular"), "new\n").unwrap();
+    fs::write(
+        fixture.root.join("config.local.toml"),
+        "new private bytes\n",
+    )
+    .unwrap();
     let after = fixture.commit("newer");
     let mut receipt = fixture.receipt(
         before,
         after,
-        &["binary", "sealed.age", "regular", "../regular"],
+        &[
+            "binary",
+            "sealed.age",
+            "regular",
+            "../regular",
+            "config.local.toml",
+        ],
     );
     assert!(fixture.render(&receipt, false).is_empty());
     assert!(
         fixture
             .render(&receipt, true)
-            .contains("Patch omitted for 3 files.")
+            .contains("Patch omitted for 4 files.")
     );
     fixture.scanner("printf '{}\n'");
     assert_eq!(
         fixture.render(&receipt, true),
-        "\nPatch omitted for 4 files.\n"
+        "\nPatch omitted for 5 files.\n"
     );
     fixture.scanner("printf '[]\n'\nexit 2");
     assert_eq!(
         fixture.render(&receipt, true),
-        "\nPatch omitted for 4 files.\n"
+        "\nPatch omitted for 5 files.\n"
     );
     receipt.updated[0].after = Some("0".repeat(40));
     fixture.scanner("printf '[]\n'");
     assert_eq!(
         fixture.render(&receipt, true),
-        "\nPatch omitted for 4 files.\n"
+        "\nPatch omitted for 5 files.\n"
     );
 }
 
@@ -288,7 +329,13 @@ fn replay_times_out_a_scanner_and_rejects_nonlocal_configuration() {
     let receipt = fixture.receipt(before, after, &["file"]);
     let start = Instant::now();
     assert_eq!(
-        fixture.render(&receipt, true),
+        patch::render(
+            &fixture.env,
+            &fixture.root,
+            &receipt,
+            true,
+            patch::MAX_BYTES
+        ),
         "\nPatch omitted for 1 file.\n"
     );
     assert!(start.elapsed() < Duration::from_secs(5));
@@ -313,14 +360,15 @@ fn replay_times_out_a_scanner_and_rejects_nonlocal_configuration() {
 
 #[test]
 fn real_gitleaks_honors_the_floor_and_path_scoped_project_detectors() {
-    if !Command::new("gitleaks")
+    let fixture = Fixture::new();
+    if !super::Tools::new(&fixture.env)
+        .command("gitleaks")
         .arg("version")
         .output()
         .is_ok_and(|o| o.status.success())
     {
         return;
     }
-    let fixture = Fixture::new();
     fs::write(fixture.root.join("plain.txt"), "old\n").unwrap();
     let before = fixture.commit("older");
     fs::write(fixture.root.join("plain.txt"), "new\n").unwrap();
@@ -351,7 +399,7 @@ regex = '''CUSTOM_MARKER_[0-9]+'''
         "\nPatch omitted for 1 file.\n"
     );
 
-    let fake_github_token = format!("ghp_{}", "AbC12".repeat(7) + "D");
+    let fake_github_token = concat!("ghp_", "A9kV7mQ2xR6cD3nL8pW4sB5zT1fH0jY8eM2q");
     fs::write(
         fixture.root.join("plain.txt"),
         format!("token = '{fake_github_token}' # gitleaks:allow\n"),
@@ -374,4 +422,240 @@ regexes = ['''.*''']
         fixture.render(&floor, true),
         "\nPatch omitted for 1 file.\n"
     );
+}
+
+#[test]
+fn oversized_or_unreplaceable_receipt_does_not_publish_partial_metadata() {
+    let fixture = Fixture::new();
+    let prior = Receipt::new(None, "previous");
+    store::save(&fixture.env, &fixture.root, &prior).unwrap();
+    let destination = fixture.stored_file();
+
+    let mut oversized = Receipt::new(None, "oversized");
+    oversized.outcome = "x".repeat(store::MAX_RECEIPT_BYTES as usize + 1);
+    assert!(store::save(&fixture.env, &fixture.root, &oversized).is_err());
+    assert_eq!(
+        store::load(&fixture.env, &fixture.root)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "previous"
+    );
+    assert_eq!(
+        fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+        1
+    );
+
+    let previous_file = fixture.dir.path().join("saved-metadata");
+    fs::rename(&destination, &previous_file).unwrap();
+    fs::create_dir(&destination).unwrap();
+    assert!(
+        store::save(
+            &fixture.env,
+            &fixture.root,
+            &Receipt::new(None, "failed replacement")
+        )
+        .is_err()
+    );
+    assert!(store::load(&fixture.env, &fixture.root).is_err());
+    assert_eq!(
+        fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+        1
+    );
+    fs::remove_dir(&destination).unwrap();
+    fs::rename(previous_file, destination).unwrap();
+    assert_eq!(
+        store::load(&fixture.env, &fixture.root)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        "previous"
+    );
+}
+
+#[test]
+fn replay_byte_budget_keeps_later_small_patches_across_groups() {
+    let fixture = Fixture::new();
+    fixture.scanner("printf '[]\n'");
+    fs::write(fixture.root.join("base"), "base\n").unwrap();
+    let before = fixture.commit("before");
+    fs::write(fixture.root.join("small-one"), "first small body\n").unwrap();
+    fs::write(fixture.root.join("too-long"), "x".repeat(1_200)).unwrap();
+    let middle = fixture.commit("middle");
+    fs::write(fixture.root.join("small-two"), "second small body\n").unwrap();
+    let after = fixture.commit("after");
+    let mut receipt = fixture.receipt(before, middle.clone(), &["small-one", "too-long"]);
+    receipt.saved.push(ChangeGroup::new(
+        Some(middle),
+        Some(after),
+        vec!["small-two".into()],
+    ));
+    // Leave enough space for both small patches, even across groups.
+    let budget = 180;
+    let rendered = patch::render_until(
+        &fixture.env,
+        &fixture.root,
+        &receipt,
+        true,
+        budget,
+        Instant::now() + Duration::from_secs(15),
+    );
+    assert!(rendered.contains("+first small body"));
+    assert!(rendered.contains("+second small body"));
+    assert!(!rendered.contains(&"x".repeat(10)));
+    assert!(rendered.contains("Patch omitted for 1 file."));
+    assert!(rendered.len() <= budget);
+}
+
+#[test]
+fn pager_receives_only_restricted_settings() {
+    let mut fixture = Fixture::new();
+    for name in ["LESS", "LESSOPEN", "LESSCLOSE", "LESSSECURE_ALLOW"] {
+        fixture
+            .env
+            .vars
+            .insert(name.into(), "fixture-nonlocal-helper".into());
+    }
+    let command = pager(&fixture.env);
+    assert_eq!(command.get_program(), "less");
+    let settings: std::collections::HashMap<_, _> = command.get_envs().collect();
+    assert_eq!(
+        settings[std::ffi::OsStr::new("LESSSECURE")],
+        Some(std::ffi::OsStr::new("1"))
+    );
+    for name in ["LESS", "LESSOPEN", "LESSCLOSE", "LESSSECURE_ALLOW"] {
+        assert!(
+            settings
+                .get(std::ffi::OsStr::new(name))
+                .copied()
+                .flatten()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn pager_exit_failure_falls_back_and_user_quit_does_not() {
+    let fixture = Fixture::new();
+    let executable = fixture.bin.join("less");
+    let install = |status| {
+        fs::write(&executable, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let content = "fixture metadata\n".repeat(8192);
+    install(2);
+    assert!(!page(&fixture.env, &content));
+    install(0);
+    assert!(page(&fixture.env, &content));
+}
+
+#[test]
+fn screening_scratch_is_private_under_permissive_umask() {
+    let fixture = Fixture::new();
+    const CHILD: &str = "DOTS_RECEIPT_UMASK_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new("/bin/sh")
+            .env_clear()
+            .envs(&fixture.env.vars)
+            .env(CHILD, "1")
+            .args(["-c", "umask 000; exec \"$@\"", "fixture"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "receipt::tests::screening_scratch_is_private_under_permissive_umask",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    fixture.scanner(
+        r#"
+        set -eu
+        mode=$1
+        shift
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --config) config=$2; shift ;;
+                --gitleaks-ignore-path) root=$2; shift ;;
+                --) shift; target=$1; break ;;
+            esac
+            shift
+        done
+        assert_mode() {
+            case "$(ls -ld "$2")" in "$1"*) ;; *) exit 2 ;; esac
+        }
+        assert_mode drwx------ "$root"
+        assert_mode drwx------ .
+        assert_mode drwx------ nested
+        assert_mode -rw------- "$config"
+        if [ "$mode" = dir ]; then assert_mode -rw------- "$target"; fi
+        printf '[]
+'
+    "#,
+    );
+    fs::create_dir(fixture.root.join("nested")).unwrap();
+    fs::write(fixture.root.join("nested/file"), "old\n").unwrap();
+    let before = fixture.commit("older");
+    fs::write(fixture.root.join("nested/file"), "new\n").unwrap();
+    let after = fixture.commit("newer");
+    fs::write(fixture.root.join("extra.toml"), "title = 'extra'\n").unwrap();
+    fs::write(
+        fixture.root.join(".gitleaks.toml"),
+        "[extend]\npath = 'extra.toml'\n",
+    )
+    .unwrap();
+    let receipt = fixture.receipt(before, after, &["nested/file"]);
+    assert!(fixture.render(&receipt, true).contains("+new"));
+}
+
+#[test]
+fn deadline_keeps_completed_patches_and_removes_stalled_scan_inputs() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("stalled-input");
+    let quoted = marker.to_string_lossy().replace('\'', "'\"'\"'");
+    fixture.scanner(&format!(
+        r#"
+        if [ "$1" = stdin ]; then
+            body=$(/bin/cat)
+        else
+            for file do :; done
+            body=$(/bin/cat "$file")
+        fi
+        case "$body" in
+            *STALL_THIS_SCAN*)
+                pwd > '{quoted}'
+                exec sleep 60
+                ;;
+        esac
+        printf '[]\n'
+    "#
+    ));
+    fs::write(fixture.root.join("base"), "base\n").unwrap();
+    let before = fixture.commit("before");
+    fs::write(fixture.root.join("a-clean"), "safe retained patch\n").unwrap();
+    fs::write(fixture.root.join("z-stall"), "STALL_THIS_SCAN\n").unwrap();
+    let after = fixture.commit("after");
+    let receipt = fixture.receipt(before, after, &["a-clean", "z-stall"]);
+    let start = Instant::now();
+    let output = patch::render_until(
+        &fixture.env,
+        &fixture.root,
+        &receipt,
+        true,
+        patch::MAX_BYTES,
+        start + Duration::from_secs(12),
+    );
+    assert!(start.elapsed() < Duration::from_secs(15));
+    assert!(output.contains("+safe retained patch"));
+    assert!(output.contains("Patch omitted for 1 file."));
+    assert!(!output.contains("STALL_THIS_SCAN"));
+    let input = fs::read_to_string(marker).unwrap();
+    assert!(!std::path::Path::new(input.trim()).exists());
 }

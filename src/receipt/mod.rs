@@ -1,7 +1,7 @@
 mod patch;
 mod store;
 
-use std::fs;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -84,7 +84,7 @@ impl Issue {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChangeGroup {
     pub before: Option<String>,
     pub after: Option<String>,
@@ -104,13 +104,13 @@ impl ChangeGroup {
 }
 
 pub fn emit(ctx: &Ctx, receipt: &Receipt, display: Display) -> Result<(), Fail> {
-    let root = physical_root(ctx);
-    let saved = store::save(&ctx.env, &root, receipt);
+    let root = ctx.root.path();
+    let saved = store::save(&ctx.env, root, receipt);
     let mut output = metadata(receipt, false);
-    if patch_eligible(ctx, display) {
+    if patch_eligible(ctx, display) && matches!(receipt.stage_outcome, Outcome::Completed) {
         output.push_str(&patch::render(
             &ctx.env,
-            &root,
+            root,
             receipt,
             false,
             patch::MAX_BYTES - output.len().min(patch::MAX_BYTES),
@@ -126,8 +126,8 @@ pub fn emit(ctx: &Ctx, receipt: &Receipt, display: Display) -> Result<(), Fail> 
 }
 
 pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
-    let root = physical_root(ctx);
-    let receipt = match store::load(&ctx.env, &root) {
+    let root = ctx.root.path();
+    let receipt = match store::load(&ctx.env, root) {
         Ok(Some(receipt)) => receipt,
         Ok(None) => {
             write_stdout("No sync receipt for this checkout.\n");
@@ -142,26 +142,23 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
             return Ok(0);
         }
     };
-    let mut output = metadata(&receipt, true);
+    let metadata = metadata(&receipt, true);
     if patch_eligible(ctx, Display::Standalone) {
+        let mut output = metadata.clone();
         if output.len() > patch::MAX_BYTES - 128 {
             let prefix = &output[..output.floor_char_boundary(patch::MAX_BYTES - 128)];
             output.truncate(prefix.rfind('\n').map_or(0, |end| end + 1));
             output.push_str("Additional receipt metadata omitted.\n");
         } else {
             let remaining = patch::MAX_BYTES - output.len();
-            output.push_str(&patch::render(&ctx.env, &root, &receipt, true, remaining));
+            output.push_str(&patch::render(&ctx.env, root, &receipt, true, remaining));
         }
         if page(&ctx.env, &output) {
             return Ok(0);
         }
     }
-    write_stdout(&output);
+    write_stdout(&metadata);
     Ok(0)
-}
-
-fn physical_root(ctx: &Ctx) -> PathBuf {
-    fs::canonicalize(ctx.root.path()).unwrap_or_else(|_| ctx.root.path().to_owned())
 }
 
 fn patch_eligible(ctx: &Ctx, display: Display) -> bool {
@@ -176,7 +173,23 @@ fn write_stdout(text: &str) {
 }
 
 fn page(env: &crate::Env, text: &str) -> bool {
-    let Ok(mut child) = local_command(env, "less")
+    let Ok(mut child) = pager(env).spawn() else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(text.as_bytes());
+    let completed = child.wait().is_ok_and(|status| status.success());
+    completed
+        && (written.is_ok()
+            || written.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe))
+}
+
+fn pager(env: &crate::Env) -> Command {
+    let mut command = Tools::new(env).command("less");
+    command
         .args(["-FX"])
         .env("LESSSECURE", "1")
         .env("LESSHISTFILE", "-")
@@ -184,27 +197,28 @@ fn page(env: &crate::Env, text: &str) -> bool {
         .env_remove("LESSOPEN")
         .env_remove("LESSCLOSE")
         .env_remove("LESSSECURE_ALLOW")
-        .stdin(Stdio::piped())
-        .spawn()
-    else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-    }
-    let _ = child.wait();
-    true
+        .stdin(Stdio::piped());
+    command
 }
 
-fn local_command(env: &crate::Env, program: &str) -> Command {
-    let mut command = Command::new(program);
-    command.env_clear();
-    for key in ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"] {
-        if let Some(value) = env.get(key) {
-            command.env(key, value);
-        }
+struct Tools(Vec<(&'static str, OsString)>);
+
+impl Tools {
+    fn new(env: &crate::Env) -> Self {
+        Self(
+            ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"]
+                .into_iter()
+                .filter_map(|key| Some((key, env.get(key)?.to_owned())))
+                .collect(),
+        )
     }
-    command
+
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command.env_clear().stdin(Stdio::null());
+        command.envs(self.0.iter().map(|(key, value)| (*key, value)));
+        command
+    }
 }
 
 fn printable(text: &str) -> String {
@@ -247,7 +261,7 @@ fn metadata(receipt: &Receipt, replay: bool) -> String {
         let _ = writeln!(text, "  {}", printable(&issue.next_action));
     }
     let outcome = printable(&receipt.outcome);
-    let _ = write!(text, "dots sync: ");
+    text.push_str("dots sync: ");
     if !receipt.local_only {
         let saved = receipt
             .saved

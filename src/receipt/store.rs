@@ -12,7 +12,7 @@ use super::Receipt;
 use crate::Env;
 
 const VERSION: u32 = 1;
-const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Stored<T> {

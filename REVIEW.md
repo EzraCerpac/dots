@@ -28,7 +28,7 @@ A change that breaks one of these is worth a comment at any size.
 
 Check that background Mac App Store work logs privately, announces its result at a stage boundary and finishes before the standalone mise stage.
 Authorization belongs in the foreground before the worker starts. Expired authorization defers the work with a next action.
-`dots reports` prints recent completed reports newest first and needs a terminal.
+`dots reports` prints the same newest-first listing to a terminal, a pipe or a redirected file.
 `dots up --last` prints the saved report and returns its recorded status.
 
 ## Facts to check claims against

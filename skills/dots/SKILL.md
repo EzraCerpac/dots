@@ -147,7 +147,7 @@ Make them executable (`chmod +x`), keep them safe to rerun, and check their synt
   Captured stages have private logs under `${XDG_STATE_HOME:-~/.local/state}/dots/`. A failed step that had the terminal gives its exit status and next action, with its output in scrollback.
 - `dots sync --last` replays the last sync receipt.
   The [sync guide](https://github.com/EzraCerpac/dots/blob/main/docs/sync.md) explains each kind of sync issue.
-- In a terminal, `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
+- `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
 - Run `dots` for help, including the configuration's commands.
 
 ## This skill

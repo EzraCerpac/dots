@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use super::{ChangeGroup, Issue, Receipt, metadata, page, pager, patch, store};
+use super::{ChangeGroup, Issue, Receipt, metadata, page, pager, pager_metadata, patch, store};
 use crate::Env;
 
 struct Fixture {
@@ -129,6 +129,8 @@ pub(super) fn isolated_env(dir: &Path) -> Env {
         ("MISE_DATA_DIR", "data/mise"),
         ("MISE_STATE_DIR", "state/mise"),
         ("MISE_CACHE_DIR", "cache/mise"),
+        ("CARGO_HOME", "cache/cargo"),
+        ("RUSTUP_HOME", "data/rustup"),
         ("TMPDIR", ""),
     ] {
         env.vars
@@ -265,6 +267,36 @@ fn recovery_and_push_outcomes_are_visible_in_saved_receipts() {
     let summary = metadata(&untouched, false);
     assert!(summary.contains("saved 0 locally"));
     assert!(summary.ends_with(" · nothing to push\n"));
+}
+
+#[test]
+fn bounded_replay_prioritizes_escaped_recovery_locations() {
+    let paths = |group| {
+        (0..1500)
+            .map(|i| PathBuf::from(format!("{group}/{i:04}/{}", "é".repeat(240))))
+            .collect()
+    };
+    let mut receipt = Receipt::new(None, "not pushed");
+    receipt
+        .saved
+        .push(ChangeGroup::new(None, None, paths("saved")));
+    receipt
+        .updated
+        .push(ChangeGroup::new(None, None, paths("updated")));
+    receipt
+        .recovery_files
+        .push("/private/copy\n\x1b[31m\\u{1b}".into());
+    let metadata = metadata(&receipt, true);
+    assert!(metadata.len() > patch::MAX_BYTES);
+    let (output, truncated) = pager_metadata(&metadata);
+    assert!(truncated);
+    assert!(output.len() <= patch::MAX_BYTES);
+    let recovery_line = "Recovery copy at /private/copy\\n\\u{1b}[31m\\\\u{1b}\n";
+    assert!(output.find(recovery_line).unwrap() < output.find("Saved locally\n").unwrap());
+    assert!(output.contains("Updated in this checkout\n"));
+    assert!(!output.contains("updated/1499"));
+    assert!(!output.contains('\x1b'));
+    assert!(output.ends_with("Additional receipt metadata omitted.\n"));
 }
 
 #[test]

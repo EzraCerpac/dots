@@ -154,12 +154,8 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     let metadata = metadata(&receipt, true);
     let mut screened = None;
     if patch_eligible(ctx, Display::Standalone) {
-        let mut output = metadata.clone();
-        if output.len() > patch::MAX_BYTES - 128 {
-            let prefix = &output[..output.floor_char_boundary(patch::MAX_BYTES - 128)];
-            output.truncate(prefix.rfind('\n').map_or(0, |end| end + 1));
-            output.push_str("Additional receipt metadata omitted.\n");
-        } else {
+        let (mut output, truncated) = pager_metadata(&metadata);
+        if !truncated {
             let remaining = patch::MAX_BYTES - output.len();
             let patches = patch::render(&ctx.env, root, &receipt, true, remaining);
             output.push_str(&patches.text);
@@ -174,11 +170,26 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     Ok(0)
 }
 
+fn pager_metadata(metadata: &str) -> (String, bool) {
+    const LIMIT: usize = patch::MAX_BYTES - 128;
+    if metadata.len() <= LIMIT {
+        return (metadata.to_owned(), false);
+    }
+    let prefix = &metadata[..metadata.floor_char_boundary(LIMIT)];
+    let mut output = prefix
+        .rfind('\n')
+        .map_or("", |end| &prefix[..=end])
+        .to_owned();
+    output.push_str("Additional receipt metadata omitted.\n");
+    (output, true)
+}
+
 fn patch_eligible(ctx: &Ctx, display: Display) -> bool {
     matches!(display, Display::Standalone)
         && !ctx.flags.plain
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
+        && child::leaders_waitable()
 }
 
 fn write_stdout(text: &str) {
@@ -305,6 +316,9 @@ fn metadata(receipt: &Receipt, replay: bool) -> String {
         );
     }
     let _ = writeln!(text, "{outcome}");
+    for path in &receipt.recovery_files {
+        let _ = writeln!(text, "Recovery copy at {}", path_label(path));
+    }
     for (label, groups) in receipt.groups() {
         let paths = groups.iter().flat_map(|group| &group.paths);
         let count = paths.clone().count();
@@ -319,9 +333,6 @@ fn metadata(receipt: &Receipt, replay: bool) -> String {
         if count > limit {
             let _ = writeln!(text, "  … and {} more", count - limit);
         }
-    }
-    for path in &receipt.recovery_files {
-        let _ = writeln!(text, "Recovery copy at {}", path_label(path));
     }
     text
 }

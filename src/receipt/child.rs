@@ -66,7 +66,7 @@ struct ChildGroup<'a> {
 
 impl<'a> ChildGroup<'a> {
     fn spawn(command: &mut Command, budget: &'a Budget) -> Option<Self> {
-        if budget.expired() {
+        if budget.expired() || !leaders_waitable() {
             return None;
         }
         let child = command
@@ -101,6 +101,20 @@ impl Drop for ChildGroup<'_> {
             let _ = self.reap();
         }
     }
+}
+
+pub(super) fn leaders_waitable() -> bool {
+    sigchld_action().is_some_and(|action| {
+        action.sa_sigaction == libc::SIG_DFL && action.sa_flags & libc::SA_NOCLDWAIT == 0
+    })
+}
+
+fn sigchld_action() -> Option<libc::sigaction> {
+    let mut action = MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: A null input queries the current disposition without changing it.
+    let result = unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), action.as_mut_ptr()) };
+    // SAFETY: A successful query initializes the output.
+    (result == 0).then(|| unsafe { action.assume_init() })
 }
 
 fn kill_group(pid: u32) {
@@ -169,6 +183,77 @@ pub(super) fn run(command: &mut Command, budget: &Budget, limit: usize) -> Optio
 mod tests {
     use super::*;
     use crate::receipt::tests::isolated_env;
+
+    fn set_sigchld(handler: libc::sighandler_t, flags: libc::c_int) -> io::Result<()> {
+        // SAFETY: The action starts zeroed, with an empty mask and no restorer.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler;
+        action.sa_flags = flags;
+        // SAFETY: The action is initialized and only the isolated test process calls this.
+        if unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[test]
+    fn screening_declines_children_when_sigchld_can_auto_reap() {
+        const MODE: &str = "DOTS_TEST_RECEIPT_SIGCHLD";
+        if let Ok(mode) = std::env::var(MODE) {
+            let (handler, flags) = match mode.as_str() {
+                "ignored" => (libc::SIG_IGN, 0),
+                "no-cld-wait" => {
+                    // Linux clears action flags during exec. Set this mode
+                    // in the re-executed fixture before calling receipt code.
+                    set_sigchld(libc::SIG_DFL, libc::SA_NOCLDWAIT).unwrap();
+                    (libc::SIG_DFL, libc::SA_NOCLDWAIT)
+                }
+                _ => unreachable!(),
+            };
+            let disposition = || {
+                let action = sigchld_action().unwrap();
+                (action.sa_sigaction, action.sa_flags & libc::SA_NOCLDWAIT)
+            };
+            assert_eq!(disposition(), (handler, flags));
+            assert!(!leaders_waitable());
+            let budget = Budget::new(Instant::now() + Duration::from_secs(15));
+            let mut command = Command::new("/bin/sh");
+            command
+                .env_clear()
+                .envs(&isolated_env(&std::env::current_dir().unwrap()).vars)
+                .args(["-c", "exec /bin/sleep 60"]);
+            assert!(ChildGroup::spawn(&mut command, &budget).is_none());
+            assert_eq!(disposition(), (handler, flags));
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let env = isolated_env(fixture.path());
+        std::fs::create_dir(fixture.path().join("home")).unwrap();
+        for mode in ["ignored", "no-cld-wait"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .env_clear()
+                .envs(&env.vars)
+                .env(MODE, mode)
+                .current_dir(fixture.path())
+                .args([
+                    "--exact",
+                    "receipt::child::tests::screening_declines_children_when_sigchld_can_auto_reap",
+                ]);
+            if mode == "ignored" {
+                // SAFETY: The pre-exec hook only uses sigaction and reads errno on failure.
+                unsafe { command.pre_exec(|| set_sigchld(libc::SIG_IGN, 0)) };
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
 
     #[test]
     fn cancellation_signals_an_exited_leaders_group_before_reaping() {

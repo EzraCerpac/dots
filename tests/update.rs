@@ -113,6 +113,10 @@ impl Fixture {
     fn run_command(&self, command: &mut Command, expected: i32) -> Value {
         let result = command.output().unwrap();
         assert_exit(&result, expected);
+        self.read_report()
+    }
+
+    fn read_report(&self) -> Value {
         let rust = self.world.home().join(".local/state/dots/reports");
         let path = if rust.exists() {
             fs::read_dir(&rust)
@@ -423,7 +427,22 @@ fn new_pre_checkpoint_failure_stops_before_sync_and_updates() {
 #[ignore = "P-08"]
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
-    let report = fixture.run_args(&["--plain", "update"], 0);
+    let output = fixture
+        .command(fixture.world.dots())
+        .args(["--plain", "update"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.to_ascii_lowercase().contains("no remote configured"))
+            .count(),
+        1,
+        "{text}"
+    );
+    assert!(!text.contains("Needs attention"), "{text}");
+    let report = fixture.read_report();
     let stages = report["stages"].as_array().unwrap();
     assert_eq!(stages[0]["label"], "Pre-update settings checkpoint");
     assert_eq!(stages[0]["outcome"], "skipped");

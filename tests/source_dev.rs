@@ -383,8 +383,12 @@ case "${1:-} ${2:-} ${3:-}" in
     if [ -n "${FIXTURE_DOTFILE_PATHS:-}" ]; then
         printf '%s\n' "$FIXTURE_DOTFILE_PATHS"
     else
-        printf '{"entries": []}\n'
+        printf '{"entries": [], "invalid": []}\n'
     fi
+    ;;
+  'bootstrap dotfiles --local')
+    [ "${4:-} ${5:-}" = 'paths --json' ]
+    printf '{"entries": [], "invalid": []}\n'
     ;;
   'bootstrap dotfiles status')
     printf '{"files": [], "edits": []}\n'
@@ -654,7 +658,8 @@ fn tracked_fixture(f: &Repo, encrypted: bool) -> String {
             "path": "~/.fixture-history",
             "mode": "track",
             "declared_in": f.a.join(declaration)
-        }]
+        }],
+        "invalid": []
     })
     .to_string()
 }
@@ -2151,6 +2156,10 @@ impl<'a> Machine<'a> {
         dots_zero(&mut self.dots(&["--verbose", "sync"]))
     }
 
+    fn replay(&self) -> String {
+        dots_zero(&mut self.dots(&["--plain", "sync", "--last"]))
+    }
+
     fn deploy(&self) {
         let mut command = self.repo.world.tool(&self.mise);
         command.current_dir(self.root);
@@ -2351,7 +2360,7 @@ copies_case!(
     }
 );
 
-fn recovery_path(base: &Path, receipt: &str, expected: &str) -> PathBuf {
+fn recovery_paths<'a>(base: &'a Path, receipt: &'a str) -> impl Iterator<Item = PathBuf> + 'a {
     receipt
         .lines()
         .flat_map(str::split_whitespace)
@@ -2361,6 +2370,10 @@ fn recovery_path(base: &Path, receipt: &str, expected: &str) -> PathBuf {
         })
         .map(PathBuf::from)
         .filter_map(|path| fixture_file(base, &path))
+}
+
+fn recovery_path(base: &Path, receipt: &str, expected: &str) -> PathBuf {
+    recovery_paths(base, receipt)
         .find(|path| fs::read_to_string(path).is_ok_and(|data| data == expected))
         .unwrap_or_else(|| {
             panic!("sync did not print a recovery path containing expected bytes: {receipt}")
@@ -2375,25 +2388,61 @@ copies_case!(
         b.source("copy.txt", "incoming version\n");
         b.sync();
         let target = a.home.join(".copied");
+        let identity = |metadata: fs::Metadata| (metadata.dev(), metadata.ino());
+        let original = identity(fs::symlink_metadata(&target).unwrap());
         let mut previous = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&target)
             .unwrap();
-        let receipt = a.sync();
-        let recovered = recovery_path(
-            &f.scratch,
-            &format!("{receipt}{}", f.replay(&f.a)),
-            "initial\n",
+        let opened = identity(previous.metadata().unwrap());
+        assert_eq!(
+            opened, original,
+            "descriptor opened a different fixture file"
         );
+        let receipt = a.sync();
+        let replay = a.replay();
+        let after_sync = identity(previous.metadata().unwrap());
+        let new_target = identity(fs::symlink_metadata(&target).unwrap());
+        // Checkout backups can have the same bytes as the deployed file.
+        // The path for an editor's old descriptor must name the same inode.
+        let candidates: Vec<_> = [("live", &receipt), ("replay", &replay)]
+            .into_iter()
+            .flat_map(|(source, text)| {
+                recovery_paths(&f.scratch, text)
+                    .map(move |path| (source, identity(fs::symlink_metadata(&path).unwrap()), path))
+            })
+            .collect();
+        let evidence = format!(
+            "device/inode: target before {original:?}, descriptor opened {opened:?}, \
+             descriptor after sync {after_sync:?}, target after sync {new_target:?}; \
+             printed paths {candidates:?}\nlive: {receipt}\nreplay: {replay}"
+        );
+        assert_eq!(after_sync, opened, "{evidence}");
+        assert_ne!(new_target, opened, "{evidence}");
+        let (_, _, recovered) = candidates
+            .iter()
+            .find(|(_, file, _)| *file == opened)
+            .unwrap_or_else(|| panic!("no printed recovery path names the open inode: {evidence}"));
         assert_eq!(mode(recovered.parent().unwrap()), 0o700);
+        assert_eq!(read(recovered), "initial\n", "{evidence}");
         previous.set_len(0).unwrap();
         previous.seek(SeekFrom::Start(0)).unwrap();
         previous
             .write_all(b"save through old descriptor\n")
             .unwrap();
-        assert_eq!(read(&recovered), "save through old descriptor\n");
-        assert_eq!(read(&target), "incoming version\n");
+        assert_eq!(identity(previous.metadata().unwrap()), opened, "{evidence}");
+        assert_eq!(
+            identity(fs::symlink_metadata(recovered).unwrap()),
+            opened,
+            "{evidence}"
+        );
+        assert_eq!(
+            read(recovered),
+            "save through old descriptor\n",
+            "{evidence}"
+        );
+        assert_eq!(read(&target), "incoming version\n", "{evidence}");
     }
 );
 
@@ -2445,8 +2494,8 @@ sync_case!(
 copies_case!(
     unchanged_real_hook_failure_preserves_phase_and_exit_without_private_output,
     true,
-    |f, a, _b, config| {
-        let private = "echo FIXTURE_PRIVATE_HOOK; echo FIXTURE_PRIVATE_HOOK_ERR >&2; exit 7";
+    |_f, a, _b, config| {
+        let private = "echo FIXTURE_PRIVATE_HOOK; printf '%s\\n' FIXTURE_PRIVATE_HOOK_ERR 'diff --git a/a b/a' '+FIXTURE_PRIVATE_HOOK_PATCH' >&2; exit 7";
         a.source("config.toml", hooks(&config, private, ":"));
         for (args, verbose, quiet) in [
             (&["--plain", "sync"][..], "0", "0"),
@@ -2458,13 +2507,19 @@ copies_case!(
                     .env("MISE_VERBOSE", verbose)
                     .env("MISE_QUIET", quiet),
             );
-            let replay = f.replay(&f.a);
+            let replay = a.replay();
             for text in [receipt, replay] {
                 if quiet == "0" {
                     has(&text, "pre-dotfiles");
                 }
-                has(&text, "7");
+                assert!(
+                    ["exit code 7", "exit status 7", "exit 7"]
+                        .iter()
+                        .any(|status| text.contains(status)),
+                    "hook exit status is missing: {text}"
+                );
                 absent(&text, "FIXTURE_PRIVATE_HOOK");
+                absent(&text, "diff --git");
             }
         }
     }
@@ -2837,7 +2892,7 @@ copies_case!(
         let receipt = a.sync();
         recovery_path(
             &f.scratch,
-            &format!("{receipt}{}", f.replay(&f.a)),
+            &format!("{receipt}{}", a.replay()),
             "native copy\n",
         );
         assert_eq!(

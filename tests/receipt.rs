@@ -22,7 +22,7 @@ case "$*" in
   --version) printf '%s\n' 2026.11.8 ;;
   *'vars.dots_source_repo') printf '%s\n' dots-tests/receipt ;;
   *'vars.dots_profiles') printf '%s\n' test ;;
-  *'dotfiles paths --json'*) printf '%s\n' '{"entries":[]}' ;;
+  *'dotfiles paths --json'*|*'dotfiles --local paths --json'*) printf '%s\n' '{"entries":[],"invalid":[]}' ;;
   *'dotfiles status --json'*) printf '%s\n' '{"files":[],"edits":[]}' ;;
   *'.encrypt'*) exit 1 ;;
   *'dotfiles save'*|*'dotfiles apply'*) exit 0 ;;

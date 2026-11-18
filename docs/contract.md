@@ -1,7 +1,7 @@
 # dots 1.0 contract
 
 Status: Frozen for 1.0. Changes go through the coordinator as amendments to this document.
-Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation and the running `dots` on children's `PATH`, recording what 0.4.0 ships.
+Amended 2026-11-18: shell completion, removal targets, the output of individual commands, cancellation, shared agent skill directory creation and the 1.0 guarantee for the running `dots` on children's `PATH`.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -814,11 +814,11 @@ Every part is optional.
 
 ### Environment of children
 
-`dots` puts its running executable first on `PATH` in the environment it hands each child it starts directly, even when the user started `dots` by an absolute path.
+**New in 1.0:** `dots` puts its running executable first on `PATH` in the environment it hands each child it starts directly, even when the user started `dots` by an absolute path.
 Every hook, recipe, configuration command and `dots test` child, and every other launch that `dots` itself makes for `dots bootstrap`, starts with that executable first on `PATH`, after any configuration environment is applied, so `dots` there is the same executable at the same version.
 `dots` arranges this without a setting.
-**New in 1.0:** 0.3.5 and 0.4.0 do not guarantee this: a configuration command inherits the caller's `PATH`, their own scripts are found under `DOTS_HOME`, and hooks and `dots test` start through `mise exec` with the configuration's `PATH`.
-`dots mise` passes its arguments and the active configuration to mise, and mise builds the environment of what `mise exec` or `mise run` starts: the tools mise selects and `[env] _.path` can come before the inherited `PATH`, so `dots` there resolves as the configuration says.
+In 0.4.0 a configuration command inherited the caller's `PATH`, and `dots test` launched the test script through `mise exec`.
+For programs started by an explicit `dots mise exec` or `dots mise run`, see [`dots mise`](#dots-mise-args).
 mise's native bootstrap likewise runs the `dots` that the configuration pins, as [`dots bootstrap`](#dots-bootstrap) describes.
 Every hook, recipe, configuration command, `dots test` child and `dots mise` child gets `DOTS_ROOT` and `DOTS_PROFILE`.
 **Changed from 0.3.5:** `DOTS_HOME` is not set.
@@ -892,6 +892,8 @@ Without options it prints the selected profile; with none selected it exits 2 wi
 
 It runs mise rooted in the configuration with this machine's `PROFILE,host-ID` environment, without the caller's `MISE_ENV`, and with auto-install off.
 `ARGS` are passed as an argument array and never evaluated by a shell.
+For an explicit `exec` or `run`, mise receives those arguments and the active configuration unchanged and applies its own `PATH` rules inside the resulting command or task.
+Configured tool directories and `[env] _.path` can precede the inherited `PATH`, so a bare `dots` there resolves according to the configuration.
 On macOS, for mise's package bootstrap and status, it exposes the configuration's already-installed Ruby so Homebrew tap evaluation does not go through a shim; it never installs Ruby.
 It exits with mise's status.
 

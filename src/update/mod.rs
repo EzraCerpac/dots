@@ -10,6 +10,7 @@ use std::thread;
 use crate::config::{Exceptions, Vars, selection};
 use crate::history::{self, Checkpoint};
 use crate::process::Mise;
+use crate::receipt::{self, Receipt};
 use crate::report;
 use crate::run::{Change, Issue, Outcome, Policy, Run, Sink, StageId, exit_code};
 use crate::{Args, Ctx, Fail, exceptions, hooks, sync};
@@ -28,7 +29,7 @@ pub fn up(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     } else {
         "dots up"
     });
-    update(ctx, &run, mas);
+    update(&run, mas);
 
     let failed = run
         .snapshot()
@@ -64,7 +65,8 @@ impl Config {
     }
 }
 
-fn update(ctx: &Ctx, run: &Run<'_>, mas: bool) {
+fn update(run: &Run<'_>, mas: bool) {
+    let ctx = run.ctx();
     if !matches!(
         step(run, "Pre-update settings checkpoint", |id| checkpoint(
             ctx, run, id
@@ -192,22 +194,47 @@ fn sync_configuration(run: &Run<'_>, id: StageId, source: sync::Loaded) -> Step 
     match source {
         sync::Loaded::LocalOnly => Ok(Outcome::Skipped),
         sync::Loaded::Problem(error) => {
+            // P-08 will turn load problems into receipts in the same producer.
             run.issue(id, error);
             Ok(Outcome::Deferred)
         }
-        sync::Loaded::Ready(_) => {
-            // P-08/P-09: wire sync::run(Display::Embedded) and consume Receipt's
-            // issues and adopted revision once the producer replaces the typed stub.
-            run.issue(
+        sync::Loaded::Ready(_) => Ok(record_sync_receipt(
+            run,
+            id,
+            sync::run(
+                run,
                 id,
-                Issue::new(
-                    "The sync producer is not implemented in this build (P-08/P-09).",
-                    "Rerun with a build that includes source sync.",
-                ),
-            );
-            Ok(Outcome::Deferred)
-        }
+                source,
+                foundation_sync_display(receipt::Display::Embedded),
+            ),
+        )),
     }
+}
+
+// P-08 replaces the foundation's placeholder Display with receipt::Display.
+fn foundation_sync_display(display: receipt::Display) -> sync::Display {
+    match display {
+        receipt::Display::Standalone => sync::Display::Standalone,
+        receipt::Display::Plain => sync::Display::Plain,
+        receipt::Display::Embedded => sync::Display::Stage,
+    }
+}
+
+fn record_sync_receipt(run: &Run<'_>, id: StageId, receipt: Receipt) -> Outcome {
+    if let Some((before, after)) = receipt.adopted_revision {
+        run.change(
+            id,
+            Change {
+                item: "configuration revision".into(),
+                before,
+                after,
+            },
+        );
+    }
+    for issue in receipt.issues {
+        run.issue(id, Issue::new(issue.diagnostic, issue.next_action));
+    }
+    receipt.stage_outcome
 }
 
 fn step(run: &Run<'_>, label: &str, f: impl FnOnce(StageId) -> Step) -> Option<Outcome> {
@@ -323,6 +350,46 @@ fn differences(before: &Versions, after: &Versions) -> Vec<Change> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_sync_records_the_verified_revision_and_issue() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        std::fs::write(root.join("config.toml"), "[vars]\ndots_profiles = 'test'\n").unwrap();
+        let env = crate::Env {
+            vars: [("DOTS_ROOT".into(), root.as_os_str().into())].into(),
+            cwd: root.into(),
+        };
+        let ctx = Ctx {
+            root: crate::config::Root::resolve(&env).unwrap(),
+            env,
+            flags: crate::Flags::default(),
+        };
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let id = run.start("Sync configuration");
+        let mut receipt = Receipt::new(None, "not pushed");
+        receipt.stage_outcome = Outcome::Deferred;
+        receipt.adopted_revision = Some(("a".repeat(40), "b".repeat(40)));
+        receipt
+            .issues
+            .push(receipt::Issue::new("Shared update deferred", "dots sync"));
+
+        let outcome = record_sync_receipt(&run, id, receipt);
+        assert_eq!(outcome, Outcome::Deferred);
+        let snapshot = run.snapshot();
+        assert_eq!(
+            snapshot.stages[0].changes,
+            [Change {
+                item: "configuration revision".into(),
+                before: "a".repeat(40),
+                after: "b".repeat(40),
+            }]
+        );
+        assert_eq!(
+            snapshot.stages[0].issues,
+            [Issue::new("Shared update deferred", "dots sync")]
+        );
+    }
 
     #[test]
     fn snapshot_records_installs_upgrades_and_removals() {

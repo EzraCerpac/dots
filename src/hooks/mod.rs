@@ -214,7 +214,7 @@ fn run_child(
         None
     };
 
-    let bundle = match env {
+    let _bundle = match env {
         ChildEnv::Hook(HookEnv::Update {
             tools_ok,
             tools_upgraded,
@@ -238,7 +238,6 @@ fn run_child(
     };
 
     let result = run.run(stage, child, Policy::Interactive);
-    drop(bundle);
     if let Some(file) = changes {
         for change in BufReader::new(file.as_file())
             .split(b'\n')

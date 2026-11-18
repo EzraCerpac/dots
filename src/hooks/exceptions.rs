@@ -13,12 +13,12 @@ pub enum Mode {
 pub fn install(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     let exceptions = Exceptions::read(&ctx.root)?;
     let run = Run::begin(ctx, Sink::Unreported);
-    let outcomes = run_with_context(&run, ctx, &exceptions, Mode::InstallOnly)?;
-    Ok(run.end(u8::from(outcomes.contains(&Outcome::Failed))))
+    let failed = run_with_context(&run, ctx, &exceptions, Mode::InstallOnly)?;
+    Ok(run.end(u8::from(failed)))
 }
 
-pub fn run(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<Vec<Outcome>, Fail> {
-    run_with_context(run, &stage_context()?, exceptions, mode)
+pub fn run(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<(), Fail> {
+    run_with_context(run, &stage_context()?, exceptions, mode).map(|_| ())
 }
 
 fn run_with_context(
@@ -26,10 +26,10 @@ fn run_with_context(
     ctx: &Ctx,
     exceptions: &Exceptions,
     mode: Mode,
-) -> Result<Vec<Outcome>, Fail> {
+) -> Result<bool, Fail> {
     let selected = selection::read(&ctx.root, &ctx.env)?;
     let profile = selected.profile.as_deref().unwrap_or_default();
-    let mut outcomes = Vec::new();
+    let mut failed = false;
     for recipe in exceptions.selected(profile)? {
         if run.cancelled() {
             break;
@@ -47,7 +47,7 @@ fn run_with_context(
         if matches!(mode, Mode::InstallOnly) && outcome == Outcome::Failed && !run.cancelled() {
             eprintln!("Failed installer exception: {}", recipe.name);
         }
-        outcomes.push(outcome);
+        failed |= outcome == Outcome::Failed;
     }
-    Ok(outcomes)
+    Ok(failed)
 }

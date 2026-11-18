@@ -173,6 +173,22 @@ pub(super) fn validate(
     {
         return Err(invalid("mise did not load the isolated configuration"));
     }
+    // Native directory manifests resolve their names from the verified index.
+    let preview_git = scratch.live.at(&root);
+    let format = scratch.git.text(["rev-parse", "--show-object-format"])?;
+    preview_git.get([
+        "init",
+        "--quiet",
+        "--template=",
+        &format!("--object-format={format}"),
+    ])?;
+    let mut alternate = scratch.objects().as_os_str().as_encoded_bytes().to_vec();
+    if alternate.contains(&b'\n') {
+        return Err(invalid("unsupported Git object directory"));
+    }
+    alternate.push(b'\n');
+    fs::write(root.join(".git/objects/info/alternates"), alternate)?;
+    preview_git.get(["read-tree", revision])?;
     let apply = ApplyPlan::new(
         run,
         root.clone(),
@@ -261,27 +277,6 @@ fn materialize(
         }
     }
     Ok(documents)
-}
-
-pub(super) fn historical_status(
-    run: &Run<'_>,
-    scratch: &Scratch<'_>,
-    revision: &str,
-    tree: &Tree,
-) -> io::Result<(tempfile::TempDir, PathBuf, Vec<u8>)> {
-    let preview = private_dir(scratch.dir.path(), "historical-")?;
-    let root = preview.path().canonicalize()?;
-    materialize(scratch, revision, tree, &root)?;
-    for (path, image) in local_files(scratch.live.root())? {
-        write_private(&root.join(path), &image)?;
-    }
-    let data = probe(
-        run,
-        &root,
-        ["bootstrap", "dotfiles", "status", "--json"],
-        true,
-    )?;
-    Ok((preview, root, data))
 }
 
 pub(super) fn overlay_environments(run: &Run<'_>, root: &Path) -> io::Result<String> {

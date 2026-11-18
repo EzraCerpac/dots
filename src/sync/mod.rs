@@ -397,12 +397,6 @@ fn synchronize(
             }
             return Ok(());
         }
-        copies
-            .seed(run, &scratch, &previous, &old)
-            .or_note("Could not preserve the previous copy declarations", RERUN)?;
-        copies
-            .persist(&shared.dir)
-            .or_note("Could not save the previous copy baselines", RERUN)?;
         let index_before = snapshot.bytes().to_vec();
         drop(snapshot);
         checkout::begin(&git, &shared.dir, &index_before, &previous, &before, true)
@@ -422,9 +416,6 @@ fn synchronize(
             installed.paths,
         ));
     }
-    copies
-        .seed(run, &scratch, &before, &base)
-        .or_note("Could not verify the previous dotfile declarations", RERUN)?;
     verify_dev(&git, &before).or_note("The dev checkout changed before copy capture", GIT)?;
     copies
         .capture(run, &git, &shared.dir, &before, &base, receipt)

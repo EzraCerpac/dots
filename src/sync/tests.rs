@@ -390,6 +390,7 @@ fn validated_crlf_config_deploys_the_copy() {
     fs::write(git.root().join("source"), "approved source\n").unwrap();
     git.get(["add", "."]).unwrap();
     fixture_commit(&git, "checkout representation fixture");
+    fs::remove_file(git.root().join("config.toml")).unwrap();
     git.get(["checkout-index", "--force", "--", "config.toml"])
         .unwrap();
     assert!(
@@ -527,32 +528,31 @@ pre-dotfiles = "printf 'generated\\n' > source"
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn guarded_hook_replay_does_not_displace_a_competing_live_source() {
-    let (fixture, mut ctx) = shared_mise_fixture(
+    use std::os::unix::fs::PermissionsExt;
+
+    let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
 '~/deployed' = { mode = 'copy', source = 'source' }
 [bootstrap.hooks]
-pre-dotfiles = "printf 'generated\\n' > source; printf 'competing\\n' > \"$FIXTURE_LIVE_SOURCE\""
+pre-dotfiles = "git ls-files --error-unmatch source >/dev/null; printf 'generated\n' > marker"
 "#,
     );
-    let source = ctx.root.path().join("source");
-    ctx.env
-        .vars
-        .insert("FIXTURE_LIVE_SOURCE".into(), source.as_os_str().to_owned());
     let git = Git::new(&ctx, ctx.root.path());
+    let source = git.root().join("source");
     fs::write(&source, "approved source\n").unwrap();
     git.get(["add", "."]).unwrap();
     fixture_commit(&git, "guarded hook fixture");
+    let hook = git.root().join(".git/hooks/pre-push");
+    fs::write(&hook, "#!/bin/sh\nprintf 'competing\\n' > source\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let receipt = shared_mise_sync(&ctx);
     assert_eq!(receipt.outcome, "pushed dev");
-    assert!(
-        receipt.issues.iter().any(|issue| issue
-            .diagnostic
-            .contains("conflicts with a pre-dotfiles hook")),
-        "{:?}",
-        receipt.issues
-    );
     assert_eq!(fs::read(source).unwrap(), b"competing\n");
-    assert!(!fixture.path().join("home/deployed").exists());
+    assert_eq!(fs::read(git.root().join("marker")).unwrap(), b"generated\n");
+    assert_eq!(
+        fs::read(fixture.path().join("home/deployed")).unwrap(),
+        b"approved source\n"
+    );
 }
 
 #[test]

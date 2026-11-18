@@ -275,6 +275,11 @@ pub fn load(env: &Env, id: &Id) -> io::Result<Report> {
     read_json(&dir.join(&id.0))
 }
 
+/// The saved file identified by an entry returned from `list`.
+pub(crate) fn path(env: &Env, id: &Id) -> io::Result<PathBuf> {
+    Ok(env.state_dir()?.join("reports").join(&id.0))
+}
+
 fn fragment_dir(path: &Path) -> io::Result<&Path> {
     let dir = path
         .parent()

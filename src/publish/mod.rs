@@ -1,8 +1,14 @@
 mod repo;
 mod scan;
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::ffi::{CStr, OsStr};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 
+use nix::libc;
 use serde::Deserialize;
 use tempfile::NamedTempFile;
 
@@ -34,10 +40,14 @@ pub fn publish(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let stage = run.start("Publish source");
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = stdin.lock();
     let mut output = stdout.lock();
     let mut terminal = Terminal {
-        input: (stdin.is_terminal() && stdout.is_terminal()).then_some(&mut input),
+        input: (stdin.is_terminal() && stdout.is_terminal()).then(|| {
+            BufReader::new(PromptInput {
+                run: &run,
+                tty: None,
+            })
+        }),
         output: &mut output,
     };
     let result = publish_source(ctx, &run, selection, &mut terminal);
@@ -417,7 +427,7 @@ fn pull_number(url: &str, slug: &str) -> Option<u64> {
 }
 
 struct Terminal<'a> {
-    input: Option<&'a mut dyn BufRead>,
+    input: Option<BufReader<PromptInput<'a>>>,
     output: &'a mut dyn Write,
 }
 
@@ -431,12 +441,12 @@ impl Terminal<'_> {
             .input
             .as_mut()
             .ok_or_else(|| failure("publishing requires confirmation in a terminal"))?;
+        input.get_ref().check_cancelled().map_err(input_error)?;
         write!(self.output, "{label} ").map_err(output_error)?;
         self.output.flush().map_err(output_error)?;
         let mut answer = String::new();
-        input
-            .read_line(&mut answer)
-            .map_err(|_| failure("could not read publication confirmation"))?;
+        input.read_line(&mut answer).map_err(input_error)?;
+        input.get_ref().check_cancelled().map_err(input_error)?;
         Ok(answer.trim().to_owned())
     }
 
@@ -448,6 +458,66 @@ impl Terminal<'_> {
             Err(failure("publication cancelled; nothing was pushed"))
         }
     }
+}
+
+struct PromptInput<'a> {
+    run: &'a Run<'a>,
+    tty: Option<File>,
+}
+
+impl PromptInput<'_> {
+    fn check_cancelled(&self) -> io::Result<()> {
+        if self.run.cancelled() {
+            // BufRead::read_line retries Interrupted, including when a
+            // partial line was already read.
+            return Err(io::Error::other("publication was interrupted"));
+        }
+        Ok(())
+    }
+}
+
+impl Read for PromptInput<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.tty.is_none() {
+            self.tty = Some(open_prompt_tty()?);
+        }
+        let mut tty = self.tty.as_ref().unwrap();
+        let mut input = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            self.check_cancelled()?;
+            match tty.read(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => return result,
+            }
+            // A bounded wait covers signals delivered just before poll starts.
+            if unsafe { libc::poll(&mut input, 1, 100) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn open_prompt_tty() -> io::Result<File> {
+    let mut name = [0; libc::PATH_MAX as usize];
+    let result = unsafe { libc::ttyname_r(libc::STDIN_FILENO, name.as_mut_ptr(), name.len()) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    let path = unsafe { CStr::from_ptr(name.as_ptr()) };
+    // Ctrl-C can flush input between poll and read. Use a separate open
+    // description so nonblocking reads leave the caller's stdin flags alone.
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(OsStr::from_bytes(path.to_bytes()))
 }
 
 fn title_for(description: &str) -> String {
@@ -481,4 +551,8 @@ fn failure(message: impl Into<String>) -> Fail {
 
 fn output_error(_: io::Error) -> Fail {
     failure("could not write publication output")
+}
+
+fn input_error(_: io::Error) -> Fail {
+    failure("could not read publication confirmation")
 }

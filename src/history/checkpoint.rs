@@ -18,18 +18,14 @@ pub enum Checkpoint {
 pub fn checkpoint(run: &Run<'_>, _stage: StageId, ctx: &Ctx) -> Result<Checkpoint, Issue> {
     let native = Native::new(run, ctx);
     let checkpoint = || {
-        let paths = tracked::paths(&native, None)?;
+        let paths = tracked::capture_paths(&native, None)?;
         if paths.is_empty() {
             return Ok(Checkpoint::NothingTracked);
         }
         let store = native.store()?;
         let _lock = native::lock(&store)?;
         require_no_pending(&store)?;
-        if exists(&store)? {
-            native.bare(&store)?;
-        }
-        tracked::secure(&paths)?;
-        save(&native)?;
+        save(&native, None, &paths)?;
         Ok(Checkpoint::Saved)
     };
     checkpoint().map_err(|error: Fail| {
@@ -40,9 +36,20 @@ pub fn checkpoint(run: &Run<'_>, _stage: StageId, ctx: &Ctx) -> Result<Checkpoin
     })
 }
 
-pub(super) fn save(native: &Native<'_, '_>) -> Result<(), Fail> {
+pub(super) fn save(
+    native: &Native<'_, '_>,
+    host: Option<&str>,
+    paths: &[PathBuf],
+) -> Result<(), Fail> {
+    // Path operands promote manual saves; automatic entries are still
+    // captured. Recheck the full native inventory under the caller's lock.
+    if tracked::capture_paths(native, host)? != paths {
+        return Err(blocked("tracked history paths changed before saving"));
+    }
+    tracked::secure(native, paths)?;
     let mut cmd = native.mise(&["bootstrap", "dotfiles", "save"])?;
-    cmd.env("MISE_HISTORY_SYNC", "manual")
+    cmd.env_remove("__MISE_HISTORY_LOCAL")
+        .env("MISE_HISTORY_SYNC", "manual")
         .env("GIT_ALLOW_PROTOCOL", "");
     native.output(cmd, "mise could not save the encrypted settings checkpoint")?;
     Ok(())

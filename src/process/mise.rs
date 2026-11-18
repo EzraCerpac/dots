@@ -320,12 +320,33 @@ pub(crate) fn validate_selection(
     }
     command
         .env("HOME", &scratch_path)
+        .env("TMPDIR", &scratch_path)
         .env("XDG_CONFIG_HOME", scratch_path.join("xdg-config"))
         .env("XDG_DATA_HOME", scratch_path.join("xdg-data"))
         .env("XDG_STATE_HOME", scratch_path.join("xdg-state"))
         .env("XDG_CACHE_HOME", scratch_path.join("xdg-cache"))
-        .env("MISE_SYSTEM_CONFIG_DIR", scratch_path.join("system"))
+        .env("CODEX_HOME", scratch_path.join(".codex"))
+        .env("CLAUDE_CONFIG_DIR", scratch_path.join(".claude"))
+        .env("MISE_SYSTEM_CONFIG_DIR", scratch_path.join("system/config"))
+        .env("MISE_SYSTEM_DATA_DIR", scratch_path.join("system/data"))
+        .env(
+            "MISE_SYSTEM_PLUGINS_DIRS",
+            scratch_path.join("system/data/plugins"),
+        )
+        .env(
+            "MISE_SYSTEM_INSTALLS_DIR",
+            scratch_path.join("system/data/installs"),
+        )
+        .env(
+            "MISE_SYSTEM_SHIMS_DIR",
+            scratch_path.join("system/data/shims"),
+        )
         .env("MISE_DATA_DIR", scratch_path.join("data"))
+        .env("MISE_INSTALLS_DIR", scratch_path.join("data/installs"))
+        .env("MISE_INSTALL_STORE_DIR", scratch_path.join("data/store"))
+        .env("MISE_PLUGINS_DIR", scratch_path.join("data/plugins"))
+        .env("MISE_DOWNLOADS_DIR", scratch_path.join("data/downloads"))
+        .env("MISE_SHIMS_DIR", scratch_path.join("data/shims"))
         .env("MISE_CEILING_PATHS", &scratch_path)
         .env("MISE_TRUSTED_CONFIG_PATHS", &root);
     let active = config_paths(command, Duration::from_secs(10)).map_err(|error| {

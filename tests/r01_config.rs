@@ -1,11 +1,13 @@
+mod support;
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use tempfile::TempDir;
+use support::{FixtureCommand, World, stage_executable};
 
 const BASE: &str = include_str!("r01_config_goldens/base.toml");
 const ORIGIN: &str = "ssh://git@example.com/dots/history.git";
@@ -20,7 +22,7 @@ fn dots_bin() -> PathBuf {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    world: World,
     base: PathBuf,
     home: PathBuf,
     config: PathBuf,
@@ -28,48 +30,37 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
-        let home = base.join("home");
-        let config = base.join("config");
-        fs::create_dir(&home).unwrap();
-        fs::create_dir(&config).unwrap();
+        let world = World::new();
+        let base = world.base().to_owned();
+        let home = world.home().to_owned();
+        let config = world.root().to_owned();
         fs::write(config.join("config.toml"), BASE).unwrap();
+        // The R-01 scenarios create their own commands/hooks.
+        fs::remove_dir_all(config.join("dots")).unwrap();
         Self {
-            _dir: dir,
+            world,
             base,
             home,
             config,
         }
     }
 
-    fn command(&self, executable: impl AsRef<OsStr>) -> Command {
-        let mut command = Command::new(executable);
+    fn command(&self, executable: impl AsRef<OsStr>) -> FixtureCommand<'_> {
+        let mut command = self.world.command(executable);
         command
-            .env_clear()
             .current_dir(&self.base)
-            .env(
-                "PATH",
-                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
-            )
-            .env("HOME", &self.home)
-            .env("TMPDIR", &self.base)
-            .env("DOTS_ROOT", &self.config)
-            .env("DOTS_SKILL_LINKS", "0")
             .env("XDG_STATE_HOME", self.base.join("xdg-state"))
             .env("XDG_CONFIG_HOME", self.base.join("xdg-config"))
             .env("XDG_CACHE_HOME", self.base.join("xdg-cache"))
             .env("XDG_DATA_HOME", self.base.join("xdg-data"))
             .env("MISE_CONFIG_DIR", &self.config)
-            .env("MISE_SYSTEM_CONFIG_DIR", self.base.join("mise-system"))
-            .env("MISE_CEILING_PATHS", &self.base)
             .env("MISE_OFFLINE", "1")
             .env("MISE_NO_HOOKS", "1")
             .env("MISE_TRUSTED_CONFIG_PATHS", &self.config);
         command
     }
 
-    fn dots(&self) -> Command {
+    fn dots(&self) -> FixtureCommand<'_> {
         self.command(dots_bin())
     }
 
@@ -94,8 +85,21 @@ impl Fixture {
     fn script(&self, name: &str, contents: &str) -> PathBuf {
         let path = self.base.join(name);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, format!("#!/bin/sh\n{contents}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Keep the executable's write descriptor out of the parallel
+        // libtest process, where an unrelated fork could inherit it.
+        let status = self
+            .command("/bin/sh")
+            .args([
+                "-eu",
+                "-c",
+                r#"printf '%s\n' "$2" > "$1"; chmod 755 "$1""#,
+                "fixture",
+            ])
+            .arg(&path)
+            .arg(format!("#!/bin/sh\n{contents}\n"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
         path
     }
 
@@ -294,6 +298,46 @@ fn new_profile_read_refuses_ambiguity_until_explicitly_repaired() {
 }
 
 #[test]
+fn rust_selection_validation_gives_mise_private_staged_directories() {
+    let f = Fixture::new();
+    let mise = f.script(
+        "mise-check",
+        r#"
+set -eu
+test "$HOME" != "$EXPECTED_FIXTURE"
+case "$HOME" in "$EXPECTED_FIXTURE"/tmp/*) ;; *) exit 80 ;; esac
+for dir in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" \
+    "$TMPDIR" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$MISE_SYSTEM_CONFIG_DIR" \
+    "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR" "$MISE_TMP_DIR" \
+    "$MISE_INSTALLS_DIR" "$MISE_INSTALL_STORE_DIR" "$MISE_DOWNLOADS_DIR" "$MISE_PLUGINS_DIR" \
+    "$MISE_SHIMS_DIR" "$MISE_SYSTEM_DATA_DIR" "$MISE_SYSTEM_INSTALLS_DIR" \
+    "$MISE_SYSTEM_PLUGINS_DIRS" "$MISE_SYSTEM_SHIMS_DIR"; do
+    case "$dir" in "$HOME"|"$HOME"/*) ;; *) exit 81 ;; esac
+done
+test ! -e "$CODEX_HOME"
+test ! -e "$CLAUDE_CONFIG_DIR"
+test -f "$MISE_CONFIG_DIR/miserc.toml"
+printf '[{"path":"%s/config.laptop.toml"},{"path":"%s/config.host-demo-machine.toml"},{"path":"%s/config.local.toml"}]\n' \
+    "$MISE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$MISE_CONFIG_DIR"
+"#,
+    );
+    successful(
+        f.command(env!("CARGO_BIN_EXE_dots"))
+            .args([
+                "profile",
+                "--profile",
+                "laptop",
+                "--machine-id",
+                "demo-machine",
+            ])
+            .env("DOTS_MISE_BIN", mise)
+            .env("EXPECTED_FIXTURE", &f.base)
+            .output()
+            .unwrap(),
+    );
+}
+
+#[test]
 fn new_mise_queries_effective_settings_and_excludes_the_callers_env() {
     let f = Fixture::new();
     f.write("config.toml", &format!("{BASE}base_value = \"base\"\n"));
@@ -410,7 +454,7 @@ exit 29
         .arg(raw)
         .env("DOTS_MISE_BIN", "/does/not/exist")
         .env("DOTS_PROFILE", "supplied")
-        .env("DOTS_HOME", "/old")
+        .env("DOTS_HOME", f.base.join("old"))
         .env("MISE_ENV", "server")
         .output()
         .unwrap();
@@ -523,7 +567,7 @@ fn new_running_dots_survives_an_upgrade_during_a_configuration_command() {
         .base
         .join("mise/installs/github-ezracerpac-dots/v1/bin/dots");
     fs::create_dir_all(install.parent().unwrap()).unwrap();
-    fs::copy(dots_bin(), &install).unwrap();
+    stage_executable(dots_bin(), &install).unwrap();
     f.script(
         "config/dots/commands/replace",
         r#"
@@ -565,7 +609,7 @@ fn new_install_method_uses_the_running_binary_location() {
     ] {
         let path = f.base.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::copy(dots_bin(), &path).unwrap();
+        stage_executable(dots_bin(), &path).unwrap();
         let link = f.base.join(format!("launch-{kind}"));
         symlink(&path, &link).unwrap();
         let output = successful(

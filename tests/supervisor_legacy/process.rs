@@ -1,12 +1,12 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::libc;
+
+use crate::support::FixtureCommand;
 
 fn check(result: libc::c_int) -> io::Result<()> {
     if result == -1 {
@@ -16,7 +16,7 @@ fn check(result: libc::c_int) -> io::Result<()> {
     }
 }
 
-pub fn foreground_terminal(command: &mut Command) -> File {
+pub fn foreground_terminal(command: &mut FixtureCommand<'_>) -> File {
     let mut size = libc::winsize {
         ws_row: 32,
         ws_col: 100,

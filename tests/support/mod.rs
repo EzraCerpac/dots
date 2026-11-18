@@ -4,28 +4,13 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-// One table sets the defaults and identifies the variables that must stay set.
-pub const PRIVATE_DIRS: &[(&str, &str)] = &[
-    ("TMPDIR", "tmp"),
-    ("CODEX_HOME", "home/.codex"),
-    ("CLAUDE_CONFIG_DIR", "home/.claude"),
-    ("MISE_SYSTEM_CONFIG_DIR", "mise-system/config"),
-    ("MISE_DATA_DIR", "mise/data"),
-    ("MISE_CACHE_DIR", "mise/cache"),
-    ("MISE_STATE_DIR", "mise/state"),
-    ("MISE_TMP_DIR", "mise/tmp"),
-    ("MISE_INSTALLS_DIR", "mise/data/installs"),
-    ("MISE_INSTALL_STORE_DIR", "mise/data/store"),
-    ("MISE_DOWNLOADS_DIR", "mise/data/downloads"),
-    ("MISE_PLUGINS_DIR", "mise/data/plugins"),
-    ("MISE_SHIMS_DIR", "mise/data/shims"),
-    ("MISE_SYSTEM_DATA_DIR", "mise-system/data"),
-    ("MISE_SYSTEM_INSTALLS_DIR", "mise-system/data/installs"),
-    ("MISE_SYSTEM_SHIMS_DIR", "mise-system/data/shims"),
-];
+mod command;
+pub use command::FixtureCommand;
+use command::PRIVATE_DIRS;
 
 pub struct World {
     _temp: tempfile::TempDir,
@@ -98,11 +83,11 @@ impl World {
     }
 
     /// Builds an unstarted command. Keep this world alive until the child exits.
-    pub fn dots(&self) -> Command {
+    pub fn dots(&self) -> FixtureCommand<'_> {
         self.command(&self.dots_bin)
     }
 
-    pub fn git(&self) -> Command {
+    pub fn git(&self) -> FixtureCommand<'_> {
         self.command(Path::new("git"))
     }
 
@@ -129,7 +114,7 @@ impl World {
         remote
     }
 
-    pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
+    pub fn command(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
         // Even when TMPDIR is inside a checkout, Git must stay inside this world.
         let git_ceiling =
             env::join_paths([&self.base]).expect("world path must be a valid Git ceiling");
@@ -163,7 +148,7 @@ impl World {
                 command.env(key, value);
             }
         }
-        command
+        FixtureCommand::new(command, &self.base)
     }
 }
 
@@ -179,5 +164,30 @@ fn copy_fixture(source: &Path, destination: &Path) {
             assert!(kind.is_file(), "unsupported fixture: {:?}", entry.path());
             fs::copy(entry.path(), target).unwrap();
         }
+    }
+}
+
+/// Give an immutable executable another install path. On a different
+/// filesystem, let a separate process own the destination's write descriptor.
+pub fn stage_executable(source: impl AsRef<Path>, target: &Path) -> io::Result<()> {
+    let source = source.as_ref().canonicalize()?;
+    match fs::hard_link(&source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            let status = Command::new("/bin/cp")
+                .env_clear()
+                .arg("-p")
+                .arg(source)
+                .arg(target)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "copying fixture executable failed: {status}"
+                )))
+            }
+        }
+        Err(error) => Err(error),
     }
 }

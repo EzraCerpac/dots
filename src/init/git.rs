@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use crate::process::Cwd;
@@ -95,7 +95,7 @@ impl Git<'_> {
             )));
         }
         let refs = self.checked(
-            &["rev-list", "--all", "--reflog", "--max-count=1"],
+            &["rev-list", "--all", "--max-count=1"],
             "inspect commit history",
         )?;
         let index = self.checked(&["ls-files", "--stage", "-z"], "inspect the index")?;
@@ -119,11 +119,14 @@ impl Git<'_> {
 
         let scratch = tempfile::tempdir().map_err(|_| git_error("create a scratch index"))?;
         let index = scratch.path().join("index");
-        let empty_tree = line(input(
-            self.command(self.root)?.arg("mktree"),
-            b"",
-            "write the empty tree",
-        )?)?;
+        checked(
+            output(
+                self.command(self.root)?
+                    .env("GIT_INDEX_FILE", &index)
+                    .args(["-c", "core.splitIndex=false", "read-tree", "--empty"]),
+            )?,
+            "initialize the scratch index",
+        )?;
         let mut entries = String::new();
         for template in TEMPLATES {
             if self.matches_file(template)? && !self.ignored(template.path)? {
@@ -137,15 +140,20 @@ impl Git<'_> {
         input(
             self.command(self.root)?
                 .env("GIT_INDEX_FILE", &index)
-                .args(["update-index", "--index-info"]),
+                .args([
+                    "-c",
+                    "core.splitIndex=false",
+                    "update-index",
+                    "--index-info",
+                ]),
             entries.as_bytes(),
             "stage the embedded templates",
         )?;
         let tree = line(checked(
             output(
                 self.command(self.root)?
-                    .env("GIT_INDEX_FILE", index)
-                    .arg("write-tree"),
+                    .env("GIT_INDEX_FILE", &index)
+                    .args(["-c", "core.splitIndex=false", "write-tree"]),
             )?,
             "write the seed tree",
         )?)?;
@@ -190,20 +198,89 @@ impl Git<'_> {
             "create the seed commit",
         )?)?;
 
-        self.checked(&["symbolic-ref", "HEAD", DEV], "select dev")?;
-        let refs = format!("create {MAIN} {oid}\ncreate {DEV} {oid}\n");
-        input(
+        let (destination, mut lock) = self.reserve_index()?;
+        // The real index is still empty, and Git cannot stage changes while we
+        // hold its index.lock. Prepare the complete replacement before moving refs.
+        let mut prepared = File::open(&index).map_err(|err| super::file_error(&index, err))?;
+        io::copy(&mut prepared, &mut lock).map_err(|err| super::file_error(lock.path(), err))?;
+        lock.as_file()
+            .sync_all()
+            .map_err(|err| super::file_error(lock.path(), err))?;
+        let previous = self.head()?.ok_or_else(|| git_error("read unborn HEAD"))?;
+        if previous != DEV {
+            self.checked(&["symbolic-ref", "HEAD", DEV], "select dev")?;
+        }
+        let refs =
+            format!("option no-deref\ncreate {MAIN} {oid}\noption no-deref\ncreate {DEV} {oid}\n");
+        if let Err(error) = input(
             self.command(self.root)?.args(["update-ref", "--stdin"]),
             refs.as_bytes(),
             "create main and dev",
-        )?;
-        // A two-tree index merge carries forward entries the user staged
-        // independently and refuses to replace a conflicting staged entry.
-        self.checked(
-            &["read-tree", "-m", &empty_tree, &tree],
-            "record the seed in the index",
-        )?;
+        ) {
+            self.restore_unborn_head(&previous)?;
+            return Err(error);
+        }
+        if let Err(error) = lock.persist(&destination) {
+            // Roll back both refs only if they still point at our candidate.
+            let refs = format!(
+                "option no-deref\ndelete {MAIN} {oid}\noption no-deref\ndelete {DEV} {oid}\n"
+            );
+            input(
+                self.command(self.root)?.args(["update-ref", "--stdin"]),
+                refs.as_bytes(),
+                "roll back the seed refs after an index write failure",
+            )?;
+            self.restore_unborn_head(&previous)?;
+            return Err(super::file_error(&destination, error.error));
+        }
         println!("created seed commit {oid} on main and dev");
+        Ok(())
+    }
+
+    fn reserve_index(&self) -> Result<(PathBuf, tempfile::NamedTempFile), Fail> {
+        let location = self.checked(&["rev-parse", "--git-path", "index"], "locate the index")?;
+        let index = self
+            .root
+            .join(OsStr::from_bytes(trim_line(&location.stdout)));
+        let mut lock = index.as_os_str().to_os_string();
+        lock.push(".lock");
+        let path = PathBuf::from(lock);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&path)
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    Fail::new(
+                        1,
+                        format!(
+                            "Git index is locked at {}; free the index before retrying init",
+                            path.display()
+                        ),
+                    )
+                } else {
+                    super::file_error(&path, err)
+                }
+            })?;
+        let temp_path = tempfile::TempPath::try_from_path(path.clone())
+            .map_err(|err| super::file_error(&path, err))?;
+        let lock = tempfile::NamedTempFile::from_parts(file, temp_path);
+        let staged = self.checked(&["ls-files", "--stage", "-z"], "inspect the index")?;
+        if !staged.stdout.is_empty() || self.commit("HEAD")?.is_some() {
+            return Err(Fail::new(
+                1,
+                "the repository changed during init; retry with its current index and history",
+            ));
+        }
+        Ok((index, lock))
+    }
+
+    fn restore_unborn_head(&self, previous: &str) -> Result<(), Fail> {
+        if previous != DEV && self.head()?.as_deref() == Some(DEV) && self.commit("HEAD")?.is_none()
+        {
+            self.checked(&["symbolic-ref", "HEAD", previous], "restore unborn HEAD")?;
+        }
         Ok(())
     }
 

@@ -17,24 +17,10 @@ use crate::{Args, Ctx, Env, Fail};
 use git::{Git, Shape};
 
 pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
-    let root = match args.get_one::<OsString>("DIR") {
-        Some(dir) => Root::from_dir(&ctx.env, Path::new(dir))?,
-        None => Root::resolve(&ctx.env)?,
-    };
-    let mut env = Env {
-        vars: ctx.env.vars.clone(),
-        cwd: ctx.env.cwd.clone(),
-    };
-    env.vars.insert("DOTS_ROOT".into(), root.path().into());
-    let target = Ctx {
-        root,
-        env,
-        flags: ctx.flags,
-    };
-    let root = target.root.path();
+    let root = ctx.root.path();
     let ancestor = existing_directory(root)?;
     let probe = Git {
-        ctx: &target,
+        ctx,
         root,
         profile: "",
     };
@@ -46,13 +32,15 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     } else {
         println!("kept configuration directory {}", root.display());
     }
-    if root != ctx.root.path() {
+    if args.get_one::<OsString>("DIR").is_some()
+        && !Root::resolve(&ctx.env).is_ok_and(|ambient| root == ambient.path())
+    {
         println!("This directory is outside the active configuration root.");
     }
     files::scaffold(root)?;
 
-    let vars = Vars::read(&target.root)?;
-    let result = selection::read_for_init(&target.root);
+    let vars = Vars::read(&ctx.root)?;
+    let result = selection::read_for_init(&ctx.root);
     let selected = match result {
         Ok(selected) => selected,
         Err(error) if error.status == 2 => {
@@ -82,9 +70,14 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         }
     };
 
+    let mut validation_env = Env {
+        vars: ctx.env.vars.clone(),
+        cwd: ctx.env.cwd.clone(),
+    };
+    validation_env.vars.insert("DOTS_ROOT".into(), root.into());
     selection::persist(
-        &target.root,
-        &target.env,
+        &ctx.root,
+        &validation_env,
         selection::Persist {
             profile,
             machine_id: machine,

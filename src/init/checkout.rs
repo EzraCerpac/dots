@@ -57,7 +57,13 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
         && git.commit("refs/remotes/origin/dev")?.is_none()
         && git
             .checked(
-                &["--no-optional-locks", "status", "--porcelain", "-z"],
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    "-z",
+                ],
                 "check for local edits",
             )?
             .stdout

@@ -160,14 +160,7 @@ fn create_and_push(
     } else if !added {
         println!("The seed push still needs to run");
     } else if git
-        .output(&[
-            "push",
-            "--no-follow-tags",
-            "--recurse-submodules=no",
-            "origin",
-            &format!("{seed}:refs/heads/main"),
-            &format!("{seed}:refs/heads/dev"),
-        ])
+        .output(&push_args(seed).each_ref().map(String::as_str))
         .is_ok_and(|out| out.status.success())
     {
         println!("pushed seed commit {seed} to origin/main and origin/dev");
@@ -197,13 +190,23 @@ fn effective_urls_match(git: &Git<'_>, expected: &RepoSetting) -> bool {
     })
 }
 
+fn push_args(seed: &str) -> [String; 6] {
+    [
+        "push".to_owned(),
+        "--no-follow-tags".to_owned(),
+        "--recurse-submodules=no".to_owned(),
+        "origin".to_owned(),
+        format!("{seed}^{{commit}}:refs/heads/main"),
+        format!("{seed}^{{commit}}:refs/heads/dev"),
+    ]
+}
+
 fn print_push(git: &Git<'_>, seed: &str) -> Result<(), Fail> {
+    let [push, tags, submodules, origin, main, dev] = push_args(seed);
     command_line(
         "git -C ",
         git.root,
-        &format!(
-            " push --no-follow-tags --recurse-submodules=no origin {seed}:refs/heads/main {seed}:refs/heads/dev"
-        ),
+        &format!(" {push} {tags} {submodules} {origin} '{main}' '{dev}'"),
     )
 }
 

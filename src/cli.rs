@@ -554,7 +554,7 @@ fn context_at(flags: Flags, directory: Option<&Path>) -> Result<Ctx, Fail> {
     Ok(ctx)
 }
 
-fn require_config(root: &Root) -> Result<(), Fail> {
+pub(crate) fn require_config(root: &Root) -> Result<(), Fail> {
     if !root.path().join("config.toml").is_file() {
         return Err(Fail::usage(format!(
             "no configuration at {} (config.toml not found); create one with dots init or set DOTS_ROOT",
@@ -682,7 +682,15 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
     let ctx = context_at(flags, directory)?;
     if !matches!(
         name,
-        "init" | "bundle" | "brew" | "install-release-app" | "status" | "sync"
+        "init"
+            | "bundle"
+            | "brew"
+            | "install-release-app"
+            | "status"
+            | "sync"
+            | "plan"
+            | "apply"
+            | "test"
     ) {
         require_config(&ctx.root)?;
     }

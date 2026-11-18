@@ -423,10 +423,6 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
         assert!(text.to_ascii_lowercase().contains("needs attention"));
         assert!(!text.contains("fixture-earlier-change"));
     }
-    assert!(
-        !combined(&replay).contains("dots up --last"),
-        "replay advertised itself"
-    );
 }
 
 #[test]

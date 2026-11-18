@@ -188,6 +188,30 @@ impl<'a> Git<'a> {
         Ok(tree)
     }
 
+    pub fn ensure_dense_index(&self) -> io::Result<()> {
+        let sparse = self.output(["config", "--type=bool", "--get", "core.sparseCheckout"])?;
+        match (sparse.status.code(), sparse.stdout.as_slice()) {
+            (Some(0), b"true\n") => return Err(invalid("sparse Git checkout")),
+            (Some(0), b"false\n") | (Some(1), b"") => (),
+            _ => return Err(invalid("could not verify Git sparse-checkout settings")),
+        }
+        // update-index --skip-worktree works independently of sparse checkout.
+        let entries = self.get([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "ls-files",
+            "--cached",
+            "--sparse",
+            "-t",
+            "-z",
+        ])?;
+        if records(&entries).any(|entry| entry.starts_with(b"S ")) {
+            return Err(invalid("Git index has skip-worktree entries"));
+        }
+        Ok(())
+    }
+
     pub fn ancestor(&self, ancestor: &str, descendant: &str) -> io::Result<bool> {
         match self
             .output(["merge-base", "--is-ancestor", ancestor, descendant])?
@@ -226,9 +250,10 @@ pub(super) fn local(path: &Path) -> bool {
     let Some(Component::Normal(first)) = path.components().next() else {
         return false;
     };
-    let first = first.as_bytes();
+    // These root names can select the same on-disk file on macOS.
+    let first = first.as_bytes().to_ascii_lowercase();
     matches!(
-        first,
+        first.as_slice(),
         b"miserc.toml" | b"config.local.toml" | b"mise.lock" | b"locks" | b".setup-state"
     ) || (first.starts_with(b"config.host-") && first.ends_with(b".toml"))
         || (first.starts_with(b"mise.") && first.ends_with(b".lock"))

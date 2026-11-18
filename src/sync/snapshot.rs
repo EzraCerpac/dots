@@ -13,7 +13,7 @@ use crate::{process::Cwd, run::Run};
 
 use super::guard::private_dir;
 
-use super::git::{Git, Tree, bounded, checked, index_row, invalid, local, records, relative};
+use super::git::{Git, Tree, bounded, checked, index_row, invalid, local, oid, records, relative};
 
 #[derive(Debug)]
 pub(super) enum ScanError {
@@ -102,7 +102,9 @@ impl<'a> Scratch<'a> {
     }
 
     pub fn capture(&self, base: &str) -> io::Result<String> {
-        self.git.get(["read-tree", base])?;
+        self.live.ensure_dense_index()?;
+        self.git
+            .get(["-c", "core.sparseCheckout=false", "read-tree", base])?;
         let listed = self.git.get([
             "ls-files",
             "-z",
@@ -136,6 +138,7 @@ impl<'a> Scratch<'a> {
                     .output()?,
             )?;
         }
+        self.live.ensure_dense_index()?;
         let tree = self.git.id(["write-tree"])?;
         let before = self.git.id(["rev-parse", &format!("{base}^{{tree}}")])?;
         if tree == before {
@@ -198,12 +201,15 @@ impl<'a> Scratch<'a> {
         include: &str,
         excludes: &[&str],
     ) -> Result<BTreeSet<PathBuf>, ScanError> {
+        let include = oid(include.as_bytes()).map_err(|_| ScanError::Failed)?;
         let mut revs = format!(
-            "--full-history --diff-merges=first-parent --no-ext-diff --no-textconv --no-renames --text {include}"
+            "--root --full-history --diff-merges=first-parent --no-ext-diff --no-textconv --no-renames --text {include}^{{commit}}"
         );
         for excluded in excludes {
-            write!(&mut revs, " ^{excluded}").map_err(|_| ScanError::Failed)?;
+            let excluded = oid(excluded.as_bytes()).map_err(|_| ScanError::Failed)?;
+            write!(&mut revs, " ^{excluded}^{{commit}}").map_err(|_| ScanError::Failed)?;
         }
+        revs.push_str(" --");
         let mut cmd = run
             .ctx()
             .command("gitleaks", Cwd::Root)
@@ -240,21 +246,19 @@ impl<'a> Scratch<'a> {
         .arg(format!("--log-opts={revs}"))
         .arg("--report-path")
         .arg(&report)
-        .env_remove("GITLEAKS_CONFIG")
-        .env_remove("GITLEAKS_CONFIG_TOML")
         // The private bare repository contains no graft file. Setting
         // GIT_GRAFT_FILE even to /dev/null makes Git warn on stderr.
         // Gitleaks can treat that as an empty scan and still return zero.
-        .env_remove("GIT_GRAFT_FILE")
-        .arg("--gitleaks-ignore-path")
-        .arg(self.live.root());
+        .env_remove("GIT_GRAFT_FILE");
+        // Match the native scanner: explicitly select the live policy files
+        // when present, and otherwise let gitleaks select its defaults.
         let config = self.live.root().join(".gitleaks.toml");
-        match fs::symlink_metadata(&config) {
-            Ok(md) if md.is_file() => {
-                cmd.arg("--config").arg(config);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            _ => return Err(ScanError::Failed),
+        if config.exists() {
+            cmd.arg("--config").arg(config);
+        }
+        let ignore = self.live.root().join(".gitleaksignore");
+        if ignore.exists() {
+            cmd.arg("--gitleaks-ignore-path").arg(ignore);
         }
         cmd.arg(&self.scanner).stdin(Stdio::null());
         let output = bounded(cmd, run, Duration::from_secs(60)).map_err(|error| {
@@ -347,6 +351,11 @@ mod tests {
     };
     use std::os::unix::fs::PermissionsExt;
 
+    fn scratch<'a>(git: &Git<'a>) -> Scratch<'a> {
+        let git_dir = git.root().join(".git");
+        Scratch::new(git, &git_dir, &git_dir).unwrap()
+    }
+
     #[test]
     fn rejects_a_scanner_error_even_with_success_status_and_empty_json() {
         let (fixture, mut ctx) = git_fixture();
@@ -362,8 +371,7 @@ mod tests {
 
         let git = Git::new(&ctx, ctx.root.path());
         let revision = fixture_commit(&git, "seed");
-        let scratch =
-            Scratch::new(&git, &git.root().join(".git"), &git.root().join(".git")).unwrap();
+        let scratch = scratch(&git);
         let run = Run::begin(&ctx, Sink::Unreported);
         assert!(matches!(
             scratch.scan(&run, &revision, &[]),
@@ -372,17 +380,165 @@ mod tests {
     }
 
     #[test]
-    fn unpublished_lockfile_history_blocks_even_when_the_latest_tree_removes_it() {
+    fn native_scan_checks_intermediate_and_merge_resolutions_with_live_policy() {
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let base = fixture_commit(&git, "seed");
+        git.get(["checkout", "-qb", "side"]).unwrap();
+        let side_path = "Side marker.txt";
+        let merge_path = "Merge marker.txt";
+        let marker = b"dots-fixture-marker\n";
+        fs::write(git.root().join(side_path), marker).unwrap();
+        git.get(["add", "--", side_path]).unwrap();
+        let added = fixture_commit(&git, "add fixture marker");
+        git.get(["rm", "--", side_path]).unwrap();
+        let side = fixture_commit(&git, "remove fixture marker");
+
+        git.get(["checkout", "-q", "dev"]).unwrap();
+        let lower_case_path = "side marker.txt";
+        fs::write(git.root().join(lower_case_path), marker).unwrap();
+        git.get(["add", "--", lower_case_path]).unwrap();
+        let first = fixture_commit(&git, "nonmatching case");
+        fs::write(git.root().join(merge_path), marker).unwrap();
+        git.get(["add", "--", merge_path]).unwrap();
+        let tree = git.id(["write-tree"]).unwrap();
+        let merged = git
+            .id([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                &tree,
+                "-p",
+                &first,
+                "-p",
+                &side,
+                "-m",
+                "merge resolution",
+            ])
+            .unwrap();
+
+        fs::write(
+            git.root().join(".gitleaks.toml"),
+            r"[[rules]]
+id = 'fixture-marker'
+description = 'Fixture marker'
+regex = 'dots-fixture-marker'
+path = '^(Side|Merge) marker\.txt$'
+",
+        )
+        .unwrap();
+        let scratch = scratch(&git);
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let found = match scratch.scan(&run, &merged, &[&base]) {
+            Err(ScanError::Missing) => return,
+            result => result.unwrap(),
+        };
+        assert_eq!(found, BTreeSet::from([side_path.into(), merge_path.into()]));
+        assert_eq!(
+            scratch.scan(&run, &merged, &[&side]).unwrap(),
+            BTreeSet::from([merge_path.into()])
+        );
+
+        fs::write(
+            git.root().join(".gitleaksignore"),
+            format!("{added}:{side_path}:fixture-marker:1\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            scratch.scan(&run, &merged, &[&base]).unwrap(),
+            BTreeSet::from([merge_path.into()])
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_root_private_aliases_and_preserves_the_real_index() {
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let before = fixture_commit(&git, "seed");
+        let private_paths = [
+            "ConFiG.Local.TOML",
+            "Config.Host-Fixture.Toml",
+            "MiSeRc.toml",
+            "MiSe.Fixture.LoCk",
+            "MiSe.LoCk",
+            "LOCKS/fixture",
+            ".Setup-State/fixture",
+        ];
+        for path in private_paths {
+            let file = git.root().join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, b"machine-local fixture").unwrap();
+        }
+        let public = "public/Config.Local.TOML";
+        fs::create_dir(git.root().join("public")).unwrap();
+        fs::write(git.root().join(public), b"public fixture").unwrap();
+        let index_path = git.root().join(".git/index");
+        let original_index = fs::read(&index_path).unwrap();
+        let scratch = scratch(&git);
+        let candidate = scratch.capture(&before).unwrap();
+
+        assert_eq!(
+            changed(
+                &git.tree(&before).unwrap(),
+                &scratch.git.tree(&candidate).unwrap()
+            ),
+            [PathBuf::from(public)]
+        );
+        assert_eq!(fs::read(index_path).unwrap(), original_index);
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+        for path in private_paths {
+            assert_eq!(
+                fs::read(git.root().join(path)).unwrap(),
+                b"machine-local fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_private_history_blocks_even_when_the_latest_tree_removes_it() {
         let (_fixture, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());
         let before = fixture_commit(&git, "seed");
-        let path = "mise.fixture.lock";
-        fs::write(git.root().join(path), b"fixture lockfile").unwrap();
+        for path in ["MiSe.Fixture.LoCk", "CoNfIg.LoCaL.TOML"] {
+            fs::write(git.root().join(path), b"machine-local fixture").unwrap();
+            git.get(["add", path]).unwrap();
+            let tracked = fixture_commit(&git, "accidentally tracked");
+            git.get(["rm", "--", path]).unwrap();
+            let latest = fixture_commit(&git, "removed again");
+            assert!(machine_local_in_history(&git, &latest, &[&before]).unwrap());
+            assert!(machine_local_in_history(&git, &latest, &[&tracked]).unwrap());
+            assert!(!machine_local_in_history(&git, &latest, &[&latest]).unwrap());
+        }
+    }
+
+    #[test]
+    fn snapshot_refuses_configured_sparse_checkout_or_a_skip_worktree_absence() {
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let path = "tracked.txt";
+        fs::write(git.root().join(path), b"tracked fixture").unwrap();
         git.get(["add", path]).unwrap();
-        let tracked = fixture_commit(&git, "accidentally tracked");
-        git.get(["rm", "--", path]).unwrap();
-        let latest = fixture_commit(&git, "removed again");
-        assert!(machine_local_in_history(&git, &latest, &[&before]).unwrap());
-        assert!(machine_local_in_history(&git, &latest, &[&tracked]).unwrap());
+        let before = fixture_commit(&git, "seed");
+        let scratch = scratch(&git);
+        let index_path = git.root().join(".git/index");
+
+        git.get(["config", "core.sparseCheckout", "true"]).unwrap();
+        assert!(scratch.capture(&before).is_err());
+        git.get(["config", "core.sparseCheckout", "false"]).unwrap();
+        assert_eq!(scratch.capture(&before).unwrap(), before);
+
+        git.get(["update-index", "--skip-worktree", "--", path])
+            .unwrap();
+        fs::remove_file(git.root().join(path)).unwrap();
+        let index = fs::read(&index_path).unwrap();
+        assert!(scratch.capture(&before).is_err());
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        assert!(!git.root().join(path).exists());
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
     }
 }

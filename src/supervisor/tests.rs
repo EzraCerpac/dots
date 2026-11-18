@@ -874,6 +874,10 @@ fn run_tty_probe_fixture(test: &str, helper: bool) {
         child.id(),
         String::from_utf8_lossy(&transcript)
     );
+    if let Ok(evidence) = fs::read_to_string(fixture.path().join("busybox-poll")) {
+        let cleanup = fs::read_to_string(fixture.path().join("competing-cleanup")).unwrap();
+        writeln!(io::stderr().lock(), "{evidence}\n{cleanup}").unwrap();
+    }
 }
 
 fn check_tty_probe(path: &Path, helper: bool) {
@@ -972,29 +976,137 @@ if [ "$marker" = F ]; then printf F; fi
                     .as_ref()
                     .is_some_and(TerminalJob::owns_foreground)
             );
-            fs::write(ready, "").unwrap();
+            fs::write(ready, stage.terminal.as_ref().unwrap().group().to_string()).unwrap();
             stage.wait().unwrap()
         });
-        assert!(wait_until(|| ready.exists()));
+        let mut foreground = None;
+        assert!(wait_until(|| {
+            foreground = fs::read_to_string(ready)
+                .ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok());
+            foreground.is_some()
+        }));
+        let foreground = foreground.unwrap();
+        #[cfg(target_os = "linux")]
+        check_busybox_poll(path, supervisor, foreground);
+        // BusyBox's read builtin polls for data first. dd enters read(2) with
+        // the tty input queue empty, so the kernel stops the competing group.
+        let competing_pid = path.join("competing-pid");
         let competing = shell(
-            "printf 'competing reader on tty\\n' > \"$1\"; IFS= read -r line </dev/tty",
-            &[&phase],
+            "printf '%s' \"$$\" > \"$2\"; printf 'competing reader on tty\\n' > \"$1\"; exec dd if=/dev/tty bs=1 count=1",
+            &[&phase, &competing_pid],
         );
         let outcome = supervisor.probe(competing, Stdio::null(), false);
         fs::write(&phase, format!("competing probe returned {outcome:?}")).unwrap();
-        release.write_all(b"release\n").unwrap();
-        let status = worker.join().unwrap();
-        assert!(status.success(), "{status}");
         let error = outcome.unwrap_err();
         assert!(
             error.to_string().contains("another foreground command"),
             "{error}"
         );
+        let pid: libc::pid_t = fs::read_to_string(competing_pid).unwrap().parse().unwrap();
+        assert!(
+            matches!(observe(pid, false), Err(error) if error.raw_os_error() == Some(libc::ECHILD))
+        );
+        assert!(
+            supervisor
+                .state()
+                .children
+                .iter()
+                .all(|child| child.pid != pid)
+        );
+        let tty = terminal::controlling_terminal().unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, foreground);
+        fs::write(path.join("competing-cleanup"), format!("Competing dd PID {pid} was refused and reaped; foreground group {foreground} retained ownership.")).unwrap();
+        release.write_all(b"release\n").unwrap();
+        let status = worker.join().unwrap();
+        assert!(status.success(), "{status}");
     });
 
     fs::write(&phase, "checking termios reclaim").unwrap();
     check_terminal_reclaim(&ctx, &supervisor);
     fs::write(&phase, "complete").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn check_busybox_poll(path: &Path, supervisor: &Supervisor<'_>, foreground: libc::pid_t) {
+    if !fs::canonicalize("/bin/sh").is_ok_and(|path| path.ends_with("busybox")) {
+        return;
+    }
+    let ready = path.join("ash-waiting");
+    let probe = supervisor
+        .spawn(
+            shell(
+                "printf ready > \"$1\"; IFS= read -r line </dev/tty",
+                &[&ready],
+            ),
+            Placement::Probe,
+            false,
+        )
+        .unwrap();
+    let pid = probe.entry.pid;
+    let pgid = unsafe { libc::getpgid(pid) };
+    assert_eq!(pgid, pid);
+    assert_ne!(pgid, foreground);
+    let mut tasks = None;
+    assert!(
+        wait_until(|| {
+            if ready.is_file() {
+                tasks = sleeping_threads(pid);
+            }
+            tasks.is_some()
+        }),
+        "BusyBox read did not reach its empty-input wait"
+    );
+    assert!(matches!(observe(pid, true), Ok(Observed::Running)));
+    fs::write(
+        path.join("busybox-poll"),
+        format!(
+            "BusyBox ash PID {pid}, process group {pgid}, foreground {foreground}: {}",
+            tasks.unwrap()
+        ),
+    )
+    .unwrap();
+    drop(probe);
+}
+
+#[cfg(target_os = "linux")]
+fn sleeping_threads(pid: libc::pid_t) -> Option<String> {
+    let mut evidence = Vec::new();
+    for task in fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        let path = task.ok()?.path();
+        let status = fs::read_to_string(path.join("status")).ok()?;
+        let field = |key| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::trim)
+        };
+        let state = field("State:")?;
+        if !state.starts_with("S ") {
+            return None;
+        }
+        let [Some(blocked), Some(ignored), Some(caught)] =
+            ["SigBlk:", "SigIgn:", "SigCgt:"].map(field)
+        else {
+            return None;
+        };
+        let ttin = 1_u64 << (libc::SIGTTIN - 1);
+        for mask in [blocked, ignored, caught] {
+            assert_eq!(
+                u64::from_str_radix(mask, 16).ok()? & ttin,
+                0,
+                "SIGTTIN disposition in {status}"
+            );
+        }
+        let wait = fs::read_to_string(path.join("wchan")).unwrap_or_default();
+        evidence.push(format!(
+            "TID {} {state}, wchan {}, SigBlk {blocked}, SigIgn {ignored}, SigCgt {caught}",
+            path.file_name()?.to_string_lossy(),
+            wait.trim()
+        ));
+    }
+    (!evidence.is_empty()).then(|| evidence.join("; "))
 }
 
 fn check_terminal_reclaim(ctx: &crate::Ctx, supervisor: &Supervisor<'_>) {

@@ -255,7 +255,6 @@ fn read_toml(path: &Path) -> DocumentMut {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_creates_layout_and_keeps_edits_on_rerun() {
     let world = World::new();
     let dir = world.root().with_file_name("fresh config");
@@ -320,7 +319,6 @@ fn unchanged_init_creates_layout_and_keeps_edits_on_rerun() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_edits_the_physical_config_referent() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -364,7 +362,6 @@ fn unchanged_init_edits_the_physical_config_referent() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_keeps_an_existing_quoted_profile_setting() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -375,7 +372,6 @@ fn unchanged_init_keeps_an_existing_quoted_profile_setting() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn new_init_refuses_a_scalar_vars_setting_without_rewriting_it() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -389,7 +385,6 @@ fn new_init_refuses_a_scalar_vars_setting_without_rewriting_it() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn new_init_adds_profiles_to_existing_toml_without_changing_other_bytes() {
     let world = World::new();
     for (directory, original, has_vars) in [

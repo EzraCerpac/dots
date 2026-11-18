@@ -2,6 +2,8 @@ use super::*;
 use std::fs;
 use std::path::Path;
 
+mod detached_probe;
+
 fn supervisor_at(path: &Path) -> Supervisor {
     let env = Env {
         vars: [("XDG_STATE_HOME".into(), path.as_os_str().into())].into(),

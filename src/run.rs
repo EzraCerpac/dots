@@ -163,6 +163,11 @@ impl<'a> Run<'a> {
     }
 
     /// Capture a noninteractive command in an owned session with a result deadline.
+    ///
+    /// The process must keep the default SIGCHLD disposition with automatic
+    /// reaping disabled. This Run exclusively waits on the child until return.
+    /// An in-process caller must not install a SIGCHLD handler or reap it from
+    /// another thread, including through `waitpid(-1, ...)`.
     pub fn probe_detached(
         &self,
         cmd: ChildCommand,

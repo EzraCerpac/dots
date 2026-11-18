@@ -966,7 +966,7 @@ fn require_waitable_children() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let action = unsafe { action.assume_init() };
-    if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+    if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
         return Err(io::Error::other(
             "the probe requires waitable child processes",
         ));

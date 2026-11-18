@@ -59,7 +59,11 @@ case "${1-}" in
             dotfiles:paths)
                 printf 'checkpoint inventory\n' >> calls
                 [ ! -f fail-checkpoint ] || exit 8
-                printf '{"entries":[]}\n'
+                printf '{"entries":[],"invalid":[]}\n'
+                ;;
+            dotfiles:--local)
+                [ "$*" = 'bootstrap dotfiles --local paths --json' ] || exit 1
+                printf '{"entries":[],"invalid":[]}\n'
                 ;;
             dotfiles:save) printf 'checkpoint save\n' >> calls ;;
             packages:where)

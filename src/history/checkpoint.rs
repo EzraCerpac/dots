@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use crate::run::{Issue, Run, StageId};
 use crate::{Ctx, Fail};
 
+use super::blocked;
 use super::native::{self, Native, exists};
-use super::{blocked, tracked};
+use super::tracked::{self, TrackedPaths};
 
 pub(super) const STAGING: &str = ".dots-restore-install";
 pub(super) const MARKER: &str = "dots-restore-pending";
@@ -67,7 +68,7 @@ pub fn checkpoint_classified(
 pub(super) fn save(
     native: &Native<'_, '_>,
     host: Option<&str>,
-    paths: &[PathBuf],
+    paths: &TrackedPaths,
 ) -> Result<(), Fail> {
     let cmd = prepare_save(native, host, paths)?;
     run_save(native, cmd)
@@ -76,18 +77,21 @@ pub(super) fn save(
 fn prepare_save(
     native: &Native<'_, '_>,
     host: Option<&str>,
-    paths: &[PathBuf],
+    paths: &TrackedPaths,
 ) -> Result<std::process::Command, Fail> {
     // Path operands promote manual saves; automatic entries are still
     // captured. Recheck the full native inventory under the caller's lock.
-    if tracked::capture_paths(native, host)? != paths {
-        return Err(blocked("tracked history paths changed before saving"));
-    }
-    tracked::secure(native, paths)?;
+    tracked::capture_paths(native, host)?.check_binding(paths.binding(), false)?;
+    // Mise recovers interrupted native operations when it takes the save
+    // lock. Only an explicit recovery may touch paths outside this inventory.
+    native.require_no_pending_operations()?;
+    paths.secure(native)?;
     let mut cmd = native.mise(&["bootstrap", "dotfiles", "save"])?;
     cmd.env_remove("__MISE_HISTORY_LOCAL")
         .env("MISE_HISTORY_SYNC", "manual")
         .env("GIT_ALLOW_PROTOCOL", "");
+    paths.recheck(native)?;
+    native.require_no_pending_operations()?;
     Ok(cmd)
 }
 

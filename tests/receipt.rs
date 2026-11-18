@@ -26,7 +26,7 @@ case "$*" in
   *'dotfiles status --json'*) printf '%s\n' '{"files":[],"edits":[]}' ;;
   *'.encrypt'*) exit 1 ;;
   *'dotfiles save'*|*'dotfiles apply'*) exit 0 ;;
-  'config ls'*) printf '%s\n' '[]' ;;
+  *'config ls --json'*) jq -n --arg path "$MISE_CONFIG_DIR/config.toml" '[{path: $path}]' ;;
   *'which dots-up'*) exit 1 ;;
   *) printf 'unexpected mise query: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -35,6 +35,7 @@ esac
 const SCANNER: &str = r#"#!/bin/sh
 set -eu
 controls=$(CDPATH='' cd -- "${0%/*}/.." && pwd -P)
+world=${controls%/*}
 mode=''
 target=''
 report='-'
@@ -59,8 +60,13 @@ done
 emit() {
     case "$report" in
       ''|-|/dev/stdout) printf '%s\n' "$1" ;;
-      "$controls"/*) printf '%s\n' "$1" > "$report" ;;
-      *) printf 'Unexpected fixture report path: %s\n' "$report" >&2; exit 2 ;;
+      /*)
+        parent=$(CDPATH='' cd -- "${report%/*}" && pwd -P)
+        case "$parent" in
+          "$world"/*) [ ! -L "$report" ]; printf '%s\n' "$1" > "$report" ;;
+          *) exit 2 ;;
+        esac ;;
+      *) exit 2 ;;
     esac
 }
 

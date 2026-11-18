@@ -50,7 +50,6 @@ impl IsolatedWorld {
         ] {
             fs::create_dir_all(private.join(name)).unwrap();
         }
-        fs::write(private.join("mise-system/config.toml"), "").unwrap();
         let git = executable_on_path(&world.git(), "git").expect("P-07 requires real Git on PATH");
         Self {
             world,

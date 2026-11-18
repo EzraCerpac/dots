@@ -94,7 +94,7 @@ impl Repo {
         fs::create_dir_all(&tools).unwrap();
         fs::create_dir_all(scratch.join("mise-system")).unwrap();
         fs::create_dir_all(scratch.join("tmp")).unwrap();
-        for tool in ["git", "node", "jq", "age", "python3"] {
+        for tool in ["git", "node", "jq", "age", "age-keygen", "python3"] {
             if let Some(binary) = executable_on_path(&world.git(), tool) {
                 symlink(binary, tools.join(tool)).unwrap();
             }
@@ -301,6 +301,7 @@ impl Repo {
             .env("MISE_TRUSTED_CONFIG_PATHS", root)
             .env("MISE_OFFLINE", "1")
             .env("DOTS_ROOT", root)
+            .env("FIXTURE_LIVE_ROOT", root)
             .env("MISE_CONFIG_DIR", root)
             .env("DOTS_MISE_BIN", &self.mise)
             .env("SETUP_PROFILE", "laptop")
@@ -363,14 +364,14 @@ case "${1:-} ${2:-} ${3:-}" in
     printf '{}\n'
     ;;
   'config ls --json')
-    if [ -n "${FIXTURE_VALIDATE:-}" ] && [ "$config" != "$DOTS_ROOT" ]; then
+    if [ -n "${FIXTURE_VALIDATE:-}" ] && [ "$config" != "$FIXTURE_LIVE_ROOT" ]; then
         if [ -n "${FIXTURE_VALIDATION_PARENT:-}" ]; then
             printf '%s\n' "$PPID" > "$FIXTURE_VALIDATION_PARENT"
         fi
         "$FIXTURE_VALIDATE"
     fi
     if grep -q 'INVALID' "$config/config.toml"; then printf 'invalid config.toml\n' >&2; exit 1; fi
-    printf '[]\n'
+    jq -n --arg path "$config/config.toml" '[{path: $path}]'
     ;;
   'bootstrap dotfiles paths')
     if [ -n "${FIXTURE_DOTFILE_PATHS:-}" ]; then
@@ -442,8 +443,8 @@ sync_case!(
         let f = Repo::new();
         let before = f.remote();
         let receipt = f.sync(&f.a);
-        has(&receipt, "no local changes");
-        has(&receipt, "nothing to push");
+        has(&receipt, "pulled dev +0, main +0");
+        has(&receipt, "dots sync:");
         assert_eq!(receipt.lines().count(), 1, "{receipt}");
         assert_eq!(f.tip(&f.a), before);
         assert_eq!(f.remote(), before);
@@ -2105,6 +2106,106 @@ impl<'a> Machine<'a> {
 const COPY_DECLARATION: &str = r#""~/.copied" = { source = "copy.txt", mode = "copy" }"#;
 const TEMPLATE_DECLARATION: &str =
     r#""~/.rendered" = { source = "template.tera", mode = "template" }"#;
+
+sync_case!(new_shared_sync_saves_encrypted_history_before_push, || {
+    let f = Repo::new();
+    let machine = Machine::new(&f, &f.a, "machine-a", false).expect("real mise on fixture PATH");
+    let key = machine.home.join("fixture-age-key");
+    let keygen = || {
+        let mut command = f.world.tool(f.tools.join("age-keygen"));
+        machine.isolate(&mut command);
+        command
+    };
+    success(keygen().arg("-o").arg(&key));
+    let recipient = success(keygen().arg("-y").arg(&key));
+
+    let history_remote = f.world.bare_remote("history.git");
+    let history_ref = "HEAD";
+    let store = machine.state.join("state/history/repo.git");
+    let checkpoint = f.scratch.join("checkpoint-before-push");
+    assert!(!store.exists());
+    f.hook(
+        &f.a,
+        "pre-push",
+        &format!(
+            "git --git-dir {store} rev-parse --verify {history_ref} > {checkpoint}",
+            store = sh(&store),
+            checkpoint = sh(&checkpoint),
+        ),
+    );
+    machine.source(
+        "config.toml",
+        format!(
+            "{}\n[dotfiles]\n\"~/.fixture-state\" = {{ mode = \"track\", encrypt = true }}\n",
+            f.config
+        ),
+    );
+    machine.source(
+        "config.local.toml",
+        format!(
+            "[settings.history]\nsync = \"manual\"\n\n[settings.age]\nidentity_files = [{key:?}]\n\n[history.origin]\nurl = {:?}\nbranch = \"host-fixture\"\n\n[history.encryption]\nrecipients = [{recipient:?}]\n",
+            format!("file://{}", history_remote.display()),
+        ),
+    );
+    let content = "private fixture state before any source push";
+    machine.target(".fixture-state", content);
+    machine.source("public", "public fixture edit\n");
+    let receipt = machine.sync();
+    assert!(checkpoint.exists(), "{receipt}");
+    let git = |args: &[&str]| finish(f.git_command(&f.a).arg("--git-dir").arg(&store).args(args));
+    let revision = git(&["rev-parse", "--verify", history_ref]);
+    assert!(revision.status.success(), "{revision:?}");
+    assert_eq!(read(&checkpoint), stdout(&revision));
+    let tree = git(&["ls-tree", "-r", "--name-only", history_ref]);
+    assert!(tree.status.success(), "{tree:?}");
+    let path = stdout(&tree)
+        .lines()
+        .find(|path| path.ends_with("/.fixture-state") || *path == ".fixture-state")
+        .expect("native checkpoint contains the tracked file");
+    let envelope = git(&["show", &format!("{history_ref}:{path}")]);
+    assert!(envelope.status.success());
+    assert!(envelope.stdout.starts_with(b"mise-encrypted-file-v1\n"));
+    let age_header = b"age-encryption.org/v1\n";
+    let encrypted = envelope
+        .stdout
+        .windows(age_header.len())
+        .position(|window| window == age_header)
+        .expect("native checkpoint contains age ciphertext");
+    let payload = f.scratch.join("checkpoint.age");
+    put(&payload, &envelope.stdout[encrypted..]);
+    let mut age = f.world.tool(f.tools.join("age"));
+    machine.isolate(&mut age);
+    let decrypted = finish(age.args(["--decrypt", "-i"]).arg(&key).arg(payload));
+    assert!(decrypted.status.success());
+    machine.target(".fixture-state", "different private fixture state");
+    let mut rollback = f.world.tool(&machine.mise);
+    machine.isolate(&mut rollback);
+    let commit = format!("commit:{}", stdout(&revision).trim());
+    success(
+        rollback
+            .current_dir(&f.a)
+            .args(["bootstrap", "dotfiles", "rollback", "--to", &commit])
+            .args(["~/.fixture-state", "--yes"]),
+    );
+    assert_eq!(read(&machine.home.join(".fixture-state")), content);
+    assert_eq!(mode(&machine.home.join(".fixture-state")), 0o600);
+    assert_eq!(f.git(&history_remote, &["for-each-ref"]), "");
+    assert_eq!(f.remote(), f.tip(&f.a));
+    assert_eq!(f.blob("dev", "public"), "public fixture edit");
+    let public =
+        finish(
+            f.git_command(&f.origin)
+                .args(["cat-file", "--batch-all-objects", "--batch"]),
+        );
+    assert!(public.status.success());
+    assert!(
+        !public
+            .stdout
+            .windows(content.len())
+            .any(|bytes| bytes == content.as_bytes()),
+        "private tracked payload entered the public source repository"
+    );
+});
 
 fn copies(f: &Repo, a: &Machine<'_>, b: &Machine<'_>) -> String {
     let config = format!(

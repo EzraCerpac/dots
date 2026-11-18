@@ -8,7 +8,7 @@ The [P-07 fixture adapter](isolation.rs) gets the executable from Q-01's `World:
 It sets private XDG, agent, Git and mise paths before starting either fixture setup or a command under test.
 JJ uses Q-01's fixture config and Git transports allow only local files.
 
-The integration suite contains 109 unchanged and 11 new tests. Each of the 99 original cases has an executable counterpart or a documented gap. Split rows preserve all externally observable portions listed below. Unchanged counts include parameterized branches split into independent tests.
+The integration suite contains 109 unchanged and 12 new tests. Each of the 99 original cases has an executable counterpart or a documented gap. Split rows preserve all externally observable portions listed below. Unchanged counts include parameterized branches split into independent tests.
 
 The Q-01 owner accounts separately for `test_dots_contract.py`.
 That suite owns the legacy public sync and replay test, the updater forwarding and stage tests,
@@ -130,14 +130,18 @@ The P-08 implementation at `5d22d1d` contains the following module tests for the
 | Fault | Module test | Coverage boundary |
 | --- | --- | --- |
 | Candidate index install returns ENOSPC | `checkout::tests::candidate_index_enospc_retains_the_index_ref_and_worktree` | Retains the original index, ref and worktree. |
-| Capture journal install fails | `dotfiles::tests::failed_capture_journal_keeps_both_versions_and_can_retry` | Retains both versions and can retry. Same-run publication of an unrelated edit remains unverified. |
+| Capture journal install fails | `dotfiles::tests::failed_capture_journal_keeps_both_versions_and_can_retry` | Retains both versions and can retry. P-08 adds a distinct shared-sync check for same-run publication of an unrelated edit. |
 | Capture stops before or after source displacement | `dotfiles::tests::interrupted_capture_recovers_on_both_sides_of_source_displacement` | Exercises recovery on both sides of displacement. |
-| Capture encounters EXDEV | `dotfiles::tests::cross_device_capture_keeps_both_versions_and_clears_its_journal` | Retains both versions and clears the journal. Same-run publication of an unrelated edit remains unverified. |
+| Capture encounters EXDEV | `dotfiles::tests::cross_device_capture_keeps_both_versions_and_clears_its_journal` | Retains both versions and clears the journal. P-08 adds a distinct shared-sync check for same-run publication of an unrelated edit. |
 | Competing writer claims the replacement path | `dotfiles::tests::competing_writer_keeps_target_and_reports_the_displaced_edit` | Keeps the competing target and reports the displaced edit. |
 
 The later-path checkout fault can use the existing Git proxy because P-08 runs `checkout-index` for each journal path with a private prefix.
 The scenario checks the earlier write before the retry.
-The Rust executable check still requires the shared history checkpoint stage.
+The executable check ran on combined Rust with the real P-06 checkpoint.
+Same-run publication for the capture-journal and EXDEV faults is exercised by
+P-08's `sync::tests::failed_capture_journal_still_shares_an_unrelated_edit_and_retries`
+and `sync::tests::cross_device_capture_still_shares_an_unrelated_edit_and_retries` at `c6a72cb`.
+Those tests are outside P-07's executable counts.
 
 ## New executable scenarios
 
@@ -146,6 +150,11 @@ The rejected-origin cases record transport attempts through a fixture Git wrappe
 `new_standalone_sync_cancellation_records_replayable_stopped_receipt` belongs to P-07’s source-dev suite, with execution after P-08 and P-11 land. It interrupts the standalone executable while its fixture Git pre-push hook blocks a reviewed main merge. It requires the owned child to finish cleanup before the CLI exits 0 and verifies the stopped receipt, replay, source checkout and bare refs. Generic cancellation and updater cancellation remain in their owning suites.
 
 - `new_standalone_sync_cancellation_records_replayable_stopped_receipt`
+- `new_shared_sync_saves_encrypted_history_before_push` uses real mise, age and
+  Git. A synthetic tracked file gets a decryptable native checkpoint before the
+  source push. Native rollback restores the exact bytes. The source bare
+  repository contains the approved public update and excludes the private payload,
+  and the separate private history remote remains empty.
 - `new_local_only_sync_skips_all_stages`
 - `new_empty_reachable_origin_creates_only_dev`
 - `new_credential_bearing_origin_is_refused_before_transport`

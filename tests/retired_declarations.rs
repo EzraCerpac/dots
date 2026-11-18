@@ -44,7 +44,7 @@ impl Retirement {
         let root = base.join("retirement");
         let peer = base.join("peer");
         for dir in [&bin, &root, &base.join("tmp"), &base.join("mise-system")] {
-            fs::create_dir(dir).unwrap();
+            fs::create_dir_all(dir).unwrap();
         }
         let mut prefix = [0; 2];
         fs::File::open(world.dots().get_program())
@@ -84,7 +84,7 @@ impl Retirement {
         fixture.git(&fixture.root, ["init", "--initial-branch=dev"]);
         fixture.write(
             "config.toml",
-            &format!("[vars]\ndots_source_repo = \"{repository}\"\n"),
+            &format!("[vars]\ndots_profiles = \"laptop\"\ndots_source_repo = \"{repository}\"\n"),
         );
         fixture.write(".gitignore", IGNORE);
         fixture.write(SOURCE, "theme = \"fixture\"\n");

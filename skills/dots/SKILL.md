@@ -102,7 +102,10 @@ App-written files that must not be shared in plain text go in encrypted settings
 "~/.config/app/state.json" = { mode = "track", encrypt = true, variants = [{ profile = "host-my-laptop" }] }
 ```
 
-- Every tracked entry is `encrypt = true`; `dots` refuses to save one that is not.
+- Use `encrypt = true` for each tracked entry. During `dots remote`, the SSH target keeps its own mise history settings. With history enabled, it stores a tracked file's payload in plaintext locally if the file is unencrypted.
+  Enable encryption on the declaration or disable history on the target to avoid local plaintext.
+- Before `dots backup` invokes mise's native sync, it checks the tracked payloads in every local checkpoint on the history branch that the remote lacks. A later declaration edit cannot encrypt data in an older checkpoint.
+  The publication check respects mise's `allow_plaintext_history` opt-in.
 - List each machine that keeps the file as its own `{ profile = "host-my-laptop" }` variant.
   Never rename or remove an existing variant: it names that machine's stream in history.
 - `dots restore` fetches private history and uses mise to apply it to the actual tracked files.

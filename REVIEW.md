@@ -18,7 +18,9 @@ For anyone reviewing a pull request here, human or automated.
   An individual command covered by the contract’s direct-output rules runs its child in the caller's foreground with direct stdin, stdout and stderr, byte for byte, so native prompts such as `sudo` or `ssh` work, and adds no banner or footer around that output.
 - A child that `dots` starts directly has the running `dots` first on `PATH`, after the configuration environment.
   An explicit `dots mise exec` or `dots mise run` follows mise's own `PATH` rules, and mise's native bootstrap callbacks use the configuration's pinned `dots`; neither is that guarantee.
-- A tracked history file is never saved unless it is declared `encrypt = true`, and `dots` keeps plaintext bundle values out of files, arguments, environment variables and its output.
+- `dots remote` preserves the SSH target’s history settings. With history enabled, mise can store an unencrypted tracked file in plaintext locally.
+  Before invoking native sync, `dots backup` checks the tracked payloads in outgoing checkpoints, including files whose declarations have changed, and respects mise’s `allow_plaintext_history` opt-in.
+- `dots` keeps plaintext bundle values out of files, arguments, environment variables and its output.
 - `dots sync` with valid arguments always exits 0 and prints a receipt.
   The receipt records verified sharing, local saves and checkout updates, and each issue carries a diagnostic and recovery action.
   Patch contents appear only on a terminal, after a clean gitleaks screen; piped, `--plain` and saved receipts carry metadata only.

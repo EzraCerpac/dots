@@ -1,6 +1,9 @@
 mod add;
 mod adopt;
 mod edit;
+#[cfg(test)]
+#[path = "../../tests/support/command.rs"]
+pub mod fixture_command;
 pub mod github;
 mod native;
 mod remove;

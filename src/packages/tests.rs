@@ -1,15 +1,16 @@
-#[path = "../../tests/support/github_env.rs"]
-mod fixture_env;
-
 use std::cell::Cell;
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nix::libc;
 
 use crate::Env;
 use crate::report::{self, Command as ReportCommand, Outcome};
+
+use super::fixture_command::{FixtureCommand, PRIVATE_DIRS};
+use super::github::test_env::private_environment;
 
 const FIXTURE: &str = "DOTS_PACKAGE_ADMISSION_FIXTURE";
 const CONFIG: &str = "[vars]\ndots_profiles = \"test\"\n\n[dotfiles]\n";
@@ -70,16 +71,16 @@ fn check(command: &str, report_command: ReportCommand, test: &str) {
         let home = base.join("home");
         fs::create_dir(&config).unwrap();
         fs::create_dir(&home).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let command_line = Command::new(std::env::current_exe().unwrap());
+        let output = FixtureCommand::new(command_line, &base)
             .env_clear()
-            .envs(fixture_env::private_environment(&base, &home, &config))
+            .envs(fixture_environment(&base, &home, &config))
             .env(FIXTURE, &base)
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", base.join("gitconfig"))
             .env("GIT_CEILING_DIRECTORIES", &base)
-            .env("MISE_SYSTEM_SHIMS_DIR", base.join("mise/system/shims"))
             .current_dir(&config)
             .args(["--exact", test, "--nocapture"])
             .output()
@@ -104,7 +105,7 @@ fn check(command: &str, report_command: ReportCommand, test: &str) {
     assert_eq!(env.cwd(), base.join("config"));
     assert_eq!(env.home(), Some(home.as_path()));
     assert!(env.get("__MISE_DIFF").is_none());
-    for (key, expected) in fixture_env::private_environment(&base, &home, env.cwd()) {
+    for (key, expected) in fixture_environment(&base, &home, env.cwd()) {
         assert_eq!(env.get(key.to_str().unwrap()), Some(expected.as_os_str()));
     }
 
@@ -146,6 +147,16 @@ fn check(command: &str, report_command: ReportCommand, test: &str) {
     assert_eq!(saved.stages.len(), 1);
     assert_eq!(saved.stages[0].outcome, Some(Outcome::Completed));
     assert!(saved.stages[0].issues.is_empty());
+}
+
+fn fixture_environment(base: &Path, home: &Path, config: &Path) -> Vec<(OsString, OsString)> {
+    let mut environment = private_environment(base, home, config);
+    for &(name, relative) in PRIVATE_DIRS {
+        if !environment.iter().any(|(key, _)| key == name) {
+            environment.push((name.into(), base.join(relative).into_os_string()));
+        }
+    }
+    environment
 }
 
 fn invoke(command: &str) -> u8 {

@@ -1155,8 +1155,17 @@ It stops with exit status 2 at the first failed check:
 6. Every effective push URL of the history store, after Git's URL rewrites, matches `dots_state_repo` and is not the source repository.
 
 Then it saves a checkpoint locally.
-**New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in every reachable local checkpoint the state repository lacks.
-Unless mise's `allow_plaintext_history` is enabled, a plaintext payload makes backup exit nonzero with a diagnostic naming the file and checkpoint, before it syncs or sends any history.
+**New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in every local checkpoint reachable from the history branch that the destination host branch lacks.
+A current unencrypted declaration still fails check 4 with exit 2 before the audit or any remote contact.
+With mise's default `history.allow_plaintext_history = false`, a plaintext or invalid encrypted payload stops backup with exit 1 before native sync, and no history is sent.
+The diagnostic on stderr names the escaped path and checkpoint and gives the recovery action:
+
+> Keep the current store and inspect the checkpoint in a private copy.
+> To publish fresh history, copy your configuration with encrypted tracking, set its history origin and dots_state_repo to an empty private repository, and run dots backup with a separate MISE_STATE_DIR.
+
+Backup reads the effective setting with `mise settings get history.allow_plaintext_history`, including mise's `MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY` override.
+Only a successful `true` skips this audit; native sync still applies its own checks.
+If the setting cannot be read as a boolean, backup stops before sync.
 Only native `mise bootstrap dotfiles sync` publishes to the state repository, and `dots backup` reports successful publication.
 
 ### `dots restore [--initialize-history]`

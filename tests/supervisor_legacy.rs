@@ -187,7 +187,6 @@ fn assert_private(world: &World, path: &Path) {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_redirected_test_preserves_binary_streams_and_private_metadata() {
     for (flag, code) in [(None, 0), (Some("--plain"), 23), (Some("--verbose"), 23)] {
         let world = fixture();

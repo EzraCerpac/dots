@@ -72,17 +72,10 @@ fn seams_cli_grammar_and_config_boundary() {
         2,
         "dots completions bash|zsh|fish",
     );
-    let brew_without_home = world
-        .dots()
-        .current_dir(cwd)
-        .env_remove("HOME")
-        .env_remove("DOTS_ROOT")
-        .args(["brew", "path"])
-        .output()
-        .unwrap();
+    let brew_without_config = invoke(&world, cwd, &["brew", "path"]);
     assert!(
-        matches!(brew_without_home.status.code(), Some(0 | 1)),
-        "{brew_without_home:?}"
+        matches!(brew_without_config.status.code(), Some(0 | 1)),
+        "{brew_without_config:?}"
     );
     assert_diagnostic(invoke(&world, cwd, &["sync", "--other"]), 2, "dots help");
     assert_diagnostic(

@@ -383,6 +383,115 @@ fn new_magic_prefix_does_not_make_a_plaintext_blob_an_envelope() {
     history.assert_refusal(&old, HOST_SCOPED);
 }
 
+const SCRYPT_SALT: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+fn synthetic_age(stanzas: &str) -> Vec<u8> {
+    let mac = "A".repeat(43);
+    let mut age = format!("age-encryption.org/v1\n{stanzas}--- {mac}\n").into_bytes();
+    age.extend([0; 33]);
+    age
+}
+
+#[test]
+fn new_scrypt_requires_canonical_fields_and_a_sole_stanza() {
+    let body = "A".repeat(43);
+    let valid = format!("-> scrypt {SCRYPT_SALT} 18\n{body}\n");
+    let plugin = "-> plugin-fixture arbitrary\n\n";
+    assert!(publication::age_file(&synthetic_age(&valid)));
+    assert!(publication::age_file(&synthetic_age(plugin)));
+    for malformed in [
+        "-> scrypt\n\n".to_owned(),
+        format!("-> scrypt {SCRYPT_SALT}\n{body}\n"),
+        format!("-> scrypt {SCRYPT_SALT} 18 extra\n{body}\n"),
+        format!("-> scrypt {} 18\n{body}\n", &SCRYPT_SALT[..21]),
+        format!("-> scrypt {}B 18\n{body}\n", &SCRYPT_SALT[..21]),
+        format!("-> scrypt {SCRYPT_SALT} 18\n\n"),
+        format!("-> scrypt {SCRYPT_SALT} 18\n{}\n", &body[..42]),
+        format!("-> scrypt {SCRYPT_SALT} 18\n{body}A\n"),
+        format!("-> scrypt {SCRYPT_SALT} 18\n{}B\n", &body[..42]),
+        format!("{plugin}{valid}"),
+        format!("{valid}{plugin}"),
+        format!("{valid}{valid}"),
+    ] {
+        assert!(
+            !publication::age_file(&synthetic_age(&malformed)),
+            "{malformed:?}"
+        );
+    }
+    for factor in ["0", "018", "+18", "-18", "1e8"] {
+        let malformed = format!("-> scrypt {SCRYPT_SALT} {factor}\n{body}\n");
+        assert!(
+            !publication::age_file(&synthetic_age(&malformed)),
+            "{factor}"
+        );
+    }
+}
+
+#[test]
+fn new_backup_rejects_malformed_scrypt_history_before_native_sync() {
+    let history = History::new();
+    history.configure(Some(false), true);
+    let live = history.world.home().join("fixture/payload");
+    let save_envelope = |stanzas: &str| {
+        let age = synthetic_age(stanzas);
+        let mut wrapper = b"mise-encrypted-file-v1\n\x84\xa4path\xd9".to_vec();
+        wrapper.push(u8::try_from(HOST_SCOPED.len()).unwrap());
+        wrapper.extend_from_slice(HOST_SCOPED.as_bytes());
+        wrapper.extend_from_slice(b"\xa4mode\xa6100644\xa6scheme\xd9\x40");
+        wrapper.extend([b'0'; 64]);
+        wrapper.extend_from_slice(b"\xaaciphertext\xc4");
+        wrapper.push(u8::try_from(age.len()).unwrap());
+        wrapper.extend(age);
+        fs::write(&live, &wrapper).unwrap();
+        let checkpoint = history.save();
+        assert_eq!(
+            history.object(&history.store, &checkpoint, HOST_SCOPED),
+            wrapper
+        );
+        checkpoint
+    };
+    let body = "A".repeat(43);
+    let valid = save_envelope(&format!("-> scrypt {SCRYPT_SALT} 18\n{body}\n"));
+    history.preflight().unwrap();
+    let malformed = save_envelope("-> scrypt\n\n");
+    assert_ne!(malformed, valid);
+    history.configure(None, false);
+    let tip = history.save();
+
+    let real_mise = text(ok(history.command("sh").args(["-c", "command -v mise"])));
+    let wrapper = history.world.base().join("observe-mise");
+    let sync_log = history.world.base().join("native-sync");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+case " $* " in
+    *" bootstrap dotfiles sync "*) : > "$FIXTURE_SYNC_LOG"; exit 97 ;;
+esac
+exec "$FIXTURE_REAL_MISE" "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let (mut backup, trace) = history.observed_backup();
+    let output = backup
+        .env("DOTS_MISE_BIN", &wrapper)
+        .env("FIXTURE_REAL_MISE", real_mise)
+        .env("FIXTURE_SYNC_LOG", &sync_log)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let diagnostic = String::from_utf8(output.stderr).unwrap();
+    let expected = format!(
+        "plaintext or invalid encrypted payload at {HOST_SCOPED:?} in checkpoint {malformed}"
+    );
+    assert!(diagnostic.contains(&expected), "{diagnostic}");
+    assert!(!sync_log.exists());
+    let trace = fs::read_to_string(trace).unwrap();
+    assert!(!trace.is_empty() && trace.lines().all(|operation| operation == "ls-remote"));
+    assert_eq!(history.tip(&history.store, "refs/heads/main"), tip);
+    history.empty_remote(&malformed);
+}
+
 #[test]
 fn new_unscoped_config_track_uses_the_checkpoint_manifest() {
     let history = History::new();

@@ -691,6 +691,16 @@ pub(super) fn age_file(bytes: &[u8]) -> bool {
         let mut fields = args.split(|&b| b == b' ');
         let kind = fields.next().unwrap_or_default();
         match kind {
+            b"scrypt"
+                if stanzas != 0
+                    || !fields
+                        .next()
+                        .is_some_and(|salt| salt.len() == 22 && raw_base64(salt))
+                    || !fields.next().is_some_and(scrypt_work_factor)
+                    || fields.next().is_some() =>
+            {
+                return false;
+            }
             b"X25519" if !fields.next().is_some_and(base64_32) || fields.next().is_some() => {
                 return false;
             }
@@ -722,16 +732,21 @@ pub(super) fn age_file(bytes: &[u8]) -> bool {
                 break;
             }
         }
-        // The RSA ciphertext is the size of its recipient modulus. The
-        // supported producers require at least 2048 bits, but this header
-        // has only the key tag and cannot prove the exact modulus size.
         match kind {
+            // A passphrase stanza must be the sole recipient in the header.
+            b"scrypt" if wrapped != 32 || !bytes.starts_with(b"--- ") => return false,
             b"X25519" | b"ssh-ed25519" if wrapped != 32 => return false,
+            // The supported producers require RSA moduli of at least 2048 bits.
+            // This header contains only a tag, so the exact size is unknown.
             b"ssh-rsa" if wrapped < 256 => return false,
             _ => {}
         }
     }
     false
+}
+
+fn scrypt_work_factor(bytes: &[u8]) -> bool {
+    matches!(bytes, [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit))
 }
 
 fn ssh_tag(bytes: &[u8]) -> bool {

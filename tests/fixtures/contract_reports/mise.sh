@@ -14,6 +14,9 @@ case "${1-} ${2-} ${3-}" in
         esac
         ;;
     'bootstrap dotfiles apply')
+        if [ "${RECORD_APPLY+x}" ]; then
+            : > "$RECORD_APPLY" || exit 91
+        fi
         shift 3
         case " $* " in
             *' --dry-run '*|' --yes ') exit 0 ;;

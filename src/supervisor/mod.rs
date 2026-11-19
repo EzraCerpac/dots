@@ -25,6 +25,7 @@ use signals::Signals;
 use terminal::{TerminalJob, foreground_terminal};
 
 pub(crate) use logs::remove_run_logs;
+pub use pipe::output_writer;
 pub use terminal::terminal_observer;
 
 const TICK: Duration = Duration::from_millis(10);

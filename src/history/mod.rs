@@ -92,33 +92,34 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     native.bare(&store)?;
     let saved = recovery::revision(native, &store, recovery::MAIN_REF)?;
     native.require_origin(&origin, &branch)?;
-    native.destinations(Some(&store), &origin, expected, &vars)?;
+    let transport = native.destinations(Some(&store), &origin, expected, &vars)?;
     tracked::capture_paths(native, Some(&branch))?.check_binding(paths.binding(), false)?;
     native.require_no_pending_operations()?;
+    let probe = |args: &[&str], access: publication::GitAccess<'_>| {
+        let mut git = native.git(Some(&store))?;
+        if let Some(parameters) = publication::git_parameters(access, git.get_envs()) {
+            git.env("GIT_CONFIG_PARAMETERS", parameters);
+        }
+        git.envs(publication::git_environment(access)).args(args);
+        let diagnostic = "could not verify the history publication range";
+        if access.is_local() {
+            native.probe(git, diagnostic)
+        } else {
+            native
+                .run
+                .probe_detached(git, std::time::Duration::from_secs(30))
+                .map_err(|_| blocked(diagnostic))
+        }
+    };
     let policy = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
     let http = if publication::allows_plaintext(native.probe(
         policy,
         "could not read mise's effective history.allow_plaintext_history setting",
     )?)? {
-        None
+        publication::http_policy(&probe, &transport)?
     } else {
         publication::preflight(
-            |args, access| {
-                let mut git = native.git(Some(&store))?;
-                if let Some(parameters) = publication::git_parameters(access, git.get_envs()) {
-                    git.env("GIT_CONFIG_PARAMETERS", parameters);
-                }
-                git.envs(publication::git_environment(access)).args(args);
-                let diagnostic = "could not verify the history publication range";
-                if access.is_local() {
-                    native.probe(git, diagnostic)
-                } else {
-                    native
-                        .run
-                        .probe_detached(git, std::time::Duration::from_secs(30))
-                        .map_err(|_| blocked(diagnostic))
-                }
-            },
+            probe,
             &branch,
             &origin,
             &saved,
@@ -144,9 +145,14 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
             "settings checkpoint saved locally; publication could not be verified. Check the private history remote",
         )
     };
-    native
+    let readback_transport = native
         .destinations(Some(&store), &origin, expected, &vars)
         .map_err(|_| unconfirmed())?;
+    if readback_transport != transport
+        && (publication::is_http(&transport) || publication::is_http(&readback_transport))
+    {
+        return Err(unconfirmed());
+    }
     let reference = format!("refs/heads/{branch}");
     let remote = remote_checkpoint(native, &store, &origin, &reference, http.as_ref())
         .map_err(|_| unconfirmed())?
@@ -407,7 +413,10 @@ fn report(run: Run<'_>, stage: StageId, result: Result<(), Fail>, next: &str) ->
     let outcome = stage_outcome(&run, stage, &result, next);
     run.finish(stage, outcome);
     let status = run.end(result.as_ref().err().map_or(0, |error| error.status));
-    result.map(|()| status)
+    result.map(|()| status).map_err(|mut error| {
+        error.status = status;
+        error
+    })
 }
 
 fn stage_outcome(run: &Run<'_>, stage: StageId, result: &Result<(), Fail>, next: &str) -> Outcome {

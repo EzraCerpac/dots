@@ -139,6 +139,42 @@ pub(super) fn constrain_http(command: &mut Command, policy: Option<&HttpPolicy>)
     }
 }
 
+pub(super) fn is_http(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+pub(super) fn http_policy(
+    run_git: &impl Fn(&[&str], GitAccess<'_>) -> Result<Output, Fail>,
+    url: &str,
+) -> Result<Option<HttpPolicy>, Fail> {
+    if !is_http(url) {
+        return Ok(None);
+    }
+    // Git's remote-curl adds a trailing slash before matching configuration.
+    let match_url = if url.ends_with('/') {
+        url.to_owned()
+    } else {
+        format!("{url}/")
+    };
+    let proof = run_git(
+        &[
+            "config",
+            "--get-urlmatch",
+            "http.followRedirects",
+            &match_url,
+        ],
+        GitAccess::CheckHttp(&match_url),
+    )?;
+    // A URL-specific setting is evidence only if Git resolves it here.
+    Ok(Some(
+        if proof.status.success() && line(&proof.stdout) == b"false" && proof.stderr.is_empty() {
+            HttpPolicy::Exact(match_url)
+        } else {
+            HttpPolicy::Default
+        },
+    ))
+}
+
 /// Read-only preflight for native sync. The launcher is bound to the native
 /// bare store and applies git_environment. The origin and branch have already
 /// passed backup's checks, and local is the resulting saved checkpoint.
@@ -231,33 +267,15 @@ pub(super) fn preflight(
     };
     let route = routes()?;
     let url = route.1.as_str();
-    let mut http = None;
-    let match_url;
-    let access = if url.starts_with("http://") || url.starts_with("https://") {
-        // Git's remote-curl adds a trailing slash before http_init matches
-        // configuration. A slash-scoped rule can outrank one for the raw URL.
-        match_url = if url.ends_with('/') {
-            url.to_owned()
-        } else {
-            format!("{url}/")
-        };
-        let proof = run_git(
-            &[
-                "config",
-                "--get-urlmatch",
-                "http.followRedirects",
-                &match_url,
-            ],
-            GitAccess::CheckHttp(&match_url),
-        )?;
-        // libcurl accepts some URLs that Git's URL matcher does not. A
-        // URL-specific setting is evidence only if Git resolves it here.
-        if proof.status.success() && line(&proof.stdout) == b"false" && proof.stderr.is_empty() {
-            http = Some(HttpPolicy::Exact(match_url.clone()));
-            Some(GitAccess::Http(&match_url))
-        } else {
-            http = Some(HttpPolicy::Default);
-            None
+    let http = http_policy(&run_git, url)?;
+    let access = if url.starts_with("http://") {
+        // Audit locally so the optional query cannot send Git's configured
+        // authentication over cleartext before the audit decides to publish.
+        None
+    } else if let Some(policy) = &http {
+        match policy {
+            HttpPolicy::Exact(match_url) => Some(GitAccess::Http(match_url)),
+            HttpPolicy::Default => None,
         }
     } else if url.starts_with("ssh://") || !url.contains("://") {
         if ssh_launcher {

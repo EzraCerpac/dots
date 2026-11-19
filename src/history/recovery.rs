@@ -22,7 +22,7 @@ const CLONE: &str = "clone-";
 const RETIRING: &str = ".dots-restore-retiring";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
-pub(super) const INTERRUPTED_RESTORE: &str = "An earlier restore was interrupted and did not finish. Run dots mise dot history --pending to see a pending native operation, then dots mise dot recover UUID for that operation. Otherwise, reconcile the file and run dots restore.";
+pub(super) const INTERRUPTED_RESTORE: &str = "An earlier restore was interrupted and did not finish. Run dots mise dot history --pending to see a pending native operation, then dots mise dot recover UUID for that operation. Otherwise, review your tracked settings and retry with dots restore.";
 
 #[derive(Deserialize, Serialize)]
 struct Journal {

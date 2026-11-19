@@ -158,10 +158,7 @@ fn create_and_push(
         );
     } else if !added {
         println!("The seed push still needs to run");
-    } else if git
-        .output(&push_args(seed).each_ref().map(String::as_str))
-        .is_ok_and(|out| out.status.success())
-    {
+    } else if push_seed(git, seed).is_ok_and(|out| out.status.success()) {
         println!("pushed seed commit {seed} to origin/main and origin/dev");
         return Ok(());
     } else {
@@ -198,6 +195,13 @@ fn push_args(seed: &str) -> [String; 6] {
         format!("{seed}^{{commit}}:refs/heads/main"),
         format!("{seed}^{{commit}}:refs/heads/dev"),
     ]
+}
+
+fn push_seed(git: &Git<'_>, seed: &str) -> Result<Output, Fail> {
+    let args = push_args(seed);
+    let [push, tags, submodules, origin, main, dev] = args.each_ref().map(String::as_str);
+    // A rejected branch must leave both refs for the printed retry.
+    git.output(&[push, "--atomic", tags, submodules, origin, main, dev])
 }
 
 fn print_push(git: &Git<'_>, seed: &str) -> Result<(), Fail> {

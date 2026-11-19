@@ -99,12 +99,16 @@ fn publish_source(
     } else {
         workspace.one_revision("@")?
     };
-    let mut revision = match selection {
-        Selection::Working => working.clone(),
-        Selection::All => selected.stack_head(&working)?,
+    let dev_target = match selection {
+        Selection::Working | Selection::All => working.clone(),
         Selection::Bookmark(name) => workspace.local_bookmark(name)?,
     };
-    selected.refuse_shared_dev(&base, &revision)?;
+    selected.refuse_shared_dev(&base, &dev_target)?;
+    let mut revision = if matches!(selection, Selection::All) {
+        selected.stack_head(&working)?
+    } else {
+        dev_target.clone()
+    };
     let mut outgoing = outgoing_commits(selected, &base, &revision)?;
     if matches!(selection, Selection::Working)
         && (outgoing.len() != 1
@@ -148,7 +152,24 @@ fn publish_source(
         && !plan
             .revisions(&format!("{} & conflicts()", jj_commit(&revision)))?
             .is_empty();
-    scan::outgoing(plan, &base, &revision, conflicts)?;
+    let screening = scan::outgoing(plan, &base, &revision, conflicts)?;
+    let preview = if conflicts {
+        None
+    } else {
+        let note = disclosure(
+            vars.publish_on_behalf_of.as_deref(),
+            ctx.env
+                .get("DOTS_PUBLISH_MODEL")
+                .and_then(|model| model.to_str()),
+        );
+        prepare_preview(
+            plan, &selection, &base, &revision, &outgoing, &note, terminal,
+        )?
+    };
+    if let Some(preview) = &preview {
+        screening.screen_preview(plan, &preview.bytes)?;
+    }
+    drop(screening);
 
     let merged_state = if let (Some(stack), Some(merge)) = (&stack, &merge) {
         terminal.message(CLEAN_SCAN)?;
@@ -169,67 +190,11 @@ fn publish_source(
         None
     };
 
-    let diff = plan.jj(
-        &[
-            "diff",
-            "--git",
-            "--from",
-            &jj_commit(&base),
-            "--to",
-            &jj_commit(&revision),
-        ],
-        "preview changes",
-    )?;
-    if diff.stdout.is_empty() && matches!(selection, Selection::Working | Selection::All) {
-        return Err(failure(
-            "there are no file changes to publish against main@origin",
-        ));
-    }
+    let preview = preview
+        .ok_or_else(|| failure("there are no file changes to publish against main@origin"))?;
     if merged_state.is_none() {
         terminal.message(CLEAN_SCAN)?;
     }
-    if terminal.input.is_some() {
-        terminal.message("Proposed changes, commit by commit (from main@origin):\n")?;
-        for commit in &outgoing {
-            let description = plan.description(commit)?;
-            let patch = plan.jj(
-                &["diff", "--git", "-r", &jj_commit(commit)],
-                "preview an outgoing commit",
-            )?;
-            terminal.message(&format!("\nCommit {}\n{description}\n", &commit[..12]))?;
-            terminal
-                .output
-                .write_all(&patch.stdout)
-                .map_err(output_error)?;
-        }
-        terminal.message("\nFinal pull request diff against main@origin:\n")?;
-        terminal
-            .output
-            .write_all(&diff.stdout)
-            .map_err(output_error)?;
-    }
-
-    let note = disclosure(
-        vars.publish_on_behalf_of.as_deref(),
-        ctx.env
-            .get("DOTS_PUBLISH_MODEL")
-            .and_then(|model| model.to_str()),
-    );
-    let (title, body) = if matches!(selection, Selection::All) {
-        stack_pull_request(plan, &outgoing, &note)?
-    } else {
-        let description = workspace.description(&revision)?;
-        let description = if description.is_empty() && matches!(selection, Selection::Working) {
-            terminal.ask("Enter a one-line description for the pull request")?
-        } else {
-            description
-        };
-        if description.is_empty() {
-            return Err(failure("publication requires a one-line description"));
-        }
-        (title_for(&description), format!("{note}{description}"))
-    };
-
     let (name, existing) = match selection {
         Selection::Bookmark(name) => (name.to_owned(), open_request(&workspace, name)?),
         Selection::All => aggregate_request(plan, &revision)?,
@@ -239,9 +204,10 @@ fn publish_source(
             (name, request)
         }
     };
-    terminal.message(&format!(
-        "Proposed pull request title: {title}\nProposed pull request description:\n{body}\n"
-    ))?;
+    terminal
+        .output
+        .write_all(&preview.bytes)
+        .map_err(output_error)?;
     terminal.confirm(&format!("Publish {name} to {}?", workspace.slug))?;
 
     match selection {
@@ -257,6 +223,9 @@ fn publish_source(
     if workspace.fetch_main()? != base {
         return Err(repo::stale());
     }
+    if dev_target != revision {
+        selected.refuse_shared_dev(&base, &dev_target)?;
+    }
     plan.refuse_shared_dev(&base, &revision)?;
     let origin = workspace.validate_origin()?;
     if let Some(state) = &merged_state {
@@ -269,18 +238,23 @@ fn publish_source(
     }
     workspace.push(&origin, &name, &revision)?;
 
-    let url = write_pull_request(&workspace, &name, &title, &body, existing.as_ref()).map_err(
-        |error| {
-            if run.cancelled() {
-                error
-            } else {
-                failure(format!(
-                    "{}; pushed {name}; rerun the same dots publish command to retry the pull request",
-                    error.diagnostic
-                ))
-            }
-        },
-    )?;
+    let url = write_pull_request(
+        &workspace,
+        &name,
+        &preview.title,
+        &preview.body,
+        existing.as_ref(),
+    )
+    .map_err(|error| {
+        if run.cancelled() {
+            error
+        } else {
+            failure(format!(
+                "{}; pushed {name}; rerun the same dots publish command to retry the pull request",
+                error.diagnostic
+            ))
+        }
+    })?;
     terminal.message(&format!("Published {name}: {url}\n"))?;
     if !matches!(selection, Selection::Bookmark(_)) && workspace.one_revision("@")? == revision {
         workspace.jj(
@@ -289,6 +263,78 @@ fn publish_source(
         )?;
     }
     Ok(())
+}
+
+struct PublicationPreview {
+    bytes: Vec<u8>,
+    title: String,
+    body: String,
+}
+
+fn prepare_preview(
+    plan: &Workspace<'_, '_>,
+    selection: &Selection<'_>,
+    base: &str,
+    revision: &str,
+    outgoing: &[String],
+    note: &str,
+    terminal: &mut Terminal<'_>,
+) -> Result<Option<PublicationPreview>, Fail> {
+    let diff = plan.jj(
+        &[
+            "diff",
+            "--git",
+            "--from",
+            &jj_commit(base),
+            "--to",
+            &jj_commit(revision),
+        ],
+        "prepare the pull request diff",
+    )?;
+    if diff.stdout.is_empty() && !matches!(selection, Selection::Bookmark(_)) {
+        return Ok(None);
+    }
+
+    let (title, body) = if matches!(selection, Selection::All) {
+        stack_pull_request(plan, outgoing, note)?
+    } else {
+        let mut description = plan.description(revision)?;
+        if description.is_empty() && matches!(selection, Selection::Working) {
+            description = terminal.ask("Enter a one-line description for the pull request")?;
+        }
+        if description.is_empty() {
+            return Err(failure("publication requires a one-line description"));
+        }
+        (title_for(&description), format!("{note}{description}"))
+    };
+
+    // Build the terminal text once. The scanner and terminal both consume
+    // this buffer, including the original bytes of the diffs.
+    let mut bytes = Vec::new();
+    if terminal.input.is_some() {
+        writeln!(
+            bytes,
+            "Proposed changes, commit by commit (from main@origin):"
+        )
+        .map_err(output_error)?;
+        for commit in outgoing {
+            let description = plan.description(commit)?;
+            let patch = plan.jj(
+                &["diff", "--git", "-r", &jj_commit(commit)],
+                "prepare an outgoing commit's preview",
+            )?;
+            writeln!(bytes, "\nCommit {}\n{description}", &commit[..12]).map_err(output_error)?;
+            bytes.write_all(&patch.stdout).map_err(output_error)?;
+        }
+        writeln!(bytes, "\nFinal pull request diff against main@origin:").map_err(output_error)?;
+        bytes.write_all(&diff.stdout).map_err(output_error)?;
+    }
+    writeln!(
+        bytes,
+        "Proposed pull request title: {title}\nProposed pull request description:\n{body}"
+    )
+    .map_err(output_error)?;
+    Ok(Some(PublicationPreview { bytes, title, body }))
 }
 
 fn outgoing_commits(

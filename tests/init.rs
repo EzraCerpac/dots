@@ -1,9 +1,11 @@
 mod support;
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -37,10 +39,7 @@ fn fixture_dots(world: &World) -> FixtureCommand<'_> {
         fs::create_dir_all(&path).unwrap();
         command.env(key, path);
     }
-    let binary = env::split_paths(&env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("mise"))
-        .find(|path| path.is_absolute() && path.is_file())
-        .expect("mise executable on PATH");
+    let binary = find_mise(&env::var_os("PATH").unwrap()).expect("mise executable on PATH");
     let guard = world.home().join("mise-guard");
     write_executable(
         &guard,
@@ -59,6 +58,7 @@ exec "$DOTS_TEST_REAL_MISE" "$@"
 "#,
     );
     command
+        .env("GIT_ALLOW_PROTOCOL", "file")
         .env("MISE_CONFIG_DIR", world.root())
         .env("MISE_OFFLINE", "1")
         .env("MISE_NO_HOOKS", "1")
@@ -67,6 +67,124 @@ exec "$DOTS_TEST_REAL_MISE" "$@"
         .env("DOTS_TEST_SCOPE", scope)
         .env("DOTS_TEST_REAL_MISE", binary);
     command
+}
+
+fn find_mise(path: &OsStr) -> Option<PathBuf> {
+    env::split_paths(path)
+        .map(|dir| dir.join("mise"))
+        .find(|path| {
+            path.is_absolute()
+                && path.metadata().is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+        })
+}
+
+#[test]
+fn fixture_mise_lookup_skips_non_executable_files() {
+    let world = World::new();
+    let shadow = world.base().join("shadow");
+    let bin = world.base().join("bin");
+    fs::create_dir(&shadow).unwrap();
+    fs::create_dir(&bin).unwrap();
+    fs::write(shadow.join("mise"), "").unwrap();
+    let executable = bin.join("mise");
+    write_executable(&executable, "#!/bin/sh\nexit 0\n");
+    let path = env::join_paths([shadow, bin]).unwrap();
+    assert_eq!(find_mise(&path), Some(executable));
+}
+
+#[test]
+fn new_init_preserves_unborn_ref_bytes_on_failure_and_seeds_on_retry() {
+    let world = World::new();
+    let root = fresh(&world);
+    fs::create_dir(&root).unwrap();
+    git(&world, &root, &["init"]);
+    let branch = OsStr::from_bytes(b"refs/heads/local-\xff");
+    success(
+        world
+            .git()
+            .current_dir(&root)
+            .args(["symbolic-ref", "HEAD"])
+            .arg(branch)
+            .output()
+            .unwrap(),
+    );
+    let lock = root.join(".git/refs/heads/main.lock");
+    fs::write(&lock, "").unwrap();
+    let failed = init(&world, &root);
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("create main and dev"),
+        "{failed:?}"
+    );
+    let actual = world
+        .git()
+        .current_dir(&root)
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(actual.status.success(), "{actual:?}");
+    assert_eq!(actual.stdout.strip_suffix(b"\n"), Some(branch.as_bytes()));
+    assert!(git(&world, &root, &["for-each-ref", "refs/heads"]).is_empty());
+    fs::remove_file(lock).unwrap();
+
+    success(init(&world, &root));
+    assert_eq!(
+        git(&world, &root, &["symbolic-ref", "HEAD"]),
+        "refs/heads/dev"
+    );
+    assert_eq!(
+        git(&world, &root, &["rev-parse", "main"]),
+        git(&world, &root, &["rev-parse", "dev"])
+    );
+}
+
+#[test]
+fn new_init_withholds_dev_advice_for_an_ignored_dirty_submodule() {
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    git(&world, &root, &["switch", "main"]);
+    git(&world, &root, &["branch", "-d", "dev"]);
+    let submodule = world.root();
+    git(&world, submodule, &["init"]);
+    fs::write(submodule.join("tracked"), "initial").unwrap();
+    git(&world, submodule, &["add", "tracked"]);
+    git(&world, submodule, &["commit", "-m", "Seed local submodule"]);
+    success(
+        world
+            .git()
+            .current_dir(&root)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["submodule", "add", "--"])
+            .arg(submodule)
+            .arg("module")
+            .output()
+            .unwrap(),
+    );
+    git(
+        &world,
+        &root,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.module.ignore",
+            "all",
+        ],
+    );
+    git(&world, &root, &["add", ".gitmodules"]);
+    git(&world, &root, &["commit", "-m", "Add local submodule"]);
+    let clean = success(init(&world, &root));
+    assert!(clean.contains(" switch -c dev"), "{clean}");
+
+    let tracked = root.join("module/tracked");
+    fs::write(&tracked, "local edit").unwrap();
+    assert!(git(&world, &root, &["status", "--porcelain"]).is_empty());
+    let dirty = success(init(&world, &root));
+    assert!(!dirty.contains(" switch -c dev"), "{dirty}");
+    assert_eq!(fs::read_to_string(tracked).unwrap(), "local edit");
 }
 
 fn success(out: Output) -> String {
@@ -118,6 +236,10 @@ esac
         r#"#!/bin/sh
 if [ "$1" = push ]; then
     printf '%s\n' "$*" >> "$HOME/push-calls"
+    # Model a remote that accepts main and rejects dev unless the push is atomic.
+    if [ "$2" != --atomic ]; then
+        printf '%s\n' 'refs/heads/main' > "$HOME/accepted-refs"
+    fi
     exit 1
 fi
 exec "$REAL_GIT" "$@"
@@ -342,12 +464,22 @@ fn new_interactive_push_failure_prints_verified_seed_retry_only_once() {
     assert!(output.contains("Could not finish pushing"), "{output}");
     assert!(!output.contains(" remote add origin "), "{output}");
     assert!(seed_push(&output, &seed), "{output}");
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("git -C ") && line.contains(" push "))
+            .count(),
+        1,
+        "{output}"
+    );
     let push = fs::read_to_string(world.home().join("push-calls")).unwrap();
-    assert!(
-        push.trim_end().ends_with(&format!(
-            "origin {seed}^{{commit}}:refs/heads/main {seed}^{{commit}}:refs/heads/dev"
-        )),
-        "{push}"
+    assert_eq!(push.lines().count(), 1, "{push}");
+    assert!(!world.home().join("accepted-refs").exists());
+    assert_eq!(
+        push,
+        format!(
+            "push --atomic --no-follow-tags --recurse-submodules=no origin {seed}^{{commit}}:refs/heads/main {seed}^{{commit}}:refs/heads/dev\n"
+        )
     );
     assert_eq!(
         git(&world, &root, &["remote", "get-url", "origin"]),

@@ -695,7 +695,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_concurrent_snapshot_is_not_reported_as_local_push,
+    active unchanged_concurrent_snapshot_is_not_reported_as_local_push,
     || {
         let f = Repo::new();
         let hook = publish_during_validation(&f, "dev");
@@ -711,7 +711,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_concurrent_snapshot_and_reviewed_push_distinguished,
+    active unchanged_concurrent_snapshot_and_reviewed_push_distinguished,
     || {
         let f = Repo::new();
         f.reviewed("actual-share", "reviewed change\n");
@@ -3239,9 +3239,16 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
+    active unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
     true,
     |f, a, _b, config| {
+        let umask_probe = f.scratch.join("directory-create-mode");
+        fs::create_dir(&umask_probe).unwrap();
+        assert_eq!(
+            mode(&umask_probe),
+            0o755,
+            "directory-copy fixtures must inherit umask 022"
+        );
         let config = format!(
             "{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\", exclude = [\"skip\"], dot_prefix = true }}\n"
         );
@@ -3436,7 +3443,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_directory_copy_uses_pre_hook_source_and_keeps_late_target_edit,
+    active unchanged_directory_copy_uses_pre_hook_source_and_keeps_late_target_edit,
     true,
     |_f, a, _b, config| {
         let config = format!("{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\" }}\n");
@@ -3466,7 +3473,65 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_adopted_directory_copy_preserves_deployed_permissions,
+    active new_declared_directory_copy_updates_matching_existing_leaf_after_pre_hook,
+    true,
+    |f, a, _b, config| {
+        let config = format!("{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\" }}\n");
+        let pre = r#"cat "$HOME/generated" > dir/leaf
+if [ -e "$HOME/.tree/replacement" ]; then
+    mv -f "$HOME/.tree/replacement" "$HOME/.tree/leaf"
+fi"#;
+        let post = "cat \"$HOME/.tree/leaf\" > \"$HOME/post\"";
+        a.source("config.toml", hooks(&config, pre, post));
+        a.source("dir/leaf", "native generated\n");
+        a.target(".tree/leaf", "native generated\n");
+        let source = a.root.join("dir/leaf");
+        let deployed = a.home.join(".tree/leaf");
+        assert_eq!(read(&source), read(&deployed));
+        assert_eq!(mode(&source), mode(&deployed));
+        assert!(f.git(a.root, &["ls-tree", "-r", "HEAD", "--", "dir/leaf"]).is_empty());
+
+        a.target("generated", "sync generated\n");
+        let receipt = a.sync();
+        assert_eq!(read(&source), "sync generated\n");
+        assert_eq!(read(&deployed), "sync generated\n");
+        assert_eq!(read(&a.home.join("post")), "sync generated\n");
+        assert!(
+            !receipt.lines().any(|line| {
+                line.contains(".tree/leaf") && line.to_ascii_lowercase().contains("kept")
+            }),
+            "{receipt}"
+        );
+
+        // The validated pre-hook renames this new inode over the observed leaf.
+        let replacement = a.home.join(".tree/replacement");
+        let original_inode = fs::metadata(&deployed).unwrap().ino();
+        let deployed_mode = mode(&deployed);
+        a.target(".tree/replacement", "sync generated\n");
+        let replacement_inode = fs::metadata(&replacement).unwrap().ino();
+        assert_ne!(original_inode, replacement_inode);
+        assert_eq!(mode(&replacement), deployed_mode);
+        assert_eq!(read(&replacement), read(&deployed));
+
+        a.target("generated", "next source\n");
+        let receipt = a.sync();
+        assert_eq!(read(&source), "next source\n");
+        assert!(!replacement.exists(), "pre-hook must rename the replacement");
+        assert_eq!(fs::metadata(&deployed).unwrap().ino(), replacement_inode);
+        assert_eq!(read(&deployed), "sync generated\n");
+        assert_eq!(mode(&deployed), deployed_mode);
+        assert_eq!(read(&a.home.join("post")), "sync generated\n");
+        assert!(
+            receipt.lines().any(|line| {
+                line.contains(".tree/leaf") && line.to_ascii_lowercase().contains("kept")
+            }),
+            "{receipt}"
+        );
+    }
+);
+
+copies_case!(
+    active unchanged_adopted_directory_copy_preserves_deployed_permissions,
     false,
     |f, a, _b, config| {
         a.source(
@@ -3496,17 +3561,21 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_reload_commands_run_once_after_copy_and_template_and_before_post,
+    active unchanged_reload_commands_run_once_after_copy_and_template_and_before_post,
     true,
     |f, a, _b, config| {
         let trace = "echo pre >> \"$HOME/events\"";
         let post = "echo post >> \"$HOME/events\"";
         a.source("config.toml", hooks(&config, trace, post));
+        let first_reload = r#"if [ ! -e "$HOME/first-reload" ]; then
+    { printf 'copy='; cat "$HOME/.copied"; printf 'template='; cat "$HOME/.rendered"; } > "$HOME/first-reload"
+fi
+cat "$HOME/.copied" >> "$HOME/events""#;
         let mut reload = "[history.reload]\n".to_owned();
         for (glob, command) in [
             (
                 "~/.copied".to_owned(),
-                "cat \"$HOME/.copied\" >> \"$HOME/events\"",
+                first_reload,
             ),
             ("~/.rendered".to_owned(), "echo native >> \"$HOME/events\""),
             (
@@ -3515,7 +3584,7 @@ copies_case!(
             ),
             (
                 a.home.join(".copied").to_string_lossy().into_owned(),
-                "cat \"$HOME/.copied\" >> \"$HOME/events\"",
+                first_reload,
             ),
         ] {
             reload.push_str(&format!("{glob:?} = {command:?}\n"));
@@ -3523,12 +3592,22 @@ copies_case!(
         a.source("config.local.toml", &reload);
         a.source("copy.txt", "native copy\n");
         a.source("template.tera", "{{ 'native template' }}\n");
+        if !f.oracle {
+            // Record the intermediate source in Git and the guarded copy state.
+            // Recreate the private targets through native apply to observe its reloads.
+            has(&a.sync(), "pushed");
+            assert_eq!(read(&a.home.join(".copied")), "native copy\n");
+            assert_eq!(read(&a.home.join(".rendered")), "native template\n");
+            fs::remove_file(a.home.join(".copied")).unwrap();
+            fs::remove_file(a.home.join(".rendered")).unwrap();
+        }
         a.target("events", "");
         a.deploy();
         assert_eq!(
             read(&a.home.join("events")),
             "pre\nnative copy\nnative\nboth\npost\n"
         );
+        fs::remove_file(a.home.join("first-reload")).unwrap();
         a.source("copy.txt", "sync copy\n");
         a.source("template.tera", "{{ 'sync template' }}\n");
         a.target("events", "");
@@ -3541,6 +3620,10 @@ copies_case!(
         assert_eq!(
             read(&a.home.join("events")),
             "pre\nsync copy\nnative\nboth\npost\n"
+        );
+        assert_eq!(
+            read(&a.home.join("first-reload")),
+            "copy=sync copy\ntemplate=sync template\n"
         );
         a.target("events", "");
         a.sync();

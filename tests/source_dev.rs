@@ -3533,17 +3533,21 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_reload_commands_run_once_after_copy_and_template_and_before_post,
+    active unchanged_reload_commands_run_once_after_copy_and_template_and_before_post,
     true,
     |f, a, _b, config| {
         let trace = "echo pre >> \"$HOME/events\"";
         let post = "echo post >> \"$HOME/events\"";
         a.source("config.toml", hooks(&config, trace, post));
+        let first_reload = r#"if [ ! -e "$HOME/first-reload" ]; then
+    { printf 'copy='; cat "$HOME/.copied"; printf 'template='; cat "$HOME/.rendered"; } > "$HOME/first-reload"
+fi
+cat "$HOME/.copied" >> "$HOME/events""#;
         let mut reload = "[history.reload]\n".to_owned();
         for (glob, command) in [
             (
                 "~/.copied".to_owned(),
-                "cat \"$HOME/.copied\" >> \"$HOME/events\"",
+                first_reload,
             ),
             ("~/.rendered".to_owned(), "echo native >> \"$HOME/events\""),
             (
@@ -3552,7 +3556,7 @@ copies_case!(
             ),
             (
                 a.home.join(".copied").to_string_lossy().into_owned(),
-                "cat \"$HOME/.copied\" >> \"$HOME/events\"",
+                first_reload,
             ),
         ] {
             reload.push_str(&format!("{glob:?} = {command:?}\n"));
@@ -3560,12 +3564,22 @@ copies_case!(
         a.source("config.local.toml", &reload);
         a.source("copy.txt", "native copy\n");
         a.source("template.tera", "{{ 'native template' }}\n");
+        if !f.oracle {
+            // Record the intermediate source in Git and the guarded copy state.
+            // Recreate the private targets through native apply to observe its reloads.
+            has(&a.sync(), "pushed");
+            assert_eq!(read(&a.home.join(".copied")), "native copy\n");
+            assert_eq!(read(&a.home.join(".rendered")), "native template\n");
+            fs::remove_file(a.home.join(".copied")).unwrap();
+            fs::remove_file(a.home.join(".rendered")).unwrap();
+        }
         a.target("events", "");
         a.deploy();
         assert_eq!(
             read(&a.home.join("events")),
             "pre\nnative copy\nnative\nboth\npost\n"
         );
+        fs::remove_file(a.home.join("first-reload")).unwrap();
         a.source("copy.txt", "sync copy\n");
         a.source("template.tera", "{{ 'sync template' }}\n");
         a.target("events", "");
@@ -3578,6 +3592,10 @@ copies_case!(
         assert_eq!(
             read(&a.home.join("events")),
             "pre\nsync copy\nnative\nboth\npost\n"
+        );
+        assert_eq!(
+            read(&a.home.join("first-reload")),
+            "copy=sync copy\ntemplate=sync template\n"
         );
         a.target("events", "");
         a.sync();

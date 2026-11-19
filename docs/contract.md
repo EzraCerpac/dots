@@ -1,6 +1,5 @@
 # dots 0.5 contract
 
-Status: Frozen for 0.5. Changes go through the coordinator as amendments to this document.
 Amended 2026-11-18 to cover shell completion, what removal can target, the output of individual commands, cancellation, creating the shared agent skill directory, the 0.5 guarantee that children find the running `dots` on `PATH`, adopting and removing files, the syntax of software versions, program versions in status, enrolling and restoring history, and retired declarations.
 Amended 2026-11-18 for the redesigned terminal output: `dots up` now writes to ordinary scrollback, hooks and recipes run in the foreground, `dots reports` prints a list, and bare `dots` prints help.
 Amended 2026-11-18 to cover the undo checkpoints that restore saves and the scope of package passes.
@@ -19,7 +18,6 @@ Labels mark where an earlier release behaves differently:
 **Changed from 0.3.5** marks behaviour that differs from 0.3.5, and explains the difference.
 **Changed from 0.4.0** marks behaviour that 0.4.0 ships and 0.5 changes, and explains the change.
 **New in 0.4.0** and **Changed in 0.4.0** mark a difference of that kind that 0.4.0 already ships; every other label marks a change that arrives with 0.5.
-A citation of a 0.3.5 file, such as `bin/dots:233`, is historical evidence for one of these labels, not part of the specification.
 What an implementation may decide for itself is listed under [Internal and subject to change](#internal-and-subject-to-change).
 A quoted message shows what its line must convey; the exact wording is binding only where this document says so.
 Examples use generic names: the profiles `laptop` and `server`, the machine `my-laptop` and the repository `OWNER/NAME`.
@@ -125,18 +123,18 @@ Commands use `SETUP_PROFILE` and `SETUP_MACHINE_ID` from the environment when th
 
 | Behaviour | 0.3.5 | 0.5 |
 | --- | --- | --- |
-| Configuration files | `dots init` writes `[vars] dots_profiles`, the `dots/` layout, `.gitleaks.toml` and `.gitignore`, without overwriting anything (`tasks/init:57-107`) | The same files, from templates built into the executable, without overwriting anything |
-| Profile and machine | Set by a separate `dots internal profile` command (`README.md:99-103`) | Selected by `dots init`, with the machine ID taken from the hostname |
+| Configuration files | `dots init` writes `[vars] dots_profiles`, the `dots/` layout, `.gitleaks.toml` and `.gitignore`, without overwriting anything | The same files, from templates built into the executable, without overwriting anything |
+| Profile and machine | Set by a separate `dots internal profile` command | Selected by `dots init`, with the machine ID taken from the hostname |
 | Git repository | Created by hand, with `main` and `dev` | Created by `dots init`, with a single seed commit on `main` and `dev` and `HEAD` on `dev` |
 | Remote | Created by hand | Optional; in a terminal with `gh`, `init` offers to create one, and otherwise prints two commands |
-| Remote kinds | Only GitHub (`lib/source-repo.mjs:30-48`) | GitHub or any Git URL |
+| Remote kinds | Only GitHub | GitHub or any Git URL |
 | `dots_source_repo` | Needed by `sync`, the sync stage of `up`, `publish` and `remote` | Optional; `origin` on its own is enough |
 | `dots up` without a remote | The sync stage stops with "missing setting: add dots_source_repo" | One line notes that the sync stage is skipped |
 | `dots sync` without a remote | Prints a stop line and exits 0 | Prints a one-line receipt explaining how to add a remote, and exits 0 |
 | `dots add` | Only software | Software or an existing file |
 | `dots remove ./FILE` | Taken as a software name that no declaration matches | Puts an adopted file back in place |
 | A missing program | Often just the child's own error, such as a failed `mise exec` | A single line that names the program and the action |
-| `dots status` | Has no program list (`tasks/status:15-45`) | Lists program versions, shows an optional version it cannot read as `version unavailable`, and lists each missing program with the commands that need it |
+| `dots status` | Has no program list | Lists program versions, shows an optional version it cannot read as `version unavailable`, and lists each missing program with the commands that need it |
 | Internal commands in the quickstart | Needed | None needed |
 
 With only mise and Git installed, the local quickstart is:
@@ -495,7 +493,7 @@ The stages run in this order:
 10. **Manager.** If the configuration declares `dots` and a stage installed a different version, it reports `dots X -> Y, used from the next run`.
 11. **Post-update checkpoint.** As stage 1.
 
-**Changed from 0.3.5:** the pre-update checkpoint is the first stage, where 0.3.5 ran it after sync and reload (`tasks/update:186-216,346`).
+**Changed from 0.3.5:** the pre-update checkpoint is the first stage, where 0.3.5 ran it after sync and reload.
 On macOS, with `--mas` and declarations that select `mas`, App Store updates run alongside stages 6 to 8, and stage 9 waits for them to finish.
 Without cached administrator access, a run without a terminal defers the App Store stage.
 An interactive run asks for administrator access in the foreground, if it needs it, before the App Store stage starts.
@@ -1016,7 +1014,7 @@ Every subcommand acts on a single named package and never runs a global Homebrew
 - The hold commands never install, upgrade or remove anything.
 - Anywhere but macOS, `update-cask`, `update-formula`, `hold-formula` and `hold-cask` print that the package is macOS-only and exit 4.
 
-**Changed from 0.3.5:** 0.3.5 returned 0 for a deferral, sending a notice to the dashboard, and returned 0 with a "Deferred" line on systems other than macOS (`lib/brew-exception.sh:65-75,105-108,218-221`).
+**Changed from 0.3.5:** 0.3.5 returned 0 for a deferral, sending a notice to the dashboard, and returned 0 with a "Deferred" line on systems other than macOS.
 
 ### Replacing 0.3.5 interfaces
 
@@ -1246,7 +1244,7 @@ Backup runs native sync once, with no publication retry and no force push.
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Where the agents keep their configuration |
 
 A `DOTS_MISE_BIN` that is set but not executable is a configuration error, with exit status 2.
-**Changed from 0.3.5:** in that case the 0.3.5 dispatcher often fell back without a word (`bin/dots:231-232`), although its sync code already refused it (`lib/source-repo.mjs:151-155`).
+**Changed from 0.3.5:** in that case the 0.3.5 dispatcher often fell back without a word, although its sync code already refused it.
 `dots` sets `DOTS_ROOT`, `DOTS_PROFILE` and the hook variables above for its children; mise children receive `MISE_CONFIG_DIR` as well, and `dots up` sets `HOMEBREW_NO_INSTALL_CLEANUP=1`.
 A variable that is a flag takes exactly `0` or `1`.
 

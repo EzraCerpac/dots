@@ -21,11 +21,7 @@ dots sync                              # scan and share your edits, take the oth
 dots remote HOST --profile P           # set up another machine from your configuration's repository
 ```
 
-<!-- TODO (A-03): Record the released 0.5.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal. -->
-
 ## Install
-
-<!-- TODO: A-07 installer -->
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh
@@ -46,16 +42,12 @@ With `--from` and `--profile`, the installer clones that repository instead of r
 </details>
 
 <details>
-<summary>Other ways to install</summary>
+<summary>Install with mise instead</summary>
 
-<!-- TODO (G-2): Verify these routes against the published 0.5.0 artifacts. -->
-<!-- TODO (C-01): Add a Cargo install route once dots-cli is published. -->
-
-Once 0.5.0 is released, these will also work; until then the Homebrew tap installs 0.4.0.
+Once 0.5.0 is released, this will also work:
 
 ```sh
 mise use -g github:EzraCerpac/dots@0.5.0
-brew install ezracerpac/tap/dots
 ```
 
 `dots --version` prints the version and how it was installed.
@@ -64,8 +56,8 @@ brew install ezracerpac/tap/dots
 
 `dots` runs on macOS and Linux, including WSL, and needs mise 2026.11.8 or newer and Git.
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
-Once your configuration declares them, for example with `dots add --base gitleaks age`, `dots up` installs and updates them through mise.
-<!-- TODO: A-08 scaffold tools -->
+A `config.toml` that `dots init` creates declares both in `[tools]`, while `init` adds only `dots_profiles` to an existing one, so declare them there yourself, for example with `dots add --base gitleaks age`.
+Once they are declared, `dots up` installs and updates them through mise.
 [Platforms and programs](docs/contract.md#platforms-and-programs) lists what each action needs.
 
 ## Start

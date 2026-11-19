@@ -90,36 +90,37 @@ fi
 exec "$@"
 '
 
-# With --from this runs after adoption, which needs an empty destination.
+# Keep separators so the first headless init continuation fits on one line.
 # shellcheck disable=SC2016
 activate='
-mise=$1 config=$2 tool=$3 shims=$4; shift 4
-old_dots=$(command -v dots || :)
-if [ "$#" -gt 0 ]; then "$@"; fi
-"$mise" -C "$HOME" use -g --path "$config" --fuzzy "$tool"
-"$mise" -C "$HOME" reshim
-configured=$("$mise" -C "$HOME" settings get shims_dir 2>/dev/null) || configured=
-shims=${configured:-$shims}
-case "$shims" in /*) ;; *) shims=$HOME/$shims ;; esac
-shim=$shims/dots
-if [ ! -x "$shim" ]; then printf "dots installer: the mise dots shim is missing.\n" >&2; exit 1; fi
-bin=$HOME/.local/bin
+mise=$1 config=$2 tool=$3 shims=$4 when=$5; shift 5;
+old_dots=$(command -v dots || :);
+if [ "$when" = adopt ]; then "$@"; fi;
+"$mise" -C "$HOME" use -g --path "$config" --fuzzy "$tool";
+"$mise" -C "$HOME" reshim;
+configured=$("$mise" -C "$HOME" settings get shims_dir 2>/dev/null) || configured=;
+shims=${configured:-$shims};
+case "$shims" in /*) ;; *) shims=$HOME/$shims ;; esac;
+shim=$shims/dots;
+if [ ! -x "$shim" ]; then printf "dots installer: the mise dots shim is missing.\n" >&2; exit 1; fi;
+bin=$HOME/.local/bin;
 if [ "$bin/dots" != "$shim" ] && [ ! -e "$bin/dots" ] && [ ! -L "$bin/dots" ]; then
     case "$old_dots" in
         ""|"$shim") mkdir -p "$bin"; ln -s "$shim" "$bin" ;;
-    esac
-fi
-mise_hint=
+    esac;
+fi;
+mise_hint=;
 if ! command -v mise >/dev/null 2>&1 && [ ! -x "$bin/mise" ]; then
-    mise_hint=" Add \"${mise%/*}\" to PATH for mise."
-fi
+    mise_hint=" Add \"${mise%/*}\" to PATH for mise.";
+fi;
 if [ "$bin/dots" = "$shim" ] || [ "$(readlink "$bin/dots" 2>/dev/null || :)" = "$shim" ]; then
     if [ "$(command -v dots || :)" != "$bin/dots" ] || [ -n "$mise_hint" ]; then
-        printf "%s%s\n" "Put \$HOME/.local/bin first on PATH to use the dots launcher." "$mise_hint" >&2
-    fi
+        printf "%s%s\n" "Put \$HOME/.local/bin first on PATH to use the dots launcher." "$mise_hint" >&2;
+    fi;
 else
-    printf "Kept your existing dots entry. Run \"%s\" to use the mise-installed dots.%s\n" "$shim" "$mise_hint" >&2
-fi
+    printf "Kept your existing dots entry. Run \"%s\" to use the mise-installed dots.%s\n" "$shim" "$mise_hint" >&2;
+fi;
+if [ "$when" = defer ]; then exec "$@"; fi
 '
 
 main() {
@@ -172,11 +173,17 @@ main() {
     case "$config" in /*) ;; *) config=$PWD/$config ;; esac
     data=${MISE_DATA_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/mise"}
     shims=${MISE_SHIMS_DIR:-"$data/shims"}
-    if [ -z "$source" ]; then
-        sh -ec "$activate" sh "$mise" "$config" "$tool" "$shims"
-    else
-        "$mise" -C "$HOME" install "$tool"
+    tty=false
+    if ( : </dev/tty ) 2>/dev/null; then tty=true; fi
+    when=now
+    if [ -n "$source" ]; then when=adopt
+    elif ! "$tty" && ! "$mise" -C "$HOME" which dots >/dev/null 2>&1; then when=defer
     fi
+    case "$when" in
+        now) sh -ec "$activate" sh "$mise" "$config" "$tool" "$shims" "$when" ;;
+        defer) "$mise" -q -C "$HOME" install "$tool" ;;
+        adopt) "$mise" -C "$HOME" install "$tool" ;;
+    esac
     dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
     setup_path=${dots%/*}:${mise%/*}:$PATH
     if [ -n "$source" ]; then
@@ -185,11 +192,12 @@ main() {
         set -- "$dots" init
     fi
     set -- env "PATH=$setup_path" "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" "$@"
-    if [ -n "$source" ]; then
-        set -- sh -ec "$activate" sh "$mise" "$config" "$tool" "$shims" "$@"
+    if [ "$when" != now ]; then
+        if [ "$when" = defer ]; then activate=$(printf '%s' "$activate" | tr '\n' ' '); fi
+        set -- sh -ec "$activate" sh "$mise" "$config" "$tool" "$shims" "$when" "$@"
     fi
 
-    if ( : </dev/tty ) 2>/dev/null; then exec "$@" </dev/tty; fi
+    if "$tty"; then exec "$@" </dev/tty; fi
     printf '%s\n' 'dots is installed. In a terminal, run:'
     for arg do quote "$arg"; printf ' '; done
     printf '\n'

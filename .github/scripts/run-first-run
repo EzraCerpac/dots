@@ -59,18 +59,21 @@ if [ -f /seed/install.sh ]; then
     export MISE_VERSION DOTS_VERSION
     curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz > "$fixture/installer.log"
     cat "$fixture/installer.log"
-    test ! -e "$MISE_CONFIG_DIR/config.toml"
-    test ! -e "$MISE_CONFIG_DIR/.git"
+    test ! -e "$MISE_CONFIG_DIR"
     test -x "$HOME/.local/bin/mise"
-    test "$(readlink "$HOME/.local/bin/dots")" = "$MISE_SHIMS_DIR/dots"
     tar -xOzf /seed/dots.tar.gz bin/dots > "$fixture/expected-dots"
-    cmp "$fixture/expected-dots" "$(mise which dots)"
-    test "$(sh -c 'command -v dots')" = "$HOME/.local/bin/dots"
-    test "$(sh -c 'dots --version')" = "dots $DOTS_VERSION (mise)"
+    tool="http:dots[url=file:///seed/dots.tar.gz]@$DOTS_VERSION"
+    cmp "$fixture/expected-dots" "$(mise which --tool "$tool" dots)"
+    if command -v dots; then exit 1; fi
 
     setup=$(sed -n '/^dots is installed\. In a terminal, run:$/ { n; p; }' "$fixture/installer.log")
     test -n "$setup"
     sh -ec "$setup"
+    test "$(readlink "$HOME/.local/bin/dots")" = "$MISE_SHIMS_DIR/dots"
+    cmp "$fixture/expected-dots" "$(mise which dots)"
+    test "$(sh -c 'command -v dots')" = "$HOME/.local/bin/dots"
+    test "$(sh -c 'dots --version')" = "dots $DOTS_VERSION (mise)"
+
     test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
     test "$(git -C "$MISE_CONFIG_DIR" rev-parse main)" = "$(git -C "$MISE_CONFIG_DIR" rev-parse dev)"
     if ! sh -c 'dots up' > "$fixture/up.log"; then cat "$fixture/up.log"; exit 1; fi

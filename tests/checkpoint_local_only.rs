@@ -375,17 +375,20 @@ fn new_checkpoint_keeps_the_merged_save_path_for_established_history() {
         "shared",
         &serde_json::json!({
             "entries": [{"mode": "track", "path": "~/setting", "declared_in": declaration}],
-            "invalid": [],
+            "invalid": [{"path": "~/inactive"}],
         })
         .to_string(),
     );
+    f.write(
+        "status",
+        r#"{"files":[{"target":"~/inactive","mode":"track","state":"tracked","reason":"no variant matches this machine: host-other"}]}"#,
+    );
 
-    let notice = state.join("notices");
-    fs::write(&notice, "queued note\n").unwrap();
-    f.seam("checkpoint", "blocked");
-    assert_eq!(fs::read_to_string(&notice).unwrap(), "queued note\n");
-    assert!(!f.world.home().join("history-calls").exists());
-    fs::write(notice, "").unwrap();
+    let local = f.world.base().join("mise/state/history-local/history");
+    fs::create_dir_all(&local).unwrap();
+    for scope in [&state, &local] {
+        fs::write(scope.join("notices"), "queued note\n").unwrap();
+    }
 
     f.seam("checkpoint", "saved");
     let calls = fs::read_to_string(f.world.home().join("history-calls")).unwrap();
@@ -541,6 +544,13 @@ printf '%s\n' "$scope" >> "$HOME/history-calls"
 if [ -n "${DOTS_TEST_NATIVE_MISE:-}" ]; then
     exec "$DOTS_TEST_NATIVE_MISE" "$@"
 fi
+# Model notice output from the live scope, including targeted status and an
+# empty local inventory.
+case "$scope" in
+    local) queue="$MISE_STATE_DIR/history-local/history/notices" ;;
+    *) queue="$MISE_STATE_DIR/history/notices" ;;
+esac
+[ ! -f "$queue" ] || cat "$queue" >&2
 cat "$HOME/$scope"
 [ ! -f "$HOME/$scope-failure" ]
 "#;

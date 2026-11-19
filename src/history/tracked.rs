@@ -18,7 +18,7 @@ use toml_edit::DocumentMut;
 use crate::Fail;
 
 use super::native::{Native, exists, expand};
-use super::probe_state::{ProbeState, check_queued_notices};
+use super::probe_state::ProbeState;
 use super::{blocked, invalid};
 
 #[derive(Deserialize)]
@@ -57,8 +57,6 @@ fn inventory_command(
     if let Some(state) = state {
         // Even the native read commands drain notice queues on dispatch.
         cmd.env("MISE_STATE_DIR", state.path());
-    } else if native.checkpoint {
-        check_queued_notices(native)?;
     }
     cmd.env_remove("__MISE_HISTORY_LOCAL")
         .env("MISE_HISTORY_SYNC", "manual")
@@ -90,7 +88,9 @@ fn inventory(
     }
     let inventory: Inventory = serde_json::from_slice(&output.stdout)
         .map_err(|_| invalid("mise returned an invalid tracked history inventory"))?;
-    if native.checkpoint && inventory.entries.is_empty() && !output.stderr.is_empty() {
+    // Only a fresh probe with isolated state can treat stderr as uncertainty.
+    // Established stores may print a queued notice alongside valid inventory.
+    if state.is_some() && inventory.entries.is_empty() && !output.stderr.is_empty() {
         return Err(blocked(diagnostic));
     }
     let unproved = if local || inventory.invalid.is_empty() {
@@ -144,7 +144,7 @@ fn inactive_invalid_paths(
     cmd.args(invalid_rows.iter().map(|entry| &entry.path))
         .env("MISE_HISTORY_ENABLED", "false");
     let output = native.probe(cmd, diagnostic)?;
-    if !output.status.success() || native.checkpoint && !output.stderr.is_empty() {
+    if !output.status.success() || state.is_some() && !output.stderr.is_empty() {
         // A malformed declaration can be absent from status completely.
         // Keep the paths command's configuration error in that case.
         return Ok(BTreeSet::new());

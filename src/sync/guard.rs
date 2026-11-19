@@ -130,11 +130,15 @@ impl Dir {
         }
     }
 
-    fn read(&self, name: &CString) -> io::Result<Image> {
+    pub(super) fn open_file(&self, name: &CString) -> io::Result<File> {
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
         // SAFETY: the directory descriptor and name live through openat.
         let fd = unsafe { libc::openat(self.fd(), name.as_ptr(), flags) };
-        match owned(fd) {
+        owned(fd)
+    }
+
+    fn read(&self, name: &CString) -> io::Result<Image> {
+        match self.open_file(name) {
             Ok(mut file) => {
                 let md = file.metadata()?;
                 if md.is_dir() {

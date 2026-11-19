@@ -497,6 +497,7 @@ mod tests {
         git.get(["init", "--quiet", "--bare", path.to_str().unwrap()])
             .unwrap();
         git.get(["remote", "add", "origin", &url]).unwrap();
+        fs::create_dir_all(path.join("hooks")).unwrap();
         let hook = path.join("hooks/post-receive");
         fs::write(&hook, "#!/bin/sh\ngit update-ref -d refs/heads/dev\n").unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();

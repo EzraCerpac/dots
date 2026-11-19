@@ -721,6 +721,9 @@ fn synchronize(
             active(run)?;
             verify_dev(&git, &merged)
                 .or_note("The dev checkout changed before dotfile apply", GIT)?;
+            copies
+                .reconcile_captures(&git, &shared.dir, &approved, &merged, &merged_tree, receipt)
+                .or_note("Could not reconcile captured copy baselines", RERUN)?;
             if !validated
                 .still_current(git.root())
                 .or_note("Could not recheck machine-local files before apply", RERUN)?

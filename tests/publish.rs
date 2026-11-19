@@ -1463,7 +1463,6 @@ fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_default_publication_scans_exactly_the_unpublished_commits_before_asking() {
     // A secret already in remote main is outside this publication's outgoing set.
     // The removed-secret and merge-resolution cases independently prove coverage
@@ -1479,7 +1478,6 @@ fn unchanged_default_publication_scans_exactly_the_unpublished_commits_before_as
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_real_gitleaks_refuses_a_token_committed_and_then_removed() {
     let fixture = token_history();
     fixture.reject_secret("wip/token", false);
@@ -1497,7 +1495,6 @@ fn token_history() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_never_previews_the_rejected_secret() {
     let token = synthetic_token();
     for terminal in [false, true] {
@@ -1513,7 +1510,6 @@ fn new_publish_never_previews_the_rejected_secret() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_real_gitleaks_scans_content_that_only_a_merge_resolution_adds() {
     merge_resolution().reject_secret("wip/merge", false);
 }
@@ -1539,7 +1535,6 @@ fn merge_resolution() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_default_publication_refuses_a_private_stack_above_main_origin() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1554,7 +1549,6 @@ fn unchanged_default_publication_refuses_a_private_stack_above_main_origin() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_publication_uses_the_callers_jj_workspace() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1576,10 +1570,10 @@ fn unchanged_publication_uses_the_callers_jj_workspace() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_one_line() {
     let fixture = Publication::new(None, false);
     let foreign = fixture.world.root().parent().unwrap().join("foreign");
+    let foreign_origin = "https://github.com/example/foreign-fixture.git";
     success(
         fixture
             .world
@@ -1593,12 +1587,7 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
         fixture
             .world
             .git()
-            .args([
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/example/foreign-fixture.git",
-            ])
+            .args(["remote", "set-url", "origin", foreign_origin])
             .current_dir(&foreign),
     );
     success(
@@ -1628,10 +1617,13 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
             1,
             "{candidate:?}: {diagnostics}"
         );
-        assert!(
-            diagnostics.to_lowercase().contains("workspace"),
-            "{diagnostics}"
-        );
+        let summary = diagnostics.to_ascii_lowercase();
+        if candidate == foreign && summary.contains("origin does not match") {
+            assert!(summary.contains("github repository"), "{diagnostics}");
+            assert!(!diagnostics.contains(foreign_origin), "{diagnostics}");
+        } else {
+            assert!(summary.contains("workspace"), "{diagnostics}");
+        }
         assert!(
             !fixture.optional_log("jj").contains("git fetch"),
             "attempted to fetch from rejected workspace {candidate:?}"
@@ -1642,7 +1634,6 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_disclosure_note_is_optional_and_names_the_configured_person() {
     for (person, model) in [
         (None, None),
@@ -1692,7 +1683,6 @@ fn set_shared_dev(fixture: &Publication, args: &[&str], already_in_main: bool) {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_shared_dev_outside_main_blocks_each_publication_mode() {
     for args in [&[][..], &["--all"], &["--bookmark", "wip/fixture-publish"]] {
         let fixture = Publication::new(None, false);
@@ -1710,7 +1700,6 @@ fn unchanged_shared_dev_outside_main_blocks_each_publication_mode() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_shared_dev_already_in_main_allows_each_publication_mode() {
     for args in [&[][..], &["--all"], &["--bookmark", "wip/fixture-publish"]] {
         let fixture = Publication::new(None, false);
@@ -1728,7 +1717,6 @@ fn unchanged_shared_dev_already_in_main_allows_each_publication_mode() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_non_github_repository_exits_before_checking_publication_tools() {
     let fixture = Publication::new(None, false);
     let origin = format!("file://{}", fixture.bare.display());
@@ -1750,7 +1738,6 @@ fn new_non_github_repository_exits_before_checking_publication_tools() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_invalid_repository_setting_exits_two_before_tool_probes() {
     for config in [
         "[vars]\ndots_source_repo = \"invalid fixture setting\"\n",
@@ -1764,7 +1751,6 @@ fn new_invalid_repository_setting_exits_two_before_tool_probes() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_rejects_absent_unsafe_or_mismatched_raw_origins_before_tool_probes() {
     let credential = "P07_FIXTURE_PASSWORD_CANARY";
     let credential_url = format!("https://fixture-user:{credential}@github.com/{REPOSITORY}.git");
@@ -1820,7 +1806,6 @@ fn new_publish_rejects_absent_unsafe_or_mismatched_raw_origins_before_tool_probe
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_checks_effective_fetch_and_every_push_url_before_contact() {
     for variant in ["fetch-rewrite", "push-rewrite", "multiple-push-urls"] {
         let fixture = Publication::new(None, false);

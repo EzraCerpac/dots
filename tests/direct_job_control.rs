@@ -824,6 +824,81 @@ fn new_intentional_background_stop_resumes_with_bash_bg() {
 }
 
 #[test]
+fn new_wrapped_intentional_stop_resumes_with_one_bash_fg() {
+    let fixture = Fixture::new();
+    let mut terminal = Terminal::start(&fixture, "background-stop", false);
+    terminal.line(&format!(
+        r#"{{ {JOB}; code=$?; printf '\nwrapper-after:%s\n' "$code"; exit "$code"; }} & job=$!"#,
+    ));
+    terminal.expect(SHELL_PROMPT);
+    terminal.line(r#"printf '%s\n' "$job" > "$DIRECT_DIR/wrapper-pid"; printf '\nwrapper-launched:%s\n' "$job""#);
+    terminal.expect("\r\nwrapper-launched:");
+    terminal.expect(SHELL_PROMPT);
+    let wrapper: Pid = fs::read_to_string(fixture.control.join("wrapper-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let dots = terminal.dots_pid();
+    let stage = terminal.session.identity("stage");
+    let bash = terminal.session.pid();
+    assert_ne!(wrapper, dots);
+    assert_eq!(group(wrapper), wrapper);
+    assert_eq!(group(dots), wrapper);
+    assert_ne!(stage.group, wrapper);
+    assert_eq!(stage.foreground, bash);
+    terminal.verify_original_tty(&stage, false);
+    terminal.line("jobs -pr; PS4='+ fixture-bash: '; set -x");
+    terminal.expect(&format!("\r\n{wrapper}\r\n"));
+    terminal.expect(SHELL_PROMPT);
+
+    let mut trace = FgTrace {
+        dots,
+        stage: stage.pid,
+        start: Instant::now(),
+        transitions: Vec::new(),
+    };
+    fs::write(fixture.control.join("stop-stage"), b"").unwrap();
+    trace.wait(&mut terminal, "wrapped stage kernel stop", |state| {
+        state.stage_stopped == Some(true)
+    });
+    assert!(!stopped(wrapper));
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!("before fg: {}", terminal.session.launch_details());
+    }
+    terminal.line(&format!("fg; {RESULT}"));
+    trace.wait(
+        &mut terminal,
+        "single fg to resume the wrapped stage",
+        |state| {
+            state.dots_stopped == Some(false)
+                && state.stage_stopped == Some(false)
+                && state.foreground_pgrp == stage.group
+        },
+    );
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!("after fg: {}", terminal.session.launch_details());
+    }
+    let resumed = terminal.session.identity("resumed");
+    assert_eq!(resumed.pid, stage.pid);
+    assert_eq!(resumed.foreground, stage.group);
+    terminal.verify_original_tty(&resumed, false);
+    assert!(!stopped(wrapper));
+
+    fs::write(fixture.control.join("finish-stage"), b"").unwrap();
+    terminal.expect("\r\nwrapper-after:0\r\n");
+    terminal.result(0);
+    trace.sample(&terminal, "shell read after wrapper marker");
+    assert_eq!(terminal.session.members(), vec![bash]);
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!(
+            "wrapper={wrapper} pgrp={wrapper}\n{}",
+            trace.describe(&terminal)
+        );
+    }
+}
+
+#[test]
 fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
     let fixture = Fixture::new();
     let mut terminal = Terminal::start(&fixture, "background-reader", false);

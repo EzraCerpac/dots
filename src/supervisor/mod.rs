@@ -1096,7 +1096,9 @@ impl Running<'_> {
             }
             return job.suspend();
         }
-        if terminal_io {
+        // A shell can foreground a running wrapper without sending SIGCONT.
+        // Self-stop only when dots leads its job's process group.
+        if terminal_io || unsafe { libc::getpid() != libc::getpgrp() } {
             return self.promote_group();
         }
 

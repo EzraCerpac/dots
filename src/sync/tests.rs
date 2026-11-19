@@ -1299,3 +1299,123 @@ fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_recei
         assert_eq!(fs::read(backup).unwrap(), b"old working version");
     }
 }
+
+#[test]
+fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
+    use std::os::unix::fs::MetadataExt;
+
+    for conflict in ["staged index", "late file"] {
+        let (fixture, ctx) = git_fixture();
+        let world = fixture.path().canonicalize().unwrap();
+        let git = Git::new(&ctx, ctx.root.path());
+        let early = git.root().join("alpha");
+        let late = git.root().join("zeta");
+        fs::write(&early, b"original alpha\n").unwrap();
+        fs::write(&late, b"original zeta\n").unwrap();
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let before = fixture_commit(&git, "private before");
+        fs::write(&early, b"incoming alpha\n").unwrap();
+        fs::write(&late, b"incoming zeta\n").unwrap();
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let after = fixture_commit(&git, "private after");
+        git.get(["reset", "--hard", &before]).unwrap();
+
+        let dir = git.root().join(".git");
+        super::checkout::begin(
+            &git,
+            &dir,
+            &super::checkout::index_snapshot(&dir).unwrap(),
+            &before,
+            &after,
+            true,
+        )
+        .unwrap();
+        // Enter the real checkout and stop only after alpha was replaced.
+        let interrupted = super::checkout::finish(&git, &dir, || {
+            fs::read(&early).is_ok_and(|bytes| bytes == b"incoming alpha\n")
+        });
+        assert!(interrupted.is_err());
+        let pending = dir.join("dots-sync-pending");
+        assert!(pending.join("started").is_file());
+        assert!(pending.join("done-0").is_file());
+        assert!(!pending.join("done-1").exists());
+        let original = pending.join("old-0");
+        assert_eq!(fs::read(&original).unwrap(), b"original alpha\n");
+
+        if conflict == "staged index" {
+            // Simulate the owner releasing its reserved lock to allow a real
+            // competing git add. Only release our fixture's hard-linked lock.
+            let lock = dir.join("index.lock");
+            let held = fs::metadata(&lock).unwrap();
+            let staged = fs::metadata(pending.join("index.after")).unwrap();
+            assert_eq!((held.dev(), held.ino()), (staged.dev(), staged.ino()));
+            fs::remove_file(lock).unwrap();
+            fs::write(&late, b"competing staged contents\n").unwrap();
+            git.get(["add", "zeta"]).unwrap();
+        }
+        fs::write(&late, b"competing live contents\n").unwrap();
+        let staging = git
+            .get(["ls-files", "--stage", "--", "alpha", "zeta"])
+            .unwrap();
+        let snapshot = super::checkout::index_snapshot(&dir).unwrap();
+        let expected_staged: &[u8] = if conflict == "staged index" {
+            b"competing staged contents\n"
+        } else {
+            b"original zeta\n"
+        };
+        assert_eq!(git.get(["show", ":zeta"]).unwrap(), expected_staged);
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+
+        let cli = |mode| {
+            let child = isolated(&world, std::env::current_exe().unwrap())
+                .env(RECEIPT_CHILD, mode)
+                .args([
+                    "--exact",
+                    "sync::tests::receipt_save_failure_child",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "{child:?}");
+            String::from_utf8(child.stdout).unwrap()
+        };
+        for receipt in [cli("1"), cli("replay")] {
+            assert!(
+                receipt.contains(&format!("recorded revisions {before} to {after}")),
+                "{receipt}"
+            );
+            assert!(
+                receipt.contains("reconcile the index and checkout"),
+                "{receipt}"
+            );
+            assert!(
+                receipt.contains("A guarded checkout is pending"),
+                "{receipt}"
+            );
+            assert!(receipt.contains("rerun dots sync"), "{receipt}");
+            assert_eq!(
+                receipt.contains("Kept a late edit"),
+                conflict == "late file",
+                "{receipt}"
+            );
+            assert!(
+                receipt
+                    .lines()
+                    .any(|line| { line.strip_prefix("Recovery copy at ") == original.to_str() }),
+                "{receipt}"
+            );
+        }
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(super::checkout::index_snapshot(&dir).unwrap(), snapshot);
+        assert_eq!(
+            git.get(["ls-files", "--stage", "--", "alpha", "zeta"])
+                .unwrap(),
+            staging
+        );
+        assert_eq!(git.get(["show", ":zeta"]).unwrap(), expected_staged);
+        assert_eq!(fs::read(&early).unwrap(), b"incoming alpha\n");
+        assert_eq!(fs::read(&late).unwrap(), b"competing live contents\n");
+        assert_eq!(fs::read(original).unwrap(), b"original alpha\n");
+        assert!(pending.join("started").is_file());
+    }
+}

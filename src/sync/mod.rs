@@ -664,6 +664,20 @@ fn synchronize(
                 changed(&published_tree, &merged_tree),
             ))
         };
+        let already_shared = if let Some(tip) = heads.dev()
+            && !receipt.saved.is_empty()
+            && git.ancestor(&approved, tip).or_note(
+                "Could not verify the saved snapshot against origin/dev",
+                GIT,
+            )? {
+            receipt
+                .saved
+                .iter()
+                .map(|group| group.paths.len())
+                .sum::<usize>()
+        } else {
+            0
+        };
         active(run)?;
         dense_index(&git)?;
         verify_dev(&git, &approved).or_note("The dev checkout changed before pushing", GIT)?;
@@ -682,11 +696,20 @@ fn synchronize(
             }
         };
         if pushed {
-            receipt.outcome = if let Some(sharing) = sharing {
+            let outcome = if let Some(sharing) = sharing {
                 receipt.shared.push(sharing);
-                "pushed dev".into()
+                "pushed dev"
             } else {
-                "dev up to date".into()
+                "dev up to date"
+            };
+            receipt.outcome = if already_shared == 0 {
+                outcome.into()
+            } else {
+                // The snapshot was already present in the verified remote tip.
+                // An ordinary push still reports the files saved locally.
+                receipt.saved.clear();
+                let unit = if already_shared == 1 { "file" } else { "files" };
+                format!("already shared {already_shared} {unit} · {outcome}")
             };
             active(run)?;
             verify_dev(&git, &approved).or_note("The dev checkout changed during the push", GIT)?;

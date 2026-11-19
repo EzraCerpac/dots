@@ -894,7 +894,7 @@ fn new_x25519_requires_canonical_share_and_wrapped_key() {
 #[test]
 fn new_http_exact_scope_disables_redirects_without_changing_other_git_config() {
     let history = History::new();
-    let url = "https://fixture.invalid/repo=fixture'with-quote.git";
+    let url = "https://fixture.invalid/repo=fixture'with-quote.git/";
     let prior =
         std::ffi::OsStr::new("'http.followRedirects'='true' 'credential.helper'='fixture-helper'");
     // Build the native command without starting it. Real Git in the
@@ -918,6 +918,166 @@ fn new_http_exact_scope_disables_redirects_without_changing_other_git_config() {
         "true"
     );
     assert_eq!(value("credential.helper", url), "fixture-helper");
+}
+
+#[test]
+fn new_http_slash_scoped_redirect_cannot_supply_remote_ancestry() {
+    let history = History::new();
+    history.configure(Some(false), false);
+    let tip = history.save();
+    let requests = http_requests(&tip, |http| {
+        let origin = format!("{http}/declared");
+        let scoped = format!("{origin}/");
+        let competing = format!("http.{scoped}/.followRedirects");
+        ok(history
+            .git(&history.store)
+            .args(["config", &competing, "true"]));
+
+        // The old proof resolved false at the raw URL, but stock Git followed
+        // a redirect and returned a checkpoint advertised by a different path.
+        let old_params = format!("'http.{origin}.followRedirects'='false'");
+        let value = |url: &str| {
+            text(ok(history
+                .git(&history.store)
+                .env("GIT_CONFIG_PARAMETERS", &old_params)
+                .args([
+                    "config",
+                    "--get-urlmatch",
+                    "http.followRedirects",
+                    url,
+                ])))
+        };
+        assert_eq!(value(&origin), "false");
+        assert_eq!(value(&scoped), "true");
+        let refs = [
+            "ls-remote",
+            "--refs",
+            "--exit-code",
+            "--",
+            &origin,
+            REMOTE_REF,
+        ];
+        let lookup = |parameters: &std::ffi::OsStr| {
+            history
+                .git(&history.store)
+                .env("GIT_ALLOW_PROTOCOL", "http")
+                .env("GIT_CONFIG_PARAMETERS", parameters)
+                .args(refs)
+                .output()
+                .unwrap()
+        };
+        let old = lookup(old_params.as_ref());
+        assert!(old.status.success());
+        assert_eq!(text(old), format!("{tip}\t{REMOTE_REF}"));
+
+        let run = |origin| {
+            publication::preflight(
+                |args, access| {
+                    let mut cmd = history.git(&history.store);
+                    if let Some(params) = git_parameters(access, cmd.get_envs()) {
+                        cmd.env("GIT_CONFIG_PARAMETERS", params);
+                    }
+                    if !access.is_local() {
+                        cmd.env("GIT_ALLOW_PROTOCOL", "http");
+                    }
+                    cmd.envs(git_environment(access))
+                        .args(args)
+                        .output()
+                        .map_err(|_| Fail::new(1, "fixture Git did not run"))
+                },
+                BRANCH,
+                origin,
+                &tip,
+                false,
+            )
+        };
+        let refusal = run(&origin).unwrap_err();
+        assert_eq!(refusal.status, 1);
+        assert!(
+            refusal
+                .diagnostic
+                .contains("could not verify saved settings history")
+        );
+
+        // A direct route still supplies ancestry. The returned policy uses
+        // the same match URL for the native command and its ref readback.
+        let direct = format!("{http}/direct/");
+        assert_eq!(run(&direct).unwrap(), Some(HttpPolicy::Exact(direct)));
+        let mut native = std::process::Command::new("mise");
+        native.env_clear();
+        publication::constrain_http(&mut native, Some(&HttpPolicy::Exact(scoped)));
+        let params = native
+            .get_envs()
+            .find_map(|(key, value)| (key == "GIT_CONFIG_PARAMETERS").then_some(value).flatten())
+            .unwrap();
+        assert!(!lookup(params).status.success());
+    });
+    let advertised_elsewhere = requests
+        .iter()
+        .filter(|path| path.starts_with("/elsewhere/info/refs"))
+        .count();
+    assert_eq!(
+        advertised_elsewhere, 1,
+        "only the old lookup follows a redirect: {requests:?}"
+    );
+}
+
+fn http_requests(tip: &str, exercise: impl FnOnce(String)) -> Vec<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let refs = format!("{tip}\t{REMOTE_REF}\n");
+    let (done, stop) = mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        loop {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop.recv_timeout(Duration::from_millis(5))
+                        == Err(mpsc::RecvTimeoutError::Timeout)
+                    {
+                        continue;
+                    }
+                    return requests;
+                }
+                Err(err) => panic!("fixture HTTP accept failed: {err}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut lines = BufReader::new(&stream).lines();
+            let request = lines.next().unwrap().unwrap();
+            let path = request.split_ascii_whitespace().nth(1).unwrap();
+            for header in lines {
+                if header.unwrap().is_empty() {
+                    break;
+                }
+            }
+            requests.push(path.to_owned());
+            if let Some(path) = path.strip_prefix("/declared/") {
+                write!(stream, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /elsewhere/{path}\r\nContent-Length: 0\r\n\r\n").unwrap();
+            } else {
+                let body = if path.ends_with("/HEAD") {
+                    "ref: refs/heads/host-fixture\n"
+                } else {
+                    &refs
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+    });
+    exercise(endpoint);
+    drop(done);
+    server.join().unwrap()
 }
 
 #[test]

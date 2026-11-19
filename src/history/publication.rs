@@ -103,11 +103,14 @@ pub(super) fn git_parameters<'a>(
     Some(parameters)
 }
 
-fn without_redirects(prior: Option<&OsStr>, url: &str) -> OsString {
+fn without_redirects(prior: Option<&OsStr>, match_url: &str) -> OsString {
     let mut parameters = prior.unwrap_or_default().to_owned();
-    // Match Git's quoted key/value representation for process-local -c
-    // settings. A URL-specific setting wins over a generic Git config value.
-    append_disabled_parameter(&mut parameters, &format!("http.{url}.followRedirects"));
+    // Git ignores one final slash on a config prefix. Include it to match
+    // the full transport URL, even when that URL already ends in a slash.
+    append_disabled_parameter(
+        &mut parameters,
+        &format!("http.{match_url}/.followRedirects"),
+    );
     parameters
 }
 
@@ -230,16 +233,29 @@ pub(super) fn preflight(
     let route = routes()?;
     let url = route.1.as_str();
     let mut http = None;
+    let match_url;
     let access = if url.starts_with("http://") || url.starts_with("https://") {
+        // Git's remote-curl adds a trailing slash before http_init matches
+        // configuration. A slash-scoped rule can outrank one for the raw URL.
+        match_url = if url.ends_with('/') {
+            url.to_owned()
+        } else {
+            format!("{url}/")
+        };
         let proof = run_git(
-            &["config", "--get-urlmatch", "http.followRedirects", url],
-            GitAccess::CheckHttp(url),
+            &[
+                "config",
+                "--get-urlmatch",
+                "http.followRedirects",
+                &match_url,
+            ],
+            GitAccess::CheckHttp(&match_url),
         )?;
         // libcurl accepts some URLs that Git's URL matcher does not. A
         // URL-specific setting is evidence only if Git resolves it here.
         if proof.status.success() && line(&proof.stdout) == b"false" && proof.stderr.is_empty() {
-            http = Some(HttpPolicy::Exact(url.to_owned()));
-            Some(GitAccess::Http(url))
+            http = Some(HttpPolicy::Exact(match_url.clone()));
+            Some(GitAccess::Http(&match_url))
         } else {
             http = Some(HttpPolicy::Default);
             None

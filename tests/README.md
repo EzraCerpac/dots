@@ -57,9 +57,10 @@ mise exec -- cargo test --locked --lib -- --test-threads 1
 
 On DriehuisNAS, run each test command through `mise run nas:build --`.
 
-In CI, a pull request into `main` that changes code runs the full Linux set and ARM macOS.
-Intel macOS runs on pushes to `main` and on tags.
-The archived v0.4.0 oracle jobs run only on code pushes to `main` and on tags, on x86_64 Linux and ARM macOS, and only those jobs install the legacy prerequisites.
+In CI, a pull request into `main` that changes code runs the Linux tests and one ARM macOS test job, and skips packaging.
+A pull request that touches `packaging/**`, `.github/workflows/**`, `.github/scripts/**`, `.github/actions/**`, `Cargo.toml` or `Cargo.lock`, and every code push to `main` and every tag, takes the full route instead.
+The full route adds sharded ARM and Intel macOS tests, the archived v0.4.0 oracle jobs on x86_64 Linux and ARM macOS, all four package jobs and real install checks.
+Only the oracle jobs install the legacy prerequisites.
 
 Name a case `unchanged_` when v0.4.0 passes it too,
 and `new_` when it covers behaviour that v0.4.0 lacks.

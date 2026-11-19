@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use crate::run::{Issue, Run, StageId};
 use crate::{Ctx, Fail};
 
-use super::blocked;
 use super::native::{self, Native, exists};
 use super::tracked::{self, TrackedPaths};
+use super::{blocked, recovery};
 
 pub(super) const STAGING: &str = ".dots-restore-install";
 pub(super) const MARKER: &str = "dots-restore-pending";
@@ -107,7 +107,7 @@ fn run_save(native: &Native<'_, '_>, command: std::process::Command) -> Result<(
 }
 
 pub(super) fn require_no_pending(store: &Path) -> Result<(), Fail> {
-    if exists(&store.join(MARKER))?
+    if (exists(&store.join(MARKER))? && !recovery::is_fetching(store))
         || exists(
             &store
                 .parent()

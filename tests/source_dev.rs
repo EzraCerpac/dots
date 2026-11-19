@@ -2186,9 +2186,20 @@ fn wrong_checkout(shape: &str, oracle_diagnostic: &str, diagnostic: &str) {
         "legacy" => f.write(&f.a, ".git/dots-dev.json", "{}"),
         _ => unreachable!(),
     }
-    let receipt = f.sync(&f.a);
-    startup_receipt(&f, &receipt, oracle_diagnostic, diagnostic, "sync guide");
-    assert_eq!(f.remote(), before);
+    let check = || {
+        let receipt = f.sync(&f.a);
+        startup_receipt(&f, &receipt, oracle_diagnostic, diagnostic, "sync guide");
+        assert_eq!(f.remote(), before);
+    };
+    check();
+    if shape == "legacy" && !f.oracle {
+        // A pending checkout bypasses the first shape check so recovery can
+        // recheck the repository under the sync lock.
+        let pending = f.a.join(".git/dots-sync-pending");
+        fs::create_dir(&pending).unwrap();
+        check();
+        assert!(pending.is_dir());
+    }
 }
 
 sync_case!(active unchanged_detached_head_stops_cleanly, || {
@@ -2201,7 +2212,11 @@ sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
     wrong_checkout("jj", ".jj", "JJ workspace");
 });
 sync_case!(active unchanged_pre_port_sync_state_stops_cleanly, || {
-    wrong_checkout("legacy", "legacy", "pre-1.0 source state in .git/dots-dev.json");
+    wrong_checkout(
+        "legacy",
+        "legacy",
+        "Sync found source state from dots 0.4.0 or earlier in .git/dots-dev.json",
+    );
 });
 sync_case!(active unchanged_wrong_origin_stops_cleanly, || {
     let f = Repo::new();

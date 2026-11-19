@@ -141,6 +141,23 @@ esac
         cmd
     }
 
+    fn offline_dots(&self, action: &str, remote: &Path) -> Output {
+        let mise = self.script(
+            "offline-native-history",
+            r#"#!/bin/sh
+case " $* " in
+    *" bootstrap dotfiles sync "*) export GIT_ALLOW_PROTOCOL= ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+        );
+        self.dots(&[action], remote)
+            .env("DOTS_MISE_BIN", mise)
+            .env("FIXTURE_MISE", &self.mise)
+            .output()
+            .unwrap()
+    }
+
     fn enroll(&self, remote: &Path, identity: &Path, recipient: &str) -> Output {
         let mut command = self.dots(&[], remote);
         if self.archive_dots(remote) {
@@ -1493,7 +1510,6 @@ fn restore_keeps_an_edit_made_during_native_fetch(established: bool) {
     if established {
         ok(&mut fixture.dots(&["restore"], &remote));
         assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
-        seed.seed(&remote, REMOTE_EDIT);
     }
     let tip = seed.tip(&remote, REF);
     let marker = fixture.world.home().join("edited-during-fetch");
@@ -1538,14 +1554,237 @@ exec "$FIXTURE_GIT" "$@"
     assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
     assert_eq!(output.status.code(), Some(1), "{}", messages(&output));
     assert!(messages(&output).contains("changed after restore started"));
-    let retry = fixture.dots(&["restore"], &remote).output().unwrap();
-    assert_eq!(retry.status.code(), Some(1), "{}", messages(&retry));
-    assert!(
-        messages(&retry).contains("changed after restore started"),
-        "{}",
-        messages(&retry)
+    assert_fetching_retry(&fixture, &remote, established);
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
+fn new_restore_reobserves_a_live_replacement_after_offline_fetch() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    for established in [false, true] {
+        let fixture = Fixture::new();
+        fixture.configure(&url, &url, &key, std::slice::from_ref(&public));
+        fixture.write(DEFAULT, 0o600);
+        if established {
+            ok(&mut fixture.dots(&["restore"], &remote));
+        }
+        let failed = fixture.offline_dots("restore", &remote);
+        assert_eq!(failed.status.code(), Some(1), "{}", messages(&failed));
+        assert!(messages(&failed).contains("mise could not fetch encrypted history"));
+        assert_eq!(
+            fs::read(fixture.active()).unwrap(),
+            if established { FIRST } else { DEFAULT }
+        );
+        let old_inode = fs::metadata(fixture.active()).unwrap().ino();
+        let replacement = fixture.world.home().join("replacement");
+        fs::write(&replacement, LOCAL_EDIT).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o640)).unwrap();
+        fs::rename(replacement, fixture.active()).unwrap();
+        let metadata = fs::metadata(fixture.active()).unwrap();
+        assert_ne!(metadata.ino(), old_inode);
+        assert_eq!(metadata.mode() & 0o777, 0o640);
+
+        let head = fixture.tip(&fixture.store(), "HEAD");
+        let backup = fixture.offline_dots("backup", &remote);
+        assert_eq!(backup.status.code(), Some(1), "{}", messages(&backup));
+        if established {
+            assert!(messages(&backup).contains("the settings checkpoint was kept locally"));
+            assert_ne!(fixture.tip(&fixture.store(), "HEAD"), head);
+        } else {
+            assert!(messages(&backup).contains("a first restore is incomplete"));
+            assert_eq!(fixture.tip(&fixture.store(), "HEAD"), head);
+            assert_eq!(seed.tip(&remote, REF), tip);
+        }
+        assert_fetching_retry(&fixture, &remote, established);
+        assert_eq!(seed.tip(&remote, REF), tip);
+    }
+}
+
+fn assert_fetching_retry(fixture: &Fixture, remote: &Path, established: bool) {
+    let marker = fixture.store().join("dots-restore-pending");
+    let journal: serde_json::Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert!(journal["progress"]["Fetching"].is_object());
+    ok(&mut fixture.dots(&["restore"], remote));
+    assert!(!marker.exists());
+    assert_eq!(
+        fs::metadata(fixture.active()).unwrap().mode() & 0o777,
+        0o600
     );
+    if !established {
+        assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+        assert_restore_undo(fixture, "rollback", LOCAL_EDIT);
+    }
     assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
+}
+
+fn assert_restore_undo(fixture: &Fixture, kind: &str, previous: &[u8]) {
+    let head = fixture.tip(&fixture.store(), "HEAD");
+    let checkpoint: serde_json::Value = serde_json::from_slice(
+        &ok(&mut fixture.mise(&[
+            "bootstrap",
+            "dotfiles",
+            "history",
+            "show",
+            &format!("commit:{head}"),
+            "--json",
+        ]))
+        .stdout,
+    )
+    .unwrap();
+    assert_eq!(checkpoint["operation"]["kind"], kind, "{checkpoint}");
+    assert_eq!(checkpoint["operation"]["status"], "completed");
+    ok(fixture
+        .mise(&["bootstrap", "dotfiles", "undo", "--yes"])
+        .env("GIT_ALLOW_PROTOCOL", ""));
+    assert_eq!(fs::read(fixture.active()).unwrap(), previous);
+}
+
+#[test]
+fn new_first_restore_reobserves_before_native_pull_and_can_undo() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(DEFAULT, 0o600);
+    let offline = fixture.offline_dots("restore", &remote);
+    assert!(messages(&offline).contains("mise could not fetch encrypted history"));
+    let marker = fixture.store().join("dots-restore-pending");
+    let journal: serde_json::Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(journal["initial"], true);
+    assert!(journal["progress"]["Fetching"].is_object());
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+
+    // Bring the live file to the cloned baseline so the next remote revision
+    // can be applied by native pull without a merge conflict.
+    fixture.write(FIRST, 0o600);
+    seed.seed(&remote, REMOTE_EDIT);
+    let tip = seed.tip(&remote, REF);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert!(!marker.exists());
+    assert_eq!(fs::read(fixture.active()).unwrap(), REMOTE_EDIT);
+    assert_restore_undo(&fixture, "apply", FIRST);
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
+fn new_established_restore_rebinds_a_previously_missing_parent_after_offline_fetch() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    let fixture = Fixture::new();
+    for host in [&seed, &fixture] {
+        host.configure(&url, &url, &key, std::slice::from_ref(&public));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(host.world.root().join("config.toml"))
+            .unwrap()
+            .write_all(
+                br#""~/new-parent/selected" = { mode = "track", encrypt = true, variants = [{ profile = "host-fixture" }] }
+"#,
+            )
+            .unwrap();
+    }
+    seed.seed(&remote, FIRST);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    let offline = fixture.offline_dots("restore", &remote);
+    assert!(messages(&offline).contains("mise could not fetch encrypted history"));
+    let marker = fixture.store().join("dots-restore-pending");
+    let fetching = fs::read(&marker).unwrap();
+    let journal: serde_json::Value = serde_json::from_slice(&fetching).unwrap();
+    assert_eq!(journal["initial"], false);
+    assert!(journal["progress"]["Fetching"].is_object());
+
+    let seed_parent = seed.world.home().join("new-parent");
+    fs::create_dir(&seed_parent).unwrap();
+    let seed_file = seed_parent.join("selected");
+    fs::write(&seed_file, SECOND).unwrap();
+    fs::set_permissions(&seed_file, fs::Permissions::from_mode(0o600)).unwrap();
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let parent = fixture.world.home().join("new-parent");
+    let other = fixture.world.home().join("app");
+    symlink(&other, &parent).unwrap();
+    let refused = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+    assert!(
+        messages(&refused).contains("new-parent"),
+        "{}",
+        messages(&refused)
+    );
+    assert_eq!(fs::read(&marker).unwrap(), fetching);
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    fs::remove_file(&parent).unwrap();
+
+    fs::write(&parent, LOCAL_EDIT).unwrap();
+    let refused = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+    assert!(
+        messages(&refused).contains("new-parent"),
+        "{}",
+        messages(&refused)
+    );
+    assert_eq!(fs::read(&marker).unwrap(), fetching);
+    assert_eq!(fs::read(&parent).unwrap(), LOCAL_EDIT);
+    fs::remove_file(&parent).unwrap();
+
+    fs::create_dir(&parent).unwrap();
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert!(!marker.exists());
+    assert_eq!(fs::read(parent.join("selected")).unwrap(), SECOND);
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
+fn new_established_restore_retries_after_an_overlapping_conflict_is_resolved() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    fixture.write(FIRST, 0o600);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    seed.seed(&remote, REMOTE_EDIT);
+    let tip = seed.tip(&remote, REF);
+    fixture.write(LOCAL_EDIT, 0o600);
+
+    let marker = fixture.store().join("dots-restore-pending");
+    let refused = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{}", messages(&refused));
+    assert!(messages(&refused).contains("both sides changed the same lines"));
+    assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
+    assert_eq!(
+        fixture.tip(&fixture.store(), "refs/remotes/origin/setup"),
+        tip
+    );
+    let retired = !marker.exists();
+
+    // Remove the overlapping local change so the incoming version can apply.
+    fixture.write(FIRST, 0o640);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert!(
+        retired,
+        "the verified pre-apply conflict left a restore marker"
+    );
+    assert!(!marker.exists());
+    assert_eq!(fs::read(fixture.active()).unwrap(), REMOTE_EDIT);
     assert_eq!(seed.tip(&remote, REF), tip);
 }
 
@@ -1608,6 +1847,9 @@ exec "$FIXTURE_MISE" "$@"
     assert!(fixture.store().join("dots-restore-pending").is_file());
     assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
     assert_eq!(fixture.tip(&remote, REF), initial);
+    let backup = fixture.dots(&["backup"], &remote).output().unwrap();
+    assert_eq!(backup.status.code(), Some(1), "{}", messages(&backup));
+    assert!(messages(&backup).contains("rerun dots restore before saving history"));
     ok(&mut fixture.dots(&["restore"], &remote));
     assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
     assert!(!fixture.store().join("dots-restore-pending").exists());

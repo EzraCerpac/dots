@@ -403,6 +403,10 @@ pub(super) mod tests {
         static BEFORE_REPLACE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     }
 
+    pub(in crate::packages) fn on_next_exchange(action: impl FnOnce() + 'static) {
+        BEFORE_REPLACE.set(Some(Box::new(action)));
+    }
+
     pub(in crate::packages) fn before_config_replace() {
         if let Some(before_replace) = BEFORE_REPLACE.take() {
             before_replace();
@@ -417,9 +421,9 @@ pub(super) mod tests {
         let mut edit = Edit::open(&path).unwrap();
         put(&mut edit.doc.document, TOOLS, "new", toml_edit::value(2)).unwrap();
         let destination = path.clone();
-        BEFORE_REPLACE.set(Some(Box::new(move || {
+        on_next_exchange(move || {
             fs::write(destination, "# later edit\n").unwrap();
-        })));
+        });
         assert!(edit.install().is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "# later edit\n");
     }

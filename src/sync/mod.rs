@@ -109,7 +109,7 @@ fn protected_shape_problem(shape: &CheckoutShape) -> Option<Note> {
         Some(Note::new("Sync stopped in a JJ workspace", GUIDE))
     } else if shape.legacy_sync {
         Some(Note::new(
-            "Sync found pre-1.0 source state in .git/dots-dev.json",
+            "Sync found source state from dots 0.4.0 or earlier in .git/dots-dev.json",
             GUIDE,
         ))
     } else if shape.head.is_none() || !shape.has_commit {

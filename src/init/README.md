@@ -227,7 +227,8 @@ post-dotfiles = '"$(command -v mise || echo "$HOME/.local/bin/mise")" x github:E
 
 `retired-declarations` is for a `[dotfiles.NAME]` table that a setup script once wrote into machines' `config.local.toml` or `config.host-*.toml`, whose source this configuration has since removed.
 Such a table would make every `dots sync` on those machines reject the configuration.
-Rows are `dotfiles.NAME<TAB>SOURCE`, with `SOURCE` a plain relative path without `.`, `..` or empty parts; other rows are ignored.
+Rows are `dotfiles.NAME<TAB>SOURCE`, with `SOURCE` a plain relative path without backslashes, `.`, `..` or empty parts.
+Other rows are ignored.
 Add the row in the same commit that removes the source.
 
 Before validating a merged configuration, sync validates it with each machine-local file's matching tables taken out.

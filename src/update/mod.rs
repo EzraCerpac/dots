@@ -85,7 +85,8 @@ fn update(run: &Run<'_>, mas: bool) {
         run.skip("Sync configuration (no remote configured)");
     } else {
         step(run, "Sync configuration", |id| {
-            sync_configuration(run, id, source)
+            let receipt = sync::run(run, id, source, receipt::Display::Embedded);
+            Ok(record_sync_receipt(run, id, receipt))
         });
     }
 
@@ -194,11 +195,6 @@ fn checkpoint(ctx: &Ctx, run: &Run<'_>, id: StageId) -> Step {
         Checkpoint::Saved => Ok(Outcome::Completed),
         Checkpoint::NothingTracked => Ok(Outcome::Skipped),
     }
-}
-
-fn sync_configuration(run: &Run<'_>, id: StageId, source: sync::Loaded) -> Step {
-    let receipt = sync::run(run, id, source, receipt::Display::Embedded);
-    Ok(record_sync_receipt(run, id, receipt))
 }
 
 fn record_sync_receipt(run: &Run<'_>, id: StageId, receipt: Receipt) -> Outcome {

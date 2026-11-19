@@ -272,13 +272,33 @@ fn assert_kept(local: &str, rows: &str, keep_source: bool) {
     assert_kept_with_source(local, rows, keep_source, None);
 }
 
+fn has_exact_file_name(path: &Path) -> bool {
+    let mut entries = match fs::read_dir(path.parent().unwrap()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("could not inspect fixture source {path:?}: {error}"),
+    };
+    let name = path.file_name().unwrap();
+    // A path lookup can resolve a differently spelled entry on macOS.
+    entries.any(|entry| {
+        let entry = entry.unwrap();
+        entry.file_name() == name && entry.file_type().unwrap().is_file()
+    })
+}
+
 fn assert_kept_with_source(local: &str, rows: &str, keep_source: bool, extra_source: Option<&str>) {
     let fixture = Retirement::with_source(rows, keep_source, extra_source);
     fixture.set_local(local);
     fixture.sync();
     fixture.assert_advanced();
     fixture.assert_local(local);
-    assert_eq!(fixture.root.join(SOURCE).is_file(), keep_source);
+    assert_eq!(has_exact_file_name(&fixture.root.join(SOURCE)), keep_source);
+    if let Some(source) = extra_source {
+        assert!(
+            has_exact_file_name(&fixture.root.join(source)),
+            "missing fixture source with exact spelling {source:?}"
+        );
+    }
 }
 
 #[test]

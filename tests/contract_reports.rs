@@ -109,9 +109,12 @@ fn git(world: &World, args: &[&str]) -> String {
 }
 
 fn sync_checkout(world: &World) -> PathBuf {
+    git(world, &["init", "-q", "-b", "main"]);
+    let origin = world.bare_remote("origin");
+    let setting = world.set_source_origin(&origin, "fixture/config");
     fs::write(
         world.root().join("config.toml"),
-        "[vars]\ndots_profiles = \"laptop server\"\ndots_source_repo = \"fixture/config\"\n",
+        format!("[vars]\ndots_profiles = \"laptop server\"\ndots_source_repo = {setting:?}\n"),
     )
     .unwrap();
     fs::write(
@@ -120,27 +123,14 @@ fn sync_checkout(world: &World) -> PathBuf {
     )
     .unwrap();
     let editor = world.root().join("editor.ini");
-    let origin = world.bare_remote("origin");
-    let url = "https://github.com/fixture/config";
-    git(world, &["init", "-q", "-b", "main"]);
     git(world, &["add", "."]);
     git(world, &["commit", "-qm", "base"]);
-    git(world, &["remote", "add", "origin", url]);
-    git(
-        world,
-        &[
-            "config",
-            &format!("url.{}.insteadOf", origin.display()),
-            url,
-        ],
-    );
     git(world, &["switch", "-qc", "dev"]);
     git(world, &["push", "-q", "origin", "main", "dev"]);
     editor
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_standalone_sync_outside_git_reports_the_problem_and_exits_zero() {
     let world = World::new();
     let output = dots(&world).arg("sync").output().unwrap();
@@ -160,6 +150,7 @@ fn assert_no_repository(message: &str) {
         [
             "not a git repository",
             "not in a git repository",
+            "outside a git repository",
             "no git repository"
         ]
         .iter()
@@ -261,7 +252,6 @@ fn new_valid_sync_reports_an_unusable_root_without_saving() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_piped_sync_replays_metadata_without_syncing() {
     let world = World::new();
     let editor = sync_checkout(&world);

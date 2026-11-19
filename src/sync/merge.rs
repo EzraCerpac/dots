@@ -232,6 +232,9 @@ mod tests {
     fn cr12_published_rename_preserves_the_published_file_at_its_path() {
         let (_world, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
         let root = git.root();
         fs::create_dir(root.join("old")).unwrap();
         fs::write(

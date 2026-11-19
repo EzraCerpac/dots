@@ -636,6 +636,9 @@ path = '^(Side|Merge) marker\.txt$'
     fn cr13_snapshot_includes_an_ignored_public_file_tracked_in_the_real_index() {
         let (_world, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
         let root = git.root();
         fs::write(root.join(".gitignore"), "/forced\n/config.local.toml\n").unwrap();
         git.get(["add", ".gitignore"]).unwrap();

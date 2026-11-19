@@ -2229,6 +2229,7 @@ fn new_sync_selects_dev_from_a_clean_main_clone() {
     f.write(&clone, "untracked", "keep local work\n");
     let refusal = f.sync(&clone);
     has(&refusal, "Git HEAD on a dev branch");
+    absent(&refusal, "Switched this checkout from main to dev");
     assert_eq!(f.dev_or_head(&clone), main);
     assert_eq!(read(&clone.join("untracked")), "keep local work\n");
     assert_eq!(f.remote(), dev);
@@ -2241,11 +2242,51 @@ fn new_sync_selects_dev_from_a_clean_main_clone() {
     f.git(&clone, &["branch", "-d", "dev"]);
     let receipt = f.sync(&clone);
     has(&receipt, "dev up to date");
+    assert_eq!(
+        receipt
+            .matches("Switched this checkout from main to dev")
+            .count(),
+        1
+    );
+    has(&f.replay(&clone), "Switched this checkout from main to dev");
+    absent(&f.sync(&clone), "Switched this checkout from main to dev");
     assert_eq!(f.git(&clone, &["branch", "--show-current"]), "dev");
     assert_eq!(f.tip(&clone), dev);
     assert_eq!(f.git(&clone, &["rev-parse", "main"]), main);
     assert_eq!(read(&clone.join("from-dev")), "published on dev\n");
     f.clean(&clone);
+}
+
+#[test]
+fn new_sync_keeps_main_when_dev_removes_the_saved_profile() {
+    let f = Repo::new();
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    let main = f.dev_or_head(&f.a);
+    let invalid = f.publish(
+        "config.toml",
+        f.config.replace("laptop selected", "selected"),
+    );
+    f.git(&f.a, &["fetch", "origin"]);
+    let local = "[env]\nSETUP_PROFILE = 'laptop'\nSETUP_MACHINE_ID = 'fixture'\n";
+    f.write(&f.a, "config.local.toml", local);
+    f.clean(&f.a);
+    let receipt = dots_zero(
+        f.dots(&f.a, &["--plain", "sync"])
+            .env_remove("SETUP_PROFILE"),
+    );
+    assert_eq!(
+        f.git(&f.a, &["branch", "--show-current"]),
+        "main",
+        "{receipt}"
+    );
+    assert_eq!(f.dev_or_head(&f.a), main);
+    assert_eq!(read(&f.a.join("config.toml")), f.config);
+    assert_eq!(read(&f.a.join("config.local.toml")), local);
+    assert_eq!(f.remote(), invalid);
+    f.clean(&f.a);
+    has(&receipt, "configuration failed validation");
+    absent(&receipt, "Switched this checkout from main to dev");
 }
 
 #[test]
@@ -2255,8 +2296,39 @@ fn new_sync_creates_dev_when_origin_only_has_main() {
     f.git(&f.a, &["switch", "main"]);
     f.git(&f.a, &["branch", "-d", "dev"]);
     f.git(&f.a, &["update-ref", "-d", "refs/remotes/origin/dev"]);
+    let main = f.dev_or_head(&f.a);
+    let concurrent = f.git(
+        &f.a,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "Concurrent main commit",
+        ],
+    );
+    let marker = sh(&f.scratch.join("main-changed-during-validation"));
+    let hook = f.validation_hook(&format!(
+        "if [ ! -e {marker} ]; then\n  git -C {} update-ref refs/heads/main {concurrent} {main}\n  touch {marker}\nfi",
+        sh(&f.a)
+    ));
+    let stopped = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
+    has(&stopped, "Source checkout changed before switching to dev");
+    absent(&stopped, "Switched this checkout from main to dev");
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "main");
+    assert_eq!(f.dev_or_head(&f.a), concurrent);
+    assert_eq!(f.git(&f.a, &["branch", "--list", "dev"]), "");
+    f.clean(&f.a);
+    f.git(&f.a, &["update-ref", "refs/heads/main", &main, &concurrent]);
     let receipt = f.sync(&f.a);
     has(&receipt, "pushed dev");
+    assert_eq!(
+        receipt
+            .matches("Switched this checkout from main to dev")
+            .count(),
+        1
+    );
     assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "dev");
     assert_eq!(f.tip(&f.a), f.git(&f.origin, &["rev-parse", "main"]));
     assert_eq!(f.remote(), f.tip(&f.a));
@@ -4799,4 +4871,56 @@ fn new_flagged_adopted_file_stays_local_with_its_declaration() {
     has(&f.blob("dev", declaring), "dotfiles/withheld.txt");
     assert_eq!(f.blob("dev", "dotfiles/withheld.txt"), "safe replacement");
     f.clean(&f.a);
+}
+
+#[test]
+fn new_flagged_copy_declaration_stays_local_while_other_edits_share() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let config = format!(
+        "{}\n[dotfiles]\n'~/.copy-target' = {{ source = './copy-source', mode = 'copy' }}\n'~/.allowed-copy' = {{ source = 'fine', mode = 'copy' }}\n",
+        f.config
+    );
+    f.write(&f.a, "config.toml", &config);
+    f.write(&f.a, "copy-source", "FIXTURE_SCAN_MATCH\n");
+    f.write(&f.a, "fine", "allowed content\n");
+    let live = f.sync(&f.a);
+    has(&live, "pushed dev");
+    has(&live, "gitleaks flagged");
+    has(&live, "copy-source:1");
+    absent(&live, "FIXTURE_SCAN_MATCH");
+    assert_eq!(f.blob("dev", "fine"), "allowed content");
+    absent(&f.tree(), "copy-source");
+    let shared = f.blob("dev", "config.toml");
+    absent(&shared, "copy-target");
+    has(&shared, "allowed-copy");
+    assert_eq!(read(&f.a.join("config.toml")), config);
+    assert_eq!(read(&f.a.join("copy-source")), "FIXTURE_SCAN_MATCH\n");
+    assert!(!f.world.home().join(".copy-target").exists());
+}
+
+#[test]
+fn new_sync_reports_the_runtime_mise_version_error_once() {
+    let f = Repo::new();
+    script(&f.mise, "printf '2026.11.7\\n'");
+    let output = finish(
+        f.dots(&f.a, &["mise", "config", "ls"])
+            .env_remove("SETUP_PROFILE"),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let error = std::str::from_utf8(&output.stderr)
+        .unwrap()
+        .trim()
+        .trim_start_matches("dots: ");
+    has(error, "2026.11.7");
+    has(error, env!("DOTS_MINIMUM_MISE"));
+    for branch in ["dev", "main"] {
+        f.git(&f.a, &["switch", branch]);
+        let live = f.sync(&f.a);
+        assert_eq!(live.matches(error).count(), 1, "{live}");
+        assert_eq!(f.replay(&f.a).matches(error).count(), 1);
+        absent(&live, "Switched this checkout from main to dev");
+        assert_eq!(f.git(&f.a, &["branch", "--show-current"]), branch);
+    }
 }

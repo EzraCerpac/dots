@@ -1,61 +1,83 @@
 use std::io;
 use std::process::Output;
 
-use crate::{Fail, run::Outcome};
+use crate::run::Outcome;
 
-use super::git::Git;
+use super::git::{Git, oid};
 
-pub(crate) fn select_dev(
-    mut git: impl FnMut(&[&str]) -> Result<Output, Fail>,
-    validate_origin: impl FnOnce() -> Result<(), Fail>,
-) -> Result<Outcome, Fail> {
-    let branch = git(&["symbolic-ref", "--quiet", "HEAD"])?;
-    if !branch.status.success() || branch.stdout != b"refs/heads/main\n" {
+pub(crate) fn select_dev<G, E>(
+    mut git: G,
+    validate: impl FnOnce(&str, &str) -> Result<(), E>,
+    failure: impl Fn(&'static str) -> E,
+) -> Result<Outcome, E>
+where
+    G: FnMut(&[&str]) -> Result<Output, E>,
+{
+    let on_branch = |git: &mut G, expected: &[u8]| {
+        let branch = git(&["symbolic-ref", "--quiet", "HEAD"])?;
+        Ok(branch.status.success() && branch.stdout == expected)
+    };
+    if !on_branch(&mut git, b"refs/heads/main\n")? {
         return Ok(Outcome::Skipped);
     }
-    let mut reference = |name| {
+    let reference = |git: &mut G, name| {
         let output = git(&["rev-parse", "--verify", "--quiet", name])?;
         match output.status.code() {
-            Some(0) => Ok(Some(output.stdout)),
+            Some(0) => oid(output.stdout.trim_ascii())
+                .map(Some)
+                .map_err(|_| failure("could not verify a source revision")),
             Some(1) => Ok(None),
-            _ => Err(Fail::new(1, "could not inspect source refs")),
+            _ => Err(failure("could not inspect source refs")),
         }
     };
-    let Some(head) = reference("HEAD")? else {
+    let Some(head) = reference(&mut git, "HEAD")? else {
         return Ok(Outcome::Skipped);
     };
-    if reference("refs/remotes/origin/main")?.as_ref() != Some(&head) {
+    if reference(&mut git, "refs/remotes/origin/main")?.as_ref() != Some(&head) {
         return Ok(Outcome::Skipped);
     }
-    let dev = match (
-        reference("refs/heads/dev")?,
-        reference("refs/remotes/origin/dev")?,
-    ) {
+    let local = reference(&mut git, "refs/heads/dev")?;
+    let remote = reference(&mut git, "refs/remotes/origin/dev")?;
+    let candidate = local.as_deref().or(remote.as_deref()).unwrap_or(&head);
+    let start = format!("{candidate}^{{commit}}");
+    let dev = match (&local, &remote) {
         (Some(local), Some(remote)) if local == remote => &["dev"][..],
-        (Some(local), None) if local == head => &["dev"],
+        (Some(local), None) if local == &head => &["dev"],
         (Some(_), _) => return Ok(Outcome::Skipped),
         (None, Some(_)) => &["--track", "-c", "dev", "refs/remotes/origin/dev"],
-        (None, None) => &["-c", "dev"],
+        (None, None) => &["-c", "dev", &start],
     };
-    let status = git(&["status", "--porcelain", "--untracked-files=all"])?;
-    if !status.status.success() {
-        return Err(Fail::new(
-            1,
-            "could not check the source checkout for local edits",
-        ));
-    }
-    if !status.stdout.is_empty() {
+    let clean = |git: &mut G| {
+        let status = git(&["status", "--porcelain", "--untracked-files=all"])?;
+        if !status.status.success() {
+            return Err(failure(
+                "could not check the source checkout for local edits",
+            ));
+        }
+        Ok(status.stdout.is_empty())
+    };
+    if !clean(&mut git)? {
         return Ok(Outcome::Skipped);
     }
-    // A normal switch may run a checkout hook. Verify origin before invoking it.
-    validate_origin()?;
+    validate(&head, candidate)?;
+    if !clean(&mut git)?
+        || !on_branch(&mut git, b"refs/heads/main\n")?
+        || reference(&mut git, "HEAD")?.as_ref() != Some(&head)
+        || reference(&mut git, "refs/remotes/origin/main")?.as_ref() != Some(&head)
+        || reference(&mut git, "refs/heads/dev")? != local
+        || reference(&mut git, "refs/remotes/origin/dev")? != remote
+    {
+        return Err(failure("Source checkout changed before switching to dev"));
+    }
     let mut args = vec!["switch", "--quiet", "--no-guess", "--no-overwrite-ignore"];
     args.extend_from_slice(dev);
     if !git(&args)?.status.success() {
-        return Err(Fail::new(
-            1,
-            "could not switch the clean source checkout to dev",
-        ));
+        return Err(failure("could not switch the clean source checkout to dev"));
+    }
+    if !on_branch(&mut git, b"refs/heads/dev\n")?
+        || reference(&mut git, "HEAD")?.as_deref() != Some(candidate)
+    {
+        return Err(failure("dev does not match the verified source revision"));
     }
     Ok(Outcome::Completed)
 }

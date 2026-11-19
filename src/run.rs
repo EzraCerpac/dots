@@ -165,7 +165,7 @@ impl<'a> Run<'a> {
 
     pub(crate) fn tool(&self, name: &str) -> std::path::PathBuf {
         self.tool_with(name, |args| {
-            crate::process::Mise::new(self.ctx())?.command_active(args)
+            crate::process::Mise::new_in_run(self)?.command_active(args)
         })
     }
 

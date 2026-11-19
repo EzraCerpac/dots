@@ -1,10 +1,12 @@
+use std::collections::{HashMap, hash_map::Entry};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -14,6 +16,9 @@ use super::{Cwd, HOOK_ENV, is_executable, stage_argv};
 use crate::config::selection::{self, Selection};
 use crate::run::Run;
 use crate::{Ctx, Env, Fail};
+
+#[cfg(test)]
+mod tests;
 
 pub struct Mise<'a> {
     ctx: &'a Ctx,
@@ -28,7 +33,21 @@ impl<'a> Mise<'a> {
     }
 
     pub fn with_selection(ctx: &'a Ctx, selected: Selection) -> Result<Self, Fail> {
-        let binary = require_mise(&ctx.env)?;
+        Self::prepare(ctx, selected, None)
+    }
+
+    pub(crate) fn new_in_run(run: &Run<'a>) -> Result<Self, Fail> {
+        let ctx = run.ctx();
+        let selected = selection::read(&ctx.root, &ctx.env)?;
+        Self::with_selection_in_run(run, selected)
+    }
+
+    pub(crate) fn with_selection_in_run(run: &Run<'a>, selected: Selection) -> Result<Self, Fail> {
+        Self::prepare(run.ctx(), selected, Some(run))
+    }
+
+    fn prepare(ctx: &'a Ctx, selected: Selection, run: Option<&Run<'_>>) -> Result<Self, Fail> {
+        let binary = require_mise_with(&ctx.env, run)?;
         Ok(Self {
             ctx,
             binary,
@@ -311,6 +330,17 @@ pub(crate) fn mise_binary(env: &Env) -> Result<PathBuf, Fail> {
 
 const MINIMUM_MISE: &str = env!("DOTS_MINIMUM_MISE");
 
+#[derive(Eq, Hash, PartialEq)]
+struct MiseFile {
+    device: u64,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+// Cache the too-old version, or the absence of one, across all Mise instances.
+static VERSION_CHECKS: LazyLock<Mutex<HashMap<MiseFile, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn version_number(version: &str) -> Option<([u32; 3], bool)> {
     if !version
         .bytes()
@@ -341,24 +371,28 @@ fn reported_version(stdout: &str) -> Option<&str> {
 }
 
 pub(crate) fn require_mise(env: &Env) -> Result<PathBuf, Fail> {
+    require_mise_with(env, None)
+}
+
+fn require_mise_with(env: &Env, run: Option<&Run<'_>>) -> Result<PathBuf, Fail> {
     let binary = mise_binary(env)?;
-    let output = Command::new(&binary)
-        .current_dir(env.cwd())
-        .env_clear()
-        .envs(&env.vars)
-        .env_remove("MISE_LOG_FILE")
-        .env("MISE_OFFLINE", "1")
-        .env("MISE_SELF_UPDATE_AUTO", "0")
-        .stdin(Stdio::null())
-        .arg("--version")
-        .output();
-    if let Ok(output) = output
-        && output.status.success()
-        && let Ok(stdout) = std::str::from_utf8(&output.stdout)
-        && let Some(found) = reported_version(stdout)
-        && let Some(version) = version_number(found)
-        && version < version_number(MINIMUM_MISE).expect("valid minimum_mise in install.sh")
-    {
+    let metadata = binary.metadata().map_err(|error| {
+        Fail::usage(format!(
+            "could not inspect mise executable {binary:?}: {error}"
+        ))
+    })?;
+    // Follow symlinks, but recheck a replacement or in-place update.
+    let file = MiseFile {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    };
+    let mut checks = VERSION_CHECKS.lock().expect("mise version cache poisoned");
+    let old_version = match checks.entry(file) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(probe_old_version(&binary, env, run)?),
+    };
+    if let Some(found) = old_version {
         // This also works with an older package-managed mise still on PATH.
         let select = if env.get("DOTS_MISE_BIN").is_some() {
             " && unset DOTS_MISE_BIN"
@@ -366,10 +400,43 @@ pub(crate) fn require_mise(env: &Env) -> Result<PathBuf, Fail> {
             ""
         };
         return Err(Fail::usage(format!(
-            "mise {found} is too old (requires {MINIMUM_MISE} or newer); update with `curl -fsSL https://mise.run | MISE_VERSION=v{MINIMUM_MISE} MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh{select}`."
+            "mise {found} is too old (executable {binary:?}, requires {MINIMUM_MISE} or newer); update with `curl -fsSL https://mise.run | MISE_VERSION=v{MINIMUM_MISE} MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh{select}`."
         )));
     }
     Ok(binary)
+}
+
+fn probe_old_version(
+    binary: &Path,
+    env: &Env,
+    run: Option<&Run<'_>>,
+) -> Result<Option<String>, Fail> {
+    let mut command = Command::new(binary);
+    command
+        .current_dir(env.cwd())
+        .env_clear()
+        .envs(&env.vars)
+        .env_remove("MISE_LOG_FILE")
+        .env("MISE_OFFLINE", "1")
+        .env("MISE_SELF_UPDATE_AUTO", "0")
+        .arg("--version");
+    let output = match run {
+        Some(run) => run.probe(command),
+        None => command.stdin(Stdio::null()).output(),
+    };
+    if run.is_some_and(Run::cancelled) {
+        return Err(Fail::new(130, "mise version check was cancelled"));
+    }
+    if let Ok(output) = output
+        && output.status.success()
+        && let Ok(stdout) = std::str::from_utf8(&output.stdout)
+        && let Some(found) = reported_version(stdout)
+        && let Some(version) = version_number(found)
+        && version < version_number(MINIMUM_MISE).expect("valid minimum_mise in install.sh")
+    {
+        return Ok(Some(found.to_owned()));
+    }
+    Ok(None)
 }
 
 pub(crate) fn quiet_probe(binary: &Path, root: &Path, scratch: &Path, env: &Env) -> Command {

@@ -33,9 +33,9 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     } else {
         println!("kept configuration directory {}", root.display());
     }
-    if args.get_one::<OsString>("DIR").is_some()
-        && !Root::resolve(&ctx.env).is_ok_and(|ambient| root == ambient.path())
-    {
+    let outside_active_root = args.get_one::<OsString>("DIR").is_some()
+        && !Root::resolve(&ctx.env).is_ok_and(|ambient| root == ambient.path());
+    if outside_active_root {
         println!("This directory is outside the active configuration root.");
     }
     files::scaffold(root)?;
@@ -111,7 +111,11 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         checkout::advise(&git)?;
     }
     remote::configure(&git, vars.source_repo.as_ref(), created_seed)?;
-    println!("Next: dots up");
+    if outside_active_root {
+        command_line("Next: DOTS_ROOT=", root, " dots up")?;
+    } else {
+        println!("Next: dots up");
+    }
     Ok(0)
 }
 

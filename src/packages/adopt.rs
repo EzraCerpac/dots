@@ -449,6 +449,20 @@ pub struct Adoption {
     original: Option<Entry>,
 }
 
+fn is_credential_path(key: &str) -> bool {
+    matches!(
+        key,
+        "~/.netrc"
+            | "~/.git-credentials"
+            | "~/.aws/credentials"
+            | "~/.config/gh/hosts.yml"
+            | "~/.docker/config.json"
+            | "~/.pgpass"
+    ) || key
+        .strip_prefix("~/.ssh/id_")
+        .is_some_and(|name| !name.contains('/') && !name.ends_with(".pub"))
+}
+
 pub fn prepare_add(
     ctx: &Ctx,
     run: &Run<'_>,
@@ -458,6 +472,12 @@ pub fn prepare_add(
     if has_template_opener(&paths.key) {
         return Err(Fail::usage(format!(
             "Cannot adopt {:?} because template openers make the dotfile declaration unreadable.",
+            paths.key
+        )));
+    }
+    if is_credential_path(&paths.key) {
+        return Err(Fail::usage(format!(
+            "Use encrypted bootstrap bundles for {:?} because it is a credential path.",
             paths.key
         )));
     }

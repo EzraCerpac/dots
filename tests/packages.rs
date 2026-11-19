@@ -1506,6 +1506,70 @@ fn new_file_adoption_refuses_template_openers_before_mutation() {
 }
 
 #[test]
+fn new_file_adoption_refuses_credential_paths_before_mutation() {
+    let world = fixture("");
+    let config = world.root().join("config.toml");
+    let before = fs::read(&config).unwrap();
+    let dotfiles = world.root().join("dotfiles");
+    let allowed = [
+        ".ssh/id_ed25519.pub",
+        "examples/.netrc",
+        ".ssh/id_dir/settings",
+    ]
+    .map(|relative| world.home().join(relative));
+    for target in &allowed {
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, "fixture").unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    for relative in [
+        ".netrc",
+        ".git-credentials",
+        ".aws/credentials",
+        ".ssh/id_ed25519",
+        ".ssh/id_rsa.pub.bak",
+        ".config/gh/hosts.yml",
+        ".docker/config.json",
+        ".pgpass",
+    ] {
+        let target = world.home().join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "fixture").unwrap();
+        let error = failed(
+            dots(&world)
+                .args(["add", "--base"])
+                .args([&allowed[0], &target])
+                .output()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(
+            error.contains(relative) && error.contains("bootstrap bundles"),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(&target).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"fixture");
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!dotfiles.join(relative).exists());
+        assert!(!dotfiles.join(".ssh/id_ed25519.pub").exists());
+    }
+
+    success(
+        dots(&world)
+            .args(["add", "--base"])
+            .args(&allowed)
+            .output()
+            .unwrap(),
+    );
+    for target in allowed {
+        assert!(target.is_symlink());
+        assert_eq!(fs::read(target).unwrap(), b"fixture");
+    }
+}
+
+#[test]
 fn new_file_adoption_refuses_a_variant_target_in_a_host_file() {
     let world = fixture("");
     let config = world.root().join("config.toml");

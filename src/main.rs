@@ -4,6 +4,9 @@ fn main() -> ExitCode {
     if let Some(status) = dots_cli::supervisor::terminal_observer(std::env::args_os()) {
         return status.into();
     }
+    if let Some(status) = dots_cli::supervisor::output_writer(std::env::args_os()) {
+        return status.into();
+    }
     match dots_cli::cli::run(std::env::args_os().collect()) {
         Ok(status) => status.into(),
         Err(error) => {

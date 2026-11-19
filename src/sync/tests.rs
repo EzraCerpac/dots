@@ -56,7 +56,6 @@ fn isolated(world: &Path, program: impl AsRef<std::ffi::OsStr>) -> Command {
         ("GIT_CONFIG_SYSTEM", "system.gitconfig"),
         ("GIT_CEILING_DIRECTORIES", ""),
         ("GIT_TEMPLATE_DIR", "git-template"),
-        ("JJ_CONFIG", "jj"),
         ("TMPDIR", "tmp"),
         ("DOTS_ROOT", "checkout"),
     ] {
@@ -85,7 +84,7 @@ fn require_shared_sync_tools(world: &Path) {
 fn git_fixture_with_format(format: &str) -> (tempfile::TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let world = tmp.path().canonicalize().unwrap();
-    for directory in ["home", "checkout", "tmp", "jj", "git-template"] {
+    for directory in ["home", "checkout", "tmp", "git-template"] {
         fs::create_dir(world.join(directory)).unwrap();
     }
     fs::write(
@@ -904,6 +903,88 @@ fn create_only_sources_and_existing_targets_are_preserved() {
 }
 
 #[test]
+fn cr18_retirement_refuses_a_late_public_declaration() {
+    use crate::run::{Run, Sink};
+    let (_fixture, ctx) = shared_mise_fixture("");
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    let local = b"[dotfiles.example]\nsource = 'templates/retired'\n";
+    fs::write(root.join("config.local.toml"), local).unwrap();
+    fs::create_dir_all(root.join("dots")).unwrap();
+    fs::write(
+        root.join("dots/retired-declarations"),
+        "dotfiles.example\ttemplates/retired\n",
+    )
+    .unwrap();
+    git.get(["add", "."]).unwrap();
+    let revision = fixture_commit(&git, "plan the unique retirement");
+    let run = Run::begin(&ctx, Sink::Unreported);
+    let scratch = super::snapshot::Scratch::new(&git, &root.join(".git")).unwrap();
+    let tree = git.tree(&revision).unwrap();
+    let validated = super::validation::validate(&run, &scratch, &revision, &tree, &tree).unwrap();
+    assert_eq!(validated.retired.len(), 1);
+    assert!(validated.pre_install_inputs_unchanged(root).unwrap());
+    assert!(validated.retirement_inputs_unchanged(root).unwrap());
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("config.toml"))
+        .unwrap()
+        .write_all(b"\n[dotfiles.example]\nsource = 'templates/retired'\n")
+        .unwrap();
+    assert!(!validated.pre_install_inputs_unchanged(root).unwrap());
+    assert!(!validated.retirement_inputs_unchanged(root).unwrap());
+    assert_eq!(fs::read(root.join("config.local.toml")).unwrap(), local);
+    let _ = run.end(0);
+}
+
+#[test]
+fn cr18_retirement_follows_the_approved_incoming_public_config() {
+    let (_fixture, ctx) = shared_mise_fixture("");
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    let config = root.join("config.toml");
+    let local = root.join("config.local.toml");
+    let original = b"[dotfiles.example]\nsource = 'templates/retired'\nmode = 'template'\nvariants = [{ target = '~/.retired-fixture' }]\n";
+    fs::write(&local, original).unwrap();
+    fs::create_dir(root.join("templates")).unwrap();
+    fs::write(root.join("templates/retired"), b"previous source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    let before = fixture_commit(&git, "original public config");
+    git.get(["push", "origin", "dev"]).unwrap();
+
+    git.get(["switch", "-qc", "peer"]).unwrap();
+    let incoming = b"[vars]\ndots_profiles = 'default'\n# approved incoming settings\n";
+    fs::write(&config, incoming).unwrap();
+    git.get(["rm", "templates/retired"]).unwrap();
+    fs::create_dir(root.join("dots")).unwrap();
+    fs::write(
+        root.join("dots/retired-declarations"),
+        "dotfiles.example\ttemplates/retired\n",
+    )
+    .unwrap();
+    git.get(["add", "."]).unwrap();
+    let after = fixture_commit(&git, "replace public config and retire obsolete source");
+    git.get(["push", "origin", "peer:dev"]).unwrap();
+    git.get(["switch", "-q", "dev"]).unwrap();
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(fs::read(&local).unwrap(), original);
+    assert_ne!(fs::read(&config).unwrap(), incoming);
+
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    assert_eq!(fs::read(config).unwrap(), incoming);
+    assert!(fs::read(local).unwrap().is_empty());
+    assert!(
+        receipt
+            .recovery_files
+            .iter()
+            .any(|file| fs::read(file).is_ok_and(|bytes| bytes == original))
+    );
+}
+
+#[test]
 fn a_flagged_live_source_is_never_deployed() {
     let (fixture, ctx) =
         shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");
@@ -1394,6 +1475,63 @@ fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_recei
 }
 
 #[test]
+fn cutover_local_only_quotes_the_checkout_in_its_remote_command() {
+    let mut receipt = crate::receipt::Receipt::new(Some("/tmp/config's root".into()), "");
+    super::local_only(&mut receipt);
+    assert!(
+        receipt
+            .outcome
+            .contains("git -C '/tmp/config'\\''s root' remote add origin URL"),
+        "{}",
+        receipt.outcome
+    );
+    assert!(receipt.local_only);
+}
+
+#[test]
+fn cutover_concurrent_staging_before_checkout_reports_not_saved() {
+    let (fixture, ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let git = Git::new(&ctx, ctx.root.path());
+    let before = fixture_commit(&git, "before");
+    fs::write(git.root().join("candidate"), b"candidate").unwrap();
+    git.get(["add", "candidate"]).unwrap();
+    let after = fixture_commit(&git, "candidate");
+    git.get(["reset", "--hard", &before]).unwrap();
+    let dir = git.root().join(".git");
+    super::checkout::begin(
+        &git,
+        &dir,
+        &super::checkout::index_snapshot(&dir).unwrap(),
+        &before,
+        &after,
+        false,
+    )
+    .unwrap();
+    fs::write(git.root().join("staged"), b"competing stage").unwrap();
+    git.get(["add", "staged"]).unwrap();
+    let snapshot = super::checkout::index_snapshot(&dir).unwrap();
+    for mode in ["1", "replay"] {
+        let child = isolated(&world, std::env::current_exe().unwrap())
+            .env(RECEIPT_CHILD, mode)
+            .args([
+                "--exact",
+                "sync::tests::receipt_save_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        let receipt = String::from_utf8(child.stdout).unwrap();
+        assert!(receipt.contains("Not saved"), "{receipt}");
+        assert!(!receipt.contains("pending checkout"), "{receipt}");
+    }
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(super::checkout::index_snapshot(&dir).unwrap(), snapshot);
+    assert!(!super::checkout::has_pending(&dir));
+}
+
+#[test]
 fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
     use std::os::unix::fs::MetadataExt;
 
@@ -1472,7 +1610,24 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
             assert!(child.status.success(), "{child:?}");
             String::from_utf8(child.stdout).unwrap()
         };
-        for receipt in [cli("1"), cli("replay")] {
+        let live = cli("1");
+        let original = if conflict == "staged index" {
+            assert!(live.contains("Guarded checkout parked at"), "{live}");
+            assert!(!pending.exists());
+            let parked = live
+                .lines()
+                .filter_map(|line| line.strip_prefix("Recovery copy at "))
+                .map(Path::new)
+                .find(|path| path.ends_with("old-0"))
+                .expect("parked original");
+            assert!(parked.starts_with(&dir) && !parked.starts_with(&pending));
+            assert!(live.contains(&format!("{:?}", parked.parent().unwrap())));
+            assert!(parked.parent().unwrap().join("started").is_file());
+            parked.to_owned()
+        } else {
+            original
+        };
+        for receipt in [live, cli("replay")] {
             assert!(
                 receipt.contains(&format!("recorded revisions {before} to {after}")),
                 "{receipt}"
@@ -1481,9 +1636,10 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
                 receipt.contains("reconcile the index and checkout"),
                 "{receipt}"
             );
-            assert!(
+            assert_eq!(
                 receipt.contains("A guarded checkout is pending"),
-                "{receipt}"
+                conflict == "late file",
+                "{receipt}",
             );
             assert!(receipt.contains("rerun dots sync"), "{receipt}");
             assert_eq!(
@@ -1509,6 +1665,6 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
         assert_eq!(fs::read(&early).unwrap(), b"incoming alpha\n");
         assert_eq!(fs::read(&late).unwrap(), b"competing live contents\n");
         assert_eq!(fs::read(original).unwrap(), b"original alpha\n");
-        assert!(pending.join("started").is_file());
+        assert_eq!(pending.join("started").is_file(), conflict == "late file");
     }
 }

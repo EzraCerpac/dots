@@ -199,7 +199,7 @@ case "$*" in
         printf '{"entries":[],"invalid":[]}\n' ;;
     'bootstrap packages status --json'|'ls --current --json') printf '{}\n' ;;
     'config ls --json') printf '[{"path":"%s/config.toml"}]\n' "$DOTS_ROOT" ;;
-    install*|upgrade*) ;;
+    'bootstrap dotfiles apply --yes'|install*|upgrade*) ;;
     'self-update --help') ;;
     'self-update --yes --no-plugins') : > "${0%/*}/mise-self-update-ran" ;;
     which*) exit 1 ;;

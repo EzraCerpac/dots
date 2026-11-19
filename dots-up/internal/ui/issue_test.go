@@ -19,7 +19,7 @@ func syncAttention(t *testing.T) (Model, string) {
 		t.Fatal(err)
 	}
 	block := "dots sync: no local changes · pulled dev +1, main +0 · nothing to push\n" +
-		"  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply\n" +
+		"  APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots up\n" +
 		"    mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found\n"
 	if err := os.WriteFile(log, []byte(block), 0o600); err != nil {
 		t.Fatal(err)
@@ -28,9 +28,9 @@ func syncAttention(t *testing.T) (Model, string) {
 	m = send(m, Event{V: 1, Kind: "run_start", Host: "mac", Profile: "laptop"})
 	m = send(m, Event{V: 1, Kind: "stage_start", ID: "source-sync", Group: "Source & settings", Label: "Sync configuration", LogPath: log})
 	m = send(m, Event{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", LogPath: log,
-		Summary: "APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots apply",
+		Summary: "APPLY FAILED: mise bootstrap dotfiles apply (exit 1); fix the error below, then run dots up",
 		Detail:  "mise $ dots internal persist-selected\nmise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
-		Action:  "dots apply"})
+		Action:  "dots up"})
 	return m, log
 }
 
@@ -50,7 +50,7 @@ func TestIssueDetailsShowTheErrorTheLogAndTheNextStep(t *testing.T) {
 	for _, want := range []string{
 		"! Sync configuration — APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
 		"    mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
-		"    Next: dots apply",
+		"    Next: dots up",
 		"    Log: " + log,
 	} {
 		if !strings.Contains(m.lastLog, want) {
@@ -76,7 +76,7 @@ func TestNeedsAttentionListShowsTheErrorAndTheNextCommand(t *testing.T) {
 	m.refreshDetail()
 	events := []Event{
 		{V: 1, Kind: "stage_start", ID: "source-sync", Group: "Source & settings", Label: "Sync configuration"},
-		{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", Summary: m.Stages[0].Summary, Detail: m.Stages[0].Detail, Action: "dots apply"},
+		{V: 1, Kind: "stage_end", ID: "source-sync", Status: "attention", Summary: m.Stages[0].Summary, Detail: m.Stages[0].Detail, Action: "dots up"},
 		{V: 1, Kind: "notice", Stage: "source-sync", Severity: "attention", Summary: "LATE EDIT: config.toml not updated; rerun", Action: "dots sync"},
 		{V: 1, Kind: "run_end"},
 	}
@@ -85,7 +85,7 @@ func TestNeedsAttentionListShowsTheErrorAndTheNextCommand(t *testing.T) {
 			"Needs attention · 2",
 			"! Sync configuration — APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
 			"        mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found",
-			"        Next: dots apply",
+			"        Next: dots up",
 			"! Sync configuration — LATE EDIT: config.toml not updated; rerun",
 			"        Next: dots sync",
 		} {
@@ -104,7 +104,7 @@ func TestNarrowDashboardWrapsTheErrorInsteadOfCuttingIt(t *testing.T) {
 	m = send(m, Event{V: 1, Kind: "run_end"})
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 40})
 	content := updated.(Model).View().Content
-	if !strings.Contains(content, "@0.3.1 not found") || !strings.Contains(content, "Next: dots apply") {
+	if !strings.Contains(content, "@0.3.1 not found") || !strings.Contains(content, "Next: dots up") {
 		t.Fatalf("the error was cut:\n%s", content)
 	}
 }
@@ -182,7 +182,7 @@ func TestAnItemWithoutOutputDoesNotBorrowAnotherProblemsLog(t *testing.T) {
 		Summary: "SAVE REFUSED: history is not enrolled; nothing saved", Action: "dots sync"})
 	m = send(m, Event{V: 1, Kind: "notice", Stage: "source-sync", Severity: "attention",
 		Summary: "APPLY FAILED: mise bootstrap dotfiles apply (exit 1)",
-		Detail:  "mise ERROR pre-dotfiles hook failed", Action: "dots apply"})
+		Detail:  "mise ERROR pre-dotfiles hook failed", Action: "dots up"})
 	items := m.issues()
 	if len(items) != 2 {
 		t.Fatalf("issues = %d, want 2", len(items))

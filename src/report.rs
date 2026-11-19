@@ -29,11 +29,10 @@ pub enum Command {
     Bundle,
     Backup,
     Restore,
-    Publish,
 }
 
 impl Command {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::Status,
         Self::Plan,
         Self::Up,
@@ -47,7 +46,6 @@ impl Command {
         Self::Bundle,
         Self::Backup,
         Self::Restore,
-        Self::Publish,
     ];
 
     pub fn name(self) -> &'static str {
@@ -65,7 +63,6 @@ impl Command {
             Self::Bundle => "bundle",
             Self::Backup => "backup",
             Self::Restore => "restore",
-            Self::Publish => "publish",
         }
     }
 }

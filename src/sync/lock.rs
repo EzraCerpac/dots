@@ -5,7 +5,7 @@ use std::path::Path;
 
 use nix::libc;
 
-/// The source-operation lock shared by sync and publish.
+/// The source-operation lock shared by sync invocations in a Git repository.
 ///
 /// Keep the inode in place: removing it would let a second process lock a new
 /// inode while another participant still holds the original one.

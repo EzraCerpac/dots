@@ -58,7 +58,7 @@ jobs:
           curl -fsSL https://mise.run | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
-          tools=(node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest jq@latest)
+          tools=(node@latest python@3.13 uv@latest age@latest gitleaks@latest jq@latest)
           if [[ "$RUNNER_OS" == Linux ]]; then
             tools+=(github:fish-shell/fish-shell@latest)
           fi
@@ -71,7 +71,7 @@ jobs:
       - name: Tool versions
         run: |
           mise --version
-          for tool in node python3 uv jj age gitleaks jq fish zsh; do
+          for tool in node python3 uv age gitleaks jq fish zsh; do
             printf '%-8s %s\n' "$tool" "$(command -v "$tool" || echo missing)"
           done
 

@@ -29,12 +29,11 @@ type group struct {
 
 var builtinGroups = []group{
 	{"Inspect", []item{{"status", "Status", "Inspect machine setup", nil}, {"reports", "Reports", "Browse saved reports", nil}, {"last", "Last update report", "Open the saved update report", []string{"up", "--last"}}}},
-	{"Maintain", []item{{"up", "Update", "Sync configuration and update tools", nil}, {"sync", "Sync", "Fetch source and apply configuration", nil}, {"apply", "Apply files", "Apply all or selected dotfiles", nil}}},
+	{"Maintain", []item{{"up", "Update", "Sync configuration and update tools", nil}, {"sync", "Sync", "Fetch source and apply configuration", nil}}},
 	{"Software", []item{{"add", "Add", "Install and record software", nil}, {"remove", "Remove", "Remove declarations and optionally uninstall", nil}}},
 	{"Settings", []item{{"backup", "Backup", "Publish encrypted settings snapshots", nil}, {"restore", "Restore", "Restore private settings", nil}, {"atuin-login", "Atuin login", "Finish Atuin enrollment", nil}, {"atuin-bundle", "Atuin bundle", "Prepare an encrypted Atuin bundle", nil}}},
 	{"Setup", []item{{"bootstrap", "Bootstrap", "Install the full declared setup", nil}, {"remote", "Remote bootstrap", "Bootstrap a machine over SSH", nil}, {"bundle-create", "Create bundle", "Encrypt private bootstrap inputs", []string{"bundle", "create"}}, {"bundle-check", "Check bundle", "Validate an encrypted bundle", []string{"bundle", "check"}}}},
-	{"Development", []item{{"test", "Test", "Run repository test suites", nil}, {"publish", "Publish", "Review source and open or update a PR", nil}}},
-	{"Advanced", []item{{"plan", "Plan", "Preview the declared setup", nil}}},
+	{"Development", []item{{"test", "Test", "Run repository test suites", nil}}},
 }
 
 type field struct {
@@ -79,8 +78,6 @@ func formFor(it item, profiles []string) form {
 	switch it.name {
 	case "up":
 		f.fields = []field{choice("Mac App Store", "--mas", "Include App Store updates", "off", "on"), choice("Output", "", "Dashboard is the default", "dashboard", "plain", "verbose"), choice("Close automatically", "--no-wait", "Close when update completes", "off", "on")}
-	case "apply":
-		f.fields = []field{positional("Target", "Optional; empty applies all. Add further targets as argument tokens.", false)}
 	case "add", "remove":
 		f.fields = []field{positional("Tool or package", "One request; add further requests as argument tokens", true), choice("Destination", "", "Default uses the selected profile", destinations...), text("Destination path", "--path", "Required only when destination is path", false)}
 		f.fields[0].label = "Tools or packages"
@@ -110,8 +107,6 @@ func formFor(it item, profiles []string) form {
 		f.fields = []field{text("Bundle path", "--bundle", "Encrypted bundle", true), text("Identity path", "--identity", "Age identity file path", true)}
 	case "test":
 		f.fields = []field{choice("Python", "python", "Select test suites; none runs all", "off", "on"), choice("Node", "node", "", "off", "on")}
-	case "publish":
-		f.fields = []field{choice("Scope", "", "Current change by default", "current", "all", "bookmark"), text("Bookmark", "--bookmark", "Required when scope is bookmark", false)}
 	}
 	if len(f.fields) == 0 {
 		f.selected = 1
@@ -158,16 +153,6 @@ func (f form) args() ([]string, error) {
 					return nil, errors.New("Profile is required")
 				}
 				out = append(out, x.flag, x.value)
-			case "Scope":
-				switch x.value {
-				case "all":
-					out = append(out, "--all")
-				case "bookmark":
-					if f.fields[1].value == "" {
-						return nil, errors.New("Bookmark is required")
-					}
-					out = append(out, "--bookmark", f.fields[1].value)
-				}
 			default:
 				if x.value == "on" {
 					out = append(out, x.flag)
@@ -175,7 +160,7 @@ func (f form) args() ([]string, error) {
 			}
 			continue
 		}
-		if x.label == "Destination path" || x.label == "Bookmark" {
+		if x.label == "Destination path" {
 			continue
 		}
 		if x.value != "" {

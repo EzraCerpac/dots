@@ -13,7 +13,7 @@ use crate::{process::Cwd, run::Run};
 
 use super::guard::private_dir;
 
-use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative};
+use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative, split};
 
 #[derive(Debug)]
 pub(super) enum ScanError {
@@ -56,6 +56,32 @@ impl<'a> Scratch<'a> {
         self.live.ensure_dense_index()?;
         self.git
             .get(["-c", "core.sparseCheckout=false", "read-tree", base])?;
+        // Seed only exact, public paths tracked in the real index but ignored
+        // in the worktree. Forcing an add by pathspec can recurse into a
+        // directory that replaced an indexed file.
+        let ignored = self.live.get([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--stage",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        let mut index = Vec::new();
+        for entry in records(&ignored) {
+            let (header, raw) = split(entry, b'\t')?;
+            if local(&relative(raw)?) {
+                continue;
+            }
+            if !header.ends_with(b" 0") {
+                return Err(invalid("unmerged path in the Git index"));
+            }
+            index.extend_from_slice(entry);
+            index.push(0);
+        }
+        if !index.is_empty() {
+            self.git.update_index(&index)?;
+        }
         let listed = self.git.get([
             "ls-files",
             "-z",
@@ -72,22 +98,20 @@ impl<'a> Scratch<'a> {
         }
         if paths.stream_position()? != 0 {
             paths.rewind()?;
-            checked(
-                self.git
-                    .command([
-                        "--literal-pathspecs",
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-c",
-                        "core.sparseCheckout=false",
-                        "add",
-                        "-A",
-                        "--pathspec-from-file=-",
-                        "--pathspec-file-nul",
-                    ])?
-                    .stdin(Stdio::from(paths))
-                    .output()?,
-            )?;
+            checked(self.git.output_with_stdin(
+                [
+                    "--literal-pathspecs",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.sparseCheckout=false",
+                    "add",
+                    "-A",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
+                Stdio::from(paths),
+            )?)?;
         }
         self.live.ensure_dense_index()?;
         let tree = self.git.id(["write-tree"])?;
@@ -583,6 +607,102 @@ path = '^(Side|Merge) marker\.txt$'
     }
 
     #[test]
+    fn cutover_snapshot_cancellation_reaps_git_and_preserves_pathspec_stdin() {
+        use std::time::Instant;
+
+        const CHILD: &str = "DOTS_TEST_SNAPSHOT_CANCEL_CHILD";
+        let (fixture, mut ctx) = git_fixture();
+        if std::env::var_os(CHILD).is_none() {
+            // Deliver a real signal only to the isolated test process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .envs(&ctx.env.vars)
+                .env(CHILD, "1")
+                .current_dir(ctx.root.path())
+                .args([
+                    "--exact",
+                    "sync::snapshot::tests::cutover_snapshot_cancellation_reaps_git_and_preserves_pathspec_stdin",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let before = fixture_commit(&git, "base");
+        let path = "literal[1] path";
+        fs::write(git.root().join(path), b"private fixture").unwrap();
+        let candidate = scratch(&git).capture(&before).unwrap();
+        assert!(git.tree(&candidate).unwrap().contains_key(Path::new(path)));
+
+        let world = fixture.path().canonicalize().unwrap();
+        let ready = world.join("ready");
+        let paths = world.join("pathspec");
+        let expired = world.join("expired");
+        let bin = world.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let search = ctx.env.get("PATH").unwrap();
+        let real = std::env::split_paths(search)
+            .map(|dir| dir.join("git"))
+            .find(|path| path.is_absolute() && path.is_file())
+            .unwrap();
+        let shim = bin.join("git");
+        fs::write(
+            &shim,
+            br#"#!/bin/sh
+set -eu
+for arg in "$@"; do
+    if [ "$arg" = --pathspec-from-file=- ]; then
+        trap 'exit 130' INT TERM
+        cat > "$DOTS_TEST_SNAPSHOT_WORLD/pathspec"
+        : > "$DOTS_TEST_SNAPSHOT_WORLD/ready"
+        sleep 4
+        : > "$DOTS_TEST_SNAPSHOT_WORLD/expired"
+        exit 0
+    fi
+done
+exec "$DOTS_TEST_SNAPSHOT_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+        let search =
+            std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(search)))
+                .unwrap();
+        ctx.env.vars.extend([
+            ("PATH".into(), search),
+            ("DOTS_TEST_SNAPSHOT_WORLD".into(), world.into_os_string()),
+            ("DOTS_TEST_SNAPSHOT_GIT".into(), real.into_os_string()),
+        ]);
+        let run = Run::begin(&ctx, Sink::Unreported);
+        let controller = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !ready.exists() {
+                assert!(Instant::now() < deadline, "snapshot did not read its stdin");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            use nix::libc;
+            // SAFETY: This test runs in its own process with a live Run.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGINT) }, 0);
+        });
+        assert!(scratch(&Git::supervised(&run)).capture(&before).is_err());
+        controller.join().unwrap();
+        assert!(run.cancelled());
+        assert!(records(&fs::read(paths).unwrap()).any(|row| row == path.as_bytes()));
+        assert!(!expired.exists(), "Git completed its blocking fallback");
+        let _ = run.end(0);
+    }
+
+    #[test]
     fn snapshot_omits_root_private_aliases_and_preserves_the_real_index() {
         let (_fixture, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());
@@ -625,6 +745,93 @@ path = '^(Side|Merge) marker\.txt$'
             assert_eq!(
                 fs::read(git.root().join(path)).unwrap(),
                 b"machine-local fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn cr13_snapshot_includes_an_ignored_public_file_tracked_in_the_real_index() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let root = git.root();
+        fs::write(root.join(".gitignore"), "/forced\n/config.local.toml\n").unwrap();
+        git.get(["add", ".gitignore"]).unwrap();
+        let before = fixture_commit(&git, "ignore fixture paths");
+        fs::write(root.join("forced"), b"intentionally staged\n").unwrap();
+        fs::write(root.join("config.local.toml"), b"local fixture\n").unwrap();
+        fs::write(root.join("ordinary"), b"ordinary independent edit\n").unwrap();
+        git.get(["add", "-f", "forced", "config.local.toml"])
+            .unwrap();
+        let index_path = root.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
+        let candidate = scratch.capture(&before).unwrap();
+        let tree = git.tree(&candidate).unwrap();
+        assert!(tree.contains_key(Path::new("ordinary")));
+        assert!(!tree.contains_key(Path::new("config.local.toml")));
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        assert_eq!(
+            git.get(["show", &format!("{candidate}:forced")]).unwrap(),
+            b"intentionally staged\n"
+        );
+    }
+
+    #[test]
+    fn cr13_snapshot_keeps_untracked_ignored_descendants_out_of_replaced_files() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let root = git.root();
+        fs::write(
+            root.join(".gitignore"),
+            "/replaced/ignored-*\n/only-ignored/*\n",
+        )
+        .unwrap();
+        for file in ["replaced", "only-ignored"] {
+            fs::write(root.join(file), b"tracked file\n").unwrap();
+        }
+        git.get(["add", ".gitignore", "replaced", "only-ignored"])
+            .unwrap();
+        let before = fixture_commit(&git, "tracked files before directory replacements");
+
+        for file in ["replaced", "only-ignored"] {
+            fs::remove_file(root.join(file)).unwrap();
+            fs::create_dir(root.join(file)).unwrap();
+        }
+        for path in [
+            "replaced/public",
+            "replaced/ignored-tracked",
+            "replaced/ignored-untracked",
+            "only-ignored/untracked",
+        ] {
+            fs::write(root.join(path), format!("{path}\n")).unwrap();
+        }
+        git.get(["add", "-f", "replaced/ignored-tracked"]).unwrap();
+        let index_path = root.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let candidate = scratch(&git).capture(&before).unwrap();
+        let tree = git.tree(&candidate).unwrap();
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        for path in ["replaced/public", "replaced/ignored-tracked"] {
+            assert_eq!(
+                git.get(["show", &format!("{candidate}:{path}")]).unwrap(),
+                format!("{path}\n").as_bytes()
+            );
+        }
+        for path in [
+            "replaced",
+            "only-ignored",
+            "replaced/ignored-untracked",
+            "only-ignored/untracked",
+        ] {
+            assert!(
+                !tree.contains_key(Path::new(path)),
+                "unexpected candidate path {path}"
             );
         }
     }

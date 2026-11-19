@@ -745,6 +745,43 @@ sync_case!(
     }
 );
 
+#[test]
+fn new_peer_revert_keeps_the_reverted_path_in_saved_locally() {
+    let f = Repo::new();
+    let published = f.scratch.join("peer-published");
+    let hook = f.validation_hook(&format!(
+        "if [ -e {published} ]; then exit 0; fi\n\
+         git -C {peer} fetch -q {local} dev\n\
+         git -C {peer} push -q origin FETCH_HEAD:dev\n\
+         git -C {peer} rev-parse FETCH_HEAD > {published}\n\
+         git -C {peer} reset -q --hard FETCH_HEAD\n\
+         git -C {peer} rm -q -- notes\n\
+         git -C {peer} commit -qm 'Revert notes only'\n\
+         git -C {peer} push -q origin HEAD:dev",
+        published = sh(&published),
+        peer = sh(&f.b),
+        local = sh(&f.a),
+    ));
+    f.write(&f.a, "notes", "saved before peer revert\n");
+    f.write(&f.a, "peer-kept", "still at the published tip\n");
+    let live = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
+    let replay = f.replay(&f.a);
+    let published = read(&published).trim().to_owned();
+    assert_ne!(published, f.remote());
+    f.check_ancestor(&published, "dev");
+    assert_eq!(f.blob(&published, "notes"), "saved before peer revert");
+    assert_eq!(f.blob("dev", "peer-kept"), "still at the published tip");
+    assert!(!f.tree().lines().any(|path| path == "notes"));
+    assert_eq!(f.tip(&f.a), f.remote());
+    for receipt in [live, replay] {
+        has(&receipt, "already shared 1 file");
+        has(&receipt, "saved 1 locally");
+        has(&receipt, "Saved locally\n  notes");
+        absent(&receipt, "peer-kept");
+        absent(&receipt, "Shared on dev");
+    }
+}
+
 fn failing_apply_fixture(f: &Repo) -> (PathBuf, PathBuf) {
     f.write(
         &f.a,
@@ -1338,13 +1375,30 @@ sync_case!(active unchanged_hanging_push_times_out, || {
     let f = Repo::new();
     let before = f.remote();
     let hook_pid = f.scratch.join("hanging-push.pid");
-    // The hook exits itself if timeout handling regresses, so the fixture is bounded.
-    // Keep its wait in the hook process to avoid leaking inherited output pipes.
-    f.hook(
-        &f.a,
-        "pre-push",
-        &format!("printf '%s\\n' \"$$\" > {}\nexec sleep 68", sh(&hook_pid)),
-    );
+    let lifetime = f.scratch.join("hanging-push.lock");
+    let hook = if f.oracle {
+        format!("printf '%s\\n' \"$$\" > {}\nexec sleep 68", sh(&hook_pid))
+    } else {
+        put(&lifetime, "");
+        // The lock follows this hook across exec and is released when it exits.
+        // Keep the bounded wait in that same process, with no extra pipe holder.
+        format!(
+            r#"exec {python} -I -S -c '
+import fcntl, os, sys
+from pathlib import Path
+
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+os.set_inheritable(fd, True)
+Path(sys.argv[2]).write_text(str(os.getpid()) + "\n")
+os.execlp("sleep", "sleep", "68")
+' {lifetime} {pid}"#,
+            python = sh(&f.tools.join("python3")),
+            lifetime = sh(&lifetime),
+            pid = sh(&hook_pid),
+        )
+    };
+    f.hook(&f.a, "pre-push", &hook);
     f.write(&f.a, "local", "waiting\n");
     let started = Instant::now();
     let receipt = f.sync(&f.a);
@@ -1355,8 +1409,12 @@ sync_case!(active unchanged_hanging_push_times_out, || {
         unconfirmed_push_issue(&f, &receipt, &before);
         let pid: libc::pid_t = read(&hook_pid).trim().parse().unwrap();
         assert!(pid > 1);
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "push hook still running");
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        let lifetime = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lifetime)
+            .unwrap();
+        lifetime.try_lock().expect("push hook still running");
     }
     assert!(started.elapsed() >= Duration::from_secs(59));
     assert_eq!(f.remote(), before);
@@ -2143,7 +2201,7 @@ sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
     wrong_checkout("jj", ".jj", "JJ workspace");
 });
 sync_case!(active unchanged_pre_port_sync_state_stops_cleanly, || {
-    wrong_checkout("legacy", "legacy", "pre-1.0 source state");
+    wrong_checkout("legacy", "legacy", "pre-1.0 source state in .git/dots-dev.json");
 });
 sync_case!(active unchanged_wrong_origin_stops_cleanly, || {
     let f = Repo::new();
@@ -2202,27 +2260,19 @@ struct RunningSync {
 }
 
 impl RunningSync {
-    fn start(repo: &Repo, command: &FixtureCommand<'_>, log: &Path) -> Self {
+    fn start(command: &mut FixtureCommand<'_>, log: &Path) -> Self {
         let stdout = log.with_extension("stdout");
         let stderr = log.with_extension("stderr");
-        // The fixture Python process makes a private group before replacing
-        // itself with dots. Both inherit the checked world environment.
-        let mut launcher = repo.world.tool(repo.tools.join("python3"));
-        let child = launcher
-            .env_clear()
-            .current_dir(command.get_current_dir().unwrap())
-            .envs(
-                command
-                    .get_envs()
-                    .filter_map(|(name, value)| value.map(|value| (name, value))),
-            )
-            .args([
-                "-I",
-                "-c",
-                "import os, sys; os.setpgid(0, 0); os.execv(sys.argv[1], sys.argv[1:])",
-            ])
-            .arg(command.get_program())
-            .args(command.get_args())
+        // SAFETY: setpgid is fork-safe and keeps the checked fixture paths.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
             .stdout(fs::File::create(&stdout).unwrap())
             .stderr(fs::File::create(&stderr).unwrap())
             .spawn()
@@ -2260,13 +2310,33 @@ impl RunningSync {
         put(release, "");
     }
 
-    fn wait_until_started(&mut self, marker: &Path) {
+    fn exited(&self) -> bool {
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: The fixture owns this child. WNOWAIT reserves its PID
+            // until any group cleanup has finished.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result == 0 {
+                return unsafe { info.si_pid() } != 0;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+        }
+    }
+
+    fn wait_until_started(&self, marker: &Path) {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(45);
         while !marker.exists() {
             assert!(
-                self.child.as_mut().unwrap().try_wait().unwrap().is_none()
-                    && Instant::now() < deadline,
+                !self.exited() && Instant::now() < deadline,
                 "sync did not reach its fixture child\nstdout: {}\nstderr: {}",
                 read(&self.stdout),
                 read(&self.stderr),
@@ -2278,14 +2348,11 @@ impl RunningSync {
     fn finish(mut self) -> Output {
         use std::time::{Duration, Instant};
         let deadline = Instant::now() + Duration::from_secs(30);
-        let status = loop {
-            if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                break status;
-            }
+        while !self.exited() {
             assert!(Instant::now() < deadline, "fixture sync did not finish");
             std::thread::sleep(Duration::from_millis(25));
-        };
-        self.child.take();
+        }
+        let status = self.child.take().unwrap().wait().unwrap();
         Output {
             status,
             stdout: fs::read(&self.stdout).unwrap(),
@@ -2297,7 +2364,7 @@ impl RunningSync {
 impl Drop for RunningSync {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
-            // process_group(0) created a group only for this fixture.
+            // The unreaped leader still reserves the fixture's group ID.
             unsafe { libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL) };
             let _ = child.kill();
             let _ = child.wait();
@@ -2323,8 +2390,7 @@ sync_case!(
         let (hook, entered, release) = block_validation(&f);
         let parent = f.scratch.join("lock-holder-pid");
         f.write(&f.a, "local", "waiting\n");
-        let mut holder = RunningSync::start(
-            &f,
+        let holder = RunningSync::start(
             f.dots(&f.a, &["--plain", "sync"])
                 .env("FIXTURE_VALIDATE", &hook)
                 .env("FIXTURE_VALIDATION_PARENT", &parent),
@@ -2353,8 +2419,7 @@ fn new_standalone_sync_cancellation_records_replayable_stopped_receipt() {
         "cat >/dev/null\ntrap 'touch \"$FIXTURE_CLEANED\"; exit 42' INT TERM HUP\ntouch {entered}\nfor n in $(seq 1 60); do sleep 1; done\nexit 97",
         entered = sh(&entered),
     ));
-    let mut run = RunningSync::start(
-        &f,
+    let run = RunningSync::start(
         f.dots(&f.a, &["--plain", "sync"])
             .env("FIXTURE_CLEANED", &cleaned),
         &f.scratch.join("cancelled"),
@@ -3232,13 +3297,6 @@ copies_case!(
     active unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
     true,
     |f, a, _b, config| {
-        let umask_probe = f.scratch.join("directory-create-mode");
-        fs::create_dir(&umask_probe).unwrap();
-        assert_eq!(
-            mode(&umask_probe),
-            0o755,
-            "directory-copy fixtures must inherit umask 022"
-        );
         let config = format!(
             "{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\", exclude = [\"skip\"], dot_prefix = true }}\n"
         );
@@ -3253,6 +3311,7 @@ copies_case!(
         ] {
             a.source(&format!("dir/{name}"), "initial\n");
         }
+        chmod(&a.root.join("dir/restricted"), 0o644);
         f.commit(&f.a, "Declare directory copy");
         f.git(&f.a, &["push", "-q", "origin", "HEAD:dev"]);
         a.deploy();
@@ -3262,7 +3321,9 @@ copies_case!(
         assert_eq!(read(&a.home.join(".tree/.prefixed")), "first sync\n");
         a.target(".tree/dirty", "local edit\n");
         a.target(".tree/unmanaged", "keep unmanaged\n");
-        chmod(&a.home.join(".tree/restricted"), 0o600);
+        let restricted = a.home.join(".tree/restricted");
+        assert_eq!(mode(&restricted), 0o644);
+        chmod(&restricted, 0o600);
         for name in [
             "nested/clean",
             "nested/late",
@@ -4378,20 +4439,20 @@ sync_case!(
             if name == "dead" {
                 command.env("FIXTURE_VALIDATION_PARENT", &parent);
             }
-            RunningSync::start(&f, &command, &f.scratch.join(format!("run-{name}")))
+            RunningSync::start(&mut command, &f.scratch.join(format!("run-{name}")))
         };
-        let mut dead = start("dead");
+        let dead = start("dead");
         dead.wait_until_started(&marker.with_extension("dead"));
         dead.kill_lock_holder(&parent, &release.with_extension("dead"));
         assert!(!dead.finish().status.success());
-        let mut a = start("a");
-        let mut b = start("b");
+        let a = start("a");
+        let b = start("b");
         let deadline = Instant::now() + Duration::from_secs(45);
         let a_marker = marker.with_extension("a");
         let b_marker = marker.with_extension("b");
         let (winner, loser) = loop {
-            let a_finished = a.child.as_mut().unwrap().try_wait().unwrap().is_some();
-            let b_finished = b.child.as_mut().unwrap().try_wait().unwrap().is_some();
+            let a_finished = a.exited();
+            let b_finished = b.exited();
             assert!(
                 !(a_marker.exists() && b_marker.exists()),
                 "both CLI processes entered the locked stage"

@@ -1,0 +1,67 @@
+scenario=$(cat scenario)
+case " $* " in
+    *' which mas '*)
+        printf '%s\n' "$HOME/store/bin/mas"
+        ;;
+    *' which ruby '*)
+        [ "$scenario" = store-ruby ] || exit 1
+        printf '%s\n' "$HOME/configured-ruby/bin/ruby"
+        ;;
+    *' which dots '*)
+        if [ "$scenario" = manager ] && [ ! -f manager-probed ]; then
+            : > manager-probed
+            exit 74
+        fi
+        printf '%s\n' "$HOME/new-manager/bin/dots"
+        ;;
+    *' ls --current --json '*)
+        if [ "$scenario" = manager ]; then
+            printf '%s\n' '{"github:EzraCerpac/dots":[{"version":"99.0.0","active":true,"installed":true}]}'
+        else
+            printf '{}\n'
+        fi
+        ;;
+    *' bootstrap packages status --json '*)
+        if [ "$scenario" = cask ]; then
+            case "${MISE_SYSTEM_PACKAGES_MANAGERS-}" in
+                '') cat inventory.json ;;
+                brew-cask) cat narrow.json ;;
+                *) cat status.json ;;
+            esac
+        elif [ -f snapshot-unavailable ]; then
+            rm snapshot-unavailable
+            printf 'fixture snapshot unavailable\n' >&2
+            exit 76
+        elif [ -f status.json ]; then
+            if [ "$scenario" = store-ruby ] && [ "${MISE_SYSTEM_PACKAGES_MANAGERS-}" = mas ]; then
+                [ "$(command -v ruby)" = "$HOME/configured-ruby/bin/ruby" ] || exit 78
+            fi
+            cat status.json
+        else
+            printf '{}\n'
+        fi
+        ;;
+    *' bootstrap packages apply '*|*' bootstrap packages upgrade '*)
+        while [ "$1" != bootstrap ]; do shift; done
+        printf '%s\n' "$*" >> "$HOME/mise-calls"
+        if [ "$3" = apply ]; then
+            case "$scenario" in
+                invalidate) printf 'invalid-row\n' > dots/exceptions.tsv ;;
+                snapshot|snapshot-action-fails)
+                    : > snapshot-unavailable
+                    [ "$scenario" != snapshot-action-fails ] || exit 74 ;;
+                store-expire) : > expired; exit 74 ;;
+                store-removal) exit 74 ;;
+            esac
+        fi
+        if [ "$scenario" = store-ruby ]; then
+            [ "$(command -v ruby)" = "$HOME/configured-ruby/bin/ruby" ] || exit 78
+            printf 'store Ruby for %s\n' "$3" >> "$HOME/mise-calls"
+        fi
+        ;;
+    *' upgrade '*)
+        [ "$scenario" != manager ] || exit 0
+        exec "$HOME/.local/bin/mise-default" "$@"
+        ;;
+    *) exec "$HOME/.local/bin/mise-default" "$@" ;;
+esac

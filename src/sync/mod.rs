@@ -108,7 +108,10 @@ fn protected_shape_problem(shape: &CheckoutShape) -> Option<Note> {
     if shape.jj_workspace {
         Some(Note::new("Sync stopped in a JJ workspace", GUIDE))
     } else if shape.legacy_sync {
-        Some(Note::new("Sync found pre-1.0 source state", GUIDE))
+        Some(Note::new(
+            "Sync found pre-1.0 source state in .git/dots-dev.json",
+            GUIDE,
+        ))
     } else if shape.head.is_none() || !shape.has_commit {
         Some(dev_required())
     } else if !shape.operations.is_empty() {
@@ -240,8 +243,24 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
 
 fn local_only(receipt: &mut Receipt) {
     receipt.local_only = true;
-    receipt.outcome = "local-only; add a remote with git remote add origin URL".into();
+    receipt.outcome = format!(
+        "local-only; add a remote with {}",
+        remote_add_command(receipt)
+    );
     receipt.stage_outcome = Outcome::Skipped;
+}
+
+fn remote_add_command(receipt: &Receipt) -> String {
+    let root = receipt
+        .checkout
+        .as_deref()
+        .and_then(Path::to_str)
+        .filter(|root| !root.chars().any(receipt::terminal_control))
+        .map_or_else(
+            || "\"$(dots root)\"".into(),
+            |root| format!("'{}'", root.replace('\'', "'\\''")),
+        );
+    format!("git -C {root} remote add origin URL")
 }
 
 #[derive(Debug)]
@@ -336,7 +355,7 @@ fn synchronize(
     let _lock = RepoLock::try_acquire(&shared.common)
         .or_note("Could not open the source operation lock", GIT)?
         .ok_or(Note::new(
-            "Sync skipped while another sync or publish is running",
+            "Sync skipped while another sync is running",
             "Wait for it to finish, then rerun dots sync.",
         ))?;
     let checked_shape = shape(&git).or_note("Could not recheck the Git checkout", GIT)?;
@@ -383,8 +402,10 @@ fn synchronize(
         if receipt.recovered.is_empty() && receipt.recovery_files.is_empty() {
             local_only(receipt);
         } else {
-            receipt.outcome =
-                "finished pending writes; add a remote with git remote add origin URL".into();
+            receipt.outcome = format!(
+                "finished pending writes; add a remote with {}",
+                remote_add_command(receipt)
+            );
         }
         receipt.stage_outcome = Outcome::Skipped;
         return Ok(());
@@ -638,45 +659,41 @@ fn synchronize(
         };
 
         if !validated
-            .still_current(git.root())
-            .or_note("Could not recheck machine-local files", RERUN)?
+            .pre_install_inputs_unchanged(git.root())
+            .or_note("Could not recheck configuration files", RERUN)?
         {
             return Err(Note::new(
-                "Machine-local files changed during validation",
+                "Configuration files changed during validation",
                 RERUN,
             ));
         }
 
         let blocked = checkout::preflight(&scratch.git, &approved, &local_tree, &merged_tree)
             .or_note("Could not verify incoming checkout paths", RERUN)?;
-        let sharing = if heads.dev() == Some(merged.as_str()) {
-            None
-        } else {
-            let published_tree = match heads.dev() {
-                Some(head) => git
-                    .tree(head)
+        let published_tree = match heads.dev() {
+            Some(head) if head == merged => Cow::Borrowed(&merged_tree),
+            Some(head) => Cow::Owned(
+                git.tree(head)
                     .or_note("Could not verify the published dev tree", GIT)?,
-                None => git::Tree::new(),
-            };
-            Some(ChangeGroup::new(
+            ),
+            None => Cow::Owned(git::Tree::new()),
+        };
+        let sharing = (heads.dev() != Some(merged.as_str())).then(|| {
+            ChangeGroup::new(
                 heads.dev().map(str::to_owned),
                 Some(merged.clone()),
                 changed(&published_tree, &merged_tree),
-            ))
-        };
-        let already_shared = if let Some(tip) = heads.dev()
+            )
+        });
+        let peer_published_snapshot = if let Some(tip) = heads.dev()
             && !receipt.saved.is_empty()
-            && git.ancestor(&approved, tip).or_note(
+        {
+            git.ancestor(&approved, tip).or_note(
                 "Could not verify the saved snapshot against origin/dev",
                 GIT,
-            )? {
-            receipt
-                .saved
-                .iter()
-                .map(|group| group.paths.len())
-                .sum::<usize>()
+            )?
         } else {
-            0
+            false
         };
         active(run)?;
         dense_index(&git)?;
@@ -696,6 +713,11 @@ fn synchronize(
             }
         };
         if pushed {
+            let already_shared = if peer_published_snapshot {
+                exclude_peer_shared_paths(receipt, &local_tree, &published_tree, &merged_tree)
+            } else {
+                0
+            };
             let outcome = if let Some(sharing) = sharing {
                 receipt.shared.push(sharing);
                 "pushed dev"
@@ -705,9 +727,6 @@ fn synchronize(
             receipt.outcome = if already_shared == 0 {
                 outcome.into()
             } else {
-                // The snapshot was already present in the verified remote tip.
-                // An ordinary push still reports the files saved locally.
-                receipt.saved.clear();
                 let unit = if already_shared == 1 { "file" } else { "files" };
                 format!("already shared {already_shared} {unit} · {outcome}")
             };
@@ -747,12 +766,19 @@ fn synchronize(
             copies
                 .reconcile_captures(&git, &shared.dir, &approved, &merged, &merged_tree, receipt)
                 .or_note("Could not reconcile captured copy baselines", RERUN)?;
-            if !validated
-                .still_current(git.root())
-                .or_note("Could not recheck machine-local files before apply", RERUN)?
+            if let Some(change) = validated
+                .changed_retirement_inputs(git.root())
+                .or_note("Could not recheck configuration files before apply", RERUN)?
             {
                 return Err(Note::new(
-                    "Machine-local files changed after validation; dotfiles were kept",
+                    match change {
+                        validation::RetirementChange::MachineLocal => {
+                            "Machine-local files changed after validation; dotfiles were kept"
+                        }
+                        validation::RetirementChange::Public => {
+                            "Public configuration files changed after validation; dotfiles were kept"
+                        }
+                    },
                     RERUN,
                 ));
             }
@@ -780,12 +806,19 @@ fn synchronize(
             "Could not verify dev after the rejected push",
             "Check origin and the Git credential helper, then rerun dots sync.",
         )?;
-        if refreshed
-            .withdraws(&git, &heads)
+        if let Some(withdrawal) = refreshed
+            .withdrawal_since(&git, &heads)
             .or_note("Could not verify refreshed published history", GIT)?
         {
             return Err(Note::new(
-                "Published dev or main was removed or rewound during sync",
+                match withdrawal {
+                    remote::Withdrawal::DevOrMain => {
+                        "Published dev or main was removed or rewound during sync"
+                    }
+                    remote::Withdrawal::TopicHistory => {
+                        "Published topic history was removed or rewound during sync"
+                    }
+                },
                 "Review origin's branch history and rerun dots sync.",
             ));
         }
@@ -801,6 +834,25 @@ fn synchronize(
         "NOT SHARED: the conditional dev push was rejected",
         "Check origin, credentials and remote branch policies, then rerun dots sync.",
     ))
+}
+
+fn exclude_peer_shared_paths(
+    receipt: &mut Receipt,
+    local: &git::Tree,
+    published: &git::Tree,
+    confirmed: &git::Tree,
+) -> usize {
+    let mut already_shared = 0;
+    receipt.saved.retain_mut(|group| {
+        group.paths.retain(|path| {
+            let entry = local.get(path);
+            let shared = published.get(path) == entry && confirmed.get(path) == entry;
+            already_shared += usize::from(shared);
+            !shared
+        });
+        !group.paths.is_empty()
+    });
+    already_shared
 }
 
 fn dense_index(git: &Git<'_>) -> Result<(), Note> {
@@ -934,13 +986,38 @@ fn finish_pending(
         }
         Ok(None) => Ok(None),
         Err(error) => {
+            use checkout::JournalDisposition::{Active, Parked, RetiredBeforeStart};
+
             receipt.recovery_files.extend(error.backups);
-            if let Some((before, after)) = error.moved_dev {
+            if error.moved_dev
+                && let Some((before, after)) = error.recorded_revisions.as_deref()
+            {
                 return Err(Note(
                     format!("dev moved during guarded checkout (expected {before} or {after})")
                         .into(),
                     "Preserve the competing dev tip, reconcile the checkout with the recorded revisions, then rerun dots sync.",
                 ));
+            }
+            match error.journal {
+                Parked(path) => {
+                    let revisions = error
+                        .recorded_revisions
+                        .as_deref()
+                        .map_or_else(String::new, |(before, after)| {
+                            format!(" (recorded revisions {before} to {after})")
+                        });
+                    return Err(Note(
+                        format!("Guarded checkout parked at {path:?}{revisions}").into(),
+                        "Preserve your edits, reconcile the index and checkout with the recorded revisions and any recovery copies, then rerun dots sync.",
+                    ));
+                }
+                RetiredBeforeStart => {
+                    return Err(Note::new(
+                        "Not saved: the Git index changed before checkout started",
+                        "Review your staged changes and rerun dots sync.",
+                    ));
+                }
+                Active => {}
             }
             if let Some(path) = error.path {
                 path_issue(

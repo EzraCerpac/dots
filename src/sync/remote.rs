@@ -187,11 +187,25 @@ impl<'a> PinnedRemote<'a> {
                 .env(format!("GIT_CONFIG_VALUE_{i}"), &alias);
         }
         cmd.env("GIT_CONFIG_COUNT", "3");
+        if self.endpoint.starts_with("https://") || self.endpoint.starts_with("http://") {
+            cmd.env(
+                "GIT_CONFIG_KEY_3",
+                format!("http.{}.followRedirects", self.endpoint),
+            )
+            .env("GIT_CONFIG_VALUE_3", "false")
+            .env("GIT_CONFIG_COUNT", "4");
+        }
         Ok(cmd)
     }
 }
 
 pub(super) struct RemoteHeads(BTreeMap<String, String>);
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Withdrawal {
+    DevOrMain,
+    TopicHistory,
+}
 
 impl RemoteHeads {
     pub fn dev(&self) -> Option<&str> {
@@ -204,16 +218,42 @@ impl RemoteHeads {
         self.0.values().map(String::as_str)
     }
 
-    pub fn withdraws(&self, git: &Git<'_>, earlier: &Self) -> io::Result<bool> {
+    pub fn withdrawal_since(
+        &self,
+        git: &Git<'_>,
+        earlier: &Self,
+    ) -> io::Result<Option<Withdrawal>> {
         for (before, after) in [(earlier.dev(), self.dev()), (earlier.main(), self.main())] {
             if let Some(before) = before {
                 match after {
                     Some(after) if git.ancestor(before, after)? => (),
-                    _ => return Ok(true),
+                    _ => return Ok(Some(Withdrawal::DevOrMain)),
                 }
             }
         }
-        Ok(false)
+        let current: std::collections::BTreeSet<_> = self.published().collect();
+        'previous: for (branch, old_tip) in &earlier.0 {
+            if matches!(branch.as_str(), DEV | MAIN) || current.contains(old_tip.as_str()) {
+                continue;
+            }
+            if let Some(new_tip) = self.0.get(branch)
+                && git.ancestor(old_tip, new_tip)?
+            {
+                continue;
+            }
+            for new_tip in &current {
+                if git.ancestor(old_tip, new_tip)? {
+                    continue 'previous;
+                }
+            }
+            return Ok(Some(Withdrawal::TopicHistory));
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn withdraws(&self, git: &Git<'_>, earlier: &Self) -> io::Result<bool> {
+        Ok(self.withdrawal_since(git, earlier)?.is_some())
     }
 
     pub fn same_incoming(&self, other: &Self) -> bool {
@@ -356,6 +396,54 @@ mod tests {
     use super::*;
     use crate::run::Sink;
     use crate::sync::tests::{fixture_commit, git_fixture};
+
+    #[test]
+    fn cr16_withdrawal_counts_history_from_an_independent_published_topic() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let base = fixture_commit(&git, "shared baseline");
+        git.get(["switch", "-qc", "topic"]).unwrap();
+        let topic = fixture_commit(&git, "independent published history");
+        git.get(["switch", "-q", "dev"]).unwrap();
+        let advanced = fixture_commit(&git, "advance dev");
+        let earlier = RemoteHeads(BTreeMap::from([
+            (DEV.into(), base),
+            ("refs/heads/topic".into(), topic.clone()),
+        ]));
+        let current = RemoteHeads(BTreeMap::from([(DEV.into(), advanced.clone())]));
+        assert!(current.withdraws(&git, &earlier).unwrap());
+        let archived = RemoteHeads(BTreeMap::from([
+            (DEV.into(), advanced),
+            ("refs/heads/archive".into(), topic),
+        ]));
+        assert!(!archived.withdraws(&git, &earlier).unwrap());
+    }
+
+    #[test]
+    fn cr17_pinned_transport_disables_http_redirects() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let url = "https://fixture.invalid/repository";
+        git.get(["config", &format!("http.{url}.followRedirects"), "true"])
+            .unwrap();
+        let endpoint = PinnedRemote::new(url).unwrap();
+        // Read the private Git command's configuration without a transport.
+        let command = endpoint.command(&git, &["fetch"], &[]).unwrap();
+        // The pinned remote's name is a positional argument for network commands.
+        // Inspect only the command overrides here, without running Git.
+        let mut read = git
+            .command(["config", "--get-urlmatch", "http.followRedirects", url])
+            .unwrap();
+        read.envs(
+            command
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        );
+        assert_eq!(
+            checked(git.output_command(read).unwrap()).unwrap(),
+            b"false\n"
+        );
+    }
 
     #[test]
     fn validates_every_effective_destination_without_resplitting_urls() {

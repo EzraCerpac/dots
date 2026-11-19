@@ -23,7 +23,7 @@ struct Tool {
     #[serde(default)]
     active: bool,
     #[serde(default)]
-    installed: bool,
+    installed: Option<bool>,
 }
 
 fn list(run: &Run<'_>, mise: &Mise<'_>) -> Result<ToolList, Issue> {
@@ -36,7 +36,7 @@ fn snapshot(tools: &ToolList) -> Versions {
         .filter_map(|(name, rows)| {
             let versions: BTreeSet<_> = rows
                 .iter()
-                .filter(|tool| tool.active && tool.installed)
+                .filter(|tool| tool.active && tool.installed == Some(true))
                 .map(|tool| tool.version.as_str())
                 .collect();
             (!versions.is_empty()).then(|| {
@@ -180,7 +180,12 @@ pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
 
 pub(super) enum ManagerSource {
     Tool,
-    Formula(String),
+    Formula { name: String, missing: bool },
+}
+
+pub(super) enum ManagerBaseline {
+    Missing,
+    Installed(String),
 }
 
 fn manager_tool(name: &str) -> bool {
@@ -236,22 +241,45 @@ pub(super) fn manager_source(
     if declared_manager_tool(ctx.root.path(), files) {
         return Some(ManagerSource::Tool);
     }
-    super::packages::declared_dots_formula(run, mise).map(ManagerSource::Formula)
+    super::packages::declared_dots_formula(run, mise)
+        .map(|(name, missing)| ManagerSource::Formula { name, missing })
 }
 
-pub(super) fn manager_version(
+fn manager_path(run: &Run<'_>, mise: &Mise<'_>, source: &ManagerSource) -> Option<PathBuf> {
+    match source {
+        ManagerSource::Tool => probe_path(run, mise, &["which", "dots"]),
+        ManagerSource::Formula { name, .. } => {
+            probe_path(run, mise, &["bootstrap", "packages", "where", name])
+                .map(|prefix| prefix.join("bin/dots"))
+        }
+    }
+}
+
+pub(super) fn manager_baseline(
     ctx: &Ctx,
     run: &Run<'_>,
     mise: &Mise<'_>,
     source: &ManagerSource,
-) -> Option<String> {
-    let executable = match source {
-        ManagerSource::Tool => probe_path(run, mise, &["which", "dots"]),
-        ManagerSource::Formula(name) => {
-            probe_path(run, mise, &["bootstrap", "packages", "where", name])
-                .map(|prefix| prefix.join("bin/dots"))
+) -> Option<ManagerBaseline> {
+    if let Some(executable) = manager_path(run, mise, source) {
+        return manager_version(ctx, run, executable).map(ManagerBaseline::Installed);
+    }
+    let missing = match source {
+        ManagerSource::Tool => {
+            let tools = list(run, mise).ok()?;
+            let mut rows = tools
+                .iter()
+                .filter(|(name, _)| manager_tool(name))
+                .flat_map(|(_, rows)| rows)
+                .peekable();
+            rows.peek().is_some() && rows.all(|row| row.installed == Some(false))
         }
-    }?;
+        ManagerSource::Formula { missing, .. } => *missing,
+    };
+    missing.then_some(ManagerBaseline::Missing)
+}
+
+fn manager_version(ctx: &Ctx, run: &Run<'_>, executable: PathBuf) -> Option<String> {
     let cmd = ctx.command(executable, Cwd::Root).map(|mut cmd| {
         cmd.arg("--version");
         cmd
@@ -267,16 +295,20 @@ pub(super) fn report_manager(
     run: &Run<'_>,
     mise: &Mise<'_>,
     source: Option<ManagerSource>,
-    before: Option<String>,
+    before: Option<ManagerBaseline>,
 ) {
     step(run, "dots manager", |id| {
+        let Some(before) = &before else {
+            return Ok(Outcome::Skipped);
+        };
         let Some(after) = source
             .as_ref()
-            .and_then(|source| manager_version(ctx, run, mise, source))
+            .and_then(|source| manager_path(run, mise, source))
+            .and_then(|path| manager_version(ctx, run, path))
         else {
             return Ok(Outcome::Skipped);
         };
-        if before.as_ref() == Some(&after) {
+        if matches!(before, ManagerBaseline::Installed(version) if version == &after) {
             return Ok(Outcome::Skipped);
         }
         let Some(running) = crate::config_commands::version(&ctx.env)

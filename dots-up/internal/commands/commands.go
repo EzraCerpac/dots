@@ -11,7 +11,6 @@ var specs = []Spec{
 	{"reports", "Saved reports", "Inspect", "Browse completed command reports", "concise", false, false},
 	{"up", "Update machine", "Maintain", "Sync configuration and update tools and plugins", "dashboard", false, false},
 	{"sync", "Sync configuration", "Maintain", "Share configuration and show changed files", "concise", false, false},
-	{"apply", "Apply dotfiles", "Maintain", "Apply declared dotfiles and templates", "scrollback", false, false},
 	{"add", "Add software", "Software", "Install and record tools or native packages", "scrollback", false, true},
 	{"remove", "Remove software", "Software", "Uninstall software and remove declarations", "scrollback", false, true},
 	{"backup", "Back up settings", "Settings", "Save and publish encrypted settings", "scrollback", false, false},
@@ -22,8 +21,6 @@ var specs = []Spec{
 	{"remote", "Bootstrap remote host", "Setup", "Bootstrap a machine over existing SSH", "scrollback", true, true},
 	{"bundle", "Private bundle", "Setup", "Create or check encrypted bootstrap inputs", "scrollback", true, true},
 	{"test", "Run tests", "Development", "Run repository test suites", "scrollback", false, false},
-	{"publish", "Publish source", "Development", "Review changes and open or update a PR", "scrollback", false, true},
-	{"plan", "Native setup plan", "Advanced", "Print the existing native mise plan", "concise", false, false},
 }
 
 func Canonical(name string) string {

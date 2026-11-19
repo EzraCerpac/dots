@@ -10,7 +10,7 @@ use crate::completion::Shell;
 use crate::config::Root;
 use crate::config_commands::Invocation;
 use crate::{Ctx, Env, Fail, Flags, bootstrap, brew, completion, config_commands, exceptions};
-use crate::{history, init, inspect, packages, publish, receipt, skill, sync, ui, update};
+use crate::{history, init, inspect, packages, receipt, skill, sync, ui, update};
 
 const HELP: &str = include_str!("cli-help.txt");
 
@@ -161,22 +161,13 @@ pub fn tree() -> Command {
                 }
             })))))
         .subcommand(sub("status", "Show programs, profile and this machine's state"))
-        .subcommand(sub("plan", "Preview mise's bootstrap plan for this machine"))
-        .subcommand(globals(sub("up", "Checkpoint settings, sync, and update packages, tools, hooks and mise"))
+        .subcommand(globals(sub("up", "Checkpoint settings, apply configuration, and update packages, tools, hooks and mise"))
             .visible_alias("update")
             .arg(flag("mas", "Include Mac App Store updates (macOS)").conflicts_with("last"))
             .arg(flag("last", "Print the last update report")))
         .subcommand(sub("sync", "Share configuration edits and apply others' changes")
             .arg(flag("last", "Replay the latest receipt without the network"))
             .after_help("A sync with valid arguments always exits 0."))
-        .subcommand(sub("apply", "Apply declared dotfiles and templates")
-            .arg(flag("force", "Overwrite conflicting files").short('f'))
-            .arg(flag("dry-run", "Show what would change").short('n'))
-            .arg(flag("yes", "Skip confirmation").short('y'))
-            .arg(flag("prune", "Remove stale dotfiles"))
-            .arg(flag("prompt-secrets", "Prompt for missing template secrets"))
-            .arg(positionals("TARGET"))
-            .after_help("Options are passed to mise."))
         .subcommand(pass_through("test", "Run the configuration's tests/run"))
         .subcommand(scopes(sub("add", "Install software or adopt a dotfile, and record it"),
             "Record in config.toml, for every profile", "Record in config.PROFILE.toml", "Record in FILE")
@@ -222,10 +213,6 @@ pub fn tree() -> Command {
         .subcommand(sub("backup", "Save and publish encrypted app settings"))
         .subcommand(sub("restore", "Fetch and restore encrypted app settings")
             .arg(flag("initialize-history", "Replace a history store connected elsewhere and keep the old one")))
-        .subcommand(sub("publish", "Open a pull request from a JJ workspace")
-            .arg(flag("all", "Publish the whole current stack").conflicts_with("bookmark"))
-            .arg(value("bookmark", "NAME", "Publish this wip/... bookmark"))
-            .after_help("Without options, publish the one change above main@origin."))
         .subcommand(sub("root", "Print the physical configuration root"))
         .subcommand(sub("profile", "Print or select this machine's profile")
             .arg(profile().requires("machine-id"))
@@ -255,16 +242,22 @@ fn bootstrap_tree() -> Command {
             "complete",
             "Run the dots stages (final bootstrap task)",
         ))
-        .arg(file(
-            "bundle",
-            "FILE",
-            "Read private inputs from this encrypted bundle",
-        ))
-        .arg(file(
-            "identity",
-            "KEY",
-            "age identity for the bundle and recovery",
-        ))
+        .arg(
+            file(
+                "bundle",
+                "FILE",
+                "Read private inputs from this encrypted bundle",
+            )
+            .allow_hyphen_values(false),
+        )
+        .arg(
+            file(
+                "identity",
+                "KEY",
+                "age identity for the bundle and recovery",
+            )
+            .allow_hyphen_values(false),
+        )
         .arg(
             value(
                 "restore",
@@ -276,7 +269,11 @@ fn bootstrap_tree() -> Command {
         )
         .arg(value("from", "REPO", "Bootstrap from this repository"))
         .arg(value("adopt", "REPO", "Adopt this repository"))
-        .arg(file("from-dir", "DIR", "Use this checkout directory").value_hint(ValueHint::DirPath))
+        .arg(
+            file("from-dir", "DIR", "Use this checkout directory")
+                .allow_hyphen_values(false)
+                .value_hint(ValueHint::DirPath),
+        )
         .arg(value(
             "config-dir",
             "DIR",
@@ -691,15 +688,7 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
     };
     if !matches!(
         name,
-        "init"
-            | "bundle"
-            | "brew"
-            | "install-release-app"
-            | "status"
-            | "sync"
-            | "plan"
-            | "apply"
-            | "test"
+        "init" | "bundle" | "brew" | "install-release-app" | "status" | "sync" | "test"
     ) {
         require_config(&ctx.root)?;
     }
@@ -711,8 +700,6 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         "up" if args.get_flag("last") => ui::last(&ctx, args),
         "up" => update::up(&ctx, args),
         "status" => inspect::status(&ctx, args),
-        "plan" => inspect::plan(&ctx, args),
-        "apply" => inspect::apply(&ctx, args),
         "test" => inspect::test(&ctx, tail),
         "retire-dotfiles" => inspect::retire_dotfiles(&ctx, args),
         "exceptions" => exceptions::install(&ctx, args),
@@ -729,7 +716,6 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         "backup" => history::backup(&ctx, args),
         "restore" => history::restore_command(&ctx, args),
         "enroll-history" => history::enroll_command(&ctx, args),
-        "publish" => publish::publish(&ctx, args),
         _ => unreachable!("covered by command grammar"),
     }
 }

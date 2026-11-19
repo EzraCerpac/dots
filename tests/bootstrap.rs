@@ -1770,3 +1770,152 @@ fn new_local_native_bootstrap_does_not_checkpoint_a_plaintext_track() {
             .exists()
     );
 }
+
+#[test]
+fn p05_missing_bundle_defers_before_resolving_fallback_identity() {
+    let world = World::new();
+    minimal(&world);
+    let output = run(complete(&world)
+        .env("DOTS_BOOTSTRAP_BUNDLE", world.home().join("missing.age"))
+        .env("SETUP_AGE_IDENTITY", "invalid relative fallback"));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains("deferred: Private inputs"),
+        "{output:?}"
+    );
+    assert!(
+        stdout(&output).contains("dots bootstrap --bundle FILE --identity FILE"),
+        "{output:?}"
+    );
+}
+
+fn p05_checkout(world: &World, path: &Path, origin: &str) {
+    fs::create_dir(path).unwrap();
+    let git = |args: &[&str]| {
+        assert_success(&run(world.git().current_dir(path).args(args)));
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["commit", "--allow-empty", "-m", "Seed fixture"]);
+    git(&["remote", "add", "origin", origin]);
+}
+
+#[test]
+fn p05_from_dir_resolves_against_caller_for_preflight_and_native_bootstrap() {
+    let world = World::new();
+    minimal(&world);
+    let caller = world.home().join("caller");
+    fs::create_dir(&caller).unwrap();
+    let checkout = caller.join("checkout");
+    let origin = format!("file://{}", world.bare_remote("source").display());
+    p05_checkout(&world, &checkout, &origin);
+    let output = run(fake(&world).current_dir(&caller).args([
+        "bootstrap",
+        "--from",
+        &origin,
+        "--from-dir",
+        "checkout",
+        "--update",
+        "--dry-run",
+    ]));
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(&format!("--from-dir\n{}\n", checkout.display())),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn p05_preflight_preserves_git_checkout_path_with_trailing_space() {
+    let world = World::new();
+    minimal(&world);
+    let checkout = world.home().join("checkout ");
+    let origin = format!("file://{}", world.bare_remote("source").display());
+    p05_checkout(&world, &checkout, &origin);
+    let output = run(fake(&world)
+        .args(["bootstrap", "--from", &origin, "--from-dir"])
+        .arg(&checkout)
+        .args(["--update", "--dry-run"]));
+    assert_success(&output);
+    assert!(stdout(&output).contains("--update"), "{output:?}");
+}
+
+#[test]
+fn p05_recovery_identity_survives_watcher_scratch_failure_and_retry() {
+    let world = World::new();
+    minimal(&world);
+    let origin = format!("file://{}", world.bare_remote("history").display());
+    write(
+        &world.root().join("config.toml"),
+        &format!(
+            "{MINIMAL}dots_state_repo = {origin:?}\n\n[dotfiles]\n        \"~/tracked\" = {{ mode = \"track\", encrypt = true, variants = [{{ profile = \"host-fixture-host\" }}] }}\n"
+        ),
+        0o644,
+    );
+    let recovery = world.home().join("recovery.key");
+    let machine = world.home().join(".config/age/keys.txt");
+    write(&recovery, "fixture recovery", 0o600);
+    write(&machine, "fixture machine", 0o600);
+    let private = world.home().join("mise-fixture");
+    let bin = private.join("bin");
+    write(
+        &bin.join("age-keygen"),
+        r#"#!/bin/sh
+. "$P05_FIXTURE_GUARD"
+case "$1:$2" in
+    "-y:$HOME/recovery.key") printf 'age1%058d\n' 1 ;;
+    "-y:$HOME/.config/age/keys.txt") printf 'age1%058d\n' 2 ;;
+    *) exit 91 ;;
+esac
+"#,
+        0o755,
+    );
+    write(&bin.join("age"), "#!/bin/sh\nexit 0\n", 0o755);
+    let mise = world.home().join("scratch-fixture-mise");
+    write(
+        &mise,
+        r#"#!/bin/sh
+set -eu
+. "$P05_FIXTURE_GUARD"
+case "$*" in
+    'bootstrap dotfiles paths --json')
+        printf '{"entries":[{"mode":"track","path":"%s/tracked","variant":"host-fixture-host","declared_in":"%s/config.toml"}],"invalid":[]}' "$HOME" "$DOTS_ROOT" ;;
+    'config get --file '*)
+        if [ -n "${FIXTURE_FAIL_SCRATCH:-}" ]; then mv "$TMPDIR" "$TMPDIR.blocked"; fi ;;
+    'bootstrap services apply --yes') test -f "$MISE_GLOBAL_CONFIG_FILE" ;;
+    'dot status --json') printf '{"history":{"watcher":"running"}}' ;;
+    *) echo "unexpected mise call: $*" >&2; exit 91 ;;
+esac
+"#,
+        0o755,
+    );
+    let mut command = fake(&world);
+    command
+        .args(["bootstrap", "complete"])
+        .env("DOTS_MISE_BIN", &mise)
+        .env("SETUP_MISE_BIN", &mise)
+        .env("SETUP_AGE_IDENTITY", &recovery);
+    let failed = run(command.env("FIXTURE_FAIL_SCRATCH", "1"));
+    let tmp = private.join("tmp");
+    fs::rename(private.join("tmp.blocked"), tmp)
+        .unwrap_or_else(|error| panic!("{error}: {failed:?}"));
+    assert!(
+        stdout(&failed).contains("could not prepare the mise history watcher"),
+        "{failed:?}"
+    );
+    let saved = fs::read_to_string(world.root().join("config.local.toml")).unwrap();
+    let retry = run(command.env_remove("FIXTURE_FAIL_SCRATCH"));
+    assert_success(&retry);
+    assert!(
+        stdout(&retry).contains("completed: Encrypted local history"),
+        "{retry:?}"
+    );
+    let saved = saved.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        saved["env"]["SETUP_AGE_IDENTITY"].as_str(),
+        recovery.to_str()
+    );
+    assert_eq!(
+        saved["settings"]["age"]["identity_files"][0].as_str(),
+        machine.to_str()
+    );
+}

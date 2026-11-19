@@ -8,7 +8,9 @@ use crate::{Args, Ctx, Fail};
 pub fn reports(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let command = args.get_one::<String>("COMMAND").map(|name| {
         let cli = crate::cli::tree();
-        let name = cli.find_subcommand(name).unwrap().get_name();
+        let name = cli
+            .find_subcommand(name)
+            .map_or(name.as_str(), |cmd| cmd.get_name());
         Command::ALL
             .into_iter()
             .find(|command| command.name() == name)

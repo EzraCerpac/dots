@@ -59,7 +59,7 @@ fn guard_commands(world: &World) -> (PathBuf, PathBuf) {
     let bin = world.home().join("guard-bin");
     let calls = world.home().join("unexpected-commands");
     fs::create_dir(&bin).unwrap();
-    for name in ["mise", "git", "jj", "sudo", "brew", "mas", "retry-update"] {
+    for name in ["mise", "git", "sudo", "brew", "mas", "retry-update"] {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

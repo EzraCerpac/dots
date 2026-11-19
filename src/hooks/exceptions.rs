@@ -26,7 +26,7 @@ fn run_selected(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<bo
     let selected = selection::read(&ctx.root, &ctx.env)?;
     let profile = selected.profile.as_deref().unwrap_or_default();
     let mut failed = false;
-    for recipe in exceptions.selected(profile)? {
+    for recipe in exceptions.selected_rows(profile) {
         if run.cancelled() {
             break;
         }
@@ -40,6 +40,7 @@ fn run_selected(run: &Run<'_>, exceptions: &Exceptions, mode: Mode) -> Result<bo
             &[]
         };
         let outcome = run_stage(run, label.as_str(), ChildEnv::Recipe(mode), |stage, env| {
+            recipe.ensure_executable()?;
             run_child(run, stage, &recipe.path, args, env)
         });
         if matches!(mode, Mode::InstallOnly) && outcome == Outcome::Failed && !run.cancelled() {

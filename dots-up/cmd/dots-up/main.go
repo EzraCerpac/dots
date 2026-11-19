@@ -162,17 +162,9 @@ func execute(opts supervisor.Options) int {
 		}
 		return supervisor.ShowLast(opts)
 	}
-	// Plan retains its original direct route; it starts no update supervisor.
-	if opts.Command == "plan" {
-		return directBackend(opts)
-	}
 	opts.Sensitive = spec.Sensitive
 	opts.Concise = spec.Mode == "concise"
 	return supervisor.Run(opts)
-}
-
-func directBackend(opts supervisor.Options) int {
-	return runDots(opts, append([]string{"--backend", opts.Command}, opts.Args...)...)
 }
 
 // runDots runs `dots ARGS...` from the manager, attached to this terminal.
@@ -197,6 +189,7 @@ func runDots(opts supervisor.Options, dotsArgs ...string) int {
 	}
 	return 0
 }
+
 // defaultRoot follows bin/dots: DOTS_ROOT, else mise's config directory.
 func defaultRoot() string {
 	if root := os.Getenv("DOTS_ROOT"); root != "" {

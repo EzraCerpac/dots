@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [rust, main, ci/overhaul]
+    branches: [rust, main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

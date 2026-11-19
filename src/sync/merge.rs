@@ -4,7 +4,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    git::{index_row, invalid, oid, relative},
+    git::{Entry, Tree, index_row, invalid, oid, relative, split},
     snapshot::Scratch,
 };
 
@@ -29,30 +29,32 @@ pub(super) fn with_published(
     let git = scratch
         .live
         .indexed(&scratch.dir.path().join("merge.index"));
-    let output = git.output([
+    let args = [
         "merge-tree",
         "--write-tree",
-        "--name-only",
         "-z",
-        "-X",
-        "theirs",
         "--allow-unrelated-histories",
-        local,
-        published,
-    ])?;
-    if !matches!(output.status.code(), Some(0 | 1)) {
-        return Err(invalid("could not merge published configuration"));
-    }
-    let mut rows = output.stdout.split(|byte| *byte == 0);
-    let native = oid(rows.next().ok_or_else(|| invalid("missing merged tree"))?)?;
-    let tree = if output.status.success() {
-        native
-    } else {
+    ];
+    // The favored merge hides binary conflicts after choosing their blob,
+    // even if the resulting mode still comes from the local side.
+    let neutral = git.output(args.into_iter().chain(["--messages", local, published]))?;
+    let (mut tree, rows) = merge_output(&neutral)?;
+    if !neutral.status.success() {
+        let binaries = binary_conflicts(rows)?;
+        let favored = git.output(args.into_iter().chain([
+            "--name-only",
+            "--no-messages",
+            "-X",
+            "theirs",
+            local,
+            published,
+        ]))?;
+        let (native, rows) = merge_output(&favored)?;
         let remaining = rows
             .take_while(|row| !row.is_empty())
             .map(relative)
             .collect::<io::Result<BTreeSet<_>>>()?;
-        if remaining.is_empty() {
+        if !favored.status.success() && remaining.is_empty() {
             return Err(invalid("merge has no classified conflicting paths"));
         }
         let roots = remaining
@@ -60,25 +62,45 @@ pub(super) fn with_published(
             .map(|path| conflict_root(path, [local, published]))
             .collect::<BTreeSet<_>>();
         let includes = |path: &Path| roots.iter().any(|root| path.starts_with(root));
-        git.get(["read-tree", &native])?;
-        let mut rows = Vec::new();
-        for path in git
-            .tree(&native)?
-            .keys()
-            .filter(|path| remaining.contains(*path) || includes(path))
-        {
-            index_row(&mut rows, path, None, local.len());
+        let mut index = Vec::new();
+        if !remaining.is_empty() || !binaries.is_empty() {
+            let merged = git.tree(&native)?;
+            for path in merged
+                .keys()
+                .filter(|path| remaining.contains(*path) || includes(path))
+            {
+                index_row(&mut index, path, None, local.len());
+            }
+            if !remaining.is_empty() {
+                for (path, entry) in git
+                    .tree(published)?
+                    .iter()
+                    .filter(|(path, _)| includes(path))
+                {
+                    index_row(&mut index, path, Some(entry), local.len());
+                }
+            }
+            for (path, entry) in binaries
+                .iter()
+                .filter(|(path, _)| !remaining.contains(*path) && !includes(path))
+            {
+                let chosen = merged
+                    .get(path)
+                    .filter(|chosen| chosen.oid == entry.oid)
+                    .ok_or_else(|| invalid("could not verify the published binary merge entry"))?;
+                if chosen != entry {
+                    index_row(&mut index, path, Some(entry), local.len());
+                }
+            }
         }
-        for (path, entry) in git
-            .tree(published)?
-            .iter()
-            .filter(|(path, _)| includes(path))
-        {
-            index_row(&mut rows, path, Some(entry), local.len());
-        }
-        git.update_index(&rows)?;
-        git.id(["write-tree"])?
-    };
+        tree = if index.is_empty() {
+            native
+        } else {
+            git.get(["read-tree", &native])?;
+            git.update_index(&index)?;
+            git.id(["write-tree"])?
+        };
+    }
     scratch.git.id([
         "-c",
         "commit.gpgSign=false",
@@ -91,6 +113,59 @@ pub(super) fn with_published(
         "-m",
         &format!("Merge published {label}"),
     ])
+}
+
+fn merge_output(
+    output: &std::process::Output,
+) -> io::Result<(String, impl Iterator<Item = &[u8]>)> {
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(invalid("could not merge published configuration"));
+    }
+    let mut rows = output.stdout.split(|byte| *byte == 0);
+    let tree = oid(rows.next().ok_or_else(|| invalid("missing merged tree"))?)?;
+    Ok((tree, rows))
+}
+
+fn binary_conflicts<'a>(mut rows: impl Iterator<Item = &'a [u8]>) -> io::Result<Tree> {
+    let mut theirs = Tree::new();
+    for row in rows.by_ref().take_while(|row| !row.is_empty()) {
+        let (header, name) = split(row, b'\t')?;
+        if let Some(header) = header.strip_suffix(b" 3") {
+            let (mode, object) = split(header, b' ')?;
+            if matches!(mode, b"100644" | b"100755") {
+                theirs.insert(
+                    relative(name)?,
+                    Entry {
+                        mode: std::str::from_utf8(mode).map_err(io::Error::other)?.into(),
+                        oid: oid(object)?,
+                    },
+                );
+            }
+        }
+    }
+    let mut binaries = Tree::new();
+    while let Some(count) = rows.next().filter(|count| !count.is_empty()) {
+        let count: usize = std::str::from_utf8(count)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| invalid("invalid merge diagnostic path count"))?;
+        let paths = rows.by_ref().take(count).collect::<Vec<_>>();
+        let kind = rows
+            .next()
+            .ok_or_else(|| invalid("missing merge diagnostic type"))?;
+        rows.next()
+            .ok_or_else(|| invalid("missing merge diagnostic message"))?;
+        if kind == b"CONFLICT (binary)" {
+            for path in paths {
+                let path = relative(path)?;
+                let entry = theirs
+                    .get(&path)
+                    .ok_or_else(|| invalid("missing published binary conflict entry"))?;
+                binaries.insert(path, entry.clone());
+            }
+        }
+    }
+    Ok(binaries)
 }
 
 fn conflict_root(path: &Path, parents: [&str; 2]) -> PathBuf {
@@ -142,6 +217,7 @@ mod tests {
         let root = git.root();
         for (path, bytes) in [
             ("binary", &b"base\0"[..]),
+            ("mode-only", &b"unchanged local contents\0"[..]),
             ("type", &b"base"[..]),
             ("deleted", &b"base"[..]),
         ] {
@@ -152,6 +228,7 @@ mod tests {
 
         fs::write(root.join("binary"), b"local\0").unwrap();
         fs::set_permissions(root.join("binary"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("mode-only"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::remove_file(root.join("type")).unwrap();
         symlink("other", root.join("type")).unwrap();
         fs::write(root.join("deleted"), b"local").unwrap();
@@ -162,6 +239,7 @@ mod tests {
 
         git.get(["switch", "-qc", "published", &base]).unwrap();
         fs::write(root.join("binary"), b"published\0").unwrap();
+        fs::write(root.join("mode-only"), b"clean published bytes\0").unwrap();
         fs::write(root.join("type"), b"published").unwrap();
         fs::remove_file(root.join("deleted")).unwrap();
         fs::write(root.join("prefix"), b"published").unwrap();
@@ -170,10 +248,10 @@ mod tests {
 
         let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
         let merged = with_published(&scratch, &local, Some(&published), "dev").unwrap();
-        assert_eq!(
-            scratch.git.tree(&merged).unwrap(),
-            git.tree(&published).unwrap()
-        );
+        let mut expected = git.tree(&published).unwrap();
+        // The local executable bit is an independent edit for this path.
+        expected.get_mut(Path::new("mode-only")).unwrap().mode = "100755".into();
+        assert_eq!(scratch.git.tree(&merged).unwrap(), expected);
         assert_eq!(
             scratch
                 .git

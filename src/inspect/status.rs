@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 
 use serde::Deserialize;
 
@@ -106,7 +107,16 @@ pub fn status(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
             "Create a configuration with dots init or set DOTS_ROOT, then rerun dots status.",
         ));
     }
-    println!("{}", one_line(&config_commands::version(&ctx.env)?));
+    match config_commands::version(&ctx.env) {
+        Ok(version) => println!("{}", one_line(&version)),
+        Err(error) => {
+            return Ok(startup_error(
+                run,
+                error,
+                "Check the dots installation, then rerun dots status.",
+            ));
+        }
+    }
     println!("Agent skill links");
     match skill::status(ctx) {
         skill::Status::Disabled => println!("  disabled"),
@@ -194,8 +204,6 @@ pub fn status(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     });
     let result = if run.cancelled() {
         130
-    } else if recipes == 2 {
-        2
     } else {
         u8::from(
             [packages, tools, files, recipes]
@@ -264,6 +272,18 @@ fn find_program(env: &Env, program: &str) -> Option<PathBuf> {
         .find(|path| is_executable(path))
 }
 
+fn probe_output(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    cwd: Cwd<'_>,
+    program: &Path,
+    args: &[&str],
+) -> Option<Output> {
+    let mut command = ctx.command_with_profile(program, cwd, "".as_ref()).ok()?;
+    command.args(args).env("HOMEBREW_NO_AUTO_UPDATE", "1");
+    run.probe(command).ok()
+}
+
 fn probe_line(
     ctx: &Ctx,
     run: &Run<'_>,
@@ -271,9 +291,7 @@ fn probe_line(
     program: &Path,
     args: &[&str],
 ) -> Option<String> {
-    let mut command = ctx.command_with_profile(program, cwd, "".as_ref()).ok()?;
-    command.args(args).env("HOMEBREW_NO_AUTO_UPDATE", "1");
-    let output = run.probe(command).ok()?;
+    let output = probe_output(ctx, run, cwd, program, args)?;
     if !output.status.success() {
         return None;
     }
@@ -296,25 +314,44 @@ fn show_source(ctx: &Ctx, run: &Run<'_>, expected: Option<&RepoSetting>) {
         git.as_deref()
             .and_then(|git| probe_line(ctx, run, Cwd::Root, git, args))
     };
-    let has_repository = ctx.root.path().join(".git").exists();
-    let origin = has_repository
-        .then(|| {
-            git_query(&[
+    let origin = match git.as_deref() {
+        None => Err(("Git is missing", "Install Git, then rerun dots status.")),
+        Some(git) if ctx.root.path().join(".git").exists() => {
+            let args = [
                 "config",
                 "--local",
                 "--includes",
                 "--get",
                 "remote.origin.url",
-            ])
-        })
-        .flatten();
-    let diagnostic = match (git.is_some(), expected, origin.as_deref()) {
-        (false, _, _) => Some(("Git is missing", "Install Git, then rerun dots status.")),
-        (_, Some(_), None) => Some((
+            ];
+            match probe_output(ctx, run, Cwd::Root, git, &args) {
+                Some(out) if out.status.success() => Ok(Some(
+                    String::from_utf8_lossy(&out.stdout)
+                        .trim_end_matches('\n')
+                        .to_owned(),
+                )),
+                Some(out)
+                    if out.status.code() == Some(1)
+                        && out.stdout.is_empty()
+                        && out.stderr.is_empty() =>
+                {
+                    Ok(None)
+                }
+                _ => Err((
+                    "could not read the source repository configuration",
+                    "Check the configuration checkout's Git config, then rerun dots status.",
+                )),
+            }
+        }
+        Some(_) => Ok(None),
+    };
+    let diagnostic = match (expected, &origin) {
+        (_, Err(issue)) => Some(*issue),
+        (Some(_), Ok(None)) => Some((
             "the configured source remote is missing",
             "Check dots_source_repo and git remote, then rerun dots status.",
         )),
-        (_, Some(expected), Some(origin)) if !expected.matches(origin) => Some((
+        (Some(expected), Ok(Some(origin))) if !expected.matches(origin) => Some((
             "origin differs from dots_source_repo",
             "Set origin to the configured repository, then rerun dots status.",
         )),
@@ -326,7 +363,7 @@ fn show_source(ctx: &Ctx, run: &Run<'_>, expected: Option<&RepoSetting>) {
         run.finish(stage, Outcome::Deferred);
         return;
     }
-    let Some(origin) = origin else {
+    let Ok(Some(origin)) = origin else {
         row("repository", "ok", "local-only", None);
         run.finish(stage, Outcome::Completed);
         return;

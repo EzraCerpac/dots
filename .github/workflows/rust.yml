@@ -64,8 +64,8 @@ jobs:
       target: x86_64-unknown-linux-musl
       suites: >-
         ${{ needs.changes.outputs.full == 'true'
-            && '["native","Fedora","Arch","Alpine","oracle"]'
-            || '["native","Fedora","Arch","Alpine"]' }}
+            && '["native","Fedora","Arch:1/2","Arch:2/2","Alpine","oracle"]'
+            || '["native","Fedora","Arch:1/2","Arch:2/2","Alpine"]' }}
       first-run: ${{ needs.changes.outputs.full == 'true' }}
 
   extended:

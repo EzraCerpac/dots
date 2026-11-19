@@ -31,7 +31,7 @@ case "$SUITE" in
     export DOTS_TEST_ORACLE=v0.4.0 DOTS_TEST_TOOL_PATH="$PATH"
     args=(--run-ignored all -E 'kind(test) & test(/(^|::)unchanged_/)' --no-tests fail)
     ;;
-  */*) args=(--partition "slice:$SUITE") ;;
+  */*) args=(--partition "slice:${SUITE##*:}") ;;
 esac
 # Overlap more Git and filesystem-heavy tests on x86_64 runners.
 case "$(uname -m)" in

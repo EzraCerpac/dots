@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-case "$SUITE" in
+DISTRO=${SUITE%%:*}
+case "$DISTRO" in
   Fedora) image=fedora:latest ;;
   Arch) image=archlinux:base ;;
   Alpine) image=alpine:3.23 ;;
@@ -13,8 +14,8 @@ BUNDLE="$RUNNER_TEMP/dots-build"
 workspace=$(cat "$BUNDLE/workspace")
 docker run --rm -i --mount "type=bind,src=$PWD,dst=$workspace" \
   --mount "type=bind,src=$BUNDLE,dst=/dots-build" --workdir "$workspace" \
-  -e SUITE -e BUNDLE=/dots-build "$image" sh -eu <<'CONTAINER'
-case "$SUITE" in
+  -e SUITE -e "DISTRO=$DISTRO" -e BUNDLE=/dots-build "$image" sh -eu <<'CONTAINER'
+case "$DISTRO" in
   Fedora) dnf install -y bash zsh fish git python3 jq tar gzip ;;
   Arch) pacman -Syu --noconfirm --needed bash zsh fish git python jq tar gzip ;;
   Alpine) apk add --no-cache bash zsh fish git python3 jq ;;

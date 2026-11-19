@@ -90,12 +90,12 @@ jobs:
         with:
           version: '0.13.9'
           enable-cache: false
-      - name: Run distribution scenarios from the musl archive
-        if: contains(fromJSON('["Fedora","Arch","Alpine"]'), matrix.suite)
-        run: bash .github/scripts/run-distro
-      - name: Run nextest from the archive
-        if: ${{ !contains(fromJSON('["Fedora","Arch","Alpine"]'), matrix.suite) }}
-        run: bash .github/scripts/run-nextest
+      - name: Run tests from the archive
+        run: |
+          case "$SUITE" in
+            Fedora|Arch:*|Alpine) bash .github/scripts/run-distro ;;
+            *) bash .github/scripts/run-nextest ;;
+          esac
       - name: Summarize timings and flakes
         if: always()
         run: python3 .github/scripts/summarize-nextest.py target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"

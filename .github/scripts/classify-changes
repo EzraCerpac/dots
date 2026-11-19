@@ -26,7 +26,9 @@ git diff --name-only --no-renames -z "$range" -- > "$paths"
 while IFS= read -r -d '' path; do
   case "$path" in
     # The legacy init contract compares its generated README to this template.
-    init/README.md) legacy=true ;;
+    init/README.md)
+      rust=true
+      legacy=true ;;
     *.md|docs/*|plan/*|LICENSE) docs=true ;;
     .github/workflows/test.yml|.github/workflows/release.yml|\
     bin/*|lib/*|tasks/*|bootstrap/*|dots-up/*|completions/*|packaging/*|\

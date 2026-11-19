@@ -281,18 +281,32 @@ fn unchanged_fixture_bootstrap_hook_runs_for_each_profile() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_fixture_update_runs_profile_recipe_and_hooks() {
     let world = World::new();
     let legacy = legacy(&world);
+    let update_mise = world.home().join("update-mise");
+    if !legacy {
+        let script = include_str!("fixtures/up/mise")
+            .strip_prefix("#!/bin/sh\n")
+            .unwrap();
+        write(
+            &update_mise,
+            &format!("#!/bin/sh\n. \"$P05_FIXTURE_GUARD\"\n{script}"),
+            0o755,
+        );
+    }
     for profile in ["laptop", "server"] {
-        let mut command = fake(&world);
+        let mut command = if legacy { fake(&world) } else { dots(&world) };
         if legacy {
             command
                 .args(["--backend", "up"])
                 .env("DOTS_SOURCE_SYNC_DONE", "1");
         } else {
-            command.args(["--plain", "up"]);
+            command
+                .env("DOTS_MISE_BIN", &update_mise)
+                .env("MISE_SELF_UPDATE_AVAILABLE", "false")
+                .env("SETUP_MACHINE_ID", "fixture-host")
+                .args(["--verbose", "up"]);
         }
         let output = run(command.env("SETUP_PROFILE", profile));
         assert_success(&output);

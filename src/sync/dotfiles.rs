@@ -1670,9 +1670,7 @@ fn isolated_apply(run: &Run<'_>, root: &Path, config: &DocumentMut) -> io::Resul
             mode: 0o600,
         },
     )?;
-    let mut command =
-        validation::command(run, root, ["bootstrap", "dotfiles", "apply", "--yes"], true)?;
-    command.env("HOME", root).env("MISE_HISTORY_ENABLED", "0");
+    let command = validation::isolated_apply(run, root)?;
     if !run.probe(command)?.status.success() {
         return Err(invalid("mise could not materialize guarded output"));
     }

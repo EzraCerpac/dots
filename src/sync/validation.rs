@@ -330,10 +330,6 @@ pub(super) fn command(
     args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
     preview: bool,
 ) -> io::Result<Command> {
-    let mise = Mise::new(run.ctx()).map_err(io::Error::other)?;
-    let mut argv = vec![OsString::from("-C"), root.as_os_str().to_owned()];
-    argv.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
-    let mut cmd = mise.command(argv).map_err(io::Error::other)?;
     let selected = if preview {
         overlay_environments(run, root)?
     } else {
@@ -341,6 +337,32 @@ pub(super) fn command(
             .map_err(io::Error::other)?
             .active_environments()
     };
+    command_selected(run, root, args, &selected, preview)
+}
+
+pub(super) fn isolated_apply(run: &Run<'_>, root: &Path) -> io::Result<Command> {
+    let mut cmd = command_selected(
+        run,
+        root,
+        ["bootstrap", "dotfiles", "apply", "--yes"],
+        "",
+        true,
+    )?;
+    cmd.env("HOME", root).env("MISE_HISTORY_ENABLED", "0");
+    Ok(cmd)
+}
+
+fn command_selected(
+    run: &Run<'_>,
+    root: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    selected: &str,
+    preview: bool,
+) -> io::Result<Command> {
+    let mise = Mise::new(run.ctx()).map_err(io::Error::other)?;
+    let mut argv = vec![OsString::from("-C"), root.as_os_str().to_owned()];
+    argv.extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+    let mut cmd = mise.command(argv).map_err(io::Error::other)?;
     cmd.current_dir(root)
         .env("MISE_ENV", selected)
         .env("MISE_CONFIG_DIR", root)

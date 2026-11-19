@@ -1,0 +1,51 @@
+dots keeps your machines in the state your mise configuration declares.
+
+Usage: dots [--plain | --verbose] [COMMAND [ARGS...]]
+       dots COMMAND --help
+
+Inspect:
+  status                Show programs, profile and this machine's state
+  reports [COMMAND]     List saved reports
+  sync --last           Replay the latest sync receipt
+  up --last             Print the last update report
+
+Everyday:
+  up [--mas]            Checkpoint settings, apply configuration, then update packages, tools, hooks and mise
+  sync                  Share configuration edits and apply others' changes
+  add REQUEST...        Install software or adopt a dotfile, and record it
+  remove TARGET...      Uninstall software or restore an adopted dotfile
+  test [ARGS...]        Run the configuration's tests/run
+
+New machines and private settings:
+  init [DIR]            Create a configuration and its Git repository
+  bootstrap             Set up this machine from the configuration
+  remote HOST --profile PROFILE  Set up another machine over SSH
+  bundle create|check   Encrypt or check private bootstrap inputs
+  backup                Save and publish encrypted app settings
+  restore               Fetch and restore encrypted app settings
+
+Helpers for hooks, recipes and scripts:
+  root                  Print the configuration root
+  profile               Print or select this machine's profile
+  mise ARGS...          Run mise in the configuration's environment
+  retire-dotfiles       Delete dangling links to retired dotfiles
+  exceptions            Install missing installer exceptions
+  enroll-history        Prepare this machine for encrypted settings history
+  install-release-app OWNER/REPO
+                        Install a macOS app from a GitHub release
+  brew SUBCOMMAND       Homebrew steps for installer exception recipes
+
+Program:
+  help                  List commands and usage (also shown by bare dots)
+  completions SHELL     Print a shell completion script
+  --version             Print the version and how dots was installed
+
+Global flags for built-in commands, before COMMAND or after up/update:
+  --plain               Print concise progress lines
+  --verbose             Show full output of every step
+--plain and --verbose exclude each other.
+
+Aliases: update is up, uninstall is remove.
+Most commands need config.toml in the configuration root. Run dots init to create one.
+Run dots COMMAND --help for built-in options. test, mise and configuration
+commands pass --help to the command they run.

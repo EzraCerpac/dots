@@ -4,7 +4,7 @@
 # The suites need only this repository: every test builds its own
 # configuration in a temporary directory or copies tests/fixtures. A suite is
 # skipped (exit status 77) when its runtime is missing. The run is isolated
-# from the caller's Git and JJ configuration so personal settings (signing,
+# from the caller's Git configuration so personal settings (signing,
 # pagers, default branches) cannot change fixture behavior.
 set -euo pipefail
 
@@ -31,8 +31,7 @@ done
 isolation="$(mktemp -d "${TMPDIR:-/tmp}/dots-tests.XXXXXX")"
 trap 'rm -rf "$isolation"' EXIT
 printf '[user]\n\tname = Dots Tests\n\temail = dots-tests@example.invalid\n' >"$isolation/gitconfig"
-printf '[user]\nname = "Dots Tests"\nemail = "dots-tests@example.invalid"\n' >"$isolation/jj.toml"
-export GIT_CONFIG_GLOBAL="$isolation/gitconfig" GIT_CONFIG_NOSYSTEM=1 JJ_CONFIG="$isolation/jj.toml"
+export GIT_CONFIG_GLOBAL="$isolation/gitconfig" GIT_CONFIG_NOSYSTEM=1
 unset MISE_ENV
 
 passed=()

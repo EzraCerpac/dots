@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Format changed Rust files, or the paths passed explicitly"
+set -euo pipefail
+
+if (( $# )); then
+  exec rustup run 1.100.0 rustfmt --edition 2024 --config skip_children=true -- "$@"
+fi
+
+{
+  git diff --name-only --diff-filter=ACMR -z HEAD -- '*.rs'
+  git ls-files --others --exclude-standard -z -- '*.rs'
+} | xargs -0 sh -c '
+  if [ "$#" -gt 0 ]; then
+    exec rustup run 1.100.0 rustfmt --edition 2024 --config skip_children=true -- "$@"
+  fi
+' format

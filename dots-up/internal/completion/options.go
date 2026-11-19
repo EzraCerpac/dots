@@ -28,18 +28,7 @@ var commandOptions = map[string][]option{
 		{name: "--last", description: "Open the latest saved update report", group: "update"},
 		{name: "--mas", description: "Include Mac App Store updates", group: "update"},
 	},
-	"sync": {{name: "--last", description: "Inspect the previous sync"}},
-	"apply": {
-		{name: "--force", short: "-f", description: "Overwrite conflicting files"},
-		{name: "--dry-run", short: "-n", description: "Preview dotfile changes"},
-		{name: "--yes", short: "-y", description: "Skip confirmation"},
-		{name: "--prune", description: "Remove stale dotfiles deployed by groups"},
-		{name: "--prompt-secrets", description: "Prompt for missing template secrets"},
-	},
-	"publish": {
-		{name: "--all", description: "Publish the unpublished setup stack", group: "publish"},
-		{name: "--bookmark", description: "Publish a private bookmark", group: "publish", value: "text"},
-	},
+	"sync":    {{name: "--last", description: "Inspect the previous sync"}},
 	"restore": {{name: "--initialize-history", description: "Initialize settings history"}},
 	"atuin-login": {
 		{name: "--browser", description: "Log in through Atuin Hub"},

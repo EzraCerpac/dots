@@ -1,0 +1,3 @@
+legacy_case	reason
+unchanged_plan_previews_declared_resources_without_writing_them	The standalone command is removed. Native passthrough preview remains tested.
+unchanged_apply_selected_target_through_mise	The standalone command is removed. Native passthrough target selection remains tested.

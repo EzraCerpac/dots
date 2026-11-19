@@ -26,7 +26,6 @@ func TestScrollbackKeepsChildOutputAndExitCode(t *testing.T) {
 		{"remove", "", "dots: no declaration or managed app matches 'codex-bar'\n", false, false, 1},
 		{"remove", "", "dots: no declaration or managed app matches 'codex-bar'\n", true, false, 1},
 		{"add", "installed fixture-tool\n", "", false, false, 0},
-		{"apply", "applied fixture-file\n", "", false, false, 0},
 		{"bootstrap", "private fixture output\n", "", false, true, 0},
 	} {
 		name := tc.command

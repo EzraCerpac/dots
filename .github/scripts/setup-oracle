@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=https://github.com/EzraCerpac/dots
+tag=v0.4.0
+commit=f5c8a0e83b333dbea6c0b5f19725cc818ffca674
+test "$(git ls-remote "$repo.git" "refs/tags/$tag" | cut -f1)" = "$commit"
+archive="dots-${tag#v}-$PLATFORM"
+oracle="$(mktemp -d "$RUNNER_TEMP/dots-oracle.XXXXXX")"
+cd "$oracle"
+for asset in SHA256SUMS "$archive.tar.gz"; do
+  curl -fsSL --retry 3 "$repo/releases/download/$tag/$asset" -o "$asset"
+done
+# Pin the published manifest so replaced assets can't change the oracle.
+printf '%s  SHA256SUMS\n' dc1319f9a2087383ef4fb443b96cd117b3d7c2d18a2fc784dc4e1a3fe864f6c3 | shasum -a 256 -c
+awk -v asset="$archive.tar.gz" '$2 == asset' SHA256SUMS | shasum -a 256 -c
+tar -xzf "$archive.tar.gz"
+test "$(cat "$archive/VERSION")" = "${tag#v}"
+test -x "$archive/bin/dots"
+test -x "$archive/bin/dots-up"
+printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"

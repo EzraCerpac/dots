@@ -1,0 +1,3 @@
+legacy_case	reason
+CommandBackendTests.test_up_last_finds_the_latest_finished_bash_log	The Bash updater fallback and its log layout are removed. This case asserted the selected fallback log path using synthetic .fallback and .active markers.
+CommandBackendTests.test_failed_standalone_command_names_the_command_to_rerun	The standalone apply command no longer creates reports. Update reports cover local deployment.

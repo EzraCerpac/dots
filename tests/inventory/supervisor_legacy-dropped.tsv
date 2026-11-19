@@ -1,0 +1,16 @@
+legacy_case	reason
+handoff_test.go.TestManualToAutomaticHandoffWithPTY	The old dashboard's manual-to-automatic transition and acknowledgement sequence are view-specific. Interactive acceptance is deferred with P-12.
+manual_terminal_test.go.TestManualTerminalBackKeysWithRunningPTY	The old dashboard's back keys and return from an open stage terminal are pending the P-12 design.
+manual_terminal_test.go.TestManualTerminalBackAfterTinyResize	The old dashboard's back keys after a resize below its layout minimum are pending the P-12 design.
+manual_terminal_test.go.TestManualTerminalHintPreservesScrollingOutput	The old in-terminal hint and scrolling region are pending the P-12 design.
+manual_terminal_test.go.TestManualTerminalHintPreservesScrollingOutputAfterResize	The old scrolling hint redraw after a resize is pending the P-12 design.
+manual_terminal_test.go.TestManualTerminalPreservesSplitANSIAndUTF8DuringResize	The old terminal renderer's fragment-aware resize and hint redraw are pending the P-12 design. Ordinary redirected byte preservation is covered by unchanged_redirected_test_preserves_binary_streams_and_private_metadata.
+manual_terminal_test.go.TestStartupFailureDoesNotPersistTypedTerminalEcho	The old startup failure test injects typed echo in a dashboard relay. Any future relay needs its own privacy coverage. Redirected metadata privacy is covered in the direct test scenario.
+manual_terminal_test.go.TestAutomaticTerminalHandoffForwardsBackKeys	The old dashboard's back-key handling differs between manual and automatic relay modes. This key policy is pending the P-12 design.
+report_test.go.TestShowLastStatusUsesSavedCommandForOlderEvents	The Go status replay filled missing command names in old run_start events. The private Go format has no migration contract. Latest up replay is covered through dots up --last.
+run_test.go.TestDashboardFailureContinuesOneUpdaterRun	The injected Go renderer failure uses the retired dashboard callback. Redirected up still verifies that plain and verbose paths execute the hook once.
+run_test.go.TestUpdaterCommandRunsManagerFromHome	The standalone Rust executable removes the separate Go frontend, Bash backend and DOTS_HOME dispatch.
+run_test.go.TestUpdaterCommandWithoutHomeUsesLegacySetupTask	The old renderer's fallback to mise run setup:update supported mixed legacy versions. The Rust executable owns up and has no legacy renderer backend.
+stream_test.go.TestEventStreamDecoderPreservesBytesAndFragmentedEvents	The framed stage/event decoder is removed. Byte preservation and stage attribution are covered through real commands in this suite, independent of the framing.
+stream_test.go.TestEventStreamDecoderRejectsInvalidNonce	The retired framed protocol has no nonce validator in the Rust port.
+stream_test.go.TestOutputReaderConvertsFramesAcrossWrites	The retired decoder reassembled split event frames. The public tests exercise ordinary binary output and stage attribution without fabricating protocol records.

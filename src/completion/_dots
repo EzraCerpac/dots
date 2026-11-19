@@ -1,0 +1,55 @@
+#compdef dots
+# Load with: source <(dots completions zsh) after compinit.
+# For autoloading, put _dots on fpath before compinit.
+
+_dots() {
+    local line value description display
+    local -a args values descriptions prefixes prefix_descriptions matching
+    local i
+    for ((i=2; i<CURRENT; i++)); do
+        value=${(Q)words[i]}
+        [[ ${words[i]} == '~/'* ]] && value="$HOME${value[2,-1]}"
+        args+=( "$value" )
+    done
+    args+=( "${(Q)PREFIX}" )
+    local reply
+    reply=$(command dots __complete zsh "${args[@]}" 2>/dev/null) || return 1
+    case $reply in
+        (:files|:dirs|:files=|:dirs=)
+            [[ $reply == *= ]] && compset -P 1 '*='
+            if [[ $reply == :dirs* ]]; then _directories; else _files; fi
+            return ;;
+    esac
+
+    for line in "${(@f)reply}"; do
+        value=${line%%$'\t'*}
+        [[ -n $value ]] || continue
+        display=$value
+        if [[ $line == *$'\t'* ]]; then
+            description=${${line#*$'\t'}%%$'\t'*}
+            [[ -z $description ]] || display="$value -- $description"
+        fi
+        if [[ $line == *$'\t'nospace ]]; then
+            prefixes+=( "$value" )
+            prefix_descriptions+=( "$display" )
+        else
+            values+=( "$value" )
+            descriptions+=( "$display" )
+        fi
+    done
+    # The query matches the prefix. When editing inside a word, also let
+    # Zsh match the suffix before it inserts a candidate.
+    [[ -z $SUFFIX ]] && matching=( -U )
+    if (( $#prefixes )); then
+        compadd "${matching[@]}" -S '' -d prefix_descriptions -a prefixes
+    fi
+    if (( $#values )); then
+        compadd "${matching[@]}" -d descriptions -a values
+    fi
+}
+
+if [[ ${zsh_eval_context[-1]} == loadautofunc ]]; then
+    _dots "$@"
+elif (( $+functions[compdef] )); then
+    compdef _dots dots
+fi

@@ -213,7 +213,7 @@ jobs:
             Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip make zlib-devel python3 jq ;;
             Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git make zlib python jq ;;
             Alpine)
-              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git make zlib-dev python3 jq
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev linux-headers git make zlib-dev python3 jq
               rust_host=x86_64-unknown-linux-musl
               ;;
             *) exit 2 ;;

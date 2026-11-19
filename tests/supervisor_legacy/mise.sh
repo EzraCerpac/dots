@@ -13,6 +13,12 @@ while [ "$#" -gt 0 ]; do
         *) break ;;
     esac
 done
+case "$#:$*" in
+    '4:bootstrap dotfiles paths --json'|'5:bootstrap dotfiles --local paths --json')
+        printf '{"entries":[],"invalid":[]}\n'
+        exit 0
+        ;;
+esac
 case "${1-} ${2-} ${3-}" in
     'config get --file')
         [ "${5-}" = vars.dots_profiles ] || exit 1
@@ -25,7 +31,6 @@ case "${1-} ${2-} ${3-}" in
         fi
         printf '[]\n'
         ;;
-    'bootstrap dotfiles paths') printf '{"entries":[]}\n' ;;
     'bootstrap dotfiles save'|'install  '|'upgrade --no-prune ') ;;
     'bootstrap packages status'|'ls '*) printf '{}\n' ;;
     'which jq ') command -v jq ;;

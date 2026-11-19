@@ -12,6 +12,13 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\n' "$*" >> "$HOME/mise-calls"
 
+case "$#:$*" in
+    '4:bootstrap dotfiles paths --json'|'5:bootstrap dotfiles --local paths --json')
+        printf '{"entries":[],"invalid":[]}\n'
+        exit 0
+        ;;
+esac
+
 case "${1:-} ${2:-} ${3:-}" in
     '--version  ') printf '%s\n' '2026.11.9' ;;
     'config get --file')
@@ -46,7 +53,6 @@ case "${1:-} ${2:-} ${3:-}" in
     'settings ls '*) printf '{}\n' ;;
     'ls '*) printf '{}\n' ;;
     'bootstrap packages status') printf '{}\n' ;;
-    'bootstrap dotfiles paths') printf '{"entries":[]}\n' ;;
     'bootstrap dotfiles status') printf '{"files":[],"edits":[]}\n' ;;
     'install  ') exit "${FIXTURE_INSTALL_STATUS:-0}" ;;
     'upgrade '*)

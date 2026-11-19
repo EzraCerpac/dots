@@ -144,7 +144,6 @@ fn ordered(text: &str, parts: &[&str]) {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_invalid_update_configuration_stops_dependent_work() {
     // The legacy renderer nonce framed the startup failure. The CLI diagnostic
     // and the absence of dependent work expose the failure without that protocol.
@@ -170,7 +169,6 @@ fn unchanged_invalid_update_configuration_stops_dependent_work() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_manager_upgrade_is_reported_for_the_next_run() {
     let f = UpdateFixture::new();
     f.write(
@@ -203,7 +201,6 @@ fn unchanged_manager_upgrade_is_reported_for_the_next_run() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_update_hook_and_recipe_keep_the_running_dots_after_mise_sets_path() {
     let f = UpdateFixture::new();
     let competing = f.world.home().join("competing");
@@ -231,7 +228,6 @@ fn new_update_hook_and_recipe_keep_the_running_dots_after_mise_sets_path() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_package_managed_mise_is_not_self_updated() {
     let f = UpdateFixture::new();
     let lib = f.world.home().join(".local/lib");
@@ -247,7 +243,6 @@ fn unchanged_package_managed_mise_is_not_self_updated() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_update_hooks_run_in_name_order_with_environment_and_outcomes() {
     let f = UpdateFixture::new();
     for (name, code) in [
@@ -311,7 +306,6 @@ if grep -q '^self-update' "$HOME/mise-calls"; then exit 1; fi"#,
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_hook_changes_are_visible_in_plain_output() {
     // The old renderer's event descriptor is gone. Check the printed changes.
     let f = UpdateFixture::new();
@@ -340,7 +334,6 @@ printf 'plugin-b\tnot installed\tadded-xyz\nplugin-c\tbefore-gone\t\n' >> "$DOTS
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_hook_labels_and_profiles_are_visible_when_run() {
     let f = UpdateFixture::new();
     for name in [
@@ -377,7 +370,6 @@ fn unchanged_hook_labels_and_profiles_are_visible_when_run() {
 // The private listing helper's exit code and tab-separated output disappeared
 // with the helper. Assert the public update failure and no hook execution.
 #[test]
-#[ignore = "P-04"]
 fn unchanged_unknown_hook_profile_prevents_all_hooks_in_that_directory() {
     let f = UpdateFixture::new();
     f.hook("10-valid", "touch \"$HOME/unexpected\"");
@@ -388,7 +380,6 @@ fn unchanged_unknown_hook_profile_prevents_all_hooks_in_that_directory() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_deferred_hook_is_visible_without_failing_the_update() {
     let f = UpdateFixture::new();
     f.hook("10-Later", "exit 3");
@@ -399,7 +390,6 @@ fn unchanged_deferred_hook_is_visible_without_failing_the_update() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_failed_tool_install_reaches_hooks_and_skips_upgrade() {
     let f = UpdateFixture::new();
     f.hook(
@@ -421,7 +411,6 @@ fn unchanged_failed_tool_install_reaches_hooks_and_skips_upgrade() {
 
 // Also covers ExceptionManifestTests.test_flags_column_is_optional_and_parsed.
 #[test]
-#[ignore = "P-04"]
 fn unchanged_update_passes_install_only_to_flagged_selected_recipes() {
     let f = UpdateFixture::new();
     for name in ["plain-app", "self-updater", "everywhere", "not-here"] {
@@ -450,7 +439,6 @@ printf '%s\n' "$DOTS_ROOT" "$DOTS_PROFILE" "$PWD" > "$HOME/recipe-env""#,
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_recipes_read_the_callers_redirected_stdin() {
     // The packaged v0.4.0 supervisor forwarded stdin only for an interactive
     // run. 1.0 also forwards redirected caller input to each recipe.
@@ -519,7 +507,6 @@ fn unchanged_update_reports_a_sync_issue_and_continues_maintenance() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_plain_update_shows_failed_and_deferred_hook_output() {
     // Retained Bash fallback log paths belonged to the old updater. The
     // actionable hook output belongs in ordinary up scrollback.

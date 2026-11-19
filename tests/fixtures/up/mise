@@ -1,0 +1,169 @@
+#!/bin/sh
+set -eu
+[ -z "${__MISE_DIFF+x}" ] || exit 75
+for directory in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" \
+    "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_STATE_DIR" "$MISE_CACHE_DIR" \
+    "$MISE_TMP_DIR" "$MISE_SYSTEM_CONFIG_DIR"; do
+    case "$directory" in "$HOME"/*) ;; *) exit 75 ;; esac
+done
+case "${MISE_GLOBAL_CONFIG_FILE-}" in ""|"$HOME"/*) ;; *) exit 75 ;; esac
+[ "$MISE_CONFIG_DIR" = "$DOTS_ROOT" ] || exit 75
+cd "$DOTS_ROOT"
+while [ "$#" -gt 0 ]; do
+    case "$1" in -C|-E) shift 2;; --quiet) shift;; *) break;; esac
+done
+case "${1-}" in
+    exec)
+        shift
+        [ "$1" != "--" ] || shift
+        exec "$@"
+        ;;
+    config)
+        case "$2" in
+            ls)
+                printf 'configuration listing\n' >> calls
+                if [ -f block-config-lookup ]; then
+                    /bin/sleep 30 &
+                    helper=$!
+                    trap 'kill -TERM "$helper" 2>/dev/null || :; wait "$helper" || :; exit 130' INT TERM
+                    printf '%s %s\n' "$$" "$helper" > config-ready
+                    wait "$helper"
+                fi
+                printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                ;;
+            get)
+                for last; do :; done
+                case "$last" in
+                    vars.dots_profiles) printf 'laptop\n' ;;
+                    *) exit 1 ;;
+                esac
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    which)
+        case "$2" in
+            jq) command -v jq ;;
+            dots) printf 'manager lookup\n' >> calls; exit 1 ;;
+            ruby)
+                [ -f block-ruby-lookup ] || exit 1
+                [ "${MISE_ENV-}" = laptop,host-fixture,extra ] || exit 79
+                printf '%s\n' "$$" > ruby-ready
+                exec /bin/sleep 30
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    ls)
+        if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
+        if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
+        ;;
+    install)
+        printf 'install tools\n' >> calls
+        if [ -f expect-store-overlap ]; then
+            attempts=0
+            until [ -f store-started ]; do
+                [ "$attempts" -lt 100 ] || exit 71
+                attempts=$((attempts + 1))
+                sleep 0.02
+            done
+            : > tools-started
+        fi
+        : > installed
+        ;;
+    upgrade) printf '%s\n' "$*" >> calls ;;
+    settings)
+        if [ -f package-settings.json ]; then
+            cat package-settings.json
+        else
+            printf '{"system_packages":{"managers":null}}\n'
+        fi
+        ;;
+    bootstrap)
+        case "$2:$3" in
+            dotfiles:paths)
+                printf 'checkpoint inventory\n' >> calls
+                [ ! -f fail-checkpoint ] || exit 8
+                printf '{"entries":[],"invalid":[]}\n'
+                ;;
+            dotfiles:--local)
+                [ "$*" = 'bootstrap dotfiles --local paths --json' ] || exit 1
+                printf 'checkpoint local inventory\n' >> calls
+                printf '{"entries":[],"invalid":[]}\n'
+                ;;
+            dotfiles:save) printf 'checkpoint save\n' >> calls ;;
+            packages:where)
+                [ "${4-}" = brew:mas ] && [ -x fixture-brew-prefix/bin/mas ] || exit 1
+                printf '%s\n' "$DOTS_ROOT/fixture-brew-prefix"
+                ;;
+            packages:status)
+                scope=${MISE_SYSTEM_PACKAGES_MANAGERS-}
+                printf '%s\n' "$scope" >> package-status-scopes
+                if [ "$scope" = apt ] && [ -f fail-apt-status ]; then
+                    printf 'fixture apt state probe failed\n' >&2
+                    exit 76
+                fi
+                case "$scope" in
+                    *,*) if [ -f fail-bare-assignment ]; then
+                        printf 'fixture grouped package status failed\n' >&2
+                        exit 77
+                    fi ;;
+                esac
+                if [ "$scope" = apt ] && [ -f apt-packages.json ]; then
+                    cat apt-packages.json
+                elif [ -n "$scope" ] && [ -f resolved-packages.json ]; then
+                    cat resolved-packages.json
+                elif [ -f packages.json ]; then
+                    cat packages.json
+                else
+                    printf '{}\n'
+                fi
+                ;;
+            packages:apply|packages:upgrade)
+                shift 2
+                printf 'packages %s\n' "$*" >> calls
+                printf '%s\t%s\n' "$3" "${MISE_SYSTEM_PACKAGES_MANAGERS-}" >> package-scopes
+                if [ -f block-mas-worker ] && [ "$3" = mas ] && [ "$1" = apply ]; then
+                    printf '%s\n' "$$" > mas-ready
+                    exec /bin/sleep 30
+                fi
+                if [ -f prepare-brew-mas ]; then
+                    if [ "$3" = brew ] && [ "${5-}" = brew:mas ] && [ "$1" = apply ]; then
+                        mkdir -p fixture-brew-prefix/bin
+                        printf '#!/bin/sh\nexit 0\n' > fixture-brew-prefix/bin/mas
+                        chmod 700 fixture-brew-prefix/bin/mas
+                    elif [ "$3" = mas ]; then
+                        [ "$(command -v mas)" = "$DOTS_ROOT/fixture-brew-prefix/bin/mas" ] || exit 78
+                    fi
+                fi
+                if [ -f expect-store-overlap ] && [ "$3" = mas ]; then
+                    if [ "$1" = apply ]; then
+                        : > store-started
+                        attempts=0
+                        until [ -f tools-started ]; do
+                            [ "$attempts" -lt 100 ] || exit 72
+                            attempts=$((attempts + 1))
+                            sleep 0.02
+                        done
+                    else
+                        : > store-finished
+                    fi
+                fi
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    --version)
+        [ ! -f fail-version ] || exit 8
+        if [ -f prepare-brew-mas ]; then arch=arm64; else arch=x64; fi
+        if [ -f updated ]; then printf '2026.11.9 macos-%s\n' "$arch"; else printf '2026.11.8 macos-%s\n' "$arch"; fi
+        ;;
+    self-update)
+        if [ "$2" != "--help" ]; then
+            if [ -f expect-store-overlap ]; then [ -f store-finished ] || exit 73; fi
+            printf 'self-update\n' >> calls
+            : > updated
+        fi
+        ;;
+    *) exit 1 ;;
+esac

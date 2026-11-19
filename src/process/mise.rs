@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::{Cwd, HOOK_ENV, is_executable, stage_argv};
 use crate::config::selection::{self, Selection};
+use crate::run::Run;
 use crate::{Ctx, Env, Fail};
 
 pub struct Mise<'a> {
@@ -20,8 +21,12 @@ pub struct Mise<'a> {
 
 impl<'a> Mise<'a> {
     pub fn new(ctx: &'a Ctx) -> Result<Self, Fail> {
-        let binary = mise_binary(&ctx.env)?;
         let selected = selection::read(&ctx.root, &ctx.env)?;
+        Self::with_selection(ctx, selected)
+    }
+
+    pub fn with_selection(ctx: &'a Ctx, selected: Selection) -> Result<Self, Fail> {
+        let binary = mise_binary(&ctx.env)?;
         Ok(Self {
             ctx,
             binary,
@@ -34,7 +39,7 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command_for(args, false)
+        self.command_for(false, None, args)
     }
 
     pub(crate) fn command_active<I, S>(&self, args: I) -> Result<Command, Fail>
@@ -42,14 +47,35 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command_for(args, true)
+        self.command_for(true, None, args)
     }
 
-    fn command_for<I, S>(&self, args: I, active: bool) -> Result<Command, Fail>
+    /// Use the active selectors and supervise native preparation probes.
+    pub fn command_in_run<I, S>(&self, run: &Run<'_>, args: I) -> Result<Command, Fail>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.command_for(true, Some(run), args)
+    }
+
+    fn command_for<I, S>(
+        &self,
+        active: bool,
+        run: Option<&Run<'_>>,
+        args: I,
+    ) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let check_cancelled = || {
+            if run.is_some_and(Run::cancelled) {
+                return Err(Fail::new(1, "mise command preparation was cancelled"));
+            }
+            Ok(())
+        };
+        check_cancelled()?;
         let args: Vec<S> = args.into_iter().collect();
         let mut command = self.raw_command()?;
         if active {
@@ -60,8 +86,9 @@ impl<'a> Mise<'a> {
             && (matches!(sub.as_ref().to_str(), Some("status" | "packages"))
                 || active && sub.as_ref() == "plan"))
         {
-            self.expose_ruby(&mut command)?;
+            self.expose_ruby(&mut command, run)?;
         }
+        check_cancelled()?;
         command.args(args);
         Ok(command)
     }
@@ -150,14 +177,22 @@ impl<'a> Mise<'a> {
     }
 
     #[cfg(target_os = "macos")]
-    fn expose_ruby(&self, command: &mut Command) -> Result<(), Fail> {
+    fn expose_ruby(&self, command: &mut Command, run: Option<&Run<'_>>) -> Result<(), Fail> {
         use std::os::unix::ffi::OsStrExt;
 
         let mut probe = self.raw_command()?;
         if let Some((_, Some(selected))) = command.get_envs().find(|(key, _)| *key == "MISE_ENV") {
             probe.env("MISE_ENV", selected);
         }
-        let Ok(output) = probe.args(["which", "ruby"]).output() else {
+        probe.args(["which", "ruby"]);
+        let result = match run {
+            Some(run) => {
+                probe.env("MISE_SELF_UPDATE_AUTO", "false");
+                run.probe(probe)
+            }
+            None => probe.output(),
+        };
+        let Ok(output) = result else {
             return Ok(());
         };
         let ruby = PathBuf::from(OsStr::from_bytes(

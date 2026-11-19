@@ -13,7 +13,7 @@ use crate::{process::Cwd, run::Run};
 
 use super::guard::private_dir;
 
-use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative};
+use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative, split};
 
 #[derive(Debug)]
 pub(super) enum ScanError {
@@ -56,6 +56,32 @@ impl<'a> Scratch<'a> {
         self.live.ensure_dense_index()?;
         self.git
             .get(["-c", "core.sparseCheckout=false", "read-tree", base])?;
+        // Seed only exact, public paths tracked in the real index but ignored
+        // in the worktree. Forcing an add by pathspec can recurse into a
+        // directory that replaced an indexed file.
+        let ignored = self.live.get([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--stage",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        let mut index = Vec::new();
+        for entry in records(&ignored) {
+            let (header, raw) = split(entry, b'\t')?;
+            if local(&relative(raw)?) {
+                continue;
+            }
+            if !header.ends_with(b" 0") {
+                return Err(invalid("unmerged path in the Git index"));
+            }
+            index.extend_from_slice(entry);
+            index.push(0);
+        }
+        if !index.is_empty() {
+            self.git.update_index(&index)?;
+        }
         let listed = self.git.get([
             "ls-files",
             "-z",
@@ -719,6 +745,93 @@ exec "$DOTS_TEST_SNAPSHOT_GIT" "$@"
             assert_eq!(
                 fs::read(git.root().join(path)).unwrap(),
                 b"machine-local fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn cr13_snapshot_includes_an_ignored_public_file_tracked_in_the_real_index() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let root = git.root();
+        fs::write(root.join(".gitignore"), "/forced\n/config.local.toml\n").unwrap();
+        git.get(["add", ".gitignore"]).unwrap();
+        let before = fixture_commit(&git, "ignore fixture paths");
+        fs::write(root.join("forced"), b"intentionally staged\n").unwrap();
+        fs::write(root.join("config.local.toml"), b"local fixture\n").unwrap();
+        fs::write(root.join("ordinary"), b"ordinary independent edit\n").unwrap();
+        git.get(["add", "-f", "forced", "config.local.toml"])
+            .unwrap();
+        let index_path = root.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
+        let candidate = scratch.capture(&before).unwrap();
+        let tree = git.tree(&candidate).unwrap();
+        assert!(tree.contains_key(Path::new("ordinary")));
+        assert!(!tree.contains_key(Path::new("config.local.toml")));
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        assert_eq!(
+            git.get(["show", &format!("{candidate}:forced")]).unwrap(),
+            b"intentionally staged\n"
+        );
+    }
+
+    #[test]
+    fn cr13_snapshot_keeps_untracked_ignored_descendants_out_of_replaced_files() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
+        let root = git.root();
+        fs::write(
+            root.join(".gitignore"),
+            "/replaced/ignored-*\n/only-ignored/*\n",
+        )
+        .unwrap();
+        for file in ["replaced", "only-ignored"] {
+            fs::write(root.join(file), b"tracked file\n").unwrap();
+        }
+        git.get(["add", ".gitignore", "replaced", "only-ignored"])
+            .unwrap();
+        let before = fixture_commit(&git, "tracked files before directory replacements");
+
+        for file in ["replaced", "only-ignored"] {
+            fs::remove_file(root.join(file)).unwrap();
+            fs::create_dir(root.join(file)).unwrap();
+        }
+        for path in [
+            "replaced/public",
+            "replaced/ignored-tracked",
+            "replaced/ignored-untracked",
+            "only-ignored/untracked",
+        ] {
+            fs::write(root.join(path), format!("{path}\n")).unwrap();
+        }
+        git.get(["add", "-f", "replaced/ignored-tracked"]).unwrap();
+        let index_path = root.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let candidate = scratch(&git).capture(&before).unwrap();
+        let tree = git.tree(&candidate).unwrap();
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        for path in ["replaced/public", "replaced/ignored-tracked"] {
+            assert_eq!(
+                git.get(["show", &format!("{candidate}:{path}")]).unwrap(),
+                format!("{path}\n").as_bytes()
+            );
+        }
+        for path in [
+            "replaced",
+            "only-ignored",
+            "replaced/ignored-untracked",
+            "only-ignored/untracked",
+        ] {
+            assert!(
+                !tree.contains_key(Path::new(path)),
+                "unexpected candidate path {path}"
             );
         }
     }

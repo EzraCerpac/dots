@@ -379,6 +379,22 @@ fn verify_parent(root: &Dir, path: &Path, held: &Dir) -> io::Result<()> {
     }
 }
 
+fn directory_move_matches(moved: &Path, opened: &Path, recorded: &Path) -> bool {
+    moved == opened && moved == recorded
+}
+
+fn directory_install_matches(
+    current: &Image,
+    replacement: &Image,
+    same_inode: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<bool> {
+    if current == replacement && *replacement != Image::Absent {
+        same_inode()
+    } else {
+        Ok(false)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn displace_directory(
     root: &Dir,
@@ -387,8 +403,10 @@ fn displace_directory(
     name: &CString,
     staging: &Dir,
     old_slot: &CStrName,
+    new_slot: &CStrName,
     current: &Image,
     replacement: &Image,
+    recorded: &Path,
     before_move: impl Fn() -> io::Result<()>,
 ) -> io::Result<bool> {
     if staging.read(&old_slot.0)? == Image::Absent {
@@ -396,14 +414,15 @@ fn displace_directory(
             return Err(invalid("no displaced directory for this replacement"));
         }
         let child = parent.subdir(OsStr::from_bytes(name.as_bytes()), false)?;
-        if !child.is_empty()? {
-            return Err(invalid("target directory has local files"));
+        let opened = child.identity()?;
+        if opened != recorded || !child.is_empty()? {
+            return Err(invalid("target directory changed or has local files"));
         }
         before_move()?;
         verify_parent(root, path, parent)?;
         parent.move_to(name, staging, &old_slot.0)?;
         let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
-        if moved.identity()? != child.identity()? || !moved.is_empty()? {
+        if !directory_move_matches(&moved.identity()?, &opened, recorded) || !moved.is_empty()? {
             let _ = staging.move_to(&old_slot.0, parent, name);
             return Err(invalid("directory changed during displacement"));
         }
@@ -412,7 +431,14 @@ fn displace_directory(
     let current = parent.read(name)?;
     if staging.read(&old_slot.0)? == Image::Directory {
         let moved = staging.subdir(OsStr::from_bytes(old_slot.0.as_bytes()), false)?;
-        if &current == replacement && *replacement != Image::Absent {
+        if moved.identity()? != recorded {
+            return Err(invalid(
+                "displaced directory no longer matches the checkout plan",
+            ));
+        }
+        if directory_install_matches(&current, replacement, || {
+            same_inode(staging, &new_slot.0, parent, name)
+        })? {
             return Ok(true);
         }
         if current == Image::Absent && moved.is_empty()? {
@@ -435,6 +461,7 @@ fn replace_with(
     replacement: &Image,
     expected_inode: Option<FileId>,
     consume_replacement: bool,
+    recorded_directory: Option<&Path>,
     before_move: impl Fn() -> io::Result<()>,
     before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
@@ -442,6 +469,7 @@ fn replace_with(
     let (current, current_inode) = parent.read_with_id(&name)?;
     let (displaced, displaced_inode) = staging.read_with_id(&old_slot.0)?;
     if *expected == Image::Directory {
+        let recorded = recorded_directory.ok_or_else(|| invalid("missing directory identity"))?;
         if displace_directory(
             root,
             path,
@@ -449,8 +477,10 @@ fn replace_with(
             &name,
             staging,
             old_slot,
+            new_slot,
             &current,
             replacement,
+            recorded,
             before_move,
         )? {
             return Ok(());
@@ -531,6 +561,7 @@ impl CStrName {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn replace_exact(
     root: &Dir,
     path: &Path,
@@ -539,6 +570,7 @@ pub(super) fn replace_exact(
     new: &CStrName,
     expected: &Image,
     replacement: &Image,
+    recorded_directory: Option<&Path>,
 ) -> io::Result<()> {
     replace_with(
         root,
@@ -550,6 +582,7 @@ pub(super) fn replace_exact(
         replacement,
         None,
         false,
+        recorded_directory,
         || Ok(()),
         || Ok(()),
     )
@@ -574,6 +607,7 @@ pub(super) fn replace_consuming(
         replacement,
         expected_inode,
         true,
+        None,
         || Ok(()),
         || Ok(()),
     )
@@ -592,6 +626,11 @@ pub(super) fn replace_at_boundary(
     before_move: impl Fn() -> io::Result<()>,
     before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
+    let recorded = if *expected == Image::Directory {
+        Some(root.directory_identity(path)?)
+    } else {
+        None
+    };
     replace_with(
         root,
         path,
@@ -602,6 +641,7 @@ pub(super) fn replace_at_boundary(
         replacement,
         None,
         false,
+        recorded.as_deref(),
         before_move,
         before_publish,
     )
@@ -695,6 +735,21 @@ mod tests {
     }
 
     #[test]
+    fn cr55_directory_move_requires_the_recorded_identity() {
+        let expected = Path::new("1-10");
+        let other = Path::new("1-11");
+        assert!(directory_move_matches(expected, expected, expected));
+        assert!(!directory_move_matches(other, other, expected));
+    }
+
+    #[test]
+    fn cr56_resumed_directory_install_requires_its_own_inode() {
+        let replacement = bytes(b"approved replacement\n");
+        assert!(directory_install_matches(&replacement, &replacement, || Ok(true)).unwrap());
+        assert!(!directory_install_matches(&replacement, &replacement, || Ok(false)).unwrap());
+    }
+
+    #[test]
     fn resumes_displacement_without_discarding_the_original_inode() {
         let world = tempfile::tempdir().unwrap();
         let root = private_dir(world.path(), "root").unwrap();
@@ -715,6 +770,7 @@ mod tests {
             &CStrName::new("replacement").unwrap(),
             &original,
             &replacement,
+            None,
         )
         .unwrap();
         editor.write_all(b" edit").unwrap();
@@ -745,6 +801,7 @@ mod tests {
             &CStrName::new("replacement").unwrap(),
             &original,
             &replacement,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -778,6 +835,7 @@ mod tests {
             &replacement,
             original_inode,
             true,
+            None,
             || fs::rename(&competitor, &live),
             || Ok(()),
         )
@@ -802,6 +860,7 @@ mod tests {
         let path = Path::new("target");
         let old = CStrName::new("old").unwrap();
         let new = CStrName::new("new").unwrap();
+        let planned = root_dir.directory_identity(path).unwrap();
 
         let error = replace_at_boundary(
             &root_dir,
@@ -832,7 +891,8 @@ mod tests {
                 &old,
                 &new,
                 &Image::Directory,
-                &replacement
+                &replacement,
+                Some(&planned),
             )
             .is_err()
         );
@@ -847,6 +907,7 @@ mod tests {
             &new,
             &Image::Directory,
             &replacement,
+            Some(&planned),
         )
         .unwrap();
         assert_eq!(fs::read(live).unwrap(), b"new file");

@@ -230,10 +230,8 @@ impl<'a> Git<'a> {
         let mut data = tempfile::tempfile()?;
         data.write_all(input)?;
         data.rewind()?;
-        let output = self
-            .command(["update-index", "-z", "--index-info"])?
-            .stdin(Stdio::from(data))
-            .output()?;
+        let output =
+            self.output_with_stdin(["update-index", "-z", "--index-info"], Stdio::from(data))?;
         checked(output).map(drop)
     }
 }

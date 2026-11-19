@@ -58,9 +58,14 @@ else
   shasum -a 256 -c SHA256SUMS
 fi
 tar -xzf "$archive"
+# Git 2.56 still supports a C build, independent of the project's Cargo target.
+git_options=(NO_RUST=YesPlease)
+if [[ ${DISTRO:-} == Alpine ]]; then
+  git_options+=(NO_REGEX=NeedsStartEnd)
+fi
 make -s -j4 -C "git-$git_version" prefix="$prefix" CC=cc \
   NO_CURL=YesPlease NO_GETTEXT=YesPlease NO_OPENSSL=YesPlease \
-  NO_PERL=YesPlease NO_TCLTK=YesPlease install
+  NO_PERL=YesPlease NO_TCLTK=YesPlease "${git_options[@]}" install
 
 # Prove fixture PATH still works when HOME and mise state are replaced,
 # including when a library case launches mise and then a child on that PATH.

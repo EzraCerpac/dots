@@ -1329,7 +1329,6 @@ exec sleep 30
 }
 
 #[test]
-#[ignore = "requires the P-06 history implementation"]
 fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
     use std::collections::BTreeSet;
     use std::io::Write as _;
@@ -1382,7 +1381,7 @@ fn new_native_bootstrap_restores_and_enrolls_with_separate_identities() {
     write(
         &seed.home().join("recovered-setting"),
         std::str::from_utf8(PAYLOAD).unwrap(),
-        0o640,
+        0o600,
     );
     let seed_mise = seed.home().join("mise-fixture/bin/mise");
     assert_success(&run(fixture_command(&seed, &seed_mise)
@@ -1591,14 +1590,17 @@ exec "$P05_DOTS" bootstrap complete
         config["vars"]["bootstrap_bundle_identity"].as_str(),
         bundle_identity.to_str()
     );
+    let identities: BTreeSet<_> = config["settings"]["age"]["identity_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item.as_str().unwrap())
+        .collect();
     assert_eq!(
-        config["settings"]["age"]["identity_files"]
-            .as_array()
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .as_str(),
-        machine.to_str()
+        identities,
+        [recovery.to_str().unwrap(), machine.to_str().unwrap()]
+            .into_iter()
+            .collect()
     );
     assert_eq!(
         config["settings"]["history"]["sync"].as_str(),

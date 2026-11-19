@@ -471,7 +471,6 @@ printf '%s:%s\n' "${0##*/}" "$line" >> "$HOME/read-lines""#,
 // Covers both legacy sync-attention cases through public diagnostics and follow-on
 // work. The Node backend's exit codes and typed renderer frames are gone.
 #[test]
-#[ignore = "P-08"]
 fn unchanged_update_reports_a_sync_issue_and_continues_maintenance() {
     let f = UpdateFixture::new();
     f.write(

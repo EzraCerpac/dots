@@ -197,33 +197,8 @@ fn checkpoint(ctx: &Ctx, run: &Run<'_>, id: StageId) -> Step {
 }
 
 fn sync_configuration(run: &Run<'_>, id: StageId, source: sync::Loaded) -> Step {
-    match source {
-        sync::Loaded::LocalOnly => Ok(Outcome::Skipped),
-        sync::Loaded::Problem(error) => {
-            // P-08 will turn load problems into receipts in the same producer.
-            run.issue(id, error);
-            Ok(Outcome::Deferred)
-        }
-        sync::Loaded::Ready(_) => Ok(record_sync_receipt(
-            run,
-            id,
-            sync::run(
-                run,
-                id,
-                source,
-                foundation_sync_display(receipt::Display::Embedded),
-            ),
-        )),
-    }
-}
-
-// P-08 replaces the foundation's placeholder Display with receipt::Display.
-fn foundation_sync_display(display: receipt::Display) -> sync::Display {
-    match display {
-        receipt::Display::Standalone => sync::Display::Standalone,
-        receipt::Display::Plain => sync::Display::Plain,
-        receipt::Display::Embedded => sync::Display::Stage,
-    }
+    let receipt = sync::run(run, id, source, receipt::Display::Embedded);
+    Ok(record_sync_receipt(run, id, receipt))
 }
 
 fn record_sync_receipt(run: &Run<'_>, id: StageId, receipt: Receipt) -> Outcome {

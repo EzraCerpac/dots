@@ -145,11 +145,8 @@ fn decision_child() {
         }
         "source" => match sync::load(&ctx) {
             Loaded::LocalOnly => "local",
-            Loaded::Problem(issue) => {
-                assert!(issue.diagnostic.contains("P-08"), "{issue:?}");
-                "blocked"
-            }
-            Loaded::Ready(_) => panic!("shared sync was loaded"),
+            Loaded::Problem(_) => "blocked",
+            Loaded::Ready(_) => "shared",
         },
         _ => panic!("unexpected test seam {seam}"),
     };
@@ -418,7 +415,11 @@ fn new_sync_load_checks_source_and_checkout_before_skipping() {
     ] {
         let path = root.join(".git").join(marker);
         fs::write(&path, "incomplete").unwrap();
-        f.seam("source", "blocked");
+        let expected = match marker {
+            "dots-sync-pending" | "dots-sync-write.json" => "shared",
+            _ => "blocked",
+        };
+        f.seam("source", expected);
         fs::remove_file(path).unwrap();
     }
     f.git(&["switch", "--detach"]);
@@ -443,9 +444,9 @@ fn new_sync_load_checks_source_and_checkout_before_skipping() {
         "origin",
         "https://github.com/example/source",
     ]);
-    f.seam("source", "blocked");
+    f.seam("source", "shared");
     fs::write(&conf, CONFIG).unwrap();
-    f.seam("source", "blocked");
+    f.seam("source", "shared");
     f.git(&["remote", "remove", "origin"]);
     f.git(&["config", "remote.origin.pushurl", "file:///absent"]);
     f.seam("source", "blocked");

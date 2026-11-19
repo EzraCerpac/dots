@@ -337,6 +337,19 @@ fn first_stderr(output: &Output) -> String {
         .split(|&byte| byte == b'\n')
         .next()
         .unwrap_or_default();
+    // Strip userinfo before truncating: the separating @ can be beyond byte 512.
+    let text = String::from_utf8_lossy(line);
+    let mut pieces = text.split("://");
+    let mut safe = pieces.next().unwrap_or_default().to_owned();
+    for piece in pieces {
+        let end = piece
+            .find(['/', '?', '#', ' ', '\t', '\r'])
+            .unwrap_or(piece.len());
+        let start = piece[..end].rfind('@').map_or(0, |at| at + 1);
+        safe.push_str("://");
+        safe.push_str(&piece[start..]);
+    }
+    let line = safe.as_bytes();
     String::from_utf8_lossy(&line[..line.len().min(512)])
         .trim_end()
         .to_owned()

@@ -5124,3 +5124,35 @@ fn new_sync_reports_the_runtime_mise_version_error_once() {
         assert_eq!(f.git(&f.a, &["branch", "--show-current"]), branch);
     }
 }
+
+#[test]
+fn new_snapshot_error_strips_url_userinfo_before_display_and_replay() {
+    let f = Repo::new();
+    let filter = f.scratch.join("reject-clean");
+    let credential = "fixture-token".repeat(48);
+    script(
+        &filter,
+        &format!(
+            "echo 'filter failed: https://user:{credential}@example.invalid/path ssh://name@mirror.invalid/repo' >&2\nexit 1"
+        ),
+    );
+    f.git(&f.a, &["config", "filter.fixture.clean", &sh(&filter)]);
+    f.git(&f.a, &["config", "filter.fixture.required", "true"]);
+    put(&f.a.join(".git/info/attributes"), "text filter=fixture\n");
+    f.write(&f.a, "text", "an edit\n");
+    let printed = f.sync(&f.a);
+    let directory = f.world.home().join(".local/state/dots/receipts");
+    let saved = fs::read_dir(directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for receipt in [printed, read(&saved), f.replay(&f.a)] {
+        absent(&receipt, "fixture-token");
+        has(
+            &receipt,
+            "filter failed: https://example.invalid/path ssh://mirror.invalid/repo",
+        );
+    }
+}

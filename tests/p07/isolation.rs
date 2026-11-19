@@ -131,10 +131,11 @@ impl IsolatedWorld {
         let program = self.private.join("native-boundary.py");
         fs::write(&program, include_bytes!("native-boundary.py")).unwrap();
         format!(
-            "{} -I -S {} {}",
+            "{} -I -S {} {} {}",
             quote(&interpreter),
             quote(&program),
-            quote(self.world.base())
+            quote(self.world.base()),
+            quote(self.world.boundary())
         )
     }
 

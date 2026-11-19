@@ -38,7 +38,8 @@ impl World {
             .prefix("dots-test-")
             .tempdir_in("/tmp")
             .unwrap();
-        let base = temp.path().canonicalize().unwrap();
+        let base = temp.path().canonicalize().unwrap().join("case");
+        fs::create_dir(&base).unwrap();
         let home = base.join("home");
         let root = base.join("config");
         fs::create_dir(base.join("tmp")).unwrap();
@@ -72,6 +73,10 @@ impl World {
 
     pub fn base(&self) -> &Path {
         &self.base
+    }
+
+    pub fn boundary(&self) -> &Path {
+        self.base.parent().unwrap()
     }
 
     pub fn home(&self) -> &Path {
@@ -148,9 +153,10 @@ impl World {
     }
 
     pub fn command(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
-        // Even when TMPDIR is inside a checkout, Git must stay inside this world.
+        // Git ignores a ceiling equal to its starting directory.
+        let boundary = self.boundary();
         let git_ceiling =
-            env::join_paths([&self.base]).expect("world path must be a valid Git ceiling");
+            env::join_paths([self.base.as_path(), boundary]).expect("valid Git ceiling paths");
         let mut command = Command::new(program);
         command
             .current_dir(&self.root)
@@ -181,7 +187,7 @@ impl World {
                 command.env(key, value);
             }
         }
-        FixtureCommand::new(command, &self.base)
+        FixtureCommand::new(command, boundary)
     }
 }
 

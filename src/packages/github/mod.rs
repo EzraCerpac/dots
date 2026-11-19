@@ -10,7 +10,7 @@ use std::{fmt::Write, path::Path};
 use toml_edit::{Array, InlineTable, Item, Value};
 
 use crate::{
-    Ctx, Env, Fail, config_commands::installer, run::Run, targets::github_repo as repo_name,
+    Ctx, Fail, config_commands::ExecutableOrigin, run::Run, targets::github_repo as repo_name,
 };
 
 pub use app::{install_release_app, validate_owned_app};
@@ -52,10 +52,9 @@ pub fn resolve(
                 "this release contains a macOS app; install it on a Mac",
             ));
         }
-        let exe = std::env::current_exe()
-            .and_then(|path| path.canonicalize())
+        let origin = ExecutableOrigin::current(&ctx.env)
             .map_err(|err| failure(format!("cannot locate dots: {err}")))?;
-        Some(app_hook(&exe, &ctx.env, &repo)?)
+        Some(app_hook(&origin, &repo)?)
     } else {
         None
     };
@@ -127,8 +126,9 @@ fn tool_options(
     Item::Value(Value::InlineTable(tool))
 }
 
-fn app_hook(exe: &Path, env: &Env, repo: &str) -> Result<String, Fail> {
-    let command = match installer(exe, env) {
+fn app_hook(origin: &ExecutableOrigin, repo: &str) -> Result<String, Fail> {
+    let exe = &origin.path;
+    let command = match origin.installer {
         "homebrew" => {
             let prefix = exe
                 .ancestors()
@@ -160,6 +160,7 @@ fn shell_path(path: &Path) -> Result<String, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Env;
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
@@ -200,7 +201,11 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                app_hook(Path::new(exe), &env, repo).unwrap(),
+                app_hook(
+                    &ExecutableOrigin::from_executable(Path::new(exe), &env).unwrap(),
+                    repo
+                )
+                .unwrap(),
                 format!("{command} install-release-app {repo}")
             );
         }
@@ -223,7 +228,14 @@ mod tests {
             cwd: fixture.path().to_owned(),
         };
         let result = Command::new("/bin/sh")
-            .args(["-c", &app_hook(&exe, &env, "owner/tool").unwrap()])
+            .args([
+                "-c",
+                &app_hook(
+                    &ExecutableOrigin::from_executable(&exe, &env).unwrap(),
+                    "owner/tool",
+                )
+                .unwrap(),
+            ])
             .env_clear()
             .envs(&env.vars)
             .env("PATH", "")

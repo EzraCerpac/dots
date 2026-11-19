@@ -13,7 +13,7 @@ const TRACKED: &str = "~/.config/app/state";
 const TRACKED_RELATIVE: &str = ".config/app/state";
 const DECLARATIONS: &str = "config.host-fx.toml";
 const HOST: &str = "host-fx";
-const EMPTY: &str = r#"{"entries":[]}"#;
+const EMPTY: &str = r#"{"entries":[],"invalid":[]}"#;
 const REPO: &str = "dots-test-fixture/fixture-state";
 const HTTPS: &str = "https://github.com/dots-test-fixture/fixture-state.git";
 const MACHINE_KEY: &str = "age1tcfkaaftjeax8f0c3hsxcwrhl6nefap2df9v9qvmxy6zjnft8pvqt89uap";
@@ -46,6 +46,20 @@ impl History {
         // The native history module uses age to validate recipients. The
         // enrollment scenarios check which public recipients were persisted.
         write(&bin.join("age"), "#!/bin/sh\nexit 0\n", 0o755);
+        write(
+            &bin.join("git"),
+            r#"#!/bin/sh
+PATH="$CONTRACT_HISTORY_REAL_PATH"
+export PATH
+if [ "$#" -eq 8 ] && [ "$1" = "--git-dir" ] && [ "$3" = "ls-remote" ] &&
+   [ "$4" = "--exit-code" ] && [ "$5" = "--refs" ] && [ "$6" = "--" ] &&
+   [ "$7" = "$CONTRACT_HISTORY_ORIGIN" ] && [ "$8" = "refs/heads/$CONTRACT_HISTORY_BRANCH" ]; then
+    exec git ls-remote --exit-code --refs -- "file://$CONTRACT_HISTORY_ACK_REMOTE" "$8"
+fi
+exec git "$@"
+"#,
+            0o755,
+        );
         fs::write(world.root().join("config.laptop.toml"), "").unwrap();
         fs::write(world.root().join("dots/exceptions.tsv"), "").unwrap();
         let mut fixture = Self {
@@ -83,6 +97,8 @@ impl History {
             .env("DOTS_MISE_BIN", &fake)
             .env("SETUP_MISE_BIN", &fake)
             .env("DOTS_UP_BIN", self.bin.join("absent-renderer"))
+            .env("CODEX_HOME", base.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", base.join("claude"))
             .env("GIT_ALLOW_PROTOCOL", "file")
             .env("MISE_OFFLINE", "1")
             .env("MISE_SYSTEM_CONFIG_DIR", base.join("system"))
@@ -92,6 +108,12 @@ impl History {
             .env("CONTRACT_HISTORY_LOG", &self.log)
             .env("CONTRACT_HISTORY_PATHS", EMPTY)
             .env("CONTRACT_HISTORY_STATUS", "{}")
+            .env("CONTRACT_HISTORY_ORIGIN", "")
+            .env("CONTRACT_HISTORY_BRANCH", "")
+            .env(
+                "CONTRACT_HISTORY_ACK_REMOTE",
+                base.join("remotes/history-acknowledged"),
+            )
             .env("CONTRACT_HISTORY_MACHINE_KEY", MACHINE_KEY);
         command
     }
@@ -127,7 +149,7 @@ impl History {
             }
             entry
         });
-        json!({ "entries": entries.collect::<Vec<_>>() }).to_string()
+        json!({ "entries": entries.collect::<Vec<_>>(), "invalid": [] }).to_string()
     }
 
     fn enroll(&self, inventory: Option<&str>) -> Output {
@@ -185,9 +207,18 @@ impl History {
     }
 
     fn backup(&self, inventory: &str, status: Value) -> Output {
+        let sync = &status["history"]["sync"];
         self.selected()
             .arg("backup")
             .env("CONTRACT_HISTORY_PATHS", inventory)
+            .env(
+                "CONTRACT_HISTORY_ORIGIN",
+                sync["origin"].as_str().unwrap_or_default(),
+            )
+            .env(
+                "CONTRACT_HISTORY_BRANCH",
+                sync["branch"].as_str().unwrap_or_default(),
+            )
             .env("CONTRACT_HISTORY_STATUS", status.to_string())
             .output()
             .unwrap()
@@ -202,14 +233,66 @@ impl History {
     }
 
     fn history_store(&self) -> PathBuf {
-        self.world.home().join(".local/state/mise/history/repo.git")
+        let command = self.dots();
+        let state = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "MISE_STATE_DIR").then_some(value).flatten())
+            .expect("guarded history fixture must set MISE_STATE_DIR");
+        Path::new(state).join("history/repo.git")
     }
 
     fn create_store(&self) -> PathBuf {
         let bare = self.world.bare_remote("history-store");
+        let acknowledged = self.world.bare_remote("history-acknowledged");
         let store = self.history_store();
         fs::create_dir_all(store.parent().unwrap()).unwrap();
         fs::rename(bare, &store).unwrap();
+        // The recorder reports an already acknowledged checkpoint without
+        // contacting the fixture's synthetic GitHub endpoint.
+        let seed = self.world.root().join("history-seed");
+        fs::create_dir(&seed).unwrap();
+        for args in [
+            &["init", "--initial-branch=main"][..],
+            &["commit", "--allow-empty", "-m", "fixture checkpoint"],
+        ] {
+            expect(
+                &self
+                    .world
+                    .git()
+                    .current_dir(&seed)
+                    .args(args)
+                    .output()
+                    .unwrap(),
+                0,
+                &[],
+            );
+        }
+        expect(
+            &self
+                .world
+                .git()
+                .current_dir(&seed)
+                .args(["push", "--"])
+                .arg(&store)
+                .args(["HEAD:refs/heads/main", "HEAD:refs/remotes/origin/setup"])
+                .output()
+                .unwrap(),
+            0,
+            &[],
+        );
+        expect(
+            &self
+                .world
+                .git()
+                .current_dir(&seed)
+                .args(["push", "--"])
+                .arg(&acknowledged)
+                .arg(format!("HEAD:refs/heads/{HOST}"))
+                .output()
+                .unwrap(),
+            0,
+            &[],
+        );
         store
     }
 
@@ -255,7 +338,6 @@ fn status(store: &Path, origin: &str, branch: &str) -> Value {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_secures_files_and_keeps_recipients_local() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -291,7 +373,6 @@ fn unchanged_enrollment_secures_files_and_keeps_recipients_local() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_defers_when_no_files_are_declared() {
     let h = History::new();
     expect(&h.enroll(Some(EMPTY)), 3, &[HOST, "track"]);
@@ -309,7 +390,6 @@ fn unchanged_enrollment_defers_when_no_files_are_declared() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_rejects_an_unencrypted_entry() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -322,7 +402,6 @@ fn unchanged_enrollment_rejects_an_unencrypted_entry() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_rejects_a_symlinked_tracked_path() {
     let h = History::new();
     let target = h.world.root().with_file_name("outside-home");
@@ -340,7 +419,6 @@ fn unchanged_enrollment_rejects_a_symlinked_tracked_path() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_backup_refuses_an_unencrypted_entry_before_saving() {
     let h = History::new();
     h.tracked_file();
@@ -351,7 +429,6 @@ fn unchanged_backup_refuses_an_unencrypted_entry_before_saving() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_backup_checks_effective_push_urls_and_branch_before_saving() {
     // These GitHub spellings are checked as text by local Git's offline
     // destination resolution. The fake save and sync never contact them.
@@ -420,7 +497,6 @@ fn unchanged_backup_checks_effective_push_urls_and_branch_before_saving() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
     let mut h = History::new();
     let store = h.create_store();
@@ -467,7 +543,6 @@ fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
 }
 
 #[test]
-#[ignore = "P-04, P-06"]
 fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
     let h = History::new();
     h.tracked_file();
@@ -482,7 +557,6 @@ fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
 }
 
 #[test]
-#[ignore = "P-04, P-06"]
 fn unchanged_up_saves_encrypted_entries_twice() {
     let h = History::new();
     h.tracked_file();
@@ -492,7 +566,6 @@ fn unchanged_up_saves_encrypted_entries_twice() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_checks_absolute_declarations_for_home_relative_paths() {
     let h = History::new();
     let tracked = h.tracked_file();
@@ -514,7 +587,6 @@ fn unchanged_enrollment_checks_absolute_declarations_for_home_relative_paths() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_enrollment_refuses_invalid_history_inventory_but_defers_for_an_empty_list() {
     let h = History::new();
     for inventory in [

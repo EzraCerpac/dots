@@ -93,8 +93,9 @@ When a file needs per-machine values or should only reach some machines, write i
 "~/.config/app/config.toml" = { source = "dotfiles/.config/app/config.toml.tera", mode = "template", variants = [{ os = "macos" }] }
 ```
 
-`dots up` applies declared dotfiles whether or not the configuration is shared.
-To apply a single target explicitly, run `dots mise bootstrap dotfiles apply TARGET`.
+In a shared configuration, the sync stage of `dots up` applies declared dotfiles.
+In a local-only one, look at the stages `dots up` prints: an **Apply dotfiles** stage means it applied them, and a run that goes from **Reload configuration** straight to **Inspect declared packages** did not.
+Either way, `dots mise bootstrap dotfiles apply TARGET` applies a single target explicitly; it writes that target, so run it only when the user asks.
 
 When you remove a declaration, add its target to `dots/retired-dotfiles` so stale links get cleaned up.
 When you remove a source that a setup script once declared in machines' `config.local.toml` or `config.host-*.toml`, add `dotfiles.NAME<TAB>SOURCE` to `dots/retired-declarations` in the same commit, or every such machine's sync rejects it.

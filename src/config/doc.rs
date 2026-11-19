@@ -60,7 +60,7 @@ impl Doc {
         &self.path
     }
 
-    pub(super) fn make_private(&mut self) {
+    pub(crate) fn make_private(&mut self) {
         self.mode = 0o600;
     }
 

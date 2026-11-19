@@ -335,26 +335,7 @@ pub(crate) fn status_code(status: ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
-pub struct BundlePipe {
-    _private: (),
-}
-
-impl BundlePipe {
-    pub fn new(_json: &[u8]) -> Result<Self, Fail> {
-        Err(Fail::unported(
-            "P-05",
-            "preparing the bootstrap hook's secret descriptor",
-        ))
-    }
-
-    /// The pipe lives through spawn. Attachment must affect only this child.
-    pub fn attach(&self, _command: &mut Command) -> Result<(), Fail> {
-        Err(Fail::unported(
-            "P-05",
-            "attaching the bootstrap hook's secret descriptor",
-        ))
-    }
-}
+pub use crate::bootstrap::bundle_pipe::BundlePipe;
 
 #[cfg(test)]
 mod launcher_tests {

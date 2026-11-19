@@ -1,0 +1,3 @@
+legacy_case	reason
+hook exit statuses map to completed, deferred, skipped and failed	The imported JS helper is superseded by the executable hook outcome scenarios and the shared Rust outcome mapping.
+an explicit bundle supplies private files without a profile bundle	Built-in private application file writes were removed; the replacement delivers options through a fresh per-hook file descriptor.

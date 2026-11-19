@@ -1459,6 +1459,53 @@ fn new_interrupted_file_adoption_names_the_source_declaration_and_staged_link() 
 }
 
 #[test]
+fn new_file_adoption_refuses_template_openers_before_mutation() {
+    let world = fixture("");
+    let config = world.root().join("config.toml");
+    let before = fs::read(&config).unwrap();
+    let literal = world.home().join("literal {name} % file");
+    fs::write(&literal, "literal contents").unwrap();
+
+    for relative in ["settings{{literal", "parent{%literal/settings"] {
+        let target = world.home().join(relative);
+        let source = world.root().join("dotfiles").join(relative);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "contents").unwrap();
+
+        let error = failed(
+            dots(&world)
+                .args(["add", "--base"])
+                .args([&literal, &target])
+                .output()
+                .unwrap(),
+            2,
+        );
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(
+            error.contains("template openers make the dotfile declaration unreadable"),
+            "{error}"
+        );
+        assert!(fs::symlink_metadata(&target).unwrap().is_file());
+        assert_eq!(fs::read(&target).unwrap(), b"contents");
+        assert!(fs::symlink_metadata(&literal).unwrap().is_file());
+        assert_eq!(fs::read(&literal).unwrap(), b"literal contents");
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!source.exists());
+        assert!(!world.root().join("dotfiles/literal {name} % file").exists());
+    }
+
+    success(
+        dots(&world)
+            .args(["add", "--base"])
+            .arg(&literal)
+            .output()
+            .unwrap(),
+    );
+    assert!(literal.is_symlink());
+    assert_eq!(fs::read(&literal).unwrap(), b"literal contents");
+}
+
+#[test]
 fn new_file_adoption_refuses_a_variant_target_in_a_host_file() {
     let world = fixture("");
     let config = world.root().join("config.toml");

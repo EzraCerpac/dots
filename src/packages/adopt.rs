@@ -212,8 +212,12 @@ fn references(ctx: &Ctx, paths: &Paths) -> Result<Vec<(PathBuf, bool)>, Fail> {
     Ok(found)
 }
 
+fn has_template_opener(value: &str) -> bool {
+    value.contains("{{") || value.contains("{%")
+}
+
 fn declared(base: &Path, home: &Path, value: &str, config: &Path) -> Result<PathBuf, Fail> {
-    if value.contains("{{") || value.contains("{%") {
+    if has_template_opener(value) {
         return Err(refusal(
             config,
             "cannot prove uniqueness with a templated dotfile path",
@@ -451,6 +455,12 @@ pub fn prepare_add(
     paths: Paths,
     config: &Path,
 ) -> Result<Adoption, Fail> {
+    if has_template_opener(&paths.key) {
+        return Err(Fail::usage(format!(
+            "Cannot adopt {:?} because template openers make the dotfile declaration unreadable.",
+            paths.key
+        )));
+    }
     let original = preflight_add(ctx, run, &paths, config)?;
     Ok(Adoption {
         paths,

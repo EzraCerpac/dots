@@ -137,7 +137,15 @@ pub(super) fn validate(
         ignored.push(path.clone());
     }
     protect_future_hosts(&root)?;
-    check_ignored(&scratch.live, &root, &ignored)?;
+    let preview_git = scratch.live.at(&root);
+    let format = scratch.git.text(["rev-parse", "--show-object-format"])?;
+    preview_git.get([
+        "init",
+        "--quiet",
+        "--template=",
+        &format!("--object-format={format}"),
+    ])?;
+    check_ignored(&preview_git, &ignored)?;
     let retired = retire(&root, &documents, &local, |source| {
         Ok(!current.contains_key(source) && source_exists(scratch.live.root(), source)?)
     })?;
@@ -178,14 +186,6 @@ pub(super) fn validate(
         return Err(invalid("mise did not load the isolated configuration"));
     }
     // Native directory manifests resolve their names from the verified index.
-    let preview_git = scratch.live.at(&root);
-    let format = scratch.git.text(["rev-parse", "--show-object-format"])?;
-    preview_git.get([
-        "init",
-        "--quiet",
-        "--template=",
-        &format!("--object-format={format}"),
-    ])?;
     let objects = scratch
         .live
         .file_path([
@@ -463,10 +463,8 @@ pub(super) fn probe(
     }
 }
 
-fn check_ignored(git: &Git<'_>, root: &Path, paths: &[PathBuf]) -> io::Result<()> {
-    let git = git.at(root);
-    git.get(["init", "--quiet", "--template="])?;
-    let mut input = tempfile::tempfile_in(root.join(".git"))?;
+fn check_ignored(git: &Git<'_>, paths: &[PathBuf]) -> io::Result<()> {
+    let mut input = tempfile::tempfile_in(git.root().join(".git"))?;
     for path in paths {
         input.write_all(path.as_os_str().as_bytes())?;
         input.write_all(&[0])?;

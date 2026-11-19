@@ -35,6 +35,10 @@ fn isolated(world: &Path, program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 pub(super) fn git_fixture() -> (tempfile::TempDir, Ctx) {
+    git_fixture_with_format("sha1")
+}
+
+fn git_fixture_with_format(format: &str) -> (tempfile::TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let world = tmp.path().canonicalize().unwrap();
     for directory in ["home", "checkout", "tmp", "jj"] {
@@ -59,7 +63,14 @@ pub(super) fn git_fixture() -> (tempfile::TempDir, Ctx) {
         flags: Flags::default(),
     };
     let git = Git::new(&ctx, ctx.root.path());
-    git.get(["init", "--quiet", "-b", "dev"]).unwrap();
+    git.get([
+        "init",
+        "--quiet",
+        "-b",
+        "dev",
+        &format!("--object-format={format}"),
+    ])
+    .unwrap();
     git.get(["add", "config.toml"]).unwrap();
     (tmp, ctx)
 }
@@ -334,7 +345,11 @@ fn capture_failure_still_shares(fault: super::dotfiles::CaptureFailure) {
 }
 
 fn shared_mise_fixture(declarations: &str) -> (tempfile::TempDir, Ctx) {
-    let (fixture, mut ctx) = git_fixture();
+    shared_mise_fixture_with_format(declarations, "sha1")
+}
+
+fn shared_mise_fixture_with_format(declarations: &str, format: &str) -> (tempfile::TempDir, Ctx) {
+    let (fixture, mut ctx) = git_fixture_with_format(format);
     let world = fixture.path().canonicalize().unwrap();
     let root = ctx.root.path();
     for key in ["MISE_TRUSTED_CONFIG_PATHS", "MISE_CEILING_PATHS"] {
@@ -354,8 +369,14 @@ fn shared_mise_fixture(declarations: &str) -> (tempfile::TempDir, Ctx) {
     git.get(["config", "user.email", "fixture@example.invalid"])
         .unwrap();
     let remote = world.join("bare-origin");
-    git.get(["init", "--bare", "--quiet", remote.to_str().unwrap()])
-        .unwrap();
+    git.get([
+        "init",
+        "--bare",
+        "--quiet",
+        &format!("--object-format={format}"),
+        remote.to_str().unwrap(),
+    ])
+    .unwrap();
     git.get([
         "remote",
         "add",
@@ -374,6 +395,66 @@ fn shared_mise_sync(ctx: &Ctx) -> crate::receipt::Receipt {
     let run = Run::begin(ctx, Sink::Unreported);
     let stage = run.start("Sync");
     super::run(&run, stage, super::load(ctx), Display::Embedded)
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn sha256_preview_preserves_ignores_and_manifest_with_sha1_default() {
+    let (fixture, mut ctx) = shared_mise_fixture_with_format(
+        "[dotfiles]\n'~/tree' = { mode = 'copy', source = 'tree', manifest = 'git' }\n",
+        "sha256",
+    );
+    ctx.env
+        .vars
+        .insert("GIT_DEFAULT_HASH".into(), "sha1".into());
+    let git = Git::new(&ctx, ctx.root.path());
+    assert_eq!(
+        git.text(["rev-parse", "--show-object-format"]).unwrap(),
+        "sha256"
+    );
+    let default = fixture.path().join("default-format");
+    fs::create_dir(&default).unwrap();
+    let default = git.at(&default);
+    default.get(["init", "--quiet", "--template="]).unwrap();
+    assert_eq!(
+        default.text(["rev-parse", "--show-object-format"]).unwrap(),
+        "sha1"
+    );
+
+    let root = git.root();
+    fs::create_dir(root.join("tree")).unwrap();
+    fs::write(root.join("tree/included"), "tracked leaf\n").unwrap();
+    fs::write(root.join("tree/private"), "ignored leaf\n").unwrap();
+    fs::write(root.join("tree/.gitignore"), "/private\n").unwrap();
+    let local = b"[vars]\np08_local = 'machine only'\n";
+    fs::write(root.join("config.local.toml"), local).unwrap();
+    git.get(["add", "."]).unwrap();
+    let expected = fixture_commit(&git, "SHA-256 fixture");
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(receipt.outcome, "pushed dev");
+    let remote = git.at(&fixture.path().join("bare-origin"));
+    assert_eq!(
+        remote.id(["rev-parse", "refs/heads/dev"]).unwrap(),
+        expected
+    );
+    let paths = remote
+        .get(["ls-tree", "-r", "--name-only", "refs/heads/dev"])
+        .unwrap();
+    assert!(
+        !paths.split(|byte| *byte == b'\n').any(|path| [
+            b"config.local.toml".as_slice(),
+            b"tree/private"
+        ]
+        .contains(&path))
+    );
+    assert_eq!(fs::read(root.join("config.local.toml")).unwrap(), local);
+    let target = fixture.path().join("home/tree");
+    assert_eq!(
+        fs::read(target.join("included")).unwrap(),
+        b"tracked leaf\n"
+    );
+    assert!(!target.join("private").exists());
 }
 
 #[test]

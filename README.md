@@ -1,368 +1,214 @@
 # dots
 
-`dots` keeps one or more machines in the state your [mise](https://mise.jdx.dev) configuration declares: tools, native packages, dotfiles and app settings.
-It wraps mise's native bootstrap and dotfile commands with a daily update, Git-based sharing of the configuration between machines, encrypted backup of app-written settings, and hooks for whatever mise cannot do itself.
+`dots` keeps your tools, native packages and dotfiles in one ordinary [mise](https://mise.jdx.dev) configuration, and `dots up` brings a machine up to date with it in one command.
+An optional Git remote shares that configuration between your machines, and `dots sync` scans your changes for secrets before it pushes them.
 
-Your configuration is an ordinary mise config directory in its own Git repository, by default `~/.config/mise`.
-This repository, the manager, holds no personal settings and lives apart from the configuration.
-
-## Requirements
-
-- mise with `mise bootstrap` and native dotfile history; 2026.11.8 or newer. No install method installs mise for you; `dots` stops with a message when it cannot find it.
-- Bash, Git 2.43 or newer, Node.js, [uv](https://docs.astral.sh/uv/) and jq.
-- [gitleaks](https://github.com/gitleaks/gitleaks) for `dots sync` and `dots publish`, and [age](https://age-encryption.org) for encrypted bundles and settings history.
-- [JJ](https://jj-vcs.github.io/jj/) only for `dots publish`, which runs in a colocated JJ workspace of the configuration repository, not in the live checkout.
-
-You can declare all of these as tools in the configuration itself, so `dots up` keeps them current.
+<!-- TODO (A-03): Record the integrated 1.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal. -->
 
 ## Install
 
-With mise:
+For the local quickstart on macOS, Linux or WSL, install mise 2026.11.8 or newer and Git.
+Choose one way to install the self-contained `dots` binary.
+
+<!-- TODO (D-01, C-01, G-2): Verify these alternatives against the published 1.0 artifacts. The current tap installs 0.4.0. -->
+
+**With mise**, activate mise in your shell or add its shims to your `PATH`.
 
 ```sh
-mise use -g github:EzraCerpac/dots
-dots --version
+mise use -g github:EzraCerpac/dots@1.0.0
 ```
 
-Each release has one archive per platform (macOS and Linux, arm64 and amd64) with `dots`, the files it runs from, and the prebuilt `dots-up` renderer; mise puts both on `PATH`.
-Pin a release with `github:EzraCerpac/dots@0.3.0`.
-
-With Homebrew:
+**With Homebrew**
 
 ```sh
 brew install ezracerpac/tap/dots
 ```
 
-The formula installs the same archive and depends on Homebrew's Git, but not on mise: install mise yourself, from [mise.jdx.dev](https://mise.jdx.dev) or with `brew install mise`.
-
-From a checkout, for development:
+**With Cargo**, install the Rust toolchain and a system linker first.
 
 ```sh
-git clone https://github.com/EzraCerpac/dots ~/.local/share/dots
-ln -s ~/.local/share/dots/bin/dots ~/.local/bin/dots
-(cd ~/.local/share/dots/dots-up && go build -o ../bin/dots-up ./cmd/dots-up)   # optional renderer
+cargo install dots-cli --locked
 ```
 
-`dots --version` prints the version and how it was installed (`mise`, `homebrew`, `checkout` or `archive`); `dots internal home` prints the directory it runs from, and `DOTS_HOME` overrides it.
+Run `dots --version` and check that it reports 1.0.0 before starting the quickstart.
+It also names the detected install method.
 
-The `dots-up` renderer adds the interactive menu, live progress and saved reports; without it every command still works with plain output.
-`dots` checks its own `bin/dots-up`, `mise which dots-up` and `PATH` for a renderer that reports `dots-shared-cli/3`.
-`DOTS_UP_BIN` overrides that search.
-Update or unset it if it points to an older renderer.
+## Requirements
 
-### Shell completions
+Beyond the local quickstart, the programs you need depend on what you run.
 
-Homebrew installs completions for Fish, Zsh and Bash in their standard directories.
-For mise, release archives, or a Homebrew shell that does not load completions automatically, add the line for your shell to its interactive configuration:
+| Program | Needed for |
+| --- | --- |
+| Git | `init`, `add FILE`, `backup`, `restore`, `bootstrap` and `publish`. Sync and the sync step of `up` need Git 2.43 or newer. |
+| [gitleaks](https://github.com/gitleaks/gitleaks) | Sharing changes, `dots publish`, and showing patches in `dots sync --last` |
+| [age](https://age-encryption.org), age-keygen | Encrypted bootstrap bundles and encrypted settings history |
+| `gh` | The optional remote offer in `dots init`; `dots publish` |
+| [JJ](https://jj-vcs.github.io/jj/) | `dots publish` |
+| ssh | `dots remote` |
+| Homebrew, apt, dnf, pacman, apk, mas | Declarations that select that package manager. The `dots brew` helpers also use Homebrew on macOS. |
 
-| Shell | Startup file | Line to add |
-| --- | --- | --- |
-| Fish | `~/.config/fish/config.fish` | `dots completions fish \| source` |
-| Zsh | `~/.zshrc`, after `compinit` | `source <(dots completions zsh)` |
-| Bash | `~/.bashrc` | `eval "$(dots completions bash)"` |
-
-For a Bash login shell, source `~/.bashrc` from your Bash login profile or put the loader in that profile.
-Each new shell loads completions from the active release.
-From a source checkout, build `bin/dots-up` as shown above.
-Try `dots remove ` followed by Tab to see managed tools, packages and apps.
-Use `--base`, `--profile` or `--path` to narrow the list.
-
-## Updating
-
-`dots up` updates `dots` only when the configuration declares it, as a mise tool or a Homebrew formula (see below); otherwise update it the way you installed it: `mise upgrade github:EzraCerpac/dots`, `brew upgrade dots`, or `git pull` in the checkout.
-`dots up` never updates a checkout.
-
-A `dots up` that installs a new `dots` finishes on the version it started with and reports `dots X -> Y, used from the next run`.
-The old version stays in place for that run: mise keeps it (`dots up` upgrades with `--no-prune`), and `dots up` sets `HOMEBREW_NO_INSTALL_CLEANUP=1`, so Homebrew keeps the old keg until your next `brew cleanup`.
-
-## Using dots from a configuration repository
-
-Pin the manager in the configuration, so every machine runs the same release and `dots up` installs the next one when you change the pin:
-
-```toml
-# config.toml
-[tools."github:EzraCerpac/dots"]
-version = "0.3.0"
-```
-
-`mise bootstrap` installs `[tools]` late, after the `pre-dotfiles` hook (see `mise bootstrap --help`), and hooks run with the caller's `PATH` only: neither `dots` nor, on a new machine, `mise` itself is on it.
-Run `dots` in a hook through `mise x`, which installs the pinned version first when it is missing, and fall back to the standalone mise path that `dots remote` installs; the `bootstrap` task runs after the tools step with the tools on its `PATH` and can call `dots` directly:
-
-```toml
-# config.laptop.toml
-[bootstrap.hooks]
-pre-dotfiles = 'SETUP_PROFILE=laptop "$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots internal persist-selected'
-
-# config.toml
-[tasks.bootstrap]
-description = "Finish the dots bootstrap"
-run = 'dots internal complete'
-raw = true
-```
-
-A configuration that still uses `"$DOTS_HOME/bin/dots"` works when the machine is bootstrapped with `dots bootstrap`, which exports `DOTS_HOME`, but not with `dots remote`, whose target runs `mise bootstrap` without it.
+`dots status` lists each program it finds, and which commands need the missing ones.
 
 ## Quickstart
 
-Create a configuration, or add the `dots` settings to an existing one.
-`dots init` never overwrites a file:
-
 ```sh
-dots init            # ~/.config/mise, or: dots init DIR
-```
-
-It adds a `[vars]` table with `dots_profiles = "default"` to `config.toml`, a `dots/` directory for hooks, commands and installer exceptions, a `.gitleaks.toml` for secret scanning, and a `.gitignore` for the files each machine writes for itself.
-
-Select this machine's profile and a name for it, once per machine:
-
-```sh
-dots internal profile --profile default --machine-id my-laptop
-```
-
-Declare a tool and a dotfile in `config.toml` with ordinary mise syntax:
-
-```toml
-[tools]
-ripgrep = "latest"
-
-[dotfiles]
-"~/.config/git/config" = { source = "dotfiles/.config/git/config", mode = "symlink" }
-```
-
-Put the file at `dotfiles/.config/git/config` in the configuration, then link it and look at the result:
-
-```sh
-dots apply
-dots status
-```
-
-`dots up` installs and updates everything the configuration declares.
-It starts by syncing the configuration's Git repository, so first push the configuration to GitHub with a `main` and a `dev` branch, make that repository the checkout's `origin`, and name it in `[vars]` as `dots_source_repo = "OWNER/NAME"`.
-Then run:
-
-```sh
+dots init
 dots up
 ```
 
-## Commands
+<details>
+<summary>Output of a first run on a fresh machine</summary>
 
-Run `dots help` for the full list with examples.
-In a terminal, `dots` alone opens a menu of the same commands.
-`dots up` shows the live update dashboard.
-Individual commands print in scrollback and return to the prompt when finished.
-To browse a saved sync receipt in your terminal pager, use `dots sync --last`.
-`--plain`, `--verbose` and `--no-wait` before a command choose how its output is shown, for example `dots --plain status`.
+From the hosted first-run check of `rust` at `4f39a55`: `dots` 1.0.0-rc.1 on Alpine with mise 2026.11.9 and Git, no terminal, with an empty home directory under `/tmp`.
 
-Update issues are listed under "Needs attention" in the dashboard, in `--plain` output and in the final report.
-Under it stand the last lines of the error, the command to run next and the path of the step's full log (under `~/.local/state/dots/`).
-In the dashboard, `A` on an issue hands it to a coding agent once the run has finished: `dots` suspends the dashboard and runs the shell command in `DOTS_AGENT_COMMAND` in the configuration directory, with the issue (its output, log path, configuration root, host, profile and `dots` version) as the last argument, for example `export DOTS_AGENT_COMMAND=claude` or `DOTS_AGENT_COMMAND=codex`.
-Without it, `A` says how to set it.
+```text
+created configuration directory /tmp/dots-first-run.XXDblMdB/home/.config/mise
+created config.toml
+created dots/
+created dots/hooks/
+created dots/hooks/update.d/
+created dots/hooks/bootstrap.d/
+created dots/commands/
+created dots/exceptions/
+created dots/README.md
+created dots/exceptions.tsv
+created dots/retired-dotfiles
+created dots/retired-declarations
+created .gitleaks.toml
+created .gitignore
+created profile default
+created machine ID 9413e1032403
+created Git repository
+created seed commit bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3 on main and dev
 
-Read-only:
+No remote yet. To share this configuration, create an empty repository and run
+git -C '/tmp/dots-first-run.XXDblMdB/home/.config/mise' remote add origin URL
+git -C '/tmp/dots-first-run.XXDblMdB/home/.config/mise' push --no-follow-tags --recurse-submodules=no origin 'bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3^{commit}:refs/heads/main' 'bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3^{commit}:refs/heads/dev'
+These publish only the seed. Later changes are shared with dots sync, which scans them first.
+==> Pre-update settings checkpoint
+Pre-update settings checkpoint: skipped
+Sync configuration (no remote configured): skipped
+==> Reload configuration
+Reload configuration: completed
+==> Inspect declared packages
+Inspect declared packages: completed
+==> Install declared mise tools
+Install declared mise tools: completed
+==> Upgrade declared mise tools
+Upgrade declared mise tools: completed
+==> Standalone mise
+Standalone mise: completed
+==> dots manager
+dots manager: skipped
+==> Post-update settings checkpoint
+Post-update settings checkpoint: skipped
+dots up: Complete (exit 0)
+Details and logs · dots up --last
+```
 
-| Command | What it does |
-| --- | --- |
-| `dots status` | Show the profile, source repository, declared packages, tools, dotfiles, history and installer exceptions |
-| `dots plan` | Preview mise's bootstrap plan for the declared setup |
-| `dots help` | List the commands, including the configuration's own |
-| `dots reports [COMMAND]` | Browse saved command reports (needs the renderer) |
-| `dots sync --last` | Inspect the files and eligible text diffs from the latest sync in this checkout |
-| `dots internal home` | Print the manager directory (`DOTS_HOME`) |
-| `dots --version` | Print the manager version and how it was installed |
+</details>
 
-Everyday:
+<!-- TODO (I-01): Replace this output with the released 1.0 binary's once it exists. -->
 
-| Command | What it does |
-| --- | --- |
-| `dots up [--mas]` | Sync the configuration, then install and update packages, tools, installer exceptions and hooks, and update mise last; `--mas` includes Mac App Store updates; `--last` reopens the last report |
-| `dots sync` | Share configuration edits through `dev`, apply the merged result and show the changed files |
-| `dots apply [TARGET...]` | Apply dotfiles and render templates |
-| `dots add [--base \| --profile P \| --path FILE] TOOL...` | Install tools or packages and record them in the configuration |
-| `dots remove [--dry-run] [--keep-installed] TOOL...` | Uninstall software and delete its declaration (`dots uninstall` is the same) |
-| `dots publish [--all \| --bookmark NAME]` | From a JJ workspace of the configuration repository, scan, push and open or update a pull request for a main-based stack |
-| `dots test [SUITE...]` | Run the configuration's `tests/run` |
+`dots init` sets up the configuration:
 
-New machines and private settings:
+- It uses mise's configuration directory, normally `~/.config/mise`. For a separate directory, use `dots init "$HOME/dotfiles"`, then `DOTS_ROOT="$HOME/dotfiles" dots up`.
+- It creates missing files and adds `dots_profiles = "default"` under `[vars]` if the existing `config.toml` lacks that setting. It preserves the rest of the file.
+- It keeps a valid saved profile and machine ID. For a fresh setup, it selects `default` if listed (otherwise the first listed profile) and derives the machine ID from the hostname. Both selections stay on this machine.
+- In a new repository it makes one seed commit on branches `main` and `dev`, with `dev` checked out. An existing repository keeps its branches and history. If its checkout shape would stop sync, `init` reports the problem and its fix.
+- In the run that creates the seed, while the seed is untouched, a terminal with `gh` signed in gets an offer to create a private GitHub repository if `dots_source_repo` is unset or matches the proposed repository. The default is no. For a pristine seed, the printed push uses the verified commit ID. For any other repository without an `origin`, follow the printed remote-add and `dots sync` instructions so outgoing commits are scanned.
 
-| Command | What it does |
-| --- | --- |
-| `dots init [DIR]` | Create a minimal configuration |
-| `dots bootstrap [--bundle FILE --identity KEY] [--restore ID]` | Run `mise bootstrap` for the whole declared setup, then the completion step |
-| `dots remote HOST --profile P [--dry-run]` | Bootstrap a machine over existing SSH from `dots_source_repo` |
-| `dots bundle create ...` | Encrypt private bootstrap inputs with age |
-| `dots backup` | Save app-written settings and publish them to the private history repository |
-| `dots restore [--initialize-history]` | Restore app-written settings from that repository |
-| `dots atuin-bundle`, `dots atuin-login` | Prepare and finish Atuin shell-history enrollment |
+`dots up` checks for tracked settings to checkpoint, then syncs and updates eligible software.
+In local-only mode (no `origin` and no `dots_source_repo`), it skips sync. Updating tools or standalone mise can still use the network.
 
-### Adding software
-
-`dots add` installs first and records only what installed:
+## Day to day
 
 ```sh
-dots add watchexec                        # current profile: config.PROFILE.toml
-dots add --base watchexec                 # config.toml, every profile
-dots add --profile server ripgrep         # another profile's file
-dots add --path ~/other/config.toml jq    # an explicit file
-dots add npm:prettier cargo:hexyl         # a backend prefix; mise still installs and updates it
-dots add brew:libmagic brew-cask:firefox  # native packages
-dots add https://github.com/OWNER/REPO    # a GitHub release
+dots status                                  # what is declared, installed and missing
+dots plan                                    # mise's bootstrap plan; installs nothing
+dots up                                      # checkpoint, sync and update eligible software
+dots apply                                   # apply declared dotfiles and templates locally
+dots up --last                               # print the saved report and return its exit status
+dots reports                                 # list recent completed reports, newest first
+dots sync                                    # share your edits and take the other machines'
+dots sync --last                             # replay the last sync receipt
+
+dots add --base ripgrep                      # install, then record it in the base config
+dots add ~/.config/example/settings.toml     # adopt an existing file that is safe to share
+dots remove --dry-run ripgrep                # show what removal would do
+dots remove --base --keep-installed ripgrep  # drop only the declaration
 ```
 
-A bare name uses mise's preferred backend and the latest version.
-`brew:` prefers a formula and selects a cask only when the formula is confirmed absent; `brew-cask:` always selects a cask.
-New Homebrew declarations are restricted to macOS, so they never become Linux requirements.
-`apt:`, `dnf:`, `pacman:`, `apk:` and `mas:` select the other native package managers.
+`dots add` writes to the selected profile's file unless you name another: `--base` for `config.toml`, `--profile P` for `config.P.toml`, or `--path FILE`.
+For file adoption or removal, a selected file must resolve to the root’s base config or one of its listed profiles’ config files.
+An argument starting with `/`, `~/`, `./` or `../` is a file; anything else is software.
+Adopting an existing regular file under your home directory moves it into the configuration's `dotfiles/` and leaves a link in its place; `dots remove` with the same path puts back a regular file with its current contents and mode.
 
-For a GitHub URL, a prebuilt command-line release uses mise's GitHub backend.
-A macOS app shipped as a ZIP or tar archive is recorded with an install hook that also replaces it in `/Applications` on upgrade, and never overwrites an app `dots` did not install.
-DMG and pkg installers are refused.
-When a release has several candidate downloads, name one with `--asset 'tool-*-macos-arm64.zip'` (exactly one URL).
-No script from the repository runs, so a source-only repository cannot be installed.
+Run `dots` or `dots help` to list the built-in commands and your configuration's own commands.
+`dots root` prints the configuration directory and `dots profile` prints the selected profile.
 
-On a failure `dots add` shows the declaration and asks whether to record it for a later retry; the default is no, and noninteractive runs never record it.
-With several requests, earlier successes stay recorded and the command stops at the first failure.
-A package that an installer exception holds (`hold=` in `dots/exceptions.tsv`) is refused.
+`dots up` writes ordinary terminal scrollback: a `==>` line when each step starts, one line with its result, and a final line such as `dots up: Complete (exit 0)`.
+Answer a hook’s or installer’s prompt directly in the terminal.
+When something went wrong, “Needs attention” lists each issue with a `Next:` action, and a completed run with only deferred issues still exits 0.
+For a failed step that owned the terminal, its output is in your scrollback. With `--plain` or without a terminal, hook and recipe failures include a private log path.
+`dots up --last` replays only that final report, not the live step output.
 
-### Removing software
+## Sharing between machines
 
-```sh
-dots remove watchexec
-dots remove --dry-run brew-cask:firefox   # show the plan only
-dots remove --keep-installed npm:prettier # delete only the declaration
+When sharing is configured, `dots sync` and the sync stage of `dots up` use two branches: `dev`, which every machine runs, and `main`, which you change through pull requests.
+
+- A sync with valid arguments always exits 0. Its receipt says what was shared, what stayed local and what needs attention.
+- Sync scans this machine's new and outgoing commits with gitleaks. A flagged file stays on disk, unshared; without gitleaks nothing is pushed.
+- Machine-local files, such as the profile selection and lockfiles, stay out of the repository.
+- On the remote, sync only creates or fast-forwards `dev`, and never moves `main`.
+- Where edits conflict, `main` wins over the shared `dev`, and `dev` over this machine's work; both sides stay in history.
+- In local-only mode, sync skips the entire pipeline and says how to add a remote.
+
+For example, this receipt followed an edit to `config.toml` next to a new file holding a secret.
+It comes from `dots` 1.0.0-rc.1 at `rust` `9a35df0`, in a disposable home directory with a local bare `origin`:
+
+```text
+NOT SHARED: gitleaks flagged a local file; it stays on disk: "leak.toml:2" (generic-api-key)
+  Remove or rotate the secret before sharing this path.
+dots sync: saved 1 locally · kept 1 files on disk · pulled dev +0, main +0 · pushed dev
+Shared on dev
+  config.toml
+Saved locally
+  config.toml
 ```
 
-`dots remove` (or `dots uninstall`) searches every active config file, including the machine-local ones; `--base`, `--profile` and `--path` narrow the search.
-Name the target by its exact declaration (`brew-cask:firefox`), by a short name that matches exactly one declaration, or by a GitHub URL; `mise:jq` selects a mise tool when another manager also has `jq`.
-If another active file still declares the tool, only the selected declaration goes and the software stays.
+`dots sync --last` printed the same receipt under a `Latest sync` heading.
 
-Each kind is removed by its own installer, without pruning anything else:
-mise tools with `mise unuse` and then `mise prune --tools TOOL`, which keeps versions other projects use;
-native packages with one targeted uninstall after checking dependents, never with zap, purge or force;
-GitHub apps by moving the app to the Trash and removing their release installation.
-When a removal cannot be confirmed safe, the command stops; when a step fails, it restores the declarations and any staged app.
-Settings and app data stay where they are.
+See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order of operations and how to read the outcome.
 
-`dots up`, `dots sync`, `dots apply`, `dots add`, `dots remove`, `dots bootstrap`, `dots backup`, `dots restore` and `dots publish` change the machine, the configuration or a remote repository.
+## Optional, later
 
-## Configuration
+- `dots publish [--all | --bookmark NAME]` opens a pull request to `main` from a separate colocated JJ workspace of a configuration hosted on GitHub. Updating an existing pull request keeps its base.
+- `dots backup` saves a local checkpoint of this machine's encrypted app settings, then publishes it to a separate private repository. It reports publication only when the remote host branch contains the saved checkpoint. If reconciliation is still pending, the checkpoint stays local and backup points to `mise dot status`; if the readback cannot verify publication, whether it was published is unknown, even if a push happened, and backup says to check the private history remote. Both exit 1.
+- `dots restore` fetches those settings back after safety checks and never pushes. It may save encrypted undo checkpoints of the files it replaces locally; a later explicit `dots backup` that succeeds publishes them.
+- [`dots bootstrap`](docs/contract.md#dots-bootstrap) sets up the local machine. `dots remote HOST --profile P` sets up a machine over SSH and leaves its mise history settings alone.
+  With history enabled, the target stores unencrypted tracked files in plaintext in its local history. Set `encrypt = true` on those files or disable history on the target to avoid that.
+  Before publishing, `dots backup` checks the outgoing checkpoints for plaintext and respects mise's `allow_plaintext_history` opt-in.
 
-`DOTS_ROOT` selects the configuration; it defaults to mise's config directory, `MISE_CONFIG_DIR` or `${XDG_CONFIG_HOME:-~/.config}/mise`.
-The manager's libraries find it the same way, wherever `dots` is installed, so a script can source `"$(dots internal home)/lib/setup-common.sh"` without setting `DOTS_ROOT`.
-Everything `dots` reads there:
+## Why dots
 
-| Path | Purpose |
-| --- | --- |
-| `config.toml` | Base mise configuration, always loaded; its `[vars]` holds the `dots` settings |
-| `config.PROFILE.toml` | Additions for one profile, loaded with `mise -E PROFILE` |
-| `dots/` | Hooks, commands, installer exceptions, retired dotfiles and retired local declarations: see [the `dots/` reference](init/README.md) |
-| `.gitleaks.toml`, `.gitleaksignore` | Secret-scan rules for `dots sync` |
-| `encrypted/bootstrap.PROFILE.json.age` | That profile's private bootstrap bundle; `dots bootstrap` uses it when present |
-| `encrypted/atuin.json.age` | Atuin enrollment bundle from `dots atuin-bundle` |
-| `tests/run` | The configuration's own tests, for `dots test` |
-| `miserc.toml`, `config.local.toml` | Written on each machine (profile, machine name, history settings) |
-| `config.host-ID.toml` | Optional additions for one machine, loaded with its `host-ID` profile |
-| `.gitignore` | Must ignore those files and mise lockfiles; `dots sync` refuses to share them |
-
-[The `dots/` reference](init/README.md) is also what `dots init` copies to `dots/README.md`.
-
-### Profiles and settings
-
-A profile is a mise environment: `config.laptop.toml` applies when the machine selects the `laptop` profile.
-List the profiles in `[vars]`; `dots` refuses any other name, in hooks, `dots add --profile` and installer exceptions alike.
-Each machine selects one profile with `dots internal profile`, or during bootstrap (below).
-
-mise `[vars]` values are strings, so a list is one string of space-separated words:
-
-```toml
-[vars]
-dots_profiles = "laptop server"              # required
-dots_source_repo = "OWNER/dotfiles"          # sync, publish, dots remote
-dots_state_repo = "OWNER/dotfiles-state"     # backup, restore, bootstrap
-dots_self_updating_casks = "some-cask"       # casks dots up only installs when missing
-dots_publish_on_behalf_of = "Your Name"      # dots publish adds a note that a model (DOTS_PUBLISH_MODEL) wrote the PR text
-dots_atuin_username = "you"                  # the only Atuin account enrollment accepts; unset, it keeps the
-                                             # account already logged in, else logs in as the one the bundle names
-```
-
-### Settings history
-
-`dots backup` and `dots restore` keep app-written files in mise's encrypted dotfile history, in the private `dots_state_repo` on one `host-ID` branch per machine.
-Declare each such file as a native track entry with one `host-ID` profile variant per machine that keeps it:
-
-```toml
-# config.laptop.toml
-[dotfiles]
-"~/.config/app/state.json" = { mode = "track", encrypt = true, variants = [{ profile = "host-my-laptop" }] }
-```
-
-The variant names that machine's stream in history (`home@host-my-laptop/…`), so another machine never applies it, even from the wrong branch; never rename or remove one that has history.
-A machine selects its `host-ID` profile next to its role, and bootstrap and restore keep its age identity and recipients in `config.local.toml` and set its tracked files to mode `0600`.
-
-### Bootstrap
-
-`dots bootstrap` runs `mise bootstrap` with `DOTS_HOME` and `DOTS_ROOT` exported.
-Two pieces of mise configuration connect it to `dots`: a hook in each profile file that records the profile, and a `bootstrap` task, which mise runs as the last bootstrap step, for the completion step (private inputs, installer exceptions, `dots/hooks/bootstrap.d`, Atuin, settings history and Tailscale).
-[Using dots from a configuration repository](#using-dots-from-a-configuration-repository) shows both.
-
-## Sync, dev and main
-
-The configuration repository has two shared branches.
-`dev` is what every machine runs: `dots sync`, and `dots up` before its updates, commit local edits to public files onto `dev`, scan them with gitleaks, merge the other machines' work and reviewed `main`, push without force and apply the result.
-`main` changes only through reviewed pull requests, so a merged PR reaches each machine with its next `dots up`.
-Machine-local files and secrets never enter the repository.
-[The sync guide](docs/sync.md) explains a run, every line of its output and what to do about it, and the requirements, including Git 2.43 or newer.
-
-## Agent skill
-
-[`skills/dots/SKILL.md`](skills/dots/SKILL.md) teaches a coding agent to work in a `dots` configuration: which commands are read-only, how to add tools, hooks and commands, and which changes need a pull request.
-
-`dots` links it for the agents you use, every time it runs, so installing or updating `dots` by any method also installs or updates the skill:
-
-| Link | Read by | Made when |
-| --- | --- | --- |
-| `~/.claude/skills/dots` | Claude Code | `~/.claude` (or `CLAUDE_CONFIG_DIR`) exists |
-| `~/.agents/skills/dots` | Codex and other clients of the shared directory | `~/.agents` or `~/.codex` (or `CODEX_HOME`) exists |
-
-Each link points at `skills/dots` in the running installation: Homebrew's stable `opt` path, so a `brew upgrade` needs no relinking, or the version directory for mise and a checkout, which the next `dots` command or `dots up` moves to the new version.
-`dots` replaces only links it made and that still point where it left them (it records them in `~/.local/state/dots/skill-links`); a directory, a file or any other link at those paths is yours, and `dots` leaves it alone with a one-time notice.
-`dots status` shows each link.
-Set `DOTS_SKILL_LINKS=0` to turn linking off.
-To remove the skill, set that and delete the two links; after `brew uninstall dots` or removing a mise version, the links dangle until you delete them or install `dots` again.
+- **Plain mise** already bootstraps a machine and manages tools, packages, dotfiles and their history. If that covers you, keep it. `dots up` checkpoints settings and updates eligible software. Shared sync can apply declared dotfiles. In local-only mode, use `dots apply`.
+- **chezmoi or GNU Stow** suit you if dotfiles are what you manage, and tools and packages are handled elsewhere. `dots` keeps all three in one mise configuration.
+- **Nix** suits you if you want fully reproducible environments and are happy to learn its language. `dots` stays with mise's TOML and your system's own package managers.
 
 ## Development
 
-| Path | Contents |
-| --- | --- |
-| `bin/dots` | The command-line entry point |
-| `packaging/` | The release build and the Homebrew formula |
-| `docs/` | [The sync guide](docs/sync.md) |
-| `lib/`, `tasks/`, `bootstrap/` | The commands' implementation; [`tasks/README.md`](tasks/README.md) details `dots up` and `dots restore` |
-| `init/` | Templates for `dots init` |
-| `dots-up/` | The Go renderer for menus, progress and reports |
-| `skills/` | The agent skill |
-| `tests/` | The test suites and a fixture configuration |
-
-Run the tests from the repository root. The Python suite uses PyYAML and tomlkit.
+This repository is the Rust crate `dots-cli`, which builds the `dots` binary; `mise.toml` pins Rust 1.100.0.
 
 ```sh
-tests/run              # Python, Node and shell suites; tests/run python, node or shell
-(cd dots-up && go vet ./... && go test ./...)
+mise install
+mise run build
+mise run test
 ```
 
-A suite whose runtime is missing is skipped (exit status 77), and so is a test whose tool is missing.
-The run ignores your Git and JJ configuration.
-`tests/fixtures/config` is a small configuration with every part of the contract.
+`dots test` is something else: it runs your configuration's own `tests/run`.
 
-To try a change without installing it, point `DOTS_HOME` at your checkout; every child of that run uses the same manager:
-
-```sh
-DOTS_HOME=~/src/dots ~/src/dots/bin/dots status
-DOTS_ROOT=/tmp/other-config dots help        # and another configuration
-```
-
-Pushing a `vX.Y.Z` tag runs the release workflow: it runs the tests and Go checks on Linux and macOS, then [`packaging/build-release`](packaging/build-release) builds `dots-X.Y.Z-{darwin,linux}-{arm64,amd64}.tar.gz`, `SHA256SUMS` and `dots.rb`, and publishes them as a GitHub release.
-The tag is the only place the version is written; the archives carry it in a `VERSION` file.
-`dots.rb` is [`packaging/homebrew/dots.rb`](packaging/homebrew/dots.rb) with the release's checksums. Nothing updates the tap automatically: copy the release's `dots.rb` by hand to `Formula/dots.rb` in `EzraCerpac/homebrew-tap` to publish the release to Homebrew.
+[The 1.0 contract](docs/contract.md) is the reference for everything `dots` does.
 
 ## License
 

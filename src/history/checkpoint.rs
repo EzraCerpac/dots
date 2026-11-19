@@ -9,6 +9,7 @@ use super::tracked::{self, TrackedPaths};
 
 pub(super) const STAGING: &str = ".dots-restore-install";
 pub(super) const MARKER: &str = "dots-restore-pending";
+pub(super) const LEGACY_RESTORE: &str = "an older pending restore cannot be safely resumed by this build; finish it with the dots version that started it";
 
 #[derive(Debug)]
 pub enum Checkpoint {
@@ -113,11 +114,13 @@ pub(super) fn require_no_pending(store: &Path) -> Result<(), Fail> {
                 .expect("history store has a parent")
                 .join(STAGING),
         )?
-        || exists(&legacy_marker(store))?
     {
         return Err(blocked(
             "a first restore is incomplete; rerun dots restore before saving history",
         ));
+    }
+    if exists(&legacy_marker(store))? {
+        return Err(blocked(LEGACY_RESTORE));
     }
     Ok(())
 }

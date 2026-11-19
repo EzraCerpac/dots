@@ -428,6 +428,25 @@ impl DirectoryIdentity {
 }
 
 impl PathBinding {
+    fn for_targets(&self, targets: &[PathBuf]) -> Self {
+        let directories = self
+            .home
+            .ancestors()
+            .chain(targets.iter().flat_map(|path| path.ancestors().skip(1)))
+            .filter_map(|path| {
+                self.directories
+                    .get(path)
+                    .map(|identity| (path.to_owned(), *identity))
+            })
+            .collect();
+        Self {
+            home: self.home.clone(),
+            source: self.source.clone(),
+            targets: targets.to_vec(),
+            directories,
+        }
+    }
+
     fn check(&self, previous: &Self, allow_created: bool) -> Result<(), Fail> {
         let same = if allow_created {
             self.home == previous.home
@@ -485,17 +504,23 @@ impl TrackedPaths {
     }
 
     pub(super) fn recheck(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
-        self.reopen(native, false).map(drop)
+        let home = physical_home(native.home()?)?;
+        let source = self.0.source.as_ref().map(|_| native.ctx.root.path());
+        reopen(home, source, self.binding(), false).map(drop)
     }
 
     pub(super) fn secure(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
-        protect_modes(self.reopen(native, true)?, self.0.source.is_some())
-    }
-
-    fn reopen(&self, native: &Native<'_, '_>, open_files: bool) -> Result<Vec<File>, Fail> {
         let home = physical_home(native.home()?)?;
         let source = self.0.source.as_ref().map(|_| native.ctx.root.path());
-        reopen(home, source, self.binding(), open_files)
+        // Validate the entire set before changing any mode, then hold only
+        // one batch of open descriptors at a time.
+        reopen(home.clone(), source, self.binding(), false)?;
+        for targets in self.chunks(16) {
+            let binding = self.0.for_targets(targets);
+            let files = reopen(home.clone(), source, &binding, true)?;
+            protect_modes(files, source.is_some())?;
+        }
+        Ok(())
     }
 }
 

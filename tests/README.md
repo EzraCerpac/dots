@@ -31,10 +31,11 @@ Remove the ignore when the implementation lands.
 Set `DOTS_BIN` to an absolute path to select another executable.
 With `DOTS_BIN` unset, Cargo supplies `dots`.
 Use a release or archive of commit `f5c8a0e` for the v0.4.0 oracle.
+Set `DOTS_TEST_ORACLE=v0.4.0` to enable the supervisor suite's archive renderer checks.
 
 ```sh
 mise run test -- --test contract
-DOTS_BIN=/absolute/path/to/v0.4.0/bin/dots mise run test -- unchanged_ -- --include-ignored
+DOTS_TEST_ORACLE=v0.4.0 DOTS_BIN=/absolute/path/to/v0.4.0/bin/dots mise run test -- unchanged_ -- --include-ignored
 mise run test -- --test contract -- --list
 ```
 

@@ -758,7 +758,9 @@ This verifies resolving the pin and launching it from the hook, not the 0.5 call
 
 `dots bootstrap persist-selected` persists the profile and machine ID the way `dots profile` does.
 An existing persisted profile and machine ID are kept.
-Failing those, it takes the profile from `SETUP_PROFILE`, or else from a single profile named in the caller's `MISE_ENV`, and the machine ID from `SETUP_MACHINE_ID`, or else from a persisted `host-` selector, or else `auto-` followed by a random identifier.
+Failing those, it takes the profile from `SETUP_PROFILE`, or else from a single profile named in the caller's `MISE_ENV`, and the machine ID from `SETUP_MACHINE_ID`, or else from a persisted `host-` selector.
+During the installer's `--from` adoption, it next tries the hostname, normalized as [`dots init`](#dots-init-dir) normalizes it; at any other time, including an ordinary bootstrap hook, it skips that step.
+Failing all of these, the machine ID is `auto-` followed by a random identifier.
 When `--restore ID` is in effect, the machine ID is `ID`, and a different persisted ID makes it stop with exit status 2.
 It records `SETUP_HISTORY_ORIGIN` as the history origin when that is set, and keeps any recorded history origin that conflicts with it.
 A full bootstrap is never run from it.

@@ -45,6 +45,12 @@ pub(super) struct Validated {
     configs: BTreeMap<PathBuf, Image>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum RetirementChange {
+    MachineLocal,
+    Public,
+}
+
 impl Validated {
     pub(super) fn revision(&self) -> &str {
         &self.revision
@@ -55,26 +61,31 @@ impl Validated {
             && (self.retired.is_empty() || self.public_before == public_root_configs(root)?))
     }
 
-    pub fn retirement_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
+    pub fn changed_retirement_inputs(&self, root: &Path) -> io::Result<Option<RetirementChange>> {
         if self.local != local_files(root)? {
-            return Ok(false);
+            return Ok(Some(RetirementChange::MachineLocal));
         }
         if self.retired.is_empty() {
-            return Ok(true);
+            return Ok(None);
         }
         let live = Dir::open(root)?;
         for (path, expected) in &self.configs {
             if !live.read_path(path)?.git_eq(expected) {
-                return Ok(false);
+                return Ok(Some(RetirementChange::Public));
             }
         }
         for entry in fs::read_dir(root)? {
             let path = PathBuf::from(entry?.file_name());
             if is_mise_config(&path) && !local(&path) && !self.configs.contains_key(&path) {
-                return Ok(false);
+                return Ok(Some(RetirementChange::Public));
             }
         }
-        Ok(true)
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub fn retirement_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
+        Ok(self.changed_retirement_inputs(root)?.is_none())
     }
 
     pub fn ready_to_apply(&self, git: &Git<'_>) -> io::Result<()> {

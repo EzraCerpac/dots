@@ -768,12 +768,19 @@ fn synchronize(
             copies
                 .reconcile_captures(&git, &shared.dir, &approved, &merged, &merged_tree, receipt)
                 .or_note("Could not reconcile captured copy baselines", RERUN)?;
-            if !validated
-                .retirement_inputs_unchanged(git.root())
+            if let Some(change) = validated
+                .changed_retirement_inputs(git.root())
                 .or_note("Could not recheck configuration files before apply", RERUN)?
             {
                 return Err(Note::new(
-                    "Configuration files changed after validation; dotfiles were kept",
+                    match change {
+                        validation::RetirementChange::MachineLocal => {
+                            "Machine-local files changed after validation; dotfiles were kept"
+                        }
+                        validation::RetirementChange::Public => {
+                            "Public configuration files changed after validation; dotfiles were kept"
+                        }
+                    },
                     RERUN,
                 ));
             }
@@ -801,12 +808,19 @@ fn synchronize(
             "Could not verify dev after the rejected push",
             "Check origin and the Git credential helper, then rerun dots sync.",
         )?;
-        if refreshed
-            .withdraws(&git, &heads)
+        if let Some(withdrawal) = refreshed
+            .withdrawal_since(&git, &heads)
             .or_note("Could not verify refreshed published history", GIT)?
         {
             return Err(Note::new(
-                "Published history was removed or rewound during sync",
+                match withdrawal {
+                    remote::Withdrawal::DevOrMain => {
+                        "Published dev or main was removed or rewound during sync"
+                    }
+                    remote::Withdrawal::TopicHistory => {
+                        "Published topic history was removed or rewound during sync"
+                    }
+                },
                 "Review origin's branch history and rerun dots sync.",
             ));
         }

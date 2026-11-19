@@ -201,6 +201,12 @@ impl<'a> PinnedRemote<'a> {
 
 pub(super) struct RemoteHeads(BTreeMap<String, String>);
 
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum Withdrawal {
+    DevOrMain,
+    TopicHistory,
+}
+
 impl RemoteHeads {
     pub fn dev(&self) -> Option<&str> {
         self.0.get(DEV).map(String::as_str)
@@ -212,12 +218,16 @@ impl RemoteHeads {
         self.0.values().map(String::as_str)
     }
 
-    pub fn withdraws(&self, git: &Git<'_>, earlier: &Self) -> io::Result<bool> {
+    pub fn withdrawal_since(
+        &self,
+        git: &Git<'_>,
+        earlier: &Self,
+    ) -> io::Result<Option<Withdrawal>> {
         for (before, after) in [(earlier.dev(), self.dev()), (earlier.main(), self.main())] {
             if let Some(before) = before {
                 match after {
                     Some(after) if git.ancestor(before, after)? => (),
-                    _ => return Ok(true),
+                    _ => return Ok(Some(Withdrawal::DevOrMain)),
                 }
             }
         }
@@ -236,9 +246,14 @@ impl RemoteHeads {
                     continue 'previous;
                 }
             }
-            return Ok(true);
+            return Ok(Some(Withdrawal::TopicHistory));
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn withdraws(&self, git: &Git<'_>, earlier: &Self) -> io::Result<bool> {
+        Ok(self.withdrawal_since(git, earlier)?.is_some())
     }
 
     pub fn same_incoming(&self, other: &Self) -> bool {

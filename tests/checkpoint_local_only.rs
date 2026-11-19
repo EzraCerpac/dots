@@ -14,6 +14,7 @@ use support::{FixtureCommand, World};
 
 const CONFIG: &str = "[vars]\ndots_profiles = \"laptop\"\n";
 const EMPTY: &str = r#"{"entries":[],"invalid":[]}"#;
+const DECISION_DONE: &str = "decision_child checked the expected result";
 
 struct Fixture {
     world: World,
@@ -88,12 +89,12 @@ impl Fixture {
         command
             .env("DOTS_TEST_SEAM", name)
             .env("DOTS_TEST_EXPECTED", expected)
-            .args(["--ignored", "--exact", "decision_child"]);
+            .args(["--ignored", "--exact", "decision_child", "--nocapture"]);
         command
     }
 
     fn seam(&self, name: &str, expected: &str) {
-        success(self.seam_command(name, expected).output().unwrap());
+        run_decision(&mut self.seam_command(name, expected));
     }
 }
 
@@ -105,6 +106,16 @@ fn executable(path: &Path, source: &str) {
 fn success(output: Output) -> Output {
     assert!(output.status.success(), "{output:?}");
     output
+}
+
+fn run_decision(command: &mut FixtureCommand<'_>) {
+    let output = success(command.output().unwrap());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == DECISION_DONE),
+        "exact decision child did not complete: {output:?}"
+    );
 }
 
 fn native_mise() -> PathBuf {
@@ -151,6 +162,59 @@ fn decision_child() {
         _ => panic!("unexpected test seam {seam}"),
     };
     assert_eq!(actual, std::env::var("DOTS_TEST_EXPECTED").unwrap());
+    println!("\n{DECISION_DONE}");
+}
+
+#[test]
+fn new_checkpoint_bounds_open_tracked_files() {
+    use nix::libc;
+
+    let f = Fixture::new();
+    let config = f.world.root().join("config.toml");
+    let mut declarations = format!("{CONFIG}\n[dotfiles]\n");
+    let mut entries = Vec::new();
+    let mut paths = Vec::new();
+    for index in 0..128 {
+        let name = format!("setting-{index}");
+        let target = format!("~/{name}");
+        declarations.push_str(&format!(
+            "'{target}' = {{ mode = 'track', encrypt = true }}\n"
+        ));
+        f.write(&name, "fixture payload\n");
+        let path = f.world.home().join(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        paths.push(path);
+        entries.push(serde_json::json!({"mode": "track", "path": target, "declared_in": config}));
+    }
+    fs::write(config, declarations).unwrap();
+    f.write(
+        "shared",
+        &serde_json::json!({"entries": entries, "invalid": []}).to_string(),
+    );
+    let mut child = f.seam_command("checkpoint", "saved");
+    // Only lower the descriptor limit in the forked fixture process.
+    unsafe {
+        child.pre_exec(|| {
+            let mut limit = std::mem::MaybeUninit::uninit();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut limit = limit.assume_init();
+            limit.rlim_cur = limit.rlim_cur.min(64);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    run_decision(&mut child);
+    assert!(
+        paths
+            .iter()
+            .all(|path| fs::metadata(path).unwrap().permissions().mode() & 0o777 == 0o600)
+    );
+    let log = fs::read_to_string(f.world.home().join("history-calls")).unwrap();
+    assert_eq!(log.lines().filter(|line| *line == "save").count(), 1);
 }
 
 #[test]
@@ -225,12 +289,10 @@ fn new_checkpoint_preserves_mise_notices_and_honors_global_override() {
     }
     let config = f.world.home().join("alternate.toml");
     let checkpoint = |expected| {
-        success(
+        run_decision(
             f.seam_command("checkpoint", expected)
                 .env("DOTS_TEST_NATIVE_MISE", &mise)
-                .env("MISE_GLOBAL_CONFIG_FILE", &config)
-                .output()
-                .unwrap(),
+                .env("MISE_GLOBAL_CONFIG_FILE", &config),
         );
         for store in &stores {
             assert_eq!(fs::read_to_string(store.join("notices")).unwrap(), notice);
@@ -308,7 +370,7 @@ fn new_checkpoint_skips_after_native_install_records_trust() {
     let checkpoint = |expected| {
         let mut command = f.seam_command("checkpoint", expected);
         fresh(&mut command);
-        success(command.output().unwrap());
+        run_decision(&mut command);
     };
     checkpoint("empty");
     assert!(!trust.exists());

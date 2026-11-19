@@ -404,6 +404,60 @@ fn assert_no_plaintext(dir: &Path) {
 }
 
 #[test]
+fn new_legacy_restore_marker_points_to_the_version_that_can_resume_it() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    seed.configure(
+        "p06-fixture/state",
+        URL,
+        &key,
+        std::slice::from_ref(&public),
+    );
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let fixture = Fixture::new();
+    fixture.configure("p06-fixture/state", URL, &key, &[public]);
+    fixture.write(DEFAULT, 0o600);
+    let store = fixture.store();
+    fs::create_dir_all(store.parent().unwrap()).unwrap();
+    ok(fixture
+        .git(None)
+        .args(["clone", "--bare", "--single-branch", "--branch", BRANCH])
+        .arg(&remote)
+        .arg(&store));
+    ok(fixture.git(Some(&store)).args(["branch", "-m", "main"]));
+    ok(fixture
+        .git(Some(&store))
+        .args(["config", "remote.origin.url", URL]));
+    let marker = store.parent().unwrap().join(".repo.git.restore-pending");
+    let pending = format!("{URL}\n");
+    fs::write(&marker, &pending).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+
+    if fixture.archive_dots(&remote) {
+        ok(&mut fixture.dots(&["restore"], &remote));
+        assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+        assert!(!marker.exists());
+    } else {
+        for command in ["backup", "restore"] {
+            let output = fixture.dots(&[command], &remote).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{}", messages(&output));
+            assert!(
+                messages(&output).contains("finish it with the dots version that started it"),
+                "{}",
+                messages(&output)
+            );
+            assert_eq!(fs::read_to_string(&marker).unwrap(), pending);
+            assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+        }
+        assert!(fixture.trace().is_empty());
+    }
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
 fn unchanged_first_checkpoint_is_encrypted_and_native_rollback_restores_content_and_mode() {
     let fixture = Fixture::new();
     let remote = fixture.world.bare_remote("private.git");

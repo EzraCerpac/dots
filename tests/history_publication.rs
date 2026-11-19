@@ -732,11 +732,13 @@ fn new_current_unencrypted_declaration_stops_before_preflight() {
     let (mut backup, trace) = history.observed_backup();
     let refused = backup.output().unwrap();
     assert_eq!(refused.status.code(), Some(2));
-    let trace = fs::read_to_string(trace).unwrap_or_default();
+    let trace = fs::read_to_string(trace).unwrap_or_else(|error| {
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        String::new()
+    });
     assert!(
-        !trace.contains("ls-remote")
-            && !trace.contains("upload-pack")
-            && !trace.contains("receive-pack")
+        trace.is_empty(),
+        "unexpected Git network commands {trace:?}"
     );
     assert_eq!(history.tip(&history.store, "refs/heads/main"), old);
     history.empty_remote(&old);

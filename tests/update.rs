@@ -1025,6 +1025,36 @@ fn new_up_embedded_sync_records_the_actual_adopted_revision_once() {
     let after = sync_fixture_git(&fixture, &["rev-parse", "HEAD"]);
     sync_fixture_git(&fixture, &["push", "--quiet", "origin", "HEAD:dev"]);
     sync_fixture_git(&fixture, &["switch", "--quiet", "dev"]);
+    fs::rename(fixture.bin.join("mise"), fixture.bin.join("update-mise")).unwrap();
+    fixture.executable(
+        &fixture.bin.join("mise"),
+        r#"#!/bin/sh
+set -eu
+if [ "${1-}" = -C ]; then
+    checkout="${HOME%/*}/config"
+    [ "$2" = "$(pwd -P)" ] && [ "$2" = "$DOTS_ROOT" ] && [ "$2" = "$MISE_CONFIG_DIR" ] || exit 75
+    case "$2" in
+        "$checkout"|"$checkout"/.git/dots-sync-*/validate-*) ;;
+        *) exit 75 ;;
+    esac
+    case "${3-}:${4-}:${5-}:${6-}:${7-}:${8-}" in
+        bootstrap:dotfiles:status:--json::)
+            printf '{"files":[],"edits":[]}\n'
+            exit 0 ;;
+        config:ls:--json:::)
+            if [ "$2" != "$checkout" ]; then
+                printf '[{"path":"%s/config.toml"}]\n' "$2"
+                exit 0
+            fi ;;
+        bootstrap:dotfiles:apply:--dry-run:--force:--yes)
+            [ "$2" != "$checkout" ]
+            exit ;;
+    esac
+    [ "$2" = "$checkout" ] || exit 75
+fi
+exec "${0%/*}/update-mise" "$@"
+"#,
+    );
     fixture.executable(
         &fixture.bin.join("gitleaks"),
         r#"#!/bin/sh

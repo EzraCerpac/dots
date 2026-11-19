@@ -276,6 +276,15 @@ impl<'a> Terminal<'a> {
         self.send(b"\n");
     }
 
+    fn read_pty(&mut self) {
+        let mut buffer = [0; 4096];
+        match self.master.read(&mut buffer) {
+            Ok(count) => self.transcript.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading PTY: {error}"),
+        }
+    }
+
     fn expect(&mut self, marker: &str) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -293,12 +302,7 @@ impl<'a> Terminal<'a> {
                 self.session.launch_details(),
                 String::from_utf8_lossy(&self.transcript)
             );
-            let mut buffer = [0; 4096];
-            match self.master.read(&mut buffer) {
-                Ok(count) => self.transcript.extend_from_slice(&buffer[..count]),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("reading PTY: {error}"),
-            }
+            self.read_pty();
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -403,6 +407,89 @@ impl<'a> Terminal<'a> {
                 "observer {pid} survived shell recovery"
             );
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JobState {
+    foreground_pgrp: Pid,
+    dots_stopped: Option<bool>,
+    stage_stopped: Option<bool>,
+}
+
+struct FgTrace {
+    dots: Pid,
+    stage: Pid,
+    start: Instant,
+    transitions: Vec<(u128, &'static str, JobState)>,
+}
+
+impl FgTrace {
+    fn sample(&mut self, terminal: &Terminal<'_>, phase: &'static str) -> JobState {
+        let owned = |pid| (session(pid) == terminal.session.pid()).then(|| stopped(pid));
+        let state = JobState {
+            foreground_pgrp: foreground(terminal.master.as_raw_fd()),
+            dots_stopped: owned(self.dots),
+            stage_stopped: owned(self.stage),
+        };
+        if self.transitions.len() < 64
+            && self
+                .transitions
+                .last()
+                .is_none_or(|&(_, last, previous)| last != phase || previous != state)
+        {
+            self.transitions
+                .push((self.start.elapsed().as_millis(), phase, state));
+        }
+        state
+    }
+
+    fn wait(
+        &mut self,
+        terminal: &mut Terminal<'_>,
+        phase: &'static str,
+        ready: impl Fn(JobState) -> bool,
+    ) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if ready(self.sample(terminal, phase)) {
+                return;
+            }
+            terminal.read_pty();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {phase}, {}\n{}",
+                terminal.session.launch_details(),
+                self.describe(terminal),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn describe(&self, terminal: &Terminal<'_>) -> String {
+        let tail = &terminal.transcript[terminal.transcript.len().saturating_sub(8192)..];
+        let mut description = format!(
+            "fixture Bash={}, dots={}, original reader={}\n",
+            terminal.session.pid(),
+            self.dots,
+            self.stage,
+        );
+        use std::fmt::Write as _;
+        for (ms, phase, state) in &self.transitions {
+            writeln!(
+                description,
+                "{ms:>4} ms {phase}: foreground_pgrp={} dots_stopped={:?} stage_stopped={:?}",
+                state.foreground_pgrp, state.dots_stopped, state.stage_stopped,
+            )
+            .unwrap();
+        }
+        write!(
+            description,
+            "PTY transcript tail: {:?}",
+            String::from_utf8_lossy(tail)
+        )
+        .unwrap();
+        description
     }
 }
 
@@ -699,6 +786,119 @@ fn new_background_dots_never_takes_shell_terminal_or_starts_observer() {
 }
 
 #[test]
+fn new_intentional_background_stop_resumes_with_bash_bg() {
+    let fixture = Fixture::new();
+    let mut terminal = Terminal::start(&fixture, "background-stop", false);
+    terminal.line(&format!("{JOB} & job=$!"));
+    terminal.expect(SHELL_PROMPT);
+    let stage = terminal.session.identity("stage");
+    let dots = terminal.dots_pid();
+    terminal.verify_original_tty(&stage, false);
+    let bash = terminal.session.pid();
+    assert_eq!(stage.foreground, bash);
+    fs::write(fixture.control.join("stop-stage"), b"").unwrap();
+    wait_for_with(
+        "intentional SIGSTOP to stop the stage and its Bash job",
+        || (stopped(stage.pid) && stopped(dots)).then_some(()),
+        || terminal.session.launch_details(),
+    );
+
+    terminal.line("jobs -sp");
+    terminal.expect(&format!("\r\n{dots}\r\n"));
+    terminal.expect(SHELL_PROMPT);
+    terminal.line("bg; printf '\\nbg-status:%s\\n' \"$?\"");
+    terminal.expect("\r\nbg-status:0\r\n");
+    let resumed = terminal.session.identity("resumed");
+    assert_eq!(resumed.pid, stage.pid);
+    terminal.verify_original_tty(&resumed, false);
+    assert_eq!(resumed.foreground, bash);
+    assert_eq!(foreground(terminal.master.as_raw_fd()), bash);
+    let mut known = vec![bash, dots, stage.pid];
+    known.sort_unstable();
+    assert_eq!(terminal.session.members(), known, "background observer");
+
+    fs::write(fixture.control.join("finish-stage"), b"").unwrap();
+    terminal.line(&format!("wait \"$job\"; {RESULT}"));
+    terminal.result(0);
+    assert!(!fixture.live("stage"));
+}
+
+#[test]
+fn new_wrapped_intentional_stop_resumes_with_one_bash_fg() {
+    let fixture = Fixture::new();
+    let mut terminal = Terminal::start(&fixture, "background-stop", false);
+    terminal.line(&format!(
+        r#"{{ {JOB}; code=$?; printf '\nwrapper-after:%s\n' "$code"; exit "$code"; }} & job=$!"#,
+    ));
+    terminal.expect(SHELL_PROMPT);
+    terminal.line(r#"printf '%s\n' "$job" > "$DIRECT_DIR/wrapper-pid"; printf '\nwrapper-launched:%s\n' "$job""#);
+    terminal.expect("\r\nwrapper-launched:");
+    terminal.expect(SHELL_PROMPT);
+    let wrapper: Pid = fs::read_to_string(fixture.control.join("wrapper-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let dots = terminal.dots_pid();
+    let stage = terminal.session.identity("stage");
+    let bash = terminal.session.pid();
+    assert_ne!(wrapper, dots);
+    assert_eq!(group(wrapper), wrapper);
+    assert_eq!(group(dots), wrapper);
+    assert_ne!(stage.group, wrapper);
+    assert_eq!(stage.foreground, bash);
+    terminal.verify_original_tty(&stage, false);
+    terminal.line("jobs -pr; PS4='+ fixture-bash: '; set -x");
+    terminal.expect(&format!("\r\n{wrapper}\r\n"));
+    terminal.expect(SHELL_PROMPT);
+
+    let mut trace = FgTrace {
+        dots,
+        stage: stage.pid,
+        start: Instant::now(),
+        transitions: Vec::new(),
+    };
+    fs::write(fixture.control.join("stop-stage"), b"").unwrap();
+    trace.wait(&mut terminal, "wrapped stage kernel stop", |state| {
+        state.stage_stopped == Some(true)
+    });
+    assert!(!stopped(wrapper));
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!("before fg: {}", terminal.session.launch_details());
+    }
+    terminal.line(&format!("fg; {RESULT}"));
+    trace.wait(
+        &mut terminal,
+        "single fg to resume the wrapped stage",
+        |state| {
+            state.dots_stopped == Some(false)
+                && state.stage_stopped == Some(false)
+                && state.foreground_pgrp == stage.group
+        },
+    );
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!("after fg: {}", terminal.session.launch_details());
+    }
+    let resumed = terminal.session.identity("resumed");
+    assert_eq!(resumed.pid, stage.pid);
+    assert_eq!(resumed.foreground, stage.group);
+    terminal.verify_original_tty(&resumed, false);
+    assert!(!stopped(wrapper));
+
+    fs::write(fixture.control.join("finish-stage"), b"").unwrap();
+    terminal.expect("\r\nwrapper-after:0\r\n");
+    terminal.result(0);
+    trace.sample(&terminal, "shell read after wrapper marker");
+    assert_eq!(terminal.session.members(), vec![bash]);
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!(
+            "wrapper={wrapper} pgrp={wrapper}\n{}",
+            trace.describe(&terminal)
+        );
+    }
+}
+
+#[test]
 fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
     let fixture = Fixture::new();
     let mut terminal = Terminal::start(&fixture, "background-reader", false);
@@ -712,20 +912,35 @@ fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
     let mut known = vec![terminal.session.pid(), dots, stage.pid];
     known.sort_unstable();
     assert_eq!(terminal.session.members(), known, "background observer");
-    terminal.line("printf '\\nshell-owns-tty\\n'");
+    // Bash xtrace distinguishes execution of fg from terminal input echo.
+    // Collect the initial job table before letting the reader reach SIGTTIN.
+    terminal.line("jobs -l; PS4='+ fixture-bash: '; set -x; printf '\\nshell-owns-tty\\n'");
     terminal.expect("\r\nshell-owns-tty\r\n");
     terminal.expect(SHELL_PROMPT);
 
+    let mut trace = FgTrace {
+        dots,
+        stage: stage.pid,
+        start: Instant::now(),
+        transitions: Vec::new(),
+    };
+    trace.sample(&terminal, "before releasing background read");
     fs::write(fixture.control.join("read-tty"), b"").unwrap();
     terminal.expect(PROMPT);
-    wait_for_with(
-        "background native /dev/tty read to stop the stage",
-        || stopped(stage.pid).then_some(()),
-        || terminal.session.launch_details(),
+    trace.wait(&mut terminal, "reader kernel stop", |state| {
+        state.stage_stopped == Some(true)
+    });
+    terminal.line(r#"fg; fg_status=$?; jobs -l; printf '\nshell-result:%s\n' "$fg_status""#);
+    trace.wait(
+        &mut terminal,
+        "Bash fg to resume dots and original reader",
+        |state| state.dots_stopped == Some(false) && state.stage_stopped == Some(false),
     );
-
-    terminal.resume_job(dots, stage.pid);
     terminal.complete_resumed_read(&stage, 0);
+    trace.sample(&terminal, "shell read after exit");
+    if env::var_os("DOTS_TEST_FG_TRACE").is_some() {
+        eprintln!("{}", trace.describe(&terminal));
+    }
 }
 
 #[test]

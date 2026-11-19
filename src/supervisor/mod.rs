@@ -495,6 +495,7 @@ impl<'a> Supervisor<'a> {
             probe,
             probe_stop_check: (probe && terminal::controlling_terminal().is_some())
                 .then(Instant::now),
+            awaiting_foreground: false,
             leader_exit: None,
             last_output: Instant::now(),
             group_empty_since: None,
@@ -713,6 +714,7 @@ struct Running<'a> {
     budget: Option<ProbeBudget>,
     probe: bool,
     probe_stop_check: Option<Instant>,
+    awaiting_foreground: bool,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_empty_since: Option<Instant>,
@@ -749,6 +751,25 @@ impl Running<'_> {
         let mut state = supervisor.state();
         let observation = self.observe(&mut state, self.job_control || self.probe)?;
         let exited = matches!(observation, Observed::Exited);
+        // Retry a possible handoff without holding up the drain of an exited leader.
+        if self.awaiting_foreground
+            && state.cancel.is_none()
+            && matches!(observation, Observed::Running | Observed::Exited)
+            && (!exited || !drained)
+            && foreground_terminal().is_some()
+            && (!exited
+                || matches!(
+                    groups::has_stopped_child(-self.entry.target, self.entry.pid),
+                    Ok(true)
+                ))
+        {
+            drop(state);
+            self.promote_group()?;
+            if !exited || !self.awaiting_foreground {
+                return Ok(None);
+            }
+            state = supervisor.state();
+        }
         if state.cancel.is_none()
             && (matches!(observation, Observed::Running) || exited && !drained)
             && self.probe_group_stopped()?
@@ -1066,38 +1087,59 @@ impl Running<'_> {
     }
 
     fn handle_stop(&mut self, signal: libc::c_int) -> io::Result<()> {
+        let terminal_io = matches!(signal, libc::SIGTTIN | libc::SIGTTOU);
         if let Some(job) = &mut self.terminal {
             // A fast native child can read or write its terminal before the
             // parent's post-spawn handoff. Resume that background stop.
-            if matches!(signal, libc::SIGTTIN | libc::SIGTTOU) && job.owns_foreground() {
+            if terminal_io && job.owns_foreground() {
                 return terminal::continue_group(-self.entry.target);
             }
             return job.suspend();
         }
-        self.promote_group()
+        // A shell can foreground a running wrapper without sending SIGCONT.
+        // Self-stop only when dots leads its job's process group.
+        if terminal_io || unsafe { libc::getpid() != libc::getpgrp() } {
+            return self.promote_group();
+        }
+
+        // Deliberate stops belong to the shell's job table. A subsequent bg
+        // continues the stage even while the shell still owns the tty.
+        self.awaiting_foreground = false;
+        if terminal::controlling_terminal().is_none() {
+            return Ok(());
+        }
+        terminal::suspend_caller()?;
+        self.try_foreground_group()?;
+        terminal::continue_group(-self.entry.target)
     }
 
     fn promote_group(&mut self) -> io::Result<()> {
-        let group = -self.entry.target;
-        if terminal::controlling_terminal().is_none() {
-            return if self.probe {
-                Err(io::Error::other(
-                    "probe stopped without a controlling terminal",
-                ))
-            } else {
-                Ok(())
-            };
+        if self.try_foreground_group()? {
+            self.awaiting_foreground = false;
+            return terminal::continue_group(-self.entry.target);
         }
-        // The shell may foreground dots before we observe its reader stop.
-        // If it has not, stop dots too so an ordinary fg can promote it.
-        if foreground_terminal().is_none() {
-            terminal::suspend_caller()?;
+        // An early fg can promote a running job without sending SIGCONT.
+        // Leave the reader stopped while the supervisor awaits the tty.
+        self.awaiting_foreground = terminal::controlling_terminal().is_some();
+        if self.probe && !self.awaiting_foreground {
+            return Err(io::Error::other(
+                "probe stopped without a controlling terminal",
+            ));
         }
-        if let Some(mut job) = TerminalJob::start(self.supervisor.ctx, Some(group))? {
-            job.enter()?;
-            self.terminal = Some(job);
+        Ok(())
+    }
+
+    fn try_foreground_group(&mut self) -> io::Result<bool> {
+        let Some(mut job) = TerminalJob::start(self.supervisor.ctx, Some(-self.entry.target))?
+        else {
+            return Ok(false);
+        };
+        job.enter()?;
+        if !job.owns_foreground() {
+            return Ok(false);
         }
-        terminal::continue_group(group)
+        self.terminal = Some(job);
+        Ok(true)
     }
 
     fn discard_display(&self) -> bool {

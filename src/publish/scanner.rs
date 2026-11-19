@@ -12,7 +12,6 @@ use crate::Fail;
 use super::failure;
 
 pub(super) const ARGS: &[&str] = &[
-    "dir",
     "--no-banner",
     "--redact=100",
     "--exit-code=20",
@@ -22,16 +21,31 @@ pub(super) const ARGS: &[&str] = &[
 ];
 
 const RECORD_PREFIX: usize = 1024;
-const SCAN_FAILED: &str = "gitleaks could not scan the outgoing commits; fix the scanner and retry";
 const DEPTH_SKIP: &str = "gitleaks skipped an archive at the one-level scan limit; remove it from the outgoing commits and retry";
 const FORMAT_SKIP: &str =
     "gitleaks skipped an unsupported file format; remove it from the outgoing commits and retry";
 
+pub(super) struct ScanMessages {
+    failed: &'static str,
+    finding: &'static str,
+}
+
+pub(super) const OUTGOING: ScanMessages = ScanMessages {
+    failed: "gitleaks could not scan the outgoing commits; fix the scanner and retry",
+    finding: "gitleaks found potential secrets; remove them from every outgoing commit and retry",
+};
+
+pub(super) const PREVIEW: ScanMessages = ScanMessages {
+    failed: "gitleaks could not scan the publication preview; fix the scanner and retry",
+    finding: "gitleaks found potential secrets in the publication preview",
+};
+
 pub(super) fn screen(
     mut command: Command,
+    messages: ScanMessages,
     probe: impl FnOnce(Command) -> Result<Output, Fail>,
 ) -> Result<(), Fail> {
-    let reader = diagnostics_pipe(&mut command).map_err(|_| failure(SCAN_FAILED))?;
+    let reader = diagnostics_pipe(&mut command).map_err(|_| failure(messages.failed))?;
     std::thread::scope(|scope| {
         let read = scope.spawn(move || read_diagnostics(reader));
         let output = probe(command)?;
@@ -39,8 +53,8 @@ pub(super) fn screen(
             .join()
             .ok()
             .and_then(Result::ok)
-            .ok_or_else(|| failure(SCAN_FAILED))?;
-        check(output.status.code(), diagnostics)
+            .ok_or_else(|| failure(messages.failed))?;
+        check(output.status.code(), diagnostics, messages)
     })
 }
 
@@ -117,18 +131,14 @@ fn read_diagnostics(stderr: impl Read) -> io::Result<Diagnostics> {
     }
 }
 
-fn check(code: Option<i32>, diagnostics: Diagnostics) -> Result<(), Fail> {
+fn check(code: Option<i32>, diagnostics: Diagnostics, messages: ScanMessages) -> Result<(), Fail> {
     match code {
         Some(0) => (),
-        Some(20) => {
-            return Err(failure(
-                "gitleaks found potential secrets; remove them from every outgoing commit and retry",
-            ));
-        }
-        _ => return Err(failure(SCAN_FAILED)),
+        Some(20) => return Err(failure(messages.finding)),
+        _ => return Err(failure(messages.failed)),
     }
     if diagnostics.failed {
-        return Err(failure(SCAN_FAILED));
+        return Err(failure(messages.failed));
     }
     diagnostics
         .skipped
@@ -183,7 +193,7 @@ mod tests {
     use super::*;
 
     fn check_stderr(code: Option<i32>, stderr: &[u8]) -> Result<(), Fail> {
-        check(code, read_diagnostics(stderr).unwrap())
+        check(code, read_diagnostics(stderr).unwrap(), OUTGOING)
     }
 
     #[test]
@@ -227,12 +237,15 @@ mod tests {
     #[test]
     fn new_scanner_failures_and_findings_block() {
         for code in [None, Some(1), Some(13)] {
-            assert_eq!(check_stderr(code, b"").unwrap_err().diagnostic, SCAN_FAILED);
+            assert_eq!(
+                check_stderr(code, b"").unwrap_err().diagnostic,
+                OUTGOING.failed
+            );
         }
         let stderr = b"11:00PM ERR could not open archive inner file path=fixture.zip\n";
         assert_eq!(
             check_stderr(Some(0), stderr).unwrap_err().diagnostic,
-            SCAN_FAILED
+            OUTGOING.failed
         );
         assert!(
             check_stderr(Some(20), b"")

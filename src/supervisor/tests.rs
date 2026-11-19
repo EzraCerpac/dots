@@ -3,6 +3,7 @@ use crate::Env;
 use std::fs;
 use std::path::Path;
 
+pub(super) mod audit;
 mod detached_probe;
 
 fn shell(source: &str, paths: &[&Path]) -> Command {
@@ -159,7 +160,7 @@ fn active_foreground_status_wins_over_fallback_and_sync_remains_zero() {
     });
 }
 
-fn fixture_context(path: &Path, verbose: bool) -> crate::Ctx {
+pub(crate) fn fixture_context(path: &Path, verbose: bool) -> crate::Ctx {
     let env = Env {
         vars: PRIVATE_DIRS
             .iter()
@@ -208,6 +209,19 @@ fn fixture_process(path: &Path, flag: &str, test: &str, input: &[u8]) -> Output 
     child.wait_with_output().unwrap()
 }
 
+pub(crate) fn bounded_fixture(path: &Path, flag: &str, test: &str) -> Output {
+    let mut child = fixture_command(path, flag, test)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    if !wait_until(|| child.try_wait().unwrap().is_some()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("isolated fixture timed out: {test}");
+    }
+    child.wait_with_output().unwrap()
+}
+
 const PRIVATE_DIRS: &[&str] = &[
     "HOME",
     "XDG_CONFIG_HOME",
@@ -237,6 +251,19 @@ const PRIVATE_DIRS: &[&str] = &[
 ];
 
 fn fixture_command(path: &Path, flag: &str, test: &str) -> Command {
+    let mut command = fixture_exec(path, flag, test);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+fn fixture_exec(path: &Path, flag: &str, test: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .env_clear()
@@ -248,14 +275,6 @@ fn fixture_command(path: &Path, flag: &str, test: &str) -> Command {
         .stderr(Stdio::piped());
     for name in PRIVATE_DIRS {
         command.env(name, path);
-    }
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
     }
     command
 }

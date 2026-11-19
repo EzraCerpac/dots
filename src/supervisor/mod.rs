@@ -5,7 +5,7 @@ mod pipe;
 mod signals;
 mod terminal;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use nix::libc;
 use std::fs::File;
@@ -391,18 +391,19 @@ impl<'a> Supervisor<'a> {
             _ => None,
         };
         let verify_wait = deadline.is_some();
-        if verify_wait {
-            require_waitable_children()?;
-        }
+        require_waitable_children()?;
         let fragment = matches!(self.mode, Mode::Fragment) && !verify_wait;
         let job_control = matches!(placement, Placement::Foreground) && !fragment;
-        let terminal = if job_control {
+        let mut terminal = if job_control {
             TerminalJob::start(self.ctx, None)?
         } else {
             None
         };
-        if let Some(terminal) = &terminal {
+        if let Some(terminal) = &mut terminal {
             command.process_group(terminal.group());
+            if native {
+                terminal.prepare_native(&mut command);
+            }
         } else if !fragment {
             if matches!(placement, Placement::Detached | Placement::DetachedProbe(_)) {
                 unsafe {
@@ -509,9 +510,11 @@ impl<'a> Supervisor<'a> {
             leader_kill: None,
             reaped: false,
         };
-        // Transfer from the parent after exec, so terminal stop signals
-        // cannot suspend the child before Command::spawn finishes.
-        if !self.cancelled()
+        #[cfg(test)]
+        tests::audit::wait_for_native_startup_check();
+        // Captured stages can still hand off from the parent after exec.
+        if !native
+            && !self.cancelled()
             && let Some(terminal) = &mut running.terminal
         {
             terminal.enter()?;
@@ -686,8 +689,7 @@ impl State {
 
 impl Entry {
     fn signal(&mut self, signal: libc::c_int, warnings: &mut Vec<String>) -> bool {
-        if self.verify_wait
-            && self.target != 0
+        if self.target != 0
             && let Err(error) = observe(self.pid, false)
         {
             self.abandon(&error, warnings);
@@ -700,7 +702,7 @@ impl Entry {
         if self.target != 0 {
             self.target = 0;
             warnings.push(format!(
-                "dots: lost ownership of the probe's processes ({error})"
+                "dots: lost ownership of the command's processes ({error})"
             ));
         }
     }
@@ -890,6 +892,11 @@ impl Running<'_> {
             if !job.fence()? {
                 return Ok(None);
             }
+            if job.take_fence_timeout() {
+                state.warnings.push(
+                    "dots: foreground signal observer did not acknowledge terminal handoff".into(),
+                );
+            }
             if job.notices()? {
                 state.terminal_interrupt(self.entry, self.draining);
             }
@@ -963,11 +970,10 @@ impl Running<'_> {
     }
 
     fn observe(&mut self, state: &mut State, stops: bool) -> io::Result<Observed> {
-        if self.entry.verify_wait
-            && state
-                .children
-                .iter()
-                .any(|entry| entry.pid == self.entry.pid && entry.target == 0)
+        if state
+            .children
+            .iter()
+            .any(|entry| entry.pid == self.entry.pid && entry.target == 0)
         {
             self.entry.target = 0;
             return Err(io::Error::from_raw_os_error(libc::ECHILD));
@@ -976,16 +982,14 @@ impl Running<'_> {
     }
 
     fn abandon(&mut self, state: &mut State, error: &io::Error) {
-        if self.entry.verify_wait {
-            if let Some(entry) = state
-                .children
-                .iter_mut()
-                .find(|entry| entry.pid == self.entry.pid)
-            {
-                entry.abandon(error, &mut state.warnings);
-            }
-            self.entry.target = 0;
+        if let Some(entry) = state
+            .children
+            .iter_mut()
+            .find(|entry| entry.pid == self.entry.pid)
+        {
+            entry.abandon(error, &mut state.warnings);
         }
+        self.entry.target = 0;
     }
 
     fn probe_group_stopped(&mut self) -> io::Result<bool> {
@@ -1090,8 +1094,7 @@ impl Running<'_> {
     fn handle_stop(&mut self, signal: libc::c_int) -> io::Result<()> {
         let terminal_io = matches!(signal, libc::SIGTTIN | libc::SIGTTOU);
         if let Some(job) = &mut self.terminal {
-            // A fast native child can read or write its terminal before the
-            // parent's post-spawn handoff. Resume that background stop.
+            // Resume a terminal I/O stop that raced with a handoff.
             if terminal_io && job.owns_foreground() {
                 return terminal::continue_group(-self.entry.target);
             }
@@ -1157,7 +1160,7 @@ impl Running<'_> {
 impl Drop for Running<'_> {
     fn drop(&mut self) {
         let mut state = self.supervisor.state();
-        if !self.reaped && (!self.entry.verify_wait || self.observe(&mut state, false).is_ok()) {
+        if !self.reaped && self.observe(&mut state, false).is_ok() {
             self.begin_group_retirement(&mut state);
             // Signal the leader separately if a mixed-privilege group accepted
             // SIGKILL only for some of its members.
@@ -1167,7 +1170,7 @@ impl Drop for Running<'_> {
             let until = Instant::now() + GROUP_RETIRE_GRACE;
             loop {
                 let observation = self.observe(&mut state, false);
-                if self.entry.verify_wait && observation.is_err() {
+                if observation.is_err() {
                     break;
                 }
                 if self.entry.verify_wait && matches!(observation, Ok(Observed::Exited)) {
@@ -1211,7 +1214,7 @@ fn require_waitable_children() -> io::Result<()> {
     let action = unsafe { action.assume_init() };
     if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
         return Err(io::Error::other(
-            "the probe requires waitable child processes",
+            "the supervisor requires waitable child processes",
         ));
     }
     Ok(())

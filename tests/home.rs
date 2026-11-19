@@ -46,7 +46,6 @@ fn unchanged_help_runs_through_a_relative_link_to_a_separate_manager() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_status_names_missing_mise_in_one_line() {
     let world = World::new();
     let bin = world.home().join(".local/bin");

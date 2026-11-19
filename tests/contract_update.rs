@@ -531,7 +531,6 @@ fn unchanged_plain_update_shows_failed_and_deferred_hook_output() {
 }
 
 #[test]
-#[ignore = "P-01"]
 fn unchanged_add_rejects_malformed_exception_rows_before_installing() {
     let f = UpdateFixture::new();
     f.script("dots/exceptions/one", ":");
@@ -565,7 +564,6 @@ fn unchanged_add_rejects_malformed_exception_rows_before_installing() {
 }
 
 #[test]
-#[ignore = "P-01"]
 fn unchanged_exception_validation_names_the_required_profiles_setting() {
     let f = UpdateFixture::new();
     f.write("config.toml", "[vars]\n");
@@ -578,7 +576,6 @@ fn unchanged_exception_validation_names_the_required_profiles_setting() {
 }
 
 #[test]
-#[ignore = "P-01"]
 fn unchanged_add_refuses_a_held_package_even_with_a_tap_and_version() {
     let f = UpdateFixture::new();
     f.script("dots/exceptions/pinned", ":");

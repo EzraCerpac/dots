@@ -203,7 +203,6 @@ fn unchanged_no_agent_directories_means_no_skill_links() {
 }
 
 #[test]
-#[ignore = "R-01 completion"]
 fn unchanged_loading_bash_completion_and_completing_a_word_leave_skills_alone() {
     let world = World::new();
     let links = agent_links(&world);
@@ -286,7 +285,6 @@ fn new_private_skill_survives_removal_of_the_installation() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_status_shows_agent_skill_links_without_mise() {
     let world = World::new();
     let links = agent_links(&world);

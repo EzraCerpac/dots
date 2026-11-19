@@ -35,6 +35,9 @@ esac
 
 const SCANNER: &str = r#"#!/bin/sh
 set -eu
+if [ "$1" = git ] && [ -x "${0%/*}/real-gitleaks" ]; then
+    exec "${0%/*}/real-gitleaks" "$@"
+fi
 controls=$(CDPATH='' cd -- "${0%/*}/.." && pwd -P)
 world=${controls%/*}
 mode=''
@@ -173,6 +176,10 @@ struct ReceiptWorld {
 
 impl ReceiptWorld {
     fn new() -> Self {
+        Self::with_scanner(false)
+    }
+
+    fn with_scanner(controlled: bool) -> Self {
         let world = IsolatedWorld::new();
         let root = world.root().to_path_buf();
         let fixture = root.parent().unwrap().join("receipt-fixture");
@@ -187,8 +194,22 @@ impl ReceiptWorld {
                 symlink(path, tools.join(name)).unwrap();
             }
         }
-        executable(&tools.join("mise"), MISE);
-        executable(&tools.join("gitleaks"), SCANNER);
+        let oracle = oracle();
+        if oracle {
+            executable(&tools.join("mise"), MISE);
+            executable(&tools.join("gitleaks"), SCANNER);
+        } else {
+            let mise = executable_on_path(&world.dots(), "mise").expect("receipt needs real mise");
+            symlink(world.native_mise_adapter(&mise), tools.join("mise")).unwrap();
+            let scanner =
+                executable_on_path(&world.dots(), "gitleaks").expect("receipt needs real gitleaks");
+            if controlled {
+                symlink(scanner, tools.join("real-gitleaks")).unwrap();
+                executable(&tools.join("gitleaks"), SCANNER);
+            } else {
+                symlink(scanner, tools.join("gitleaks")).unwrap();
+            }
+        }
 
         let f = Self {
             world,
@@ -199,7 +220,7 @@ impl ReceiptWorld {
         };
         let remote = f.world.bare_remote("receipt-origin");
         let local_url = format!("file://{}", remote.display());
-        let (repository, origin) = if oracle() {
+        let (repository, origin) = if oracle {
             ("dots-tests/receipt", ORIGIN)
         } else {
             (local_url.as_str(), local_url.as_str())
@@ -222,7 +243,7 @@ impl ReceiptWorld {
         );
         f.commit(&f.root);
         f.git(&f.root, &["remote", "add", "origin", origin]);
-        if oracle() {
+        if oracle {
             // The frozen dispatcher requires the raw GitHub origin spelling.
             // In the fixture alone, Git resolves it to the temporary bare repo.
             f.git(
@@ -342,7 +363,6 @@ impl ReceiptWorld {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_stays_in_the_selected_checkout() {
     let f = ReceiptWorld::new();
     f.write(&f.publisher, "receipt-routing-path", "incoming\n");
@@ -371,7 +391,6 @@ fn unchanged_replay_stays_in_the_selected_checkout() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_lists_renamed_deleted_added_and_binary_paths() {
     let f = ReceiptWorld::new();
     let old_name = "odd\tfile\nname";
@@ -391,15 +410,20 @@ fn unchanged_replay_lists_renamed_deleted_added_and_binary_paths() {
     // the metadata contract permits a path entry without exact Git quoting.
     let output = f.sync();
     let replay = f.last();
+    let oracle = oracle();
     for metadata in [&output, &replay] {
-        present(metadata, &["binary-path", "deleted-path", "added-path"]);
+        present(
+            metadata,
+            &["binary-path", "deleted-path", "added-path", "new name"],
+        );
+        // The 1.0 receipt promises changed paths and lists a rename as two paths.
         assert!(
             metadata.lines().any(|line| {
-                line.contains("new name")
+                (!oracle || line.contains("new name"))
                     && (line.contains(r"odd\tfile\nname")
                         || line.contains(r"odd\u0009file\u000aname"))
             }),
-            "missing escaped old and new names on the rename line: {metadata}"
+            "missing escaped rename metadata: {metadata}"
         );
         excluded(metadata, &[old_name]);
     }
@@ -408,14 +432,12 @@ fn unchanged_replay_lists_renamed_deleted_added_and_binary_paths() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_clean_sync_is_one_line() {
     let output = ReceiptWorld::new().sync();
     assert_eq!(output.trim().lines().count(), 1, "{output:?}");
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_sync_limits_each_group_to_five_paths() {
     let f = ReceiptWorld::new();
     for i in 0..6 {
@@ -440,7 +462,6 @@ fn unchanged_sync_limits_each_group_to_five_paths() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_latest_receipt_is_checkout_local() {
     let f = ReceiptWorld::new();
     f.write(
@@ -468,9 +489,19 @@ fn unchanged_latest_receipt_is_checkout_local() {
         "{empty}"
     );
     let stopped = succeeded(f.dots(&linked, &["sync"]).output().unwrap());
-    present(&stopped.to_ascii_lowercase(), &["other", "dev"]);
     let linked_last = succeeded(f.dots(&linked, &["sync", "--last"]).output().unwrap());
-    present(&linked_last.to_ascii_lowercase(), &["other"]);
+    if oracle() {
+        present(&stopped.to_ascii_lowercase(), &["other", "dev"]);
+        present(&linked_last.to_ascii_lowercase(), &["other"]);
+    } else {
+        // The 1.0 receipt gives the dev-checkout requirement and its next action.
+        for output in [&stopped, &linked_last] {
+            present(
+                &output.to_ascii_lowercase(),
+                &["dev branch", "use a plain git dev checkout"],
+            );
+        }
+    }
     excluded(&linked_last, &["initial-receipt-entry"]);
 
     f.write(
@@ -512,7 +543,6 @@ fn unchanged_latest_receipt_is_checkout_local() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn new_replay_ignores_a_pre_1_0_receipt() {
     let f = ReceiptWorld::new();
     // Supply legacy input to a valid checkout that has never run sync. No
@@ -536,7 +566,6 @@ fn new_replay_ignores_a_pre_1_0_receipt() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_inline_patch_uses_committed_inputs() {
     let f = ReceiptWorld::new();
     f.write(&f.publisher, ".gitattributes", "tracked-text diff=marker\n");
@@ -594,7 +623,6 @@ fn unchanged_inline_patch_uses_committed_inputs() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_inline_suppresses_overlong_patch() {
     let f = ReceiptWorld::new();
     f.write(
@@ -609,9 +637,9 @@ fn unchanged_inline_suppresses_overlong_patch() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_inline_at_most_two_paths() {
-    let f = ReceiptWorld::new();
+    // Exercise the path limit independently of real scanner startup time.
+    let f = ReceiptWorld::with_scanner(true);
     for name in ["first", "second"] {
         f.write(&f.publisher, name, format!("short {name} fixture\n"));
     }
@@ -630,7 +658,6 @@ fn unchanged_inline_at_most_two_paths() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_plain_replay_has_metadata_without_pager() {
     let f = ReceiptWorld::new();
     f.write(
@@ -648,9 +675,8 @@ fn unchanged_plain_replay_has_metadata_without_pager() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_live_terminal_omits_a_displayable_secret_patch() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     let file = "live-screening.txt";
     f.write(&f.publisher, file, "safe inline control\n");
     f.publish();
@@ -669,9 +695,8 @@ fn unchanged_live_terminal_omits_a_displayable_secret_patch() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_screens_both_file_versions_and_displayed_text() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     let old = "PATH_RULE old path-sensitive bytes";
     let new = "PATH_RULE new path-sensitive bytes";
     f.write(&f.publisher, "01-before/rule.yml", format!("{old}\n"));
@@ -742,9 +767,8 @@ fn unchanged_replay_screens_both_file_versions_and_displayed_text() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_omits_unsafe_patch_bodies() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     f.write(&f.publisher, "removed-path", "SCAN_ALERT removed bytes\n");
     f.write(
         &f.publisher,
@@ -812,7 +836,6 @@ fn unchanged_replay_omits_unsafe_patch_bodies() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_caps_retained_patch_bytes() {
     let f = ReceiptWorld::new();
     // Distinct local and incoming paths make independently scoped receipt
@@ -848,9 +871,8 @@ fn unchanged_replay_caps_retained_patch_bytes() {
 }
 
 #[test]
-#[ignore = "P-09"]
 fn unchanged_replay_keeps_screened_patches_when_screening_stalls() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     f.write(&f.publisher, "a-clean", "screened before the stall\n");
     f.write(&f.publisher, "m-stalled", "STALL_SCAN demand\n");
     f.write(&f.publisher, "z-later", "unscreened after the stall\n");
@@ -859,6 +881,7 @@ fn unchanged_replay_keeps_screened_patches_when_screening_stalls() {
 
     f.write(&f.root, "config.toml", "broken = ???\n");
     let no_mise = f.fixture.join("mise-was-called");
+    fs::remove_file(f.tools.join("mise")).unwrap();
     executable(
         &f.tools.join("mise"),
         "#!/bin/sh\nprintf 'invoked' > \"${0%/*}/../mise-was-called\"\nexit 17\n",

@@ -464,7 +464,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires actual gitleaks"]
     fn native_scan_reports_a_verified_default_rule_and_positive_line() {
         let (_fixture, ctx) = git_fixture();
         let git = Git::new(&ctx, ctx.root.path());

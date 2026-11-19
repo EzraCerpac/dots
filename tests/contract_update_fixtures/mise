@@ -17,6 +17,8 @@ case "$#:$*" in
         printf '{"entries":[],"invalid":[]}\n'
         exit 0
         ;;
+    # The v0.4.0 updater saves a checkpoint even with no tracked paths.
+    '3:bootstrap dotfiles save') exit 0 ;;
 esac
 
 case "${1:-} ${2:-} ${3:-}" in

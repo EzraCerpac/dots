@@ -33,6 +33,7 @@ pub struct Enroll<'a> {
     pub machine: &'a str,
     pub origin: &'a RepoSetting,
     pub identity: &'a Path,
+    pub recovery_identity: Option<&'a Path>,
     pub recipients: &'a [String],
 }
 
@@ -276,6 +277,7 @@ pub fn enroll_command(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
                 .expect("required identity"),
         ),
         origin: origin.as_ref().unwrap_or(state),
+        recovery_identity: None,
         recipients: &recipients,
     };
     prepare_enrollment(native, &vars, settings, true)?;
@@ -306,6 +308,7 @@ fn prepare_enrollment(
         machine,
         origin,
         identity,
+        recovery_identity,
         recipients,
     } = settings;
     if !vars.profiles.iter().any(|configured| configured == profile) {
@@ -360,12 +363,10 @@ fn prepare_enrollment(
         )?;
         local = LocalSettings::read(&native)?;
     }
+    // Standalone enrollment selects the key for later restore. Bootstrap
+    // supplies a separate recovery key and preserves an existing selection.
+    local.set_recovery_identity(recovery_identity.unwrap_or(&identity), persist_selection)?;
     local.set_history(&branch, origin, &identity, &all)?;
-    if persist_selection {
-        // Standalone --identity also selects the key for a later standalone
-        // restore. Bootstrap supplies a machine key separately from recovery.
-        local.set_recovery_identity(&identity)?;
-    }
     local.install(&native)
 }
 

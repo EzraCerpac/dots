@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -267,7 +267,7 @@ fn mise_path(ctx: &Ctx, name: &str) -> Result<Option<PathBuf>, Fail> {
     Ok(Some(path.to_owned()))
 }
 
-fn update_directory(ctx: &Ctx, from: bool, from_dir: Option<&OsString>) -> Result<PathBuf, Fail> {
+fn update_directory(ctx: &Ctx, from: bool, from_dir: Option<&Path>) -> Result<PathBuf, Fail> {
     let root = ctx.root.path();
     if from {
         let checkout = if let Some(path) = from_dir {
@@ -303,7 +303,7 @@ pub(super) fn validate_update(
     run: &Run<'_>,
     vars: &Vars,
     source: Option<&(&str, NativeSource)>,
-    from_dir: Option<&OsString>,
+    from_dir: Option<&Path>,
 ) -> Result<(), Fail> {
     let dir = update_directory(
         ctx,
@@ -332,7 +332,8 @@ pub(super) fn validate_update(
     if !top.status.success() {
         return Ok(());
     }
-    let checkout = PathBuf::from(text(top, "could not identify the bootstrap checkout")?.trim())
+    let path = top.stdout.strip_suffix(b"\n").unwrap_or(&top.stdout);
+    let checkout = Path::new(OsStr::from_bytes(path))
         .canonicalize()
         .map_err(|_| Fail::new(1, "could not resolve the bootstrap checkout"))?;
     if source.is_none() && checkout != resolved && !dir.is_symlink() {

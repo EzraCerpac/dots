@@ -996,6 +996,8 @@ fn rejected_group_blocks_its_dependent_by_group_name() {
 root = "tree"
 target = "~/predecessor"
 mode = "copy"
+[settings.dotfiles]
+root = "{{ mise_config_dir }}"
 [bootstrap.hooks]
 pre-dotfiles = '''
 if test -e "$HOME/reject"; then

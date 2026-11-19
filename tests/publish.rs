@@ -260,6 +260,9 @@ classify() {
             --no-pager|--color=never|--ignore-working-copy|--no-integrate-operation|--at-op=*) shift ;;
             --at-op) shift 2 ;;
             --config=ui.quiet=false|--config=debug.randomness-seed=*|--config=debug.commit-timestamp=*|'--config=revset-aliases."immutable_heads()"='*) shift ;;
+            "--config=templates.file_show='\"\"'")
+                [ "${2-} ${3-}" = 'file show' ] || return 88
+                shift ;;
             --config)
                 case "$2" in git.abandon-unreachable-commits=false|debug.commit-timestamp=*) ;; *) return 88 ;; esac
                 shift 2 ;;

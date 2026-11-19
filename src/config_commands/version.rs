@@ -159,8 +159,13 @@ fn installer(exe: &Path, env: &Env) -> &'static str {
                 .map(|path| Path::new(path).join("mise"))
         })
         .or_else(|| env.home().map(|home| home.join(".local/share/mise")));
-    let in_mise_data = mise_data
-        .and_then(|dir| dir.join("installs").canonicalize().ok())
+    let mise_installs = env
+        .get("MISE_INSTALLS_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| mise_data.map(|dir| dir.join("installs")));
+    let in_mise_data = mise_installs
+        .and_then(|dir| env.cwd().join(dir).canonicalize().ok())
         .is_some_and(|dir| exe.starts_with(dir));
     let in_mise_layout = components
         .windows(2)

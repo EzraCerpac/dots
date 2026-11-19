@@ -190,12 +190,22 @@ fn read_record(marker: &Path, applications: &Path) -> Result<Record, OwnershipEr
         // A valid marker is useful even when the app is already absent. P-01
         // must revalidate the bundle and its identifier before moving it.
         directory_or_absent(applications)
-            .and_then(|()| directory_or_absent(path))
-            .map(|()| OwnedApp {
-                marker: marker.to_owned(),
-                repo,
-                path: path.to_owned(),
-                bundle_id: owner.bundle_id.clone(),
+            .and_then(|_| directory_or_absent(path))
+            .and_then(|installed| {
+                if let (Some(proof), Some(installed)) = (owner.installation, installed)
+                    && !proof.matches(&installed)
+                {
+                    return Err(OwnershipError::at(
+                        path,
+                        "app installation identity differs",
+                    ));
+                }
+                Ok(OwnedApp {
+                    marker: marker.to_owned(),
+                    repo,
+                    path: path.to_owned(),
+                    bundle_id: owner.bundle_id.clone(),
+                })
             })
     };
     Ok(Record {
@@ -217,11 +227,11 @@ pub(crate) fn marker_filename(bundle: &str) -> String {
     filename
 }
 
-fn directory_or_absent(path: &Path) -> Result<(), OwnershipError> {
+fn directory_or_absent(path: &Path) -> Result<Option<fs::Metadata>, OwnershipError> {
     match fs::symlink_metadata(path) {
-        Ok(info) if info.is_dir() => Ok(()),
+        Ok(info) if info.is_dir() => Ok(Some(info)),
         Ok(_) => Err(OwnershipError::at(path, "expected a real app directory")),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(OwnershipError::at(path, error)),
     }
 }

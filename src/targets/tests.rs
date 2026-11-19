@@ -194,6 +194,20 @@ fn aliases_share_an_identity_and_keep_original_declarations() {
 }
 
 #[test]
+fn trailing_slash_github_declarations_offer_the_normalized_short_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut targets = Targets::default();
+    declare(
+        &mut targets,
+        &dir.path().join("config.toml"),
+        "[tools]\n'https://github.com/acme/widget/' = 'latest'\n",
+    );
+    targets.finish(|_| None);
+    assert_eq!(one(&targets, "widget", false).id, "github:acme/widget");
+    assert_eq!(values(&targets, "widget", &[], false), ["widget"]);
+}
+
+#[test]
 fn managers_and_taps_stay_distinct_and_unsafe_names_are_omitted() {
     let dir = tempfile::tempdir().unwrap();
     let mut targets = Targets::default();
@@ -348,6 +362,33 @@ fn unsafe_markers_cannot_offer_apps_or_make_an_ambiguous_alias_unique() {
     assert!(target.owned_apps.is_empty());
     assert_eq!(target.ownership_error.unwrap().path, linked);
     assert!(targets.ownership_error().is_none());
+}
+
+#[test]
+fn mismatched_installation_is_omitted_but_a_missing_app_can_be_cleaned_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let apps = dir.path().join("Applications");
+    let markers = dir.path().join("github-apps");
+    let path = apps.join("Owned.app");
+    fs::create_dir_all(&path).unwrap();
+    let marker = marker(&markers, &path, "acme/widget", None);
+    let installation =
+        ownership::AppInstallation::from_metadata(&fs::metadata(&path).unwrap()).unwrap();
+    fs::write(&marker, json!({"repo": "acme/widget", "path": path, "bundle_id": "test.example", "installation": installation}).to_string()).unwrap();
+    fs::rename(&path, apps.join("Original.app")).unwrap();
+    fs::create_dir(&path).unwrap();
+
+    let mut targets = Targets::default();
+    targets.add_ownership(&markers, &apps, false);
+    targets.finish(|_| None);
+    assert!(values(&targets, "owned", &[], false).is_empty());
+    assert!(one(&targets, "owned", false).ownership_error.is_some());
+
+    fs::remove_dir(&path).unwrap();
+    let mut targets = Targets::default();
+    targets.add_ownership(&markers, &apps, false);
+    targets.finish(|_| None);
+    assert_eq!(values(&targets, "owned", &[], false), ["owned"]);
 }
 
 #[test]

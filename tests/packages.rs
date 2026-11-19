@@ -1252,6 +1252,61 @@ exit 1"#,
 }
 
 #[test]
+fn apt_uninstall_waits_for_the_last_active_spelling() {
+    for requests in [
+        ["apt:fixture", "apt:fixture:amd64"],
+        ["apt:fixture:amd64", "apt:fixture"],
+    ] {
+        let world =
+            fixture("\n[bootstrap.packages]\n'apt:fixture' = '2'\n'apt:fixture:amd64' = '2'\n");
+        fake_mise(&world, "exit 91");
+        script(
+            &bin(&world).join("dpkg-query"),
+            r#"
+if [ ! -e "$HOME/removed" ]; then printf 'fixture:amd64 installed\n'; fi"#,
+        );
+        script(&bin(&world).join("sudo"), "exec \"$@\"");
+        script(
+            &bin(&world).join("apt-get"),
+            "test \"$1\" = --simulate\nprintf 'Remv fixture:amd64 [2]\\n'",
+        );
+        script(
+            &bin(&world).join("dpkg"),
+            r#"
+test "$*" = "--no-force-depends --no-force-depends-version --remove fixture:amd64"
+test ! -e "$HOME/removed"
+if grep -q 'apt:fixture' "$DOTS_ROOT/config.toml"; then exit 19; fi
+touch "$HOME/removed""#,
+        );
+        success(
+            dots(&world)
+                .args(["remove", "--base"])
+                .args(requests)
+                .output()
+                .unwrap(),
+        );
+        assert!(world.home().join("removed").is_file());
+    }
+}
+
+#[test]
+fn version_recognizes_a_custom_mise_installs_directory() {
+    let world = fixture("");
+    let installs = world.home().join("tools");
+    let executable = installs.join("github-owner-dots/1.0.0/dots");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::copy(dots(&world).get_program(), &executable).unwrap();
+    let output = success(
+        fixture_child(&world, &executable)
+            .env("MISE_INSTALLS_DIR", &installs)
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    assert!(output.trim_end().ends_with(" (mise)"), "{output}");
+}
+
+#[test]
 fn new_status_lists_the_adopted_target() {
     let world = fixture("");
     let target = world.home().join("status-fixture");

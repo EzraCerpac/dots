@@ -61,14 +61,7 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
         }
     }
 
-    let selected_declarations: Vec<_> = plans
-        .iter()
-        .flat_map(|plan| match plan {
-            Plan::Software(software) => software.target.declarations.as_slice(),
-            Plan::File(_) => &[],
-        })
-        .cloned()
-        .collect();
+    let mut declarations_through_stage = Vec::new();
     for plan in &mut plans {
         if let Plan::Software(plan) = plan
             && !keep
@@ -77,7 +70,9 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
                 .as_ref()
                 .or(inventory.as_ref())
                 .expect("software inventory");
-            plan.prepare(ctx, run, active, &selected_declarations)?;
+            // Later requests still need the installed package if this run stops early.
+            declarations_through_stage.extend(plan.target.declarations.iter().cloned());
+            plan.prepare(ctx, run, active, &declarations_through_stage)?;
         }
     }
     for plan in plans {

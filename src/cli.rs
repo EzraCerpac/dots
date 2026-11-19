@@ -677,7 +677,18 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
     } else {
         None
     };
-    let ctx = context_at(flags, directory)?;
+    let ctx = match context_at(flags, directory) {
+        Ok(ctx) => ctx,
+        Err(error) if name == "sync" => {
+            if args.get_flag("last") {
+                receipt::no_receipt();
+            } else {
+                receipt::startup_failure(&error);
+            }
+            return Ok(0);
+        }
+        Err(error) => return Err(error),
+    };
     if !matches!(
         name,
         "init"

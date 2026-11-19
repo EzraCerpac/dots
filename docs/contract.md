@@ -8,6 +8,7 @@ Amended 2026-11-18: report listing and exit status, the init seed commit message
 Amended 2026-11-18: sync diagnostics and hook-generated inputs, backup publication verification and history format checks, diverged publish approval, and update report replay.
 Amended 2026-11-19: restore checkpoint encryption and validated sync pre-hook context.
 Amended 2026-11-19: source sync writes and publication, native history recovery, trusted recipient fragments, outgoing history audits, and resuming a suspended terminal session.
+Amended 2026-11-19: directory copy matching and protection, live sync receipt groups, installer-exception failure scope, and the restore recipient check.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -572,8 +573,11 @@ Package, tool and standalone mise changes come from comparing state before and a
 - When dots takes over or displaces an existing file, it verifies the displaced file and installs the replacement exclusively at an empty path.
 - When another writer claims the path, sync leaves it alone and prints where the moved file is.
 - The original inode stays at a printed private path on the same filesystem, so an editor that still has it open can finish saving.
-- For a directory copy, sync verifies the bytes and permissions of each leaf it replaces; edited and unmanaged files stay.
-- When the deployed mode of a leaf cannot be verified, the leaf is updated only if its current mode can stay.
+- When sync would replace an existing file in a directory copy, it compares the file with the source previously deployed at that path.
+- If both bytes and permissions match, sync treats the file as deployed regardless of who created it and updates it to the new source without reporting it as kept.
+- If the bytes or verified permissions differ, or if the file changes after sync observes it, sync leaves it in place and reports it as kept.
+- When the deployed mode cannot be verified, sync updates the file only if its bytes match the previously deployed source and its current mode can stay.
+- Unmatched local files stay in place.
 - Recovery files stay on the same filesystem as the target; when that is impossible, sync reports the path and keeps both versions.
 - Other targets are applied in dependency order with the usual mise hooks.
 - Ordinary template and inline installs use native mise apply on the live targets.
@@ -592,8 +596,10 @@ Each issue carries a diagnostic and a recovery action.
 
 - Each finished sync, including the one inside `dots up`, prints a receipt and records it for replay with private permissions.
 - When recording fails, sync still prints this run's receipt, warns that it could not save it for replay, and exits 0; the run's outcome does not change, and `sync --last` may show an earlier sync or none.
-- A clean run prints one line, which summarizes local work, incoming changes and the push.
-- Otherwise the receipt leads with any issue and its next action, then lists up to five paths per group: shared, saved locally, updated in this checkout, finished after an interruption.
+- A clean receipt has a one-line summary of local work, incoming changes and the push.
+- If the run has issues, the receipt prints them and their next actions before the summary.
+- Nonempty groups can follow the summary.
+- The live receipt lists up to five paths in each group for shared files, local saves, checkout updates and work finished after an interruption.
 - When stdin and stdout are terminals, standalone sync may show a complete small text diff for up to two paths and twelve displayed lines.
 - Piped output, `--plain` output and saved reports contain metadata only.
 - **New in 1.0:** live and saved sync receipts exclude raw child stderr and may include vetted scanner metadata such as rule, path and line.
@@ -961,7 +967,9 @@ It runs before mise loads the configuration: no sync, tool installs or package u
 
 `exceptions.tsv` has one row per app, tab-separated: the profile (`base` for every profile), the recipe name, and optional comma-separated flags.
 Empty lines and lines starting with `#` are ignored.
-A row with a fourth column, an unknown profile, an invalid name or an unknown flag stops the reading command with exit status 2.
+A row with a fourth column, an unknown profile, an invalid name or an unknown flag causes standalone `dots exceptions` to exit 2.
+In `dots bootstrap complete`, a malformed row fails the installer exceptions stage and later stages can still run.
+A completed bootstrap with a failed stage exits 1, subject to the existing cancellation rules.
 The recipe is the executable `exceptions/NAME`, with `NAME` matching `^[A-Za-z0-9][A-Za-z0-9._-]*$`; a selected row without an executable recipe is an error.
 `install-only` makes `dots up` pass `--install-only`, so the recipe only installs a missing app.
 `hold=MANAGER:NAME` records that the recipe pins that package, so `dots add` refuses it; the value matches `^[a-z][a-z0-9-]*:[A-Za-z0-9@._/+-]+$`, and a request matches after dropping any tap prefix or `@version`.
@@ -1240,6 +1248,7 @@ Backup uses one native sync and performs no publication retry or force push.
 - **New in 1.0:** before any native restore operation that can capture a checkpoint, including fetch, `dots` requires a nonempty recipient list from history configuration that native mise trusts at system or global scope, and `history.allow_plaintext_history = false`.
   A recipient supplied only by a trusted system or global `conf.d` fragment satisfies the recipient check.
   Project-only recipients are excluded from this check.
+  Restore checks recipient settings in mise’s default trusted directories for the active environment seen by dots, so an environment selected only by an early `miserc` can make that check disagree with the settings mise uses to encrypt history.
   If either condition fails, restore exits 2 before capture or target installation.
   The diagnostic names the failed condition and tells the user to configure history recipients or disable plaintext history, as applicable, without showing key material.
 - As in 0.4.0, native mise applies the fetched history to the actual targets and may save local undo checkpoints of their live contents before overwriting them.

@@ -450,14 +450,17 @@ fn replay_times_out_a_scanner_and_rejects_nonlocal_configuration() {
 #[test]
 fn real_gitleaks_honors_the_floor_and_path_scoped_project_detectors() {
     let fixture = Fixture::new();
-    if !super::Tools::new(&fixture.env)
+    let version = super::Tools::new(&fixture.env)
         .command("gitleaks")
         .arg("version")
         .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return;
-    }
+        .expect("receipt scanner test requires gitleaks on PATH");
+    assert!(
+        version.status.success(),
+        "receipt scanner test requires `gitleaks version` to succeed, got {}. {}",
+        version.status,
+        String::from_utf8_lossy(&version.stderr).trim()
+    );
     fs::write(fixture.root.join("plain.txt"), "old\n").unwrap();
     let before = fixture.commit("older");
     fs::write(fixture.root.join("plain.txt"), "new\n").unwrap();

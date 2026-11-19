@@ -202,6 +202,7 @@ struct Repo {
     mise: PathBuf,
     mise_real: Option<PathBuf>,
     gitleaks_real: Option<PathBuf>,
+    oracle: bool,
     config: String,
 }
 
@@ -251,6 +252,7 @@ impl Repo {
             mise,
             mise_real,
             gitleaks_real,
+            oracle,
             config,
         };
         for item in fs::read_dir(&fixture.a).unwrap() {
@@ -609,14 +611,14 @@ sync_case!(
     }
 );
 
-sync_case!(unchanged_offline_commit_is_saved_then_shared, || {
+sync_case!(active unchanged_offline_commit_is_saved_then_shared, || {
     let f = Repo::new();
     let before = f.remote();
     let offline = f.origin_offline();
     f.write(&f.a, "local", "saved offline\n");
     let receipt = f.sync(&f.a);
     has(&receipt, "offline");
-    has(&receipt, "1 commit");
+    has(&receipt, if f.oracle { "1 commit" } else { "saved 1 locally" });
     let snapshot = f.tip(&f.a);
     assert_ne!(before, snapshot);
     assert_eq!(
@@ -972,10 +974,20 @@ fn withdrawn_dev(during_push: bool) {
         f.hook(&f.a, "pre-push", &format!("rm \"$0\"\n{remove}"));
         f.sync(&f.a)
     } else {
-        let hook = f.validation_hook(&remove);
+        let once = sh(&f.scratch.join("withdrawn-during-validation"));
+        let hook = f.validation_hook(&format!(
+            "if [ -e {once} ]; then exit 0; fi\n{remove}\n: > {once}"
+        ));
         f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())])
     };
-    has(&receipt, "disappeared");
+    has(
+        &receipt,
+        if f.oracle {
+            "disappeared"
+        } else {
+            "published dev or main was removed or rewound"
+        },
+    );
     assert_eq!(f.git(&f.origin, &["for-each-ref", "refs/heads/dev"]), "");
     assert_eq!(f.git(&f.a, &["show", "dev:local"]), "before deletion");
     assert!(!f.a.join("withdrawn").exists());
@@ -987,10 +999,10 @@ fn withdrawn_dev(during_push: bool) {
     absent(&f.tree(), "withdrawn");
 }
 
-sync_case!(unchanged_deleted_dev_after_fetch_stays_withdrawn, || {
+sync_case!(active unchanged_deleted_dev_after_fetch_stays_withdrawn, || {
     withdrawn_dev(false);
 });
-sync_case!(unchanged_deleted_dev_during_push_stays_withdrawn, || {
+sync_case!(active unchanged_deleted_dev_during_push_stays_withdrawn, || {
     withdrawn_dev(true);
 });
 
@@ -1010,7 +1022,7 @@ sync_case!(unchanged_sync_pushes_no_tags_or_main_changes, || {
     assert_eq!(f.git(&f.origin, &["rev-parse", "main"]), main);
 });
 
-sync_case!(unchanged_retry_leaves_withdrawn_history_withdrawn, || {
+sync_case!(active unchanged_retry_leaves_withdrawn_history_withdrawn, || {
     let f = Repo::new();
     let initial = f.remote();
     let withdrawn = f.publish("withdrawn", "remote update\n");
@@ -1023,7 +1035,14 @@ sync_case!(unchanged_retry_leaves_withdrawn_history_withdrawn, || {
             sh(&f.origin)
         ),
     );
-    has(&f.sync(&f.a), "history was removed");
+    has(
+        &f.sync(&f.a),
+        if f.oracle {
+            "history was removed"
+        } else {
+            "published dev or main was removed or rewound"
+        },
+    );
     assert_eq!(f.remote(), initial);
     assert_eq!(f.git(&f.a, &["show", "dev:local"]), "local edit");
     assert!(!f.a.join("withdrawn").exists());
@@ -1048,12 +1067,19 @@ fn endless_race(f: &Repo, withdraw: bool) {
 }
 
 sync_case!(
-    unchanged_final_retry_checks_the_tip_used_for_that_merge,
+    active unchanged_final_retry_checks_the_tip_used_for_that_merge,
     || {
         let f = Repo::new();
         f.write(&f.a, "local", "local edit\n");
         endless_race(&f, true);
-        has(&f.sync(&f.a), "history was removed");
+        let receipt = f.sync(&f.a);
+        if f.oracle {
+            has(&receipt, "history was removed");
+        } else {
+            has(&receipt, "conditional dev push was rejected");
+            assert_eq!(f.blob("dev", "change-2"), "2");
+            absent(&f.tree(), "change-3");
+        }
         assert!(!f.a.join("change-3").exists());
         assert_eq!(f.git(&f.a, &["show", "dev:local"]), "local edit");
         has(&f.sync(&f.a), "pushed");
@@ -1061,11 +1087,23 @@ sync_case!(
     }
 );
 
-sync_case!(unchanged_only_repeated_races_report_a_moving_branch, || {
+sync_case!(active unchanged_only_repeated_races_report_a_moving_branch, || {
     let f = Repo::new();
     endless_race(&f, false);
     f.write(&f.a, "local", "waiting\n");
-    has(&f.sync(&f.a), "kept moving");
+    let receipt = f.sync(&f.a);
+    if f.oracle {
+        has(&receipt, "kept moving");
+    } else {
+        has(&receipt, "conditional dev push was rejected");
+        assert_eq!(f.remote(), f.tip(&f.b));
+        for attempt in 1..=4 {
+            assert_eq!(
+                f.blob("dev", &format!("change-{attempt}")),
+                attempt.to_string()
+            );
+        }
+    }
     absent(&f.tree(), "local");
     assert_eq!(f.git(&f.a, &["show", "dev:local"]), "waiting");
 });
@@ -1088,7 +1126,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_rejected_push_reports_reason_without_hook_or_patch_content,
+    active unchanged_rejected_push_reports_reason_without_hook_or_patch_content,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -1098,7 +1136,12 @@ sync_case!(
         for args in [&["--plain", "sync"][..], &["--verbose", "sync"][..]] {
             let receipt = dots_zero(&mut f.dots(&f.a, args));
             for output in [receipt, f.replay(&f.a)] {
-                has(&output, "pre-receive hook declined");
+                if f.oracle {
+                    has(&output, "pre-receive hook declined");
+                } else {
+                    has(&output, "conditional dev push was rejected");
+                    has(&output, "remote branch policies");
+                }
                 absent(&output, "FIXTURE_PRIVATE_");
                 absent(&output, "diff --git");
             }
@@ -1108,15 +1151,30 @@ sync_case!(
     }
 );
 
+fn unconfirmed_push_issue(f: &Repo, receipt: &str, expected: &str) {
+    let candidate = f.tip(&f.a);
+    assert_ne!(candidate, expected);
+    for report in [receipt, &f.replay(&f.a)] {
+        has(report, "dev push unconfirmed");
+        has(report, &format!("candidate {candidate}"));
+        has(report, &format!("expected {expected}"));
+        has(report, "compare refs/heads/dev");
+    }
+}
+
 sync_case!(
-    unchanged_failed_push_preserves_authentication_diagnostic,
+    active unchanged_failed_push_preserves_authentication_diagnostic,
     || {
         let f = Repo::new();
         let before = f.remote();
         f.hook(&f.a, "pre-push", "echo \"fatal: Authentication failed for 'https://fixture.invalid/dots.git/'\" >&2\nexit 1");
         f.write(&f.a, "local", "waiting\n");
         let receipt = f.sync(&f.a);
-        has(&receipt, "authentication failed");
+        if f.oracle {
+            has(&receipt, "authentication failed");
+        } else {
+            unconfirmed_push_issue(&f, &receipt, &before);
+        }
         absent(&receipt, "kept moving");
         absent(&receipt, "OFFLINE");
         assert_eq!(f.remote(), before);
@@ -1124,9 +1182,10 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_failed_push_reports_reason_and_offline_when_origin_disappears,
+    active unchanged_failed_push_reports_reason_and_offline_when_origin_disappears,
     || {
         let f = Repo::new();
+        let before = f.remote();
         let offline = f.origin.with_extension("offline");
         f.hook(&f.a, "pre-push", &format!(
         "mv {} {}\necho 'fatal: unable to access origin: Could not resolve host' >&2\nexit 1",
@@ -1134,43 +1193,68 @@ sync_case!(
     ));
         f.write(&f.a, "local", "waiting\n");
         let receipt = f.sync(&f.a);
-        has(&receipt, "could not resolve host");
-        has(&receipt, "offline");
-        has(&receipt, "1 commit");
+        if f.oracle {
+            has(&receipt, "could not resolve host");
+            has(&receipt, "offline");
+            has(&receipt, "1 commit");
+        } else {
+            unconfirmed_push_issue(&f, &receipt, &before);
+            has(&receipt, "saved 1 locally");
+        }
         assert_eq!(f.git(&f.a, &["show", "dev:local"]), "waiting");
         fs::rename(offline, &f.origin).unwrap();
     }
 );
 
 sync_case!(
-    unchanged_git_diagnostic_never_discloses_url_credentials,
+    active unchanged_git_diagnostic_never_discloses_url_credentials,
     || {
         let f = Repo::new();
+        let before = f.remote();
         let synthetic = "FIXTURE_CREDENTIAL_CANARY";
         f.hook(&f.a, "pre-push", &format!(
         "echo \"fatal: unable to access 'https://fixture-user:{synthetic}@fixture.invalid/dots.git/': The requested URL returned error: 403\" >&2\nexit 1",
     ));
         f.write(&f.a, "local", "waiting\n");
-        for text in [f.sync(&f.a), f.replay(&f.a)] {
-            has(&text, "403");
+        let receipt = f.sync(&f.a);
+        if !f.oracle {
+            unconfirmed_push_issue(&f, &receipt, &before);
+        }
+        for text in [receipt, f.replay(&f.a)] {
+            if f.oracle {
+                has(&text, "403");
+            }
             absent(&text, synthetic);
             absent(&text, "fixture-user:");
         }
     }
 );
 
-sync_case!(unchanged_hanging_push_times_out, || {
+sync_case!(active unchanged_hanging_push_times_out, || {
     use std::time::{Duration, Instant};
     let f = Repo::new();
     let before = f.remote();
+    let hook_pid = f.scratch.join("hanging-push.pid");
     // The hook exits itself if timeout handling regresses, so the fixture is bounded.
     // Keep its wait in the hook process to avoid leaking inherited output pipes.
-    f.hook(&f.a, "pre-push", "exec sleep 68");
+    f.hook(
+        &f.a,
+        "pre-push",
+        &format!("printf '%s\\n' \"$$\" > {}\nexec sleep 68", sh(&hook_pid)),
+    );
     f.write(&f.a, "local", "waiting\n");
     let started = Instant::now();
     let receipt = f.sync(&f.a);
-    has(&receipt, "timed out");
-    has(&receipt, "credential");
+    if f.oracle {
+        has(&receipt, "timed out");
+        has(&receipt, "credential");
+    } else {
+        unconfirmed_push_issue(&f, &receipt, &before);
+        let pid: libc::pid_t = read(&hook_pid).trim().parse().unwrap();
+        assert!(pid > 1);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "push hook still running");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
     assert!(started.elapsed() >= Duration::from_secs(59));
     assert_eq!(f.remote(), before);
 });
@@ -1266,7 +1350,7 @@ sync_case!(active unchanged_long_native_failure_keeps_receipt_readable, || {
 });
 
 sync_case!(
-    new_native_history_failure_keeps_backend_secret_out_of_live_and_replay,
+    active new_native_history_failure_keeps_backend_secret_out_of_live_and_replay,
     || {
         let f = Repo::new();
         let marker = "SYNTHETIC_HISTORY_PASSWORD_7E341A";
@@ -1279,18 +1363,26 @@ sync_case!(
 const FLAG_SCANNER: &str = r#"
 report=''
 opts=''
+finding_status=1
 while [ "$#" -gt 1 ]; do
     case "$1" in
         --report-path) report=$2; shift ;;
         --report-path=*) report=${1#*=} ;;
         --log-opts) opts=$2; shift ;;
         --log-opts=*) opts=${1#*=} ;;
+        --exit-code) finding_status=$2; shift ;;
+        --exit-code=*) finding_status=${1#*=} ;;
     esac
     shift
 done
 root=$1
 [ -n "$report" ] || exit 2
-git -C "$root" log --format='commit %H' -p $opts -- |
+case "$opts" in
+    *' --') ;;
+    *) opts="$opts --" ;;
+esac
+set -f
+git -C "$root" log --format='commit %H' -p $opts |
 awk '
 /^commit / { commit = $2 }
 /^\+\+\+ b\// { path = substr($0, 7); if (path == "fine") saw_fine = 1 }
@@ -1310,13 +1402,13 @@ END {
         if (found) print "blocked" >> trace
         else if (saw_fine) print "clean fine" >> trace
     }
-    exit (found ? 1 : 0)
+    exit (found ? finding_status : 0)
 }
-' trace="${FIXTURE_SCAN_TRACE:-}" > "$report"
+' trace="${FIXTURE_SCAN_TRACE:-}" finding_status="$finding_status" > "$report"
 "#;
 
 sync_case!(
-    unchanged_flagged_candidate_stays_unreferenced_and_safe_file_is_shared,
+    active unchanged_flagged_candidate_stays_unreferenced_and_safe_file_is_shared,
     || {
         let f = Repo::new();
         script(&f.tools.join("gitleaks"), FLAG_SCANNER);
@@ -1370,7 +1462,7 @@ sync_case!(unchanged_no_working_scanner_shares_nothing, || {
 });
 
 sync_case!(
-    unchanged_flagged_existing_commit_blocks_push_without_rewrite,
+    active unchanged_flagged_existing_commit_blocks_push_without_rewrite,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -1378,8 +1470,13 @@ sync_case!(
         f.write(&f.a, "scanner-match", "FIXTURE_SCAN_MATCH\n");
         let committed = f.commit(&f.a, "Scanner match");
         let receipt = f.sync(&f.a);
-        has(&receipt, "scanner-match:1");
-        has(&receipt, &committed[..12]);
+        if f.oracle {
+            has(&receipt, "scanner-match:1");
+            has(&receipt, &committed[..12]);
+        } else {
+            has(&receipt, "gitleaks flagged unpublished history");
+            has(&receipt, "remove or rotate");
+        }
         absent(&receipt, "FIXTURE_SCAN_MATCH");
         assert_eq!(f.remote(), before);
         assert_eq!(f.tip(&f.a), committed);
@@ -1387,7 +1484,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_private_file_in_unpublished_history_blocks_push,
+    active unchanged_private_file_in_unpublished_history_blocks_push,
     || {
         for private in ["config.host-private.toml", "mise.laptop.lock"] {
             let f = Repo::new();
@@ -1401,8 +1498,14 @@ sync_case!(
             assert!(!f.a.join(private).exists());
             let tip = f.tip(&f.a);
             let receipt = f.sync(&f.a);
-            has(&receipt, private);
-            has(&receipt, &forbidden[..12]);
+            if f.oracle {
+                has(&receipt, private);
+                has(&receipt, &forbidden[..12]);
+            } else {
+                has(&receipt, "unpublished history tracked a machine-local file");
+                has(&receipt, "review local history");
+                absent(&receipt, "private fixture contents");
+            }
             assert_eq!(f.remote(), before);
             assert_eq!(f.tip(&f.a), tip);
         }
@@ -1813,7 +1916,31 @@ sync_case!(
     }
 );
 
-fn wrong_checkout(shape: &str, diagnostic: &str) {
+fn startup_receipt(
+    f: &Repo,
+    receipt: &str,
+    oracle_diagnostic: &str,
+    diagnostic: &str,
+    recovery: &str,
+) {
+    if f.oracle {
+        assert_eq!(receipt.lines().count(), 1, "{receipt}");
+        has(receipt, oracle_diagnostic);
+    } else {
+        assert_eq!(
+            receipt
+                .lines()
+                .filter(|line| line.starts_with("dots sync:"))
+                .count(),
+            1,
+            "{receipt}"
+        );
+        has(receipt, diagnostic);
+        has(receipt, recovery);
+    }
+}
+
+fn wrong_checkout(shape: &str, oracle_diagnostic: &str, diagnostic: &str) {
     let f = Repo::new();
     let before = f.remote();
     match shape {
@@ -1828,24 +1955,23 @@ fn wrong_checkout(shape: &str, diagnostic: &str) {
         _ => unreachable!(),
     }
     let receipt = f.sync(&f.a);
-    assert_eq!(receipt.lines().count(), 1, "{receipt}");
-    has(&receipt, diagnostic);
+    startup_receipt(&f, &receipt, oracle_diagnostic, diagnostic, "sync guide");
     assert_eq!(f.remote(), before);
 }
 
-sync_case!(unchanged_detached_head_stops_cleanly, || {
-    wrong_checkout("detached", "detached");
+sync_case!(active unchanged_detached_head_stops_cleanly, || {
+    wrong_checkout("detached", "detached", "Git HEAD on a dev branch");
 });
-sync_case!(unchanged_main_checkout_stops_cleanly, || {
-    wrong_checkout("main", "main");
+sync_case!(active unchanged_main_checkout_stops_cleanly, || {
+    wrong_checkout("main", "main", "Git HEAD on a dev branch");
 });
-sync_case!(unchanged_jj_checkout_stops_cleanly, || {
-    wrong_checkout("jj", ".jj");
+sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
+    wrong_checkout("jj", ".jj", "JJ workspace");
 });
-sync_case!(unchanged_pre_port_sync_state_stops_cleanly, || {
-    wrong_checkout("legacy", "legacy");
+sync_case!(active unchanged_pre_port_sync_state_stops_cleanly, || {
+    wrong_checkout("legacy", "legacy", "pre-1.0 source state");
 });
-sync_case!(unchanged_wrong_origin_stops_cleanly, || {
+sync_case!(active unchanged_wrong_origin_stops_cleanly, || {
     let f = Repo::new();
     let local = f.tip(&f.a);
     let mismatched = f.world.bare_remote("mismatched-origin.git");
@@ -1858,8 +1984,7 @@ sync_case!(unchanged_wrong_origin_stops_cleanly, || {
     assert_eq!(f.git(&f.a, &["remote", "get-url", "--push", "origin"]), url);
     let attempted = deny_transport(&f);
     let receipt = f.sync(&f.a);
-    assert_eq!(receipt.lines().count(), 1, "{receipt}");
-    has(&receipt, "origin");
+    startup_receipt(&f, &receipt, "origin", "unsafe", "rerun dots sync");
     assert!(!attempted.exists(), "sync tried Git transport: {receipt}");
     assert_eq!(refs(&f.origin), expected_refs);
     assert_eq!(refs(&mismatched), mismatched_refs);
@@ -2044,7 +2169,6 @@ sync_case!(
 );
 
 #[test]
-#[ignore = "P-08 sync and P-11 cancellation"]
 fn new_standalone_sync_cancellation_records_replayable_stopped_receipt() {
     let f = Repo::new();
     let previous = f.tip(&f.a);
@@ -2365,7 +2489,7 @@ const COPY_DECLARATION: &str = r#""~/.copied" = { source = "copy.txt", mode = "c
 const TEMPLATE_DECLARATION: &str =
     r#""~/.rendered" = { source = "template.tera", mode = "template" }"#;
 
-sync_case!(new_shared_sync_saves_encrypted_history_before_push, || {
+sync_case!(active new_shared_sync_saves_encrypted_history_before_push, || {
     let f = Repo::new();
     let machine = Machine::new(&f, &f.a, "machine-a", false);
     let key = machine.home.join("fixture-age-key");
@@ -3536,7 +3660,7 @@ sync_case!(
     }
 );
 
-sync_case!(new_local_only_sync_skips_all_stages, || {
+sync_case!(active new_local_only_sync_skips_all_stages, || {
     let f = Repo::new();
     let before = f.tip(&f.a);
     f.git(&f.a, &["remote", "remove", "origin"]);
@@ -3561,7 +3685,7 @@ sync_case!(new_local_only_sync_skips_all_stages, || {
     assert_eq!(read(&f.a.join("public")), "keep local\n");
 });
 
-sync_case!(new_empty_reachable_origin_creates_only_dev, || {
+sync_case!(active new_empty_reachable_origin_creates_only_dev, || {
     let f = Repo::new();
     f.git(&f.origin, &["update-ref", "-d", "refs/heads/dev"]);
     f.git(&f.origin, &["update-ref", "-d", "refs/heads/main"]);
@@ -3596,13 +3720,13 @@ fn deny_transport(f: &Repo) -> PathBuf {
     attempted
 }
 
-fn rejected_remote(configured: &str, origin: &str) {
+fn rejected_remote(origin: &str) {
     let f = Repo::new();
     let before = f.remote();
     f.write(
         &f.a,
         "config.toml",
-        format!("[vars]\ndots_profiles = \"laptop selected\"\ndots_source_repo = {configured:?}\n"),
+        "[vars]\ndots_profiles = \"laptop selected\"\n",
     );
     f.git(&f.a, &["remote", "set-url", "origin", origin]);
     let attempted = deny_transport(&f);
@@ -3619,20 +3743,20 @@ fn rejected_remote(configured: &str, origin: &str) {
 }
 
 sync_case!(
-    new_credential_bearing_origin_is_refused_before_transport,
+    active new_credential_bearing_origin_is_refused_before_transport,
     || {
         let url = "https://fixture-user:FIXTURE_REMOTE_CREDENTIAL@fixture.invalid/dots";
-        rejected_remote(url, url);
+        rejected_remote(url);
     }
 );
 
-sync_case!(new_remote_helper_origin_is_refused_before_transport, || {
+sync_case!(active new_remote_helper_origin_is_refused_before_transport, || {
     let url = "ext::false";
-    rejected_remote(url, url);
+    rejected_remote(url);
 });
 
 sync_case!(
-    new_effective_push_rewrite_is_refused_before_transport,
+    active new_effective_push_rewrite_is_refused_before_transport,
     || {
         let f = Repo::new();
         let raw = format!("file://{}", f.origin.display());
@@ -3667,7 +3791,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_matching_explicit_file_url_syncs_through_local_origin,
+    active new_matching_explicit_file_url_syncs_through_local_origin,
     || {
         let f = Repo::new();
         let remote = format!("file://{}", f.origin.display());
@@ -3688,7 +3812,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_configured_remote_without_origin_reports_missing_and_keeps_edits,
+    active new_configured_remote_without_origin_reports_missing_and_keeps_edits,
     || {
         let f = Repo::new();
         let before = f.tip(&f.a);
@@ -3704,7 +3828,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_sync_missing_configuration_still_exits_zero_with_receipt,
+    active new_sync_missing_configuration_still_exits_zero_with_receipt,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -3716,7 +3840,7 @@ sync_case!(
     }
 );
 
-sync_case!(new_sync_missing_mise_still_exits_zero_with_receipt, || {
+sync_case!(active new_sync_missing_mise_still_exits_zero_with_receipt, || {
     let f = Repo::new();
     let before = f.remote();
     fs::remove_file(f.tools.join("mise")).unwrap();
@@ -3730,7 +3854,7 @@ sync_case!(new_sync_missing_mise_still_exits_zero_with_receipt, || {
 });
 
 sync_case!(
-    new_sync_invalid_option_exits_two_without_touching_state,
+    active new_sync_invalid_option_exits_two_without_touching_state,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -4028,7 +4152,6 @@ copies_case!(
 );
 
 #[test]
-#[ignore = "requires real mise and gitleaks in a private World"]
 fn new_file_adoption_below_home_shares_and_preserves_source_guard() {
     let world = IsolatedWorld::new();
     let root = world.home().join(".config/mise");

@@ -182,7 +182,7 @@ impl<'a> Scratch<'a> {
         revs.push_str(" --");
         let mut cmd = run
             .ctx()
-            .command("gitleaks", Cwd::Root)
+            .command(run.tool("gitleaks"), Cwd::Root)
             .map_err(|_| ScanError::Failed)?;
         let git_environment = self
             .live

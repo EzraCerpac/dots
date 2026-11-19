@@ -28,7 +28,7 @@ else
     git diff --name-only --no-renames -z "$range" -- > "$paths"
     while IFS= read -r -d '' path; do
         case "$path" in
-            packaging/*|.github/workflows/*|.github/scripts/*|.github/actions/*|Cargo.toml|Cargo.lock)
+            install.sh|packaging/*|.github/workflows/*|.github/scripts/*|.github/actions/*|Cargo.toml|Cargo.lock)
                 code=true
                 full=true
                 break

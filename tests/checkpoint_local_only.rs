@@ -377,6 +377,8 @@ fn new_checkpoint_skips_after_native_install_records_trust() {
 
     let mut install = f.world.command(&mise);
     fresh(&mut install);
+    // This offline fixture exercises native trust, independent of release downloads.
+    install.env("MISE_DISABLE_TOOLS", "age,gitleaks");
     success(install.current_dir(&root).arg("install").output().unwrap());
     let records: Vec<_> = fs::read_dir(&trust)
         .unwrap()

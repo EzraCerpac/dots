@@ -17,7 +17,7 @@ use nix::libc;
 use crate::config_commands::{ExecutableOrigin, PIN_PREFIX};
 use crate::{Ctx, Fail};
 
-pub(crate) use mise::{config_paths, mise_binary, quiet_probe, validate_selection};
+pub(crate) use mise::{config_paths, mise_binary, quiet_probe, tool_path, validate_selection};
 
 const HOOK_ENV: &[&str] = &[
     "DOTS_CHANGES",

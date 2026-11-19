@@ -163,6 +163,21 @@ impl<'a> Run<'a> {
         self.probe_with_stdin(cmd, Stdio::null())
     }
 
+    pub(crate) fn tool(&self, name: &str) -> std::path::PathBuf {
+        crate::process::tool_path(&self.ctx().env, name, self.up(), |args| {
+            let mut cmd = crate::process::Mise::new(self.ctx())
+                .ok()?
+                .command_active(args)
+                .ok()?;
+            cmd.env("MISE_NO_HOOKS", "1").env("MISE_NO_ENV", "1");
+            if args[0] != "install" {
+                cmd.env("MISE_OFFLINE", "1").env("MISE_SAFE", "1");
+            }
+            let output = self.probe(cmd).ok()?;
+            output.status.success().then_some(output.stdout)
+        })
+    }
+
     /// Capture a probe, detaching its session when it belongs to an alongside stage.
     pub fn probe_for(&self, id: StageId, cmd: ChildCommand) -> io::Result<Output> {
         self.supervisor

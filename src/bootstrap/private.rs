@@ -327,7 +327,7 @@ pub(super) fn enroll(
     use crate::process::{Cwd, Mise};
     use crate::run::Policy;
 
-    let mut derive = ctx.command("age-keygen", Cwd::Root)?;
+    let mut derive = ctx.command(run.tool("age-keygen"), Cwd::Root)?;
     derive.arg("-y").arg(&resolved.identity);
     let public = run.probe(derive).map_err(age_keygen_error)?;
     let public = String::from_utf8(public.stdout)
@@ -481,7 +481,7 @@ fn machine_identity(ctx: &Ctx, run: &Run<'_>) -> Result<PathBuf, Fail> {
         ));
     }
 
-    let command = ctx.command("age-keygen", Cwd::Root)?;
+    let command = ctx.command(run.tool("age-keygen"), Cwd::Root)?;
     let generated = run.probe(command).map_err(age_keygen_error)?;
     if !generated.status.success()
         || !generated

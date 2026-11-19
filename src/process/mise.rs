@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -193,8 +194,6 @@ impl<'a> Mise<'a> {
 
     #[cfg(target_os = "macos")]
     fn expose_ruby(&self, command: &mut Command, run: Option<&Run<'_>>) -> Result<(), Fail> {
-        use std::os::unix::ffi::OsStrExt;
-
         let mut probe = self.raw_command()?;
         if let Some((_, Some(selected))) = command.get_envs().find(|(key, _)| *key == "MISE_ENV") {
             probe.env("MISE_ENV", selected);
@@ -234,6 +233,43 @@ impl<'a> Mise<'a> {
         command.env("PATH", result);
         Ok(())
     }
+}
+
+pub(crate) fn tool_path(
+    env: &Env,
+    name: &str,
+    install: bool,
+    mut mise: impl FnMut(&[&str]) -> Option<Vec<u8>>,
+) -> PathBuf {
+    if let Some(path) = env
+        .get("PATH")
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| env.cwd().join(dir).join(name))
+        .find(|path| is_executable(path))
+    {
+        return path;
+    }
+    let which = |bytes: Vec<u8>| {
+        let path = PathBuf::from(OsStr::from_bytes(
+            bytes.strip_suffix(b"\n").unwrap_or(&bytes),
+        ));
+        (path.is_absolute() && is_executable(&path)).then_some(path)
+    };
+    if let Some(path) = mise(&["which", name]).and_then(which) {
+        return path;
+    }
+    let tool = if name == "age-keygen" { "age" } else { name };
+    if install
+        && mise(&["tool", "--json", tool])
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|info| info["config_source"].is_object())
+        && mise(&["install", tool]).is_some()
+        && let Some(path) = mise(&["which", name]).and_then(which)
+    {
+        return path;
+    }
+    PathBuf::from(name)
 }
 
 pub(crate) fn mise_binary(env: &Env) -> Result<PathBuf, Fail> {

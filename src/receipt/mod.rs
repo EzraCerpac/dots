@@ -257,7 +257,7 @@ impl Tools {
         )
     }
 
-    fn command(&self, program: &str) -> Command {
+    fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new(program);
         command.env_clear().stdin(Stdio::null());
         command.envs(self.0.iter().map(|(key, value)| (*key, value)));

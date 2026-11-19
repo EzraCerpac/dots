@@ -251,7 +251,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         raw: &str,
         expected: &RepoSetting,
         vars: &Vars,
-    ) -> Result<(), Fail> {
+    ) -> Result<String, Fail> {
         let invalid_destination = || {
             invalid(
                 "effective history destinations must match private dots_state_repo and differ from the source repository",
@@ -282,10 +282,13 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         };
         let resolver = store.or_else(|| temporary.as_ref().map(|temp| temp.path()));
         self.url_config(resolver)?;
-        for url in self
+        let mut operands = self
             .operand_urls(raw, || self.git(resolver))
             .map_err(|_| invalid_destination())?
-        {
+            .into_iter();
+        let fetch = operands.next().ok_or_else(invalid_destination)?;
+        check(&fetch)?;
+        for url in operands {
             check(&url)?;
         }
         if let Some(store) = store {
@@ -293,7 +296,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
                 check(&url)?;
             }
         }
-        Ok(())
+        Ok(fetch)
     }
 
     fn source_urls(&self, configured: Option<&RepoSetting>) -> Result<Vec<String>, Fail> {

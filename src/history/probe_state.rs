@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
-use std::io::ErrorKind;
-use std::os::unix::fs::symlink;
+use std::fs::{self, Permissions};
+use std::io::{ErrorKind, Read as _};
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
 use crate::Fail;
 
-use super::native::{Native, exists};
+use super::native::{Native, exists, read_native_file};
 use super::{blocked, invalid};
 
 const STORES: [&str; 2] = ["history", "history-local/history"];
@@ -15,7 +15,13 @@ const STORES: [&str; 2] = ["history", "history-local/history"];
 pub(super) struct ProbeState {
     scratch: tempfile::TempDir,
     live: PathBuf,
-    trust: BTreeMap<OsString, PathBuf>,
+    trust: BTreeMap<OsString, TrustRecord>,
+}
+
+#[derive(PartialEq, Eq)]
+enum TrustRecord {
+    Link(PathBuf),
+    Hash(Vec<u8>),
 }
 
 impl ProbeState {
@@ -34,15 +40,22 @@ impl ProbeState {
             return Ok(None);
         }
         check_configuration_state(&live)?;
-        let trust = trust_links(&live)?;
-        let scratch =
-            tempfile::tempdir().map_err(|_| invalid("could not isolate mise inventory state"))?;
+        let trust = trust_records(&live)?;
+        let scratch = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(|_| invalid("could not isolate mise inventory state"))?;
         if !trust.is_empty() {
             let directory = scratch.path().join("trusted-configs");
             let failure = || invalid("could not copy mise trust records for the inventory probe");
             fs::create_dir(&directory).map_err(|_| failure())?;
-            for (name, target) in &trust {
-                symlink(target, directory.join(name)).map_err(|_| failure())?;
+            for (name, record) in &trust {
+                let path = directory.join(name);
+                match record {
+                    TrustRecord::Link(target) => symlink(target, path),
+                    TrustRecord::Hash(hash) => fs::write(path, hash),
+                }
+                .map_err(|_| failure())?;
             }
         }
         Ok(Some(Self {
@@ -58,7 +71,7 @@ impl ProbeState {
 
     pub(super) fn recheck(&self) -> Result<(), Fail> {
         check_configuration_state(&self.live)?;
-        if has_repository(&self.live)? || trust_links(&self.live)? != self.trust {
+        if has_repository(&self.live)? || trust_records(&self.live)? != self.trust {
             return Err(blocked(
                 "mise history or trust state changed during inventory; retry the update",
             ));
@@ -85,7 +98,7 @@ fn check_configuration_state(state: &Path) -> Result<(), Fail> {
     Ok(())
 }
 
-fn trust_links(state: &Path) -> Result<BTreeMap<OsString, PathBuf>, Fail> {
+fn trust_records(state: &Path) -> Result<BTreeMap<OsString, TrustRecord>, Fail> {
     let failure =
         || invalid("could not mirror the current mise trust records for the inventory probe");
     let directory = state.join("trusted-configs");
@@ -94,27 +107,46 @@ fn trust_links(state: &Path) -> Result<BTreeMap<OsString, PathBuf>, Fail> {
         Ok(metadata) if metadata.is_dir() => (),
         _ => return Err(failure()),
     }
-    // Preserve native path trust, including the link created by mise install.
-    // Hash and monorepo sidecar files require a different proof.
+    // Preserve both native path trust and content-bound trust. Other sidecar
+    // types need their own proof.
     fs::read_dir(directory)
         .map_err(|_| failure())?
         .map(|entry| {
             let entry = entry.map_err(|_| failure())?;
             let name = entry.file_name();
-            let hash = name
-                .as_encoded_bytes()
+            let filename = name.as_encoded_bytes();
+            let stem = filename.strip_suffix(b".hash");
+            let identity = stem
+                .unwrap_or(filename)
                 .rsplit(|byte| *byte == b'-')
                 .next()
                 .ok_or_else(failure)?;
-            let target = fs::read_link(entry.path()).map_err(|_| failure())?;
-            if hash.is_empty()
-                || hash.len() > 16
-                || !hash.iter().all(u8::is_ascii_hexdigit)
-                || !target.is_absolute()
+            if identity.is_empty()
+                || identity.len() > 16
+                || !identity.iter().all(u8::is_ascii_hexdigit)
             {
                 return Err(failure());
             }
-            Ok((name, target))
+            let path = entry.path();
+            let record = if stem.is_some() {
+                let mut hash = Vec::new();
+                read_native_file(&path)
+                    .map_err(|_| failure())?
+                    .take(65)
+                    .read_to_end(&mut hash)
+                    .map_err(|_| failure())?;
+                if hash.len() != 64 || !hash.iter().all(u8::is_ascii_hexdigit) {
+                    return Err(failure());
+                }
+                TrustRecord::Hash(hash)
+            } else {
+                let target = fs::read_link(path).map_err(|_| failure())?;
+                if !target.is_absolute() {
+                    return Err(failure());
+                }
+                TrustRecord::Link(target)
+            };
+            Ok((name, record))
         })
         .collect()
 }

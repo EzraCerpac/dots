@@ -1079,39 +1079,27 @@ fn new_http_slash_scoped_redirect_cannot_supply_remote_ancestry() {
         assert!(old.status.success());
         assert_eq!(text(old), format!("{tip}\t{REMOTE_REF}"));
 
-        let run = |origin| {
-            publication::preflight(
-                |args, access| {
-                    let mut cmd = history.git(&history.store);
-                    if let Some(params) = git_parameters(access, cmd.get_envs()) {
-                        cmd.env("GIT_CONFIG_PARAMETERS", params);
-                    }
-                    if !access.is_local() {
-                        cmd.env("GIT_ALLOW_PROTOCOL", "http");
-                    }
-                    cmd.envs(git_environment(access))
-                        .args(args)
-                        .output()
-                        .map_err(|_| Fail::new(1, "fixture Git did not run"))
-                },
-                BRANCH,
-                origin,
-                &tip,
-                false,
-            )
+        let probe = |args: &[&str], access: GitAccess<'_>| {
+            assert!(
+                access.is_local(),
+                "cleartext HTTP audit queried remote refs"
+            );
+            history.probe(args, access)
         };
-        let refusal = run(&origin).unwrap_err();
+        let refusal = publication::preflight(probe, BRANCH, &origin, &tip, false).unwrap_err();
         assert_eq!(refusal.status, 1);
         assert!(
             refusal
                 .diagnostic
-                .contains("could not verify saved settings history")
+                .contains("plaintext or invalid encrypted payload")
         );
 
-        // A direct route still supplies ancestry. The returned policy uses
-        // the same match URL for the native command and its ref readback.
+        // A direct route still gets a scoped policy for sync and readback.
         let direct = format!("{http}/direct/");
-        assert_eq!(run(&direct).unwrap(), Some(HttpPolicy::Exact(direct)));
+        assert_eq!(
+            publication::http_policy(&probe, &direct).unwrap(),
+            Some(HttpPolicy::Exact(direct))
+        );
         let mut native = std::process::Command::new("mise");
         native.env_clear();
         publication::constrain_http(&mut native, Some(&HttpPolicy::Exact(scoped)));
@@ -1302,6 +1290,25 @@ fn new_configured_ssh_audits_full_local_ancestry_without_probing_the_wrapper() {
         }
     }
     history.empty_remote(&old);
+}
+
+#[test]
+fn new_cleartext_http_audits_full_ancestry_without_an_initial_ref_query() {
+    let history = History::new();
+    history.configure(Some(false), false);
+    let tip = history.save();
+    let refusal = publication::preflight(
+        |args, access| {
+            assert!(access.is_local(), "initial audit attempted a remote query");
+            history.probe(args, access)
+        },
+        BRANCH,
+        "http://fixture.invalid/state.git",
+        &tip,
+        false,
+    )
+    .unwrap_err();
+    assert!(refusal.diagnostic.contains(UNSCOPED) && refusal.diagnostic.contains(&tip));
 }
 
 #[test]

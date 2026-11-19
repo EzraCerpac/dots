@@ -325,6 +325,30 @@ fn new_checkpoint_skips_after_native_install_records_trust() {
     checkpoint("empty");
     assert_eq!(fs::read_link(&records[0]).unwrap(), home);
 
+    let unrelated = home.join("unrelated/mise.toml");
+    fs::create_dir(unrelated.parent().unwrap()).unwrap();
+    fs::write(&unrelated, "# Synthetic project config\n").unwrap();
+    let mut trust_project = f.world.command(&mise);
+    fresh(&mut trust_project);
+    success(
+        trust_project
+            .env("MISE_PARANOID", "true")
+            .arg("trust")
+            .arg(&unrelated)
+            .output()
+            .unwrap(),
+    );
+    let sidecar = fs::read_dir(&trust)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "hash"))
+        .expect("native mise did not write a content trust sidecar");
+    let hash = fs::read(&sidecar).unwrap();
+    assert_eq!(hash.len(), 64);
+    checkpoint("empty");
+    assert_eq!(fs::read(&sidecar).unwrap(), hash);
+    assert!(!state.join("history/repo.git").exists());
+
     let config = root.join("config.toml");
     let original = fs::read_to_string(&config).unwrap();
     f.write("setting", "fixture payload\n");

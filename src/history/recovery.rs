@@ -436,18 +436,15 @@ impl Recovery<'_, '_, '_> {
 
     fn restore_established(&mut self) -> Result<(), Fail> {
         let live = self.pin_fetch_paths()?;
-        let target = self.fetch(&live)?;
-        let created = self.verify_plan(&target)?;
-        let attempt = self.attempt(target, live, created)?;
         let record = new_journal(
             self.native,
             self.store,
             self.origin,
             self.branch,
             &self.paths,
-            attempt.head.clone(),
+            revision(self.native, self.store, MAIN_REF)?,
             false,
-            Progress::Pulling(attempt),
+            Progress::Fetching(live),
             None,
         )?;
         write_journal(self.store, &record)?;

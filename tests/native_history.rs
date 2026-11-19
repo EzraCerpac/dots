@@ -280,6 +280,12 @@ recipients = {recipients:?}
             .arg(format!("HEAD:{REF}")));
     }
 
+    fn assert_published_encrypted(&self, repo: &Path, keys: [&Path; 3]) {
+        let stream = format!("{REF}:home@{BRANCH}/app/selected");
+        ok(self.git(Some(repo)).args(["cat-file", "-e", &stream]));
+        self.assert_encrypted(repo, keys);
+    }
+
     fn assert_encrypted(&self, repo: &Path, keys: [&Path; 3]) {
         let all = ok(self
             .git(Some(repo))
@@ -415,7 +421,7 @@ fn unchanged_first_checkpoint_is_encrypted_and_native_rollback_restores_content_
     );
     fixture.write(SECOND, 0o600);
     ok(&mut fixture.dots(&["backup"], &remote));
-    fixture.assert_encrypted(&remote, [&key, &recovery, &wrong]);
+    fixture.assert_published_encrypted(&remote, [&key, &recovery, &wrong]);
     ok(&mut fixture.mise(&[
         "bootstrap",
         "dotfiles",
@@ -527,7 +533,7 @@ fn unchanged_fresh_restore_requires_key_and_fetches_then_backup_publishes_undo_a
     ok(fixture
         .git(Some(&remote))
         .args(["merge-base", "--is-ancestor", &restored_tip, REF]));
-    fixture.assert_encrypted(&remote, [&key, &partner, &wrong]);
+    fixture.assert_published_encrypted(&remote, [&key, &partner, &wrong]);
 
     let sender = Fixture::new();
     sender.configure("p06-fixture/state", URL, &key, &recipients);
@@ -855,6 +861,83 @@ exec "$FIXTURE_GIT" "$@"
 }
 
 #[test]
+fn new_backup_keeps_http_readback_bound_with_plaintext_opt_in() {
+    let fixture = Fixture::new();
+    let remote = fixture.world.bare_remote("unused.git");
+    let (key, public) = fixture.key("recovery");
+    let origin = "https://github.com/p06-fixture/state.git";
+    fixture.configure(origin, origin, &key, &[public]);
+    fixture.write(FIRST, 0o600);
+    let readback = fixture.world.home().join("http-readback");
+    let mise = fixture.script(
+        "report-native-sync",
+        r#"#!/bin/sh
+set -eu
+case " $* " in
+    *" bootstrap dotfiles sync "*)
+        if [ -n "$FIXTURE_REWRITE" ]; then
+            "$FIXTURE_GIT" --git-dir "$FIXTURE_STORE" config \
+                "url.$FIXTURE_REWRITE.insteadOf" "$FIXTURE_ORIGIN"
+        fi
+        exit 0
+        ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+    );
+    fixture.script(
+        "git",
+        r#"#!/bin/sh
+set -eu
+if [ "${1-}" = "--git-dir" ] && [ "${3-}" = "ls-remote" ] && [ "${4-}" = "--exit-code" ]; then
+    printf 'readback\n' > "$FIXTURE_READBACK"
+    [ "$7" = "$FIXTURE_ORIGIN" ]
+    policy=$("$FIXTURE_GIT" --git-dir "$2" config --get-urlmatch http.followRedirects "$7/")
+    printf '%s\n' "$policy" > "$FIXTURE_READBACK"
+    oid=$("$FIXTURE_GIT" --git-dir "$2" rev-parse refs/heads/main)
+    printf '%s\t%s\n' "$oid" "$8"
+    exit 0
+fi
+exec "$FIXTURE_GIT" "$@"
+"#,
+    );
+    let backup = |rewrite: &str| {
+        fixture
+            .dots(&["backup"], &remote)
+            .env("DOTS_MISE_BIN", &mise)
+            .env("FIXTURE_MISE", &fixture.mise)
+            .env("FIXTURE_STORE", fixture.store())
+            .env("FIXTURE_ORIGIN", origin)
+            .env("FIXTURE_REWRITE", rewrite)
+            .env("FIXTURE_READBACK", &readback)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .env("GIT_SSH_COMMAND", "/bin/false")
+            .env("MISE_HISTORY_ALLOW_PLAINTEXT_HISTORY", "true")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                format!("'http.{origin}/.followRedirects'='true'"),
+            )
+            .output()
+            .unwrap()
+    };
+
+    let verified = backup("");
+    assert_eq!(verified.status.code(), Some(0), "{}", messages(&verified));
+    assert_eq!(fs::read_to_string(&readback).unwrap(), "false\n");
+    fs::remove_file(&readback).unwrap();
+
+    // The spelling still names the same GitHub repository, but the effective
+    // transport changed after its redirect policy was checked.
+    let mismatch = backup("https://github.com/P06-fixture/state.git");
+    assert_eq!(mismatch.status.code(), Some(1), "{}", messages(&mismatch));
+    assert!(messages(&mismatch).contains("publication could not be verified"));
+    assert!(
+        !readback.exists(),
+        "readback was attempted after the route changed"
+    );
+}
+
+#[test]
 fn new_backup_reports_native_sync_failure_without_readback() {
     let fixture = Fixture::new();
     let remote = fixture.world.bare_remote("private.git");
@@ -913,6 +996,81 @@ exec "$FIXTURE_GIT" "$@"
         .args(["show", "refs/heads/main:home@host-fixture/app/selected"]))
     .stdout;
     assert!(fixture.can_decrypt(&stored, &key));
+}
+
+#[test]
+fn new_backup_probe_cancellation_matches_its_report() {
+    history_probe_cancellation_matches_its_report(
+        "backup",
+        "could not read the effective history sync mode",
+    );
+}
+
+#[test]
+fn new_restore_probe_cancellation_matches_its_report() {
+    history_probe_cancellation_matches_its_report(
+        "restore",
+        "could not confirm that the mise history watcher is stopped",
+    );
+}
+
+fn history_probe_cancellation_matches_its_report(command: &str, diagnostic: &str) {
+    use std::time::{Duration, Instant};
+
+    let fixture = Fixture::new();
+    let remote = fixture.world.bare_remote("unused.git");
+    let ready = fixture.world.home().join("probe-ready");
+    let probe = fixture.script(
+        "pgrep",
+        "#!/bin/sh\nprintf 'ready\\n' > \"$FIXTURE_READY\"\nexec sleep 30\n",
+    );
+    let mut child = fixture
+        .dots(&[command], &remote)
+        .env("DOTS_MISE_BIN", probe)
+        .env("FIXTURE_READY", &ready)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        panic!(
+            "history probe did not start: {:?}",
+            child.wait_with_output().unwrap()
+        );
+    }
+    // SAFETY: the PID belongs to the unreaped dots child in this fixture.
+    assert_eq!(
+        unsafe { nix::libc::kill(child.id() as i32, nix::libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    let report = fs::read_dir(fixture.world.home().join(".local/state/dots/reports"))
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension()? == "json").then(|| fs::read(path).unwrap())
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&report).unwrap();
+    assert_eq!(report["status"], 130, "{report}");
+    assert_eq!(report["cancelled"], true);
+    assert_eq!(report["stages"][0]["issues"][0]["diagnostic"], diagnostic);
+    assert!(
+        messages(&output).contains(diagnostic),
+        "{}",
+        messages(&output)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{command}: {}",
+        messages(&output)
+    );
 }
 
 #[test]
@@ -1260,16 +1418,30 @@ fn new_restore_does_not_promote_a_project_only_recipient() {
 
 #[test]
 fn new_first_restore_keeps_an_edit_made_during_native_fetch() {
+    restore_keeps_an_edit_made_during_native_fetch(false);
+}
+
+#[test]
+fn new_established_restore_keeps_an_edit_made_during_native_fetch() {
+    restore_keeps_an_edit_made_during_native_fetch(true);
+}
+
+fn restore_keeps_an_edit_made_during_native_fetch(established: bool) {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");
     let (key, public) = seed.key("recovery");
     let url = format!("file://{}", remote.display());
     seed.configure(&url, &url, &key, std::slice::from_ref(&public));
     seed.seed(&remote, FIRST);
-    let tip = seed.tip(&remote, REF);
     let fixture = Fixture::new();
     fixture.configure(&url, &url, &key, &[public]);
     fixture.write(DEFAULT, 0o600);
+    if established {
+        ok(&mut fixture.dots(&["restore"], &remote));
+        assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+        seed.seed(&remote, REMOTE_EDIT);
+    }
+    let tip = seed.tip(&remote, REF);
     let marker = fixture.world.home().join("edited-during-fetch");
     let mise = fixture.script(
         "edit-at-native-fetch",
@@ -1314,6 +1486,11 @@ exec "$FIXTURE_GIT" "$@"
     assert!(messages(&output).contains("changed after restore started"));
     let retry = fixture.dots(&["restore"], &remote).output().unwrap();
     assert_eq!(retry.status.code(), Some(1), "{}", messages(&retry));
+    assert!(
+        messages(&retry).contains("changed after restore started"),
+        "{}",
+        messages(&retry)
+    );
     assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
     assert_eq!(seed.tip(&remote, REF), tip);
 }

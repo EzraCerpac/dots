@@ -1141,7 +1141,6 @@ fn new_historical_merge_scans_new_blob_at_the_same_main_path() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflict_is_screened_then_retained_only_after_merge_approval() {
     let fixture = Publication::with_seed(None, false, &[("collision.txt", b"base content\n")]);
     fs::write(
@@ -1244,7 +1243,6 @@ fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_unavailable_detached_operations_refuse_only_diverged_all() {
     let diverged = Publication::new(None, false);
     diverged.change(0);
@@ -1279,7 +1277,6 @@ fn new_unavailable_detached_operations_refuse_only_diverged_all() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_rechecks_late_working_changes_without_integrating_candidate() {
     for at_publication in [false, true] {
         let fixture = Publication::new(None, false);
@@ -1824,7 +1821,6 @@ fn new_publish_checks_effective_fetch_and_every_push_url_before_contact() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1919,7 +1915,6 @@ fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_divergent_operation_heads_never_reconcile_during_verification() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1964,7 +1959,6 @@ fn new_divergent_operation_heads_never_reconcile_during_verification() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_interrupted_integration_retry_gives_native_recovery_command() {
     let fixture = Publication::new(None, false);
     fixture.change(0);

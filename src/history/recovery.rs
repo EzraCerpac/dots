@@ -466,9 +466,9 @@ impl Recovery<'_, '_, '_> {
 
     fn resume(&mut self, mut journal: Journal) -> Result<(), Fail> {
         if matches!(journal.progress, Progress::Prepared | Progress::Fetching(_)) {
-            // A fetch never starts applying the incoming files. Observe again
-            // for this invocation, while keeping later apply phases pinned.
-            if !journal.initial && matches!(journal.progress, Progress::Fetching(_)) {
+            // Fetching has not applied incoming files, so a retry can bind
+            // the current inventory. Prepared still validates the clone binding.
+            if matches!(journal.progress, Progress::Fetching(_)) {
                 journal.paths = self.paths.binding().clone();
             } else {
                 self.paths.check_binding(&journal.paths, false)?;

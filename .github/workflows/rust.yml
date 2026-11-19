@@ -163,7 +163,10 @@ jobs:
   mac-tests:
     name: Rust tests (${{ matrix.target }} shard ${{ matrix.shard }}/2)
     needs: [changes, mac-build]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+          && needs.mac-build.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
@@ -207,7 +210,10 @@ jobs:
   oracle:
     name: v0.4.0 oracle (${{ matrix.platform }})
     needs: [changes, native, mac-build]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+          && needs.native.result == 'success' && needs.mac-build.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -255,14 +261,14 @@ jobs:
 
   package:
     name: Package (${{ matrix.platform }})
-    needs: [changes, lint, native, mac-pr, mac-build, mac-tests, distros, oracle, secrets]
+    needs: [changes, lint, native, mac-build, mac-tests, distros, oracle, secrets]
     if: >-
       ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
           && needs.lint.result == 'success' && needs.native.result == 'success'
           && needs.distros.result == 'success' && needs.secrets.result == 'success'
-          && ((needs.changes.outputs.full == 'false' && needs.mac-pr.result == 'success')
-              || (needs.changes.outputs.full == 'true' && needs.mac-build.result == 'success'
-                  && needs.mac-tests.result == 'success' && needs.oracle.result == 'success')) }}
+          && needs.mac-build.result == 'success' && needs.mac-tests.result == 'success'
+          && needs.oracle.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -289,6 +295,10 @@ jobs:
   assets:
     name: Assemble release assets
     needs: [changes, package]
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+          && needs.package.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -300,12 +310,10 @@ jobs:
           pattern: archive-*
           merge-multiple: true
           path: ${{ runner.temp }}/dots-release
-      - env:
-          ASSEMBLE: ${{ needs.changes.outputs.full == 'true' && 'assemble' || 'assemble-pr' }}
-        run: packaging/build-release "$ASSEMBLE" "$RUNNER_TEMP/dots-release"
+      - run: packaging/build-release assemble "$RUNNER_TEMP/dots-release"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ needs.changes.outputs.full == 'true' && 'release-archives' || 'pr-archives' }}
+          name: release-archives
           path: |
             ${{ runner.temp }}/dots-release/dots-*.tar.gz
             ${{ runner.temp }}/dots-release/SHA256SUMS
@@ -317,6 +325,10 @@ jobs:
   install:
     name: Test installs (${{ matrix.platform }})
     needs: [changes, assets]
+    if: >-
+      ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+          && needs.assets.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
@@ -329,7 +341,7 @@ jobs:
       - uses: ./.github/actions/scenario-tools
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ${{ needs.changes.outputs.full == 'true' && 'release-archives' || 'pr-archives' }}
+          name: release-archives
           path: ${{ runner.temp }}/dots-release
       - env:
           PLATFORM: ${{ matrix.platform }}
@@ -353,8 +365,8 @@ jobs:
             def expected($selected): if $selected then "success" else "skipped" end;
             .changes.result == "success" and .secrets.result == "success" and
             ."mac-pr".result == expected($code == "true" and $full == "false") and
-            ([."mac-build", ."mac-tests", .oracle] |
+            ([."mac-build", ."mac-tests", .oracle, .package, .assets, .install] |
               all(.[]; .result == expected($code == "true" and $full == "true"))) and
-            (del(.changes, .secrets, ."mac-pr", ."mac-build", ."mac-tests", .oracle) |
+            (del(.changes, .secrets, ."mac-pr", ."mac-build", ."mac-tests", .oracle, .package, .assets, .install) |
               all(.[]; .result == expected($code == "true")))
           ' <<< "$RESULTS"

@@ -1,10 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+code=false
 full=false
-if [[ "$EVENT" == push || "$REF_TYPE" == tag ]]; then
+# A release always runs every gate, independent of the tag's diff.
+if [[ "$REF_TYPE" == tag ]]; then
+    code=true
     full=true
+else
+    case "$EVENT" in
+        pull_request) range="$BASE...$HEAD_SHA" ;;
+        push)
+            full=true
+            if [[ "$BASE" =~ ^0+$ ]]; then
+                BASE=$(git hash-object -w -t tree /dev/null)
+            elif ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+                git fetch --no-tags origin "$BASE"
+            fi
+            range="$BASE..$HEAD_SHA"
+            ;;
+        *) echo "Unsupported CI event: $EVENT" >&2; exit 2 ;;
+    esac
+
+    paths=$(mktemp)
+    trap 'rm -f "$paths"' EXIT
+    # Treat a rename as a deletion and addition so both paths are classified.
+    git diff --name-only --no-renames -z "$range" -- > "$paths"
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            packaging/*|.github/workflows/*|.github/scripts/*|.github/actions/*|Cargo.toml|Cargo.lock)
+                code=true
+                full=true
+                break
+                ;;
+            *.md|docs/*|plan/*|LICENSE) ;;
+            *) code=true ;;
+        esac
+    done < "$paths"
 fi
+
 # Use the same platform selection for packaging and install verification.
 matrix=$(jq -cn --argjson full "$full" '
     [
@@ -21,37 +55,7 @@ matrix=$(jq -cn --argjson full "$full" '
         mac: {include:$mac},
         shards: {include:[$mac[] | . + {shard:1}, . + {shard:2}]},
         oracle: {include:(if $full then [$linux[0], $mac_all[0]] else [] end)},
-        packages: {include:(if $full then $linux + $mac else $linux end)}
+        packages: {include:(if $full then $linux + $mac else [] end)}
     }
 ')
-printf 'full=%s\nmatrix=%s\n' "$full" "$matrix" >> "$GITHUB_OUTPUT"
-
-# A release always runs every gate, independent of the tag's diff.
-if [[ "$REF_TYPE" == tag ]]; then
-    echo 'code=true' >> "$GITHUB_OUTPUT"
-    exit
-fi
-
-case "$EVENT" in
-    pull_request) range="$BASE...$HEAD_SHA" ;;
-    push)
-        if [[ "$BASE" =~ ^0+$ ]]; then
-            BASE=$(git hash-object -w -t tree /dev/null)
-        elif ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            git fetch --no-tags origin "$BASE"
-        fi
-        range="$BASE..$HEAD_SHA"
-        ;;
-    *) echo "Unsupported CI event: $EVENT" >&2; exit 2 ;;
-esac
-
-paths=$(mktemp)
-trap 'rm -f "$paths"' EXIT
-git diff --name-only --no-renames -z "$range" -- > "$paths"
-while IFS= read -r -d '' path; do
-    case "$path" in
-        *.md|docs/*|plan/*|LICENSE) ;;
-        *) echo 'code=true' >> "$GITHUB_OUTPUT"; exit ;;
-    esac
-done < "$paths"
-echo 'code=false' >> "$GITHUB_OUTPUT"
+printf 'code=%s\nfull=%s\nmatrix=%s\n' "$code" "$full" "$matrix" >> "$GITHUB_OUTPUT"

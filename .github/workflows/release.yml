@@ -13,6 +13,7 @@ jobs:
 
   release:
     needs: test
+    if: ${{ !cancelled() && github.ref_type == 'tag' && needs.test.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

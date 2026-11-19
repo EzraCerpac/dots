@@ -64,8 +64,10 @@ candidate_mise() (
         MISE_YES=1 "$mise" "$@"
 )
 candidate_mise install
-[[ "$(candidate_mise exec -- dots --version)" == "dots $version (mise)" ]]
+mise_version=$(candidate_mise exec -- dots --version)
+[[ "$mise_version" == "dots $version (mise)" ]]
 cmp expected-dots "$(candidate_mise which dots)"
+printf 'Verified mise install: %s\n' "$mise_version"
 
 # Keep the tap, keg, and cache within the scratch prefix on every platform.
 brew_prefix="$scratch/brew"
@@ -90,7 +92,9 @@ cmp expected-dots "$keg/bin/dots"
 brew_dots() {
     private "$scratch/brew-state" "$keg/bin/dots" "$@"
 }
-[[ "$(brew_dots --version)" == "dots $version (homebrew)" ]]
+brew_version=$(brew_dots --version)
+[[ "$brew_version" == "dots $version (homebrew)" ]]
+printf 'Verified Homebrew install: %s\n' "$brew_version"
 for shell in bash zsh fish; do
     case "$shell" in
         bash) completion=etc/bash_completion.d/dots ;;
@@ -99,5 +103,6 @@ for shell in bash zsh fish; do
     esac
     brew_dots completions "$shell" > "expected-$shell"
     cmp "expected-$shell" "$keg/$completion"
+    printf 'Verified Homebrew %s completion matches installed dots output\n' "$shell"
 done
 printf 'Verified mise and Homebrew installs of %s from %s\n' "$version" "$archive"

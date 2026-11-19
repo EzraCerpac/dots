@@ -5,18 +5,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 root=$(pwd -P)
 version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]
-target=${1:?usage: packaging/build-release TARGET|assemble|assemble-pr OUTDIR}
+target=${1:?usage: packaging/build-release TARGET|assemble OUTDIR}
 out=${2:?missing output directory}
 mkdir -p "$out"
 out=$(cd "$out" && pwd -P)
 
-platforms=(darwin-arm64 darwin-amd64 linux-arm64 linux-amd64)
-if [[ "$target" == assemble-pr ]]; then
-    platforms=(linux-arm64 linux-amd64)
-fi
-if [[ "$target" == assemble || "$target" == assemble-pr ]]; then
+if [[ "$target" == assemble ]]; then
     cd "$out"
-    for platform in "${platforms[@]}"; do
+    for platform in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
         archive="dots-$version-$platform.tar.gz"
         # Validate the checksum against the exact filename verified on its native runner.
         read -r sum name < "$archive.sha256"
@@ -24,7 +20,7 @@ if [[ "$target" == assemble || "$target" == assemble-pr ]]; then
         printf '%s  %s\n' "$sum" "$archive"
     done > SHA256SUMS
     shasum -a 256 -c SHA256SUMS
-    awk -v version="$version" -v platforms="${#platforms[@]}" '
+    awk -v version="$version" '
         NR == FNR {
             n = split($2, fields, "-")
             sub(/[.]tar[.]gz$/, "", fields[n])
@@ -38,7 +34,7 @@ if [[ "$target" == assemble || "$target" == assemble-pr ]]; then
             seen++
         }
         { print }
-        END { if (seen != platforms) exit 1 }
+        END { if (seen != 4) exit 1 }
     ' SHA256SUMS "$root/packaging/homebrew/dots.rb" > dots.rb
     ruby -c dots.rb
     exit
@@ -77,6 +73,7 @@ if [[ "$platform" == linux-* ]]; then
         echo "$archive must have no ELF interpreter or shared-library dependencies" >&2
         exit 1
     fi
+    printf 'Verified %s: ELF64 %s, no PT_INTERP or DT_NEEDED\n' "$archive" "$machine"
 else
     [[ "$(lipo -archs "$dots")" == "$machine" ]]
 fi

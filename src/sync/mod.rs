@@ -314,7 +314,7 @@ fn validation_note(error: io::Error) -> Note {
 }
 
 fn check_mise(run: &Run<'_>) -> Result<(), Note> {
-    crate::process::Mise::new(run.ctx())
+    crate::process::Mise::new_in_run(run)
         .map(drop)
         .map_err(|error| {
             Note(

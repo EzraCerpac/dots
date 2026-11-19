@@ -74,9 +74,10 @@ Commits pushed straight to `origin/dev` from a task worktree are fine: the next 
 
 Sync works on one shape only: a plain Git checkout at the repository root, with `HEAD` on `dev` and at least one commit.
 
-- Sync stops with one line when `HEAD` is detached or on another branch, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
+- Sync stops with one line when `HEAD` is detached or on a branch other than `dev`, apart from the clean `main` case below, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
   The `.jj` check is only a refusal: `dots` neither needs nor runs JJ.
-- `dots bootstrap` switches a fresh clone from `main` to `dev` when it has no edits.
+- The installer's `--from` clones `dev` when the remote has it.
+  A checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, is switched to `dev` by `dots bootstrap`, or by the next shared sync, whose report then lists the change of configuration revision, if any.
   Every other checkout gets a one-time conversion by hand, which keeps its edits and unpushed commits.
 - Sync skips with one line during a merge, rebase, cherry-pick, revert or bisect, and while another sync holds the lock for the same repository.
   It takes over a lock whose owner died on this host.
@@ -112,6 +113,7 @@ Convert the checkout before you run sync again:
    When a path bound for the clean candidate has a staged version that differs from its unstaged one, settle the two before that path can be shared.
 4. **Scan.** Scans the candidate with gitleaks before `dev` or the index advances.
    A flagged file stays on disk and out of the candidate, and the rest is scanned again; only a clean candidate becomes `dev`.
+   When the flagged file is the source of a dotfile you just adopted, its new declaration stays out of the candidate as well, so it is kept on this machine only.
    A rejected candidate never reaches `dev`, the real index or the push, and its edits stay on disk.
    Without a working gitleaks, or when a scan fails, nothing is shared or pushed.
 5. **Fetch.** Fetches `dev` and `main`.

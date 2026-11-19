@@ -10,6 +10,7 @@ Amended 2026-11-19 to cover what source sync writes and publishes, native recove
 Amended 2026-11-19 to cover how directory copies are matched and protected, the groups in a live sync receipt, how far an installer-exception failure reaches, and the recipient check before restore.
 Amended 2026-11-19 to remove `dots publish` and the need for JJ.
 Amended 2026-11-19 to remove `dots plan` and `dots apply`, and to have local-only `dots up` apply the declared dotfiles.
+Amended 2026-11-19 to cover adoption through the installer's `--from`, and sync selecting `dev` in a clean checkout still on `main`.
 
 This contract defines `dots` 0.5 as the outside world sees it: its commands, files, settings, environment, output and exit codes.
 Each statement is about 0.5.
@@ -515,8 +516,9 @@ Changes to packages, tools and the standalone mise come from comparing the state
 #### Checkout shape
 
 - The checkout is a plain Git checkout at the root of the repository, with `HEAD` on `dev` and at least one commit.
-- Sync stops with a single line on a detached `HEAD`, on another branch, with a `.jj` directory, or with state left by a pre-0.5 sync layout.
-- `dots bootstrap` moves a fresh clone that is still on `main` and has no edits to `dev`; any other shape has to be converted by hand.
+- Sync stops with a single line on a detached `HEAD`, on a branch other than `dev` apart from the case below, with a `.jj` directory, or with state left by a pre-0.5 sync layout.
+- `dots bootstrap`, and a shared sync before anything else, move a checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, to `dev`; sync then reports the change of configuration revision, if any.
+  Any other shape has to be converted by hand.
 - Sync skips with a single line while a merge, rebase, cherry-pick, revert or bisect is under way, or while another sync of the same repository is running.
 - A lock that a dead process on this host left behind is reclaimed.
 - Sync skips with a single line when Git is older than 2.43.
@@ -732,7 +734,7 @@ Relative `--bundle` and `--identity` paths resolve against the caller's director
 `--restore ID` restores the settings history of machine `ID`, which must be a valid machine ID; it cannot be combined with `--only`.
 Under `--restore`, `dots` skips mise's services step in the native bootstrap, so no history watcher runs before the restore; the completion stage restores first, and enrollment then activates the watcher.
 
-A configuration links bootstrap to `dots` in two places:
+A configuration can link bootstrap to `dots` in two places:
 
 ```toml
 # config.laptop.toml
@@ -760,6 +762,13 @@ Failing those, it takes the profile from `SETUP_PROFILE`, or else from a single 
 When `--restore ID` is in effect, the machine ID is `ID`, and a different persisted ID makes it stop with exit status 2.
 It records `SETUP_HISTORY_ORIGIN` as the history origin when that is set, and keeps any recorded history origin that conflicts with it.
 A full bootstrap is never run from it.
+
+**New in 0.5:** a fresh machine adopts a configuration through the installer's `--from`, in a terminal.
+The installer clones the repository, its `dev` branch when the remote has one, and checks the profile against `dots_profiles` in the cloned configuration.
+A profile requested with `--profile` must be declared there, and must match a profile the machine has already saved.
+Without one, the saved profile is used, or else the only declared profile; with several, the installer asks.
+A refusal exits with status 2, lists the declared profiles and leaves the cloned checkout in place.
+After mise's native bootstrap succeeds, the installer checks the profile again and runs `dots bootstrap persist-selected`, so the profile and machine ID are saved even when the configuration has no hook for that; only then does it select `dots`.
 
 `dots bootstrap complete` runs the following stages, printing a result line for each and a final count:
 

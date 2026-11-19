@@ -84,7 +84,7 @@ Sync works on one shape only: a plain Git checkout at the repository root, with 
 
 ### Converting a legacy checkout
 
-Releases up to v0.4.0 kept their sync state in a `dots-dev.json` record inside Git's directory.
+`dots` 0.4.0 or earlier kept its sync state in a `dots-dev.json` record inside Git's directory.
 Both sync and `dots init` recognize the record and leave it alone: sync stops, and init prints a warning pointing here.
 In a linked worktree the record is not under `.git/`, so ask Git where it is; a relative answer is relative to the configuration root:
 
@@ -187,7 +187,7 @@ A path the other machine has since reverted stays under **Saved locally**, even 
 `dots sync --last` replays the receipt with the same accounting.
 
 For example, this receipt followed an edit to `config.toml` next to a new file holding a secret.
-It comes from `dots` 1.0.0-rc.1 at `rust` `9a35df0`, in a disposable home directory with a local bare `origin`:
+It comes from a pre-release `dots` built from `rust` at `9a35df0`, run in a disposable home directory with a local bare `origin`:
 
 ```text
 NOT SHARED: gitleaks flagged a local file; it stays on disk: "leak.toml:2" (generic-api-key)

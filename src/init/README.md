@@ -3,9 +3,9 @@
 This directory connects this configuration to `dots`.
 Every part is optional; delete what you do not use.
 `dots init` writes this file and the others here only when they are absent, and never overwrites them.
-`dots help` lists every command, and `dots COMMAND --help` prints a built-in command's usage.
+`dots help` lists every command, and `dots COMMAND --help` prints a built-in command's usage, except that `dots test` and `dots mise` forward `--help` to the program they run.
 
-> TODO(P-03): Check every example here against the integrated 1.0 binary and against the copy `dots init` installs, then delete this line.
+<!-- TODO(P-03): Run the font hook and the Homebrew recipe examples on a real macOS machine; they have not been run against the integrated binary. -->
 
 | Path | Purpose |
 | --- | --- |
@@ -81,12 +81,13 @@ The exit status is the outcome:
 | 4 | skipped |
 | other | failed |
 
-A hook or recipe can prompt using the caller's stdin, stdout, stderr and controlling terminal from the start of its step.
-If stdin is redirected, the child receives that input.
-Answer prompts directly. Only the child reads the reply.
-`dots up` prints the step and its result in scrollback.
-If a step that had the terminal fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
-The step’s output stays in scrollback. Ordinary captured steps have private logs.
+During an interactive update in terminal scrollback, a hook or recipe owns the terminal from the start of its step.
+Answer its prompts directly. Only the child reads the reply.
+If the step fails, its report gives the exit status and next action and says “Output was shown on the terminal.”
+In concise output, including headless and `--plain` updates, the child reads the caller's stdin and its output goes to a private log.
+A failure includes the last lines of that log. With `--verbose`, the output is also displayed as it arrives.
+
+If Ctrl-Z suspends `dots` in a session without a job-control shell, send `SIGCONT` to the `dots` process from another session to resume it.
 
 ### Update hooks
 
@@ -168,7 +169,7 @@ base	example-tool	hold=brew:example
 ```
 
 - The recipe is the executable `exceptions/NAME`; a selected row without one is an error.
-- A row with a fourth column, an unknown profile, an invalid name or an unknown flag stops the reading command with exit status 2.
+- A row with a fourth column, an unknown profile, an invalid name or an unknown flag makes `dots exceptions` exit 2. During bootstrap the exceptions stage fails, later stages can run, and the completed bootstrap exits 1.
 - `install-only` makes `dots up` pass `--install-only`, so the recipe only installs a missing app; use it for apps that update themselves.
 - `hold=MANAGER:NAME` records that the recipe pins that package, so `dots add` refuses it, ignoring any tap prefix or `@version` in the request.
 - `dots bootstrap` and `dots exceptions` always pass `--install-only`.
@@ -184,14 +185,14 @@ A recipe can prompt, as a hook can.
 
 | Subcommand | Does |
 | --- | --- |
-| `update-cask [--auto-updates] [--admin] TOKEN [PROCESS] [--install-only]` | Installs a missing cask, or upgrades an outdated one unless `--install-only`; defers with exit 3 while `PROCESS` runs, or with `--admin` when administrator access is unavailable |
+| `update-cask [--auto-updates] [--admin] TOKEN [PROCESS] [--install-only]` | Installs a missing cask, or upgrades an outdated one unless `--install-only`; when a change is needed, defers with exit 3 while `PROCESS` runs or when `--admin` requires unavailable administrator access |
 | `update-formula TOKEN [--install-only]` | The same for one formula, without the process and administrator checks |
 | `hold-formula TOKEN VERSION [REASON]` | Succeeds when exactly that version is installed, else refuses with exit 1 |
 | `hold-cask TOKEN VERSION APP_PATH [REASON]` | The same, reading the version from the app bundle at `APP_PATH` |
 | `path`, `version formula\|cask TOKEN` | Print the Homebrew executable, or a package's installed version |
 | `admin-available` | Exits 0 for root, cached sudo access, or terminal stdin and stdout where authorization can prompt. Otherwise exits 1 |
 | `defer-for-admin TOKEN` | Says `TOKEN` needs interactive administrator access and exits 3 |
-| `record formula\|cask TOKEN installed\|updated [BEFORE]` | Appends a change line to `DOTS_CHANGES` |
+| `record formula\|cask TOKEN installed\|updated [BEFORE]` | Appends a change line when `DOTS_CHANGES` is set. An update requires two known, different versions |
 
 `--auto-updates` opts into upgrading a self-updating cask.
 `update-cask` and `update-formula` record each verified installation or upgrade themselves.
@@ -223,8 +224,6 @@ Call it from a mise `post-dotfiles` hook, the same way the [bootstrap hook](#con
 [bootstrap.hooks]
 post-dotfiles = '"$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots retire-dotfiles'
 ```
-
-> TODO(P-02): Confirm this hook form under native bootstrap and `dots apply` with the integrated binary.
 
 `retired-declarations` is for a `[dotfiles.NAME]` table that a setup script once wrote into machines' `config.local.toml` or `config.host-*.toml`, whose source this configuration has since removed.
 Such a table would make every `dots sync` on those machines reject the configuration.
@@ -260,4 +259,4 @@ raw = true
 The `pre-dotfiles` hook can run before `mise` is on `PATH`, so it locates mise itself and runs the `dots` version that `[tools]` pins.
 `dots bootstrap complete` then reads private inputs, moves a fresh clone to `dev`, restores settings history when asked, installs installer exceptions, runs `hooks/bootstrap.d/`, and prepares encrypted history when a state repository is set.
 
-> TODO(P-05): Replace the pinned version with the first released 1.0 version and confirm both callbacks against it.
+<!-- TODO(P-05): Replace the pinned version with the first released 1.0 version and confirm a cold install fetches it for both callbacks. -->

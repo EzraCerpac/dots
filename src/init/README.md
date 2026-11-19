@@ -6,8 +6,6 @@ None of it is required, so remove whatever you have no use for.
 `dots help` lists the commands, and `dots COMMAND --help` shows how a built-in command is used.
 `dots test` and `dots mise` are the exceptions: they hand `--help` to the program they start.
 
-<!-- TODO(P-03): Try the font hook and Homebrew recipe examples on a real macOS machine; nobody has run them against the integrated binary yet. -->
-
 | Path | Purpose |
 | --- | --- |
 | `hooks/update.d/` | Executables that `dots up` runs once packages, tools and installer exceptions are done |
@@ -263,5 +261,3 @@ raw = true
 
 Because the `pre-dotfiles` hook may run before `mise` is on `PATH`, it finds mise on its own and runs the `dots` version pinned in `[tools]`.
 `dots bootstrap complete` then reads the private inputs, switches a fresh clone to `dev`, restores settings history if asked, installs installer exceptions, runs `hooks/bootstrap.d/`, and prepares encrypted history when a state repository is configured.
-
-<!-- TODO(P-05): Once 0.5.0 is published, confirm that a cold install fetches the pinned version for both callbacks. -->

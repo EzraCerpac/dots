@@ -2,7 +2,7 @@
 
 This is a historical record of the P-07 translation. D-01 removed the legacy suites it cites, so their paths and line numbers refer to oracle `f5c8a0e`, and `docs/contract.md` line numbers refer to the contract as it stood when P-07 was written. The Rust suites it names are the tests that run today.
 
-P-07 accounts for all 11 cases in `tests/test_retired_declarations.mjs`, including their nested variants. The legacy file is byte-identical in the base checkout and the staged v0.4.0 oracle. The executable suite in `tests/retired_declarations.rs` has 11 `unchanged_` tests and one `new_` test. The table identifies every translated case and the legacy helper assertions replaced by executable observations. The tests no longer carry the P-08 ignore marker; they run against the Rust sync implementation. See `plan/plan.md:192,198` and `docs/contract.md:887–893`.
+P-07 accounts for all 11 cases in `tests/test_retired_declarations.mjs`, including their nested variants. The legacy file is byte-identical in the base checkout and the staged v0.4.0 oracle. The executable suite in `tests/retired_declarations.rs` has 11 `unchanged_` tests and one `new_` test. The table identifies every translated case and the legacy helper assertions replaced by executable observations. The tests no longer carry the P-08 ignore marker; they run against the Rust sync implementation. See `plan/plan.md:192,198` at `f0c21ee`, before the plan was removed, and `docs/contract.md:887–893`.
 
 | Legacy case | Executable counterpart | Variants and observations |
 | --- | --- | --- |

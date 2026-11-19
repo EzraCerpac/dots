@@ -3,7 +3,7 @@
 This is a historical record of the P-07 translation. D-01 removed the legacy suites it cites, so their paths and line numbers refer to oracle `f5c8a0e`, and `docs/contract.md` line numbers refer to the contract as it stood when P-07 was written. The Rust suites it names are the tests that run today.
 
 Oracle suite: `tests/test_sync_receipt.mjs`, nine top-level cases at `f5c8a0e`. The executable draft has fourteen unchanged cases and one new case. All nine originals have at least one counterpart; the nested omissions and ownership are listed below.
-The test file in the P-07 checkout matches that revision. P-07 asks for a CLI counterpart or a reason for each original scenario (plan/plan.json:258–266). The target uses the executable selected by absolute `DOTS_BIN`, through Q-01's isolated `World` (`docs/rust-port.md:42–49` at `f0c21ee`, before D-01 removed that note). References below are to the normative `docs/contract.md`.
+The test file in the P-07 checkout matches that revision. P-07 asks for a CLI counterpart or a reason for each original scenario (`plan/plan.json:258–266` at `f0c21ee`, before the plan was removed). The target uses the executable selected by absolute `DOTS_BIN`, through Q-01's isolated `World` (`docs/rust-port.md:42–49` at `f0c21ee`, before D-01 removed that note). References below are to the normative `docs/contract.md`.
 
 | Original case | Executable counterpart and disposition |
 | --- | --- |

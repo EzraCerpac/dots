@@ -424,7 +424,7 @@ fn ordinary_crlf_sources_deploy_as_checked_out() {
     assert_eq!(git.get(["show", "HEAD:source"]).unwrap(), lf);
 
     fs::remove_file(&source).unwrap();
-    git.get(["checkout-index", "--", "source"]).unwrap();
+    git.get(["checkout-index", "-u", "--", "source"]).unwrap();
     assert_eq!(fs::read(&source).unwrap(), crlf);
     let status = git
         .get(["status", "--porcelain=v1", "-z", "--no-renames"])

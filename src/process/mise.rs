@@ -39,7 +39,7 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command_for(false, None, args)
+        self.command_for(false, None, args, Ok)
     }
 
     pub(crate) fn command_active<I, S>(&self, args: I) -> Result<Command, Fail>
@@ -47,7 +47,7 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command_for(true, None, args)
+        self.command_for(true, None, args, Ok)
     }
 
     /// Use the active selectors and supervise native preparation probes.
@@ -56,7 +56,21 @@ impl<'a> Mise<'a> {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.command_for(true, Some(run), args)
+        self.command_in_run_with(run, args, Ok)
+    }
+
+    /// Configure the native command before mise's configured Ruby is exposed.
+    pub(crate) fn command_in_run_with<I, S>(
+        &self,
+        run: &Run<'_>,
+        args: I,
+        configure: impl FnOnce(Command) -> Result<Command, Fail>,
+    ) -> Result<Command, Fail>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command_for(true, Some(run), args, configure)
     }
 
     fn command_for<I, S>(
@@ -64,6 +78,7 @@ impl<'a> Mise<'a> {
         active: bool,
         run: Option<&Run<'_>>,
         args: I,
+        configure: impl FnOnce(Command) -> Result<Command, Fail>,
     ) -> Result<Command, Fail>
     where
         I: IntoIterator<Item = S>,
@@ -77,7 +92,7 @@ impl<'a> Mise<'a> {
         };
         check_cancelled()?;
         let args: Vec<S> = args.into_iter().collect();
-        let mut command = self.raw_command()?;
+        let mut command = configure(self.raw_command()?)?;
         if active {
             command.env("MISE_ENV", self.selected.active_environments());
         }

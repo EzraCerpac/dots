@@ -975,6 +975,132 @@ fn new_established_restore_can_undo_after_the_configured_recipient_changes() {
     assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
 }
 
+fn remove_local_history_encryption(fixture: &Fixture) -> PathBuf {
+    let local = fixture.world.root().join("config.local.toml");
+    let mut doc: toml_edit::DocumentMut = fs::read_to_string(&local).unwrap().parse().unwrap();
+    doc["history"]
+        .as_table_mut()
+        .unwrap()
+        .remove("encryption")
+        .unwrap();
+    fs::write(&local, doc.to_string()).unwrap();
+    local
+}
+
+fn history_fragment(dir: &Path, name: &str, recipients: &[String]) -> PathBuf {
+    let dir = dir.join("conf.d");
+    fs::create_dir_all(&dir).unwrap();
+    let fragment = dir.join(name);
+    fs::write(
+        &fragment,
+        format!("[history.encryption]\nrecipients = {recipients:?}\n"),
+    )
+    .unwrap();
+    fragment
+}
+
+#[test]
+fn new_restore_accepts_trusted_history_fragments() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("fragment.git");
+    let url = format!("file://{}", remote.display());
+    let (identity, selected) = seed.key("selected.age");
+    let (recovery, independent) = seed.key("fragment-only.age");
+    let (shadowed, lower) = seed.key("lower-precedence.age");
+    let recipients = [selected.clone(), independent.clone()];
+    seed.configure(&url, &url, &identity, &[]);
+    remove_local_history_encryption(&seed);
+    history_fragment(seed.world.root(), "10-first.toml", &[lower]);
+    let global = history_fragment(seed.world.root(), "50-history.toml", &recipients);
+    let listing = ok(&mut seed.mise(&["config", "ls", "--json"]));
+    let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert!(listing.as_array().unwrap().iter().any(|row| {
+        row["path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path) == global)
+    }));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+    let payload = ok(seed
+        .git(Some(&remote))
+        .arg("show")
+        .arg(format!("{tip}:home@host-fixture/app/selected")))
+    .stdout;
+    assert!(payload.starts_with(b"mise-encrypted-file-v1\n"));
+    assert!(seed.can_decrypt(&payload, &recovery));
+    assert!(!seed.can_decrypt(&payload, &shadowed));
+
+    for system in [false, true] {
+        let target = Fixture::new();
+        let key = target.world.home().join("selected.age");
+        fs::copy(&identity, &key).unwrap();
+        target.configure(&url, &url, &key, &[]);
+        let local = remove_local_history_encryption(&target);
+        let system_dir = target.world.home().join(".mise-system");
+        let dir = if system {
+            &system_dir
+        } else {
+            target.world.root()
+        };
+        let name = if system {
+            let miserc = target.world.root().join("miserc.toml");
+            let selectors = fs::read_to_string(&miserc).unwrap();
+            fs::write(miserc, format!("{selectors}env_conf_d = true\n")).unwrap();
+            "50-history.laptop.toml"
+        } else {
+            "50-history.toml"
+        };
+        let fragment = history_fragment(dir, name, &recipients);
+        let original_fragment = fs::read(&fragment).unwrap();
+        let original_local = fs::read(&local).unwrap();
+        target.write(DEFAULT, 0o600);
+
+        let empty = history_fragment(dir, "90-empty.toml", &[]);
+        for denied in [None, Some(&fragment)] {
+            if denied.is_some() {
+                fs::remove_file(&empty).unwrap();
+            }
+            let mut cmd = target.dots(&["restore"], &remote);
+            if let Some(path) = denied {
+                cmd.env(
+                    "MISE_IGNORED_CONFIG_PATHS",
+                    path.with_file_name(format!("{{{name},missing.toml}}")),
+                );
+            }
+            let refused = cmd.output().unwrap();
+            assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+            assert!(messages(&refused).contains("configure [history.encryption].recipients"));
+            assert!(!target.store().exists());
+            assert_eq!(fs::read(target.active()).unwrap(), DEFAULT);
+            assert_eq!(fs::read(&local).unwrap(), original_local);
+        }
+
+        if !system {
+            let ignored = target.world.home().join("state/ignored-configs");
+            fs::create_dir_all(&ignored).unwrap();
+            symlink(fragment.canonicalize().unwrap(), ignored.join("ignored")).unwrap();
+            let refused = target
+                .dots(&["restore"], &remote)
+                .env_remove("MISE_TRUSTED_CONFIG_PATHS")
+                .output()
+                .unwrap();
+            assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+            assert!(messages(&refused).contains("configure [history.encryption].recipients"));
+            assert!(!target.store().exists());
+            assert_eq!(fs::read(&local).unwrap(), original_local);
+            // The fixture's explicit trusted path takes precedence over the dismissal.
+        }
+
+        ok(&mut target.dots(&["restore"], &remote));
+        assert_eq!(fs::read(target.active()).unwrap(), FIRST);
+        assert_eq!(fs::read(&fragment).unwrap(), original_fragment);
+        let written = fs::read(local).unwrap();
+        assert!(contains(&written, selected.as_bytes()));
+        assert!(!contains(&written, independent.as_bytes()));
+        assert_eq!(seed.tip(&remote, REF), tip);
+    }
+}
+
 #[test]
 fn new_restore_does_not_promote_a_project_only_recipient() {
     let seed = Fixture::new();

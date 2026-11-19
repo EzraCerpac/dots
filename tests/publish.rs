@@ -2058,7 +2058,6 @@ fn nested_archive(note: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflict_projection_does_not_rescan_main_only_archive() {
     let fixture = Publication::with_seed(None, false, &[("collision.txt", b"base content\n")]);
     fs::write(
@@ -2109,7 +2108,6 @@ fn new_conflict_projection_does_not_rescan_main_only_archive() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflict_projection_still_screens_new_logical_resolution() {
     const RULES: &[u8] = br#"[[rules]]
 id = "fixture-logical-resolution"
@@ -2167,7 +2165,6 @@ regex = '''(?s)\AFIXTURE_LEFT_MARKER\n.*\nFIXTURE_RIGHT_MARKER\n\z'''
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_legitimate_jjconflict_name_is_scanned() {
     let fixture = Publication::new(None, false);
     let directory = fixture.workspace.join(".jjconflict-side-0");
@@ -2234,7 +2231,6 @@ fn merged_archive_fixture(change_and_restore: bool) -> Publication {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_archive_inherited_through_outgoing_parent_is_not_rescanned() {
     let fixture = merged_archive_fixture(false);
     let command = fixture.dots(&["publish", "--bookmark", "wip/merged-archive"]);
@@ -2251,7 +2247,6 @@ fn new_archive_inherited_through_outgoing_parent_is_not_rescanned() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_changed_then_restored_archive_in_outgoing_parent_is_scanned() {
     let fixture = merged_archive_fixture(true);
     let head = fixture.working_oid();

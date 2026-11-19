@@ -91,7 +91,9 @@ Machine-local files stay out of the repository, and encrypted settings history l
 
 - **`dots up`** checkpoints tracked settings and syncs, then updates packages and tools, runs your update hooks and updates mise itself.
   It prints each step and ends with anything that needs attention and what to run next.
+  It applies your declared dotfiles too: through sync when there is a remote, directly in local-only mode.
   It never removes undeclared software, restarts services or updates project dependencies.
+  To preview or apply on their own, run `dots mise bootstrap plan` or `dots mise bootstrap dotfiles apply TARGET`.
 - **`dots add`** installs software and records it, or adopts a file.
   It writes to this machine's profile unless you pass `--base` for every machine or `--profile P` for another profile.
   A path starting with `/`, `~/`, `./` or `../` is a file: it moves into the configuration's `dotfiles/` and a link takes its place.

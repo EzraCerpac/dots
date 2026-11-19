@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Permissions};
-use std::io::{Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -245,10 +245,7 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     recipients.extend(recovered_keys);
     local.set_history(&branch, &RepoSetting::parse(&raw)?, &identity, &recipients)?;
     local.install(native)?;
-    fs::remove_file(store.join(MARKER))
-        .map_err(|_| blocked("could not finish the pending restore marker"))?;
-    fsync_dir(&store)?;
-    Ok(())
+    clear_journal(&store)
 }
 
 #[derive(Deserialize)]
@@ -346,7 +343,7 @@ impl Recovery<'_, '_, '_> {
         verify_tree(self.native, self.store, commit, self.branch, &self.paths)
     }
 
-    fn verify_plan(&self, target: &str) -> Result<BTreeSet<PathBuf>, Fail> {
+    fn verify_plan(&self, target: &str) -> Result<Option<BTreeSet<PathBuf>>, Fail> {
         let head = revision(self.native, self.store, MAIN_REF)?;
         let local = self.verify(&head)?;
         let remote = self.verify(target)?;
@@ -363,7 +360,7 @@ impl Recovery<'_, '_, '_> {
             return Err(invalid("native restore plan has an unchecked checkpoint"));
         }
         if !sync.conflicts.is_empty() {
-            return Err(history_conflict());
+            return Ok(None);
         }
         let stem = format!("home@{}/", self.branch);
         let home = physical_home(self.native)?;
@@ -385,9 +382,10 @@ impl Recovery<'_, '_, '_> {
         }
         self.paths.recheck(self.native)?;
         if sync.pending_directories == 0 {
-            return Ok(BTreeSet::new());
+            return Ok(Some(BTreeSet::new()));
         }
         self.verify_directories(&directories, sync.pending_directories)
+            .map(Some)
     }
 
     fn verify_directories(
@@ -433,7 +431,6 @@ impl Recovery<'_, '_, '_> {
     }
 
     fn restore_established(&mut self) -> Result<(), Fail> {
-        let live = self.pin_fetch_paths()?;
         let record = new_journal(
             self.native,
             self.store,
@@ -442,10 +439,9 @@ impl Recovery<'_, '_, '_> {
             &self.paths,
             revision(self.native, self.store, MAIN_REF)?,
             false,
-            Progress::Fetching(live),
+            Progress::Prepared,
             None,
         )?;
-        write_journal(self.store, &record)?;
         self.resume(record)
     }
 
@@ -469,6 +465,13 @@ impl Recovery<'_, '_, '_> {
     }
 
     fn resume(&mut self, mut journal: Journal) -> Result<(), Fail> {
+        if matches!(journal.progress, Progress::Prepared | Progress::Fetching(_)) {
+            // A fetch never starts applying the incoming files. Observe again
+            // for this invocation, while keeping later apply phases pinned.
+            self.paths.check_binding(&journal.paths, false)?;
+            journal.progress = Progress::Fetching(self.pin_fetch_paths()?);
+            write_journal(self.store, &journal)?;
+        }
         loop {
             if let Some(scope) = journal.obsolete_scope.take() {
                 self.remove_scope(&scope)?;
@@ -494,17 +497,20 @@ impl Recovery<'_, '_, '_> {
                 _ => None,
             };
             journal.progress = match &journal.progress {
-                Progress::Cloning(_) => {
+                Progress::Cloning(_) | Progress::Prepared => {
                     return Err(invalid("refusing an unfinished history clone"));
-                }
-                Progress::Prepared => {
-                    self.paths.check_binding(&journal.paths, false)?;
-                    Progress::Fetching(self.pin_fetch_paths()?)
                 }
                 Progress::Fetching(live) => {
                     self.paths.check_binding(&journal.paths, false)?;
                     let target = self.fetch(live)?;
-                    let created = self.verify_plan(&target)?;
+                    let Some(created) = self.verify_plan(&target)? else {
+                        // A first restore still needs its initial-apply marker.
+                        if !journal.initial {
+                            self.native.require_no_pending_operations()?;
+                            clear_journal(self.store)?;
+                        }
+                        return Err(history_conflict());
+                    };
                     Progress::Pulling(self.attempt(target, live.clone(), created)?)
                 }
                 Progress::Pulling(attempt) => {
@@ -512,7 +518,10 @@ impl Recovery<'_, '_, '_> {
                     if completed.is_none() {
                         self.paths.check_binding(&journal.paths, false)?;
                         require_unchanged(&attempt.live, &BTreeSet::new())?;
-                        if self.verify_plan(&attempt.target)? != attempt.created {
+                        let created = self
+                            .verify_plan(&attempt.target)?
+                            .ok_or_else(history_conflict)?;
+                        if created != attempt.created {
                             return Err(unsafe_tree());
                         }
                         self.launch_attempt(attempt, false)?;
@@ -1515,8 +1524,76 @@ fn read_journal(store: &Path) -> Result<Journal, Fail> {
     parse_journal(&read_private(&store.join(MARKER))?)
 }
 
+fn clear_journal(store: &Path) -> Result<(), Fail> {
+    fs::remove_file(store.join(MARKER))
+        .map_err(|_| blocked("could not finish the pending restore marker"))?;
+    fsync_dir(store)
+}
+
+#[cfg(test)]
+#[test]
+fn journal_round_trips_above_four_mib() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let home = PathBuf::from("/fixture/home");
+    let metadata = fs::metadata(store).unwrap();
+    let live: LiveVersions = (0..32_000)
+        .map(|index| {
+            let version = FileVersion {
+                device: metadata.dev(),
+                inode: index,
+                size: 1024,
+                modified: (1_720_000_000, 123_000_000),
+                changed: (1_720_000_001, 456_000_000),
+                mode: 0o100600,
+            };
+            (
+                home.join(format!("settings/target-{index}.toml")),
+                Some(version),
+            )
+        })
+        .collect();
+    let paths = serde_json::from_value(serde_json::json!({
+        "home": home,
+        "source": null,
+        "targets": live.keys().collect::<Vec<_>>(),
+        "directories": {},
+    }))
+    .unwrap();
+    let journal = Journal {
+        root: home.join("config"),
+        home,
+        paths,
+        origin: "file:///fixture/origin.git".into(),
+        branch: "host-fixture".into(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        seed: "1".repeat(40),
+        initial: true,
+        progress: Progress::Fetching(live.clone()),
+        obsolete_scope: None,
+        previous: None,
+    };
+    write_journal(store, &journal).unwrap();
+    assert!(fs::metadata(store.join(MARKER)).unwrap().len() > 4 * 1024 * 1024);
+    let read = read_journal(store).unwrap();
+    assert!(matches!(read.progress, Progress::Fetching(observed) if observed == live));
+    assert!(is_fetching(store));
+}
+
+pub(super) fn is_fetching(store: &Path) -> bool {
+    let Ok(Some(metadata)) = existing_directory(store) else {
+        return false;
+    };
+    read_journal(store).is_ok_and(|record| {
+        matches!(record.progress, Progress::Fetching(_))
+            && record.obsolete_scope.is_none()
+            && match_journal_directory(&record, &metadata).is_ok()
+    })
+}
+
 fn parse_journal(file: &File) -> Result<Journal, Fail> {
-    serde_json::from_reader(file.take(4 * 1024 * 1024))
+    serde_json::from_reader(BufReader::new(file))
         .map_err(|_| invalid("could not validate the pending history recovery marker"))
 }
 

@@ -23,30 +23,22 @@ pub(crate) use mise::{
 
 pub(crate) fn fill_commit_identity<E>(
     command: &mut Command,
-    mut git: impl FnMut(&[&str]) -> Result<std::process::Output, E>,
+    mut probe: impl FnMut(&str, &[(&str, &str)]) -> Result<std::process::Output, E>,
 ) -> Result<(), E> {
-    for role in ["author", "committer"] {
-        let prefix = format!("GIT_{}", role.to_ascii_uppercase());
-        if git(&["var", &format!("{prefix}_IDENT")])?.status.success() {
-            continue;
-        }
-        for (field, fallback) in [("name", "dots"), ("email", "dots@localhost")] {
-            let key = format!("{prefix}_{}", field.to_ascii_uppercase());
-            let present = command.get_envs().any(|(name, value)| {
-                value.is_some() && (name == key.as_str() || field == "email" && name == "EMAIL")
-            });
-            if !present
-                && git(&[
-                    "config",
-                    "--name-only",
-                    "--get-regexp",
-                    &format!(r"^({role}|user)\.{field}$"),
-                ])?
-                .status
-                .code()
-                    == Some(1)
-            {
-                command.env(key, fallback);
+    for [ident, name, email] in [
+        ["GIT_AUTHOR_IDENT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"],
+        [
+            "GIT_COMMITTER_IDENT",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ],
+    ] {
+        let defaults = [(name, "dots"), (email, "dots@localhost")];
+        // A single default can succeed only if Git can resolve the other field.
+        for trial in [&[][..], &defaults[..1], &defaults[1..], &defaults] {
+            if probe(ident, trial)?.status.success() {
+                command.envs(trial.iter().copied());
+                break;
             }
         }
     }

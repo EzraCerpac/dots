@@ -166,12 +166,18 @@ impl<'a> Git<'a> {
     }
 
     pub fn commit(&self, tree: &str, parents: &[&str], message: &str) -> io::Result<String> {
+        let git = || {
+            let mut cmd = self.command(["-c", "commit.gpgSign=false"])?;
+            cmd.env("LC_ALL", "C");
+            Ok::<_, io::Error>(cmd)
+        };
         let command = || {
-            let mut cmd = self.command(["-c", "commit.gpgSign=false", "commit-tree", tree])?;
+            let mut cmd = git()?;
+            cmd.args(["commit-tree", tree]);
             for parent in parents {
                 cmd.args(["-p", parent]);
             }
-            cmd.args(["-m", message]).env("LC_ALL", "C");
+            cmd.args(["-m", message]);
             Ok::<_, io::Error>(cmd)
         };
         let mut output = self.output_command(command()?)?;
@@ -184,9 +190,9 @@ impl<'a> Git<'a> {
                 == Some(1)
         {
             let mut cmd = command()?;
-            crate::process::fill_commit_identity(&mut cmd, |args| {
-                let mut probe = self.command(args)?;
-                probe.env("LC_ALL", "C");
+            crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {
+                let mut probe = git()?;
+                probe.args(["var", ident]).envs(defaults.iter().copied());
                 self.output_command(probe)
             })?;
             output = self.output_command(cmd)?;
@@ -331,6 +337,19 @@ fn first_stderr(output: &Output) -> String {
         .split(|&byte| byte == b'\n')
         .next()
         .unwrap_or_default();
+    // Strip userinfo before truncating: the separating @ can be beyond byte 512.
+    let text = String::from_utf8_lossy(line);
+    let mut pieces = text.split("://");
+    let mut safe = pieces.next().unwrap_or_default().to_owned();
+    for piece in pieces {
+        let end = piece
+            .find(['/', '?', '#', ' ', '\t', '\r'])
+            .unwrap_or(piece.len());
+        let start = piece[..end].rfind('@').map_or(0, |at| at + 1);
+        safe.push_str("://");
+        safe.push_str(&piece[start..]);
+    }
+    let line = safe.as_bytes();
     String::from_utf8_lossy(&line[..line.len().min(512)])
         .trim_end()
         .to_owned()

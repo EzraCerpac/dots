@@ -33,7 +33,7 @@ case "$SUITE" in
     ;;
   */*) args=(--partition "slice:$SUITE") ;;
 esac
-# The Intel runner spends much of each shard waiting on Git and filesystem I/O.
+# Overlap more Git and filesystem-heavy tests on Intel macOS.
 if [[ "${RUNNER_OS:-}" == macOS && "${RUNNER_ARCH:-}" == X64 ]]; then
   args+=(--test-threads 6)
 fi

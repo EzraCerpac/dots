@@ -4,7 +4,7 @@
 
 _dots() {
     local line value description display
-    local -a args values descriptions prefixes prefix_descriptions
+    local -a args values descriptions prefixes prefix_descriptions matching
     local i
     for ((i=2; i<CURRENT; i++)); do
         value=${(Q)words[i]}
@@ -37,11 +37,14 @@ _dots() {
             descriptions+=( "$display" )
         fi
     done
+    # The query matches the prefix. When editing inside a word, also let
+    # Zsh match the suffix before it inserts a candidate.
+    [[ -z $SUFFIX ]] && matching=( -U )
     if (( $#prefixes )); then
-        compadd -U -S '' -d prefix_descriptions -a prefixes
+        compadd "${matching[@]}" -S '' -d prefix_descriptions -a prefixes
     fi
     if (( $#values )); then
-        compadd -U -d descriptions -a values
+        compadd "${matching[@]}" -d descriptions -a values
     fi
 }
 

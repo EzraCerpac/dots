@@ -609,6 +609,9 @@ path = '^(Side|Merge) marker\.txt$'
         }
 
         let git = Git::new(&ctx, ctx.root.path());
+        git.get(["config", "user.name", "Fixture"]).unwrap();
+        git.get(["config", "user.email", "fixture@example.invalid"])
+            .unwrap();
         let before = fixture_commit(&git, "base");
         let path = "literal[1] path";
         fs::write(git.root().join(path), b"private fixture").unwrap();

@@ -188,7 +188,7 @@ struct KnownCopy {
     #[serde(default)]
     deployed: Option<[u8; 32]>,
     #[serde(default)]
-    native_epoch: Option<DeploymentEpoch>,
+    native_epoch: Option<NativeEpoch>,
 }
 
 impl KnownCopy {
@@ -209,8 +209,16 @@ impl KnownCopy {
         native: Option<&str>,
     ) -> bool {
         if let Some(native) = native {
-            matches_native_copy(observed, native, mode)
-        } else if let (
+            if !matches_native_copy(observed, native, mode) {
+                return false;
+            }
+            // Legacy guarded records do not say when mise last deployed.
+            // An extant but undated native record may only corroborate them.
+            if self.deployed.is_none() || self.native_epoch.is_some() {
+                return true;
+            }
+        }
+        if let (
             Some(digest),
             Image::Regular {
                 bytes,
@@ -245,7 +253,19 @@ struct Captured {
     mode: u32,
     digest: [u8; 32],
     #[serde(default)]
-    native_epoch: Option<DeploymentEpoch>,
+    native_epoch: Option<NativeEpoch>,
+}
+
+impl Captured {
+    fn is_current(self, native: Option<&NativeDeployment>) -> bool {
+        !native.is_some_and(|record| record.supersedes(self.native_epoch))
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
+enum NativeEpoch {
+    Absent,
+    Present(DeploymentEpoch),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
@@ -270,6 +290,12 @@ impl From<fs::Metadata> for DeploymentEpoch {
 struct NativeDeployment {
     digest: String,
     epoch: DeploymentEpoch,
+}
+
+impl NativeDeployment {
+    fn supersedes(&self, earlier: Option<NativeEpoch>) -> bool {
+        earlier.is_some_and(|epoch| epoch != NativeEpoch::Present(self.epoch))
+    }
 }
 
 const STATE: &str = "dots-sync-copies.json";
@@ -354,8 +380,12 @@ fn native_deployments(run: &Run<'_>) -> io::Result<BTreeMap<PathBuf, NativeDeplo
 }
 
 impl Copies {
-    fn native_epoch(&self, target: &Path) -> Option<DeploymentEpoch> {
-        self.deployments.get(target).map(|native| native.epoch)
+    fn native_epoch(&self, target: &Path) -> NativeEpoch {
+        self.deployments
+            .get(target)
+            .map_or(NativeEpoch::Absent, |native| {
+                NativeEpoch::Present(native.epoch)
+            })
     }
 
     fn native_baseline(&self, target: &Path, known: &KnownCopy) -> Option<&str> {
@@ -363,7 +393,11 @@ impl Copies {
         // native deployment takes precedence even if it wrote older bytes.
         self.deployments
             .get(target)
-            .filter(|native| known.deployed.is_none() || known.native_epoch != Some(native.epoch))
+            .filter(|native| {
+                known.deployed.is_none()
+                    || known.native_epoch.is_none()
+                    || native.supersedes(known.native_epoch)
+            })
             .map(|native| native.digest.as_str())
     }
 
@@ -371,7 +405,7 @@ impl Copies {
         self.state
             .captured
             .get(target)
-            .is_some_and(|capture| capture.native_epoch == self.native_epoch(target))
+            .is_some_and(|capture| capture.is_current(self.deployments.get(target)))
     }
 
     pub fn load(dir: &Path) -> io::Result<Self> {
@@ -459,7 +493,7 @@ impl Copies {
                             .get(&destination)
                             .is_some_and(|native| native.digest == copy_digest(bytes));
                     if matches {
-                        let native_epoch = self.native_epoch(&destination);
+                        let native_epoch = Some(self.native_epoch(&destination));
                         self.state.known.entry(destination).or_insert(KnownCopy {
                             source: source.to_owned(),
                             entry: None,
@@ -603,7 +637,7 @@ impl Copies {
                         baseline: Captured {
                             mode: *deployed_mode,
                             digest: Sha256::digest(bytes).into(),
-                            native_epoch: self.native_epoch(&path),
+                            native_epoch: Some(self.native_epoch(&path)),
                         },
                     }),
                     receipt,
@@ -638,8 +672,7 @@ impl Copies {
             return Ok(());
         }
         for (path, observed) in &self.state.captured {
-            let epoch = self.deployments.get(path).map(|native| native.epoch);
-            if observed.native_epoch != epoch {
+            if !observed.is_current(self.deployments.get(path)) {
                 continue;
             }
             let Some(known) = self.state.known.get_mut(path) else {
@@ -656,7 +689,7 @@ impl Copies {
                 known.revision = Some(revision.to_owned());
                 known.mode = Some(observed.mode);
                 known.deployed = Some(observed.digest);
-                known.native_epoch = epoch;
+                known.native_epoch = observed.native_epoch;
             }
         }
         self.persist(git_dir)
@@ -677,7 +710,7 @@ impl Copies {
         // A saved capture is still a local edit until the adopted checkout
         // contains it. Keep the protection if a published merge replaced it.
         for (path, capture) in std::mem::take(&mut self.state.captured) {
-            if capture.native_epoch != self.native_epoch(&path) {
+            if !capture.is_current(self.deployments.get(&path)) {
                 continue;
             }
             let Some(known) = self.state.known.get(&path) else {
@@ -1014,11 +1047,7 @@ impl Copies {
         let copy_is_edited = match previous_copy {
             Some(copy) if current != Image::Absent => {
                 let common = copy.source_image(git, validated.revision())?;
-                let native = if absent {
-                    self.native_baseline(path, copy)
-                } else {
-                    None
-                };
+                let native = self.native_baseline(path, copy);
                 !copy.matches(&current, &common, copy.mode, native)
             }
             None if absent && current != Image::Absent => self
@@ -1251,7 +1280,7 @@ impl Copies {
                     entry,
                     mode: Some(*mode),
                     deployed: Some(Sha256::digest(bytes).into()),
-                    native_epoch: self.native_epoch(&path),
+                    native_epoch: Some(self.native_epoch(&path)),
                 })
             } else {
                 None
@@ -1267,9 +1296,13 @@ impl Copies {
                         let next = next_baseline
                             .as_ref()
                             .filter(|next| path == destination && next.source == known.source);
-                        let native = next.and_then(|_| self.native_baseline(&path, known));
-                        let mode = if native.is_some() {
-                            next.and_then(|next| next.mode)
+                        let native = if path == destination {
+                            self.native_baseline(&path, known)
+                        } else {
+                            None
+                        };
+                        let mode = if native.is_some() && known.native_epoch.is_some() {
+                            next.and_then(|next| next.mode).or(known.mode)
                         } else {
                             known.mode
                         };
@@ -1329,6 +1362,15 @@ impl Copies {
                 self.state = Self::load(git_dir)?.state;
                 self.written.insert(path.clone());
             } else if let Some(baseline) = next_baseline {
+                if self.pending_capture(&path)
+                    && same_copy(
+                        &current,
+                        &baseline.source_image(git, validated.revision())?,
+                        baseline.mode,
+                    )
+                {
+                    self.state.captured.remove(&path);
+                }
                 self.state.known.insert(path.clone(), baseline);
             } else {
                 self.state.known.remove(&path);

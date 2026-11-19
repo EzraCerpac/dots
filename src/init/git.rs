@@ -1,7 +1,7 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -273,10 +273,19 @@ impl Git<'_> {
         Ok((index, lock))
     }
 
-    fn restore_unborn_head(&self, previous: &str) -> Result<(), Fail> {
-        if previous != DEV && self.head()?.as_deref() == Some(DEV) && self.commit("HEAD")?.is_none()
+    fn restore_unborn_head(&self, previous: &OsStr) -> Result<(), Fail> {
+        if previous != DEV
+            && self.head()?.as_deref() == Some(OsStr::new(DEV))
+            && self.commit("HEAD")?.is_none()
         {
-            self.checked(&["symbolic-ref", "HEAD", previous], "restore unborn HEAD")?;
+            checked(
+                output(
+                    self.command(self.root)?
+                        .args(["symbolic-ref", "HEAD"])
+                        .arg(previous),
+                )?,
+                "restore unborn HEAD",
+            )?;
         }
         Ok(())
     }
@@ -330,7 +339,7 @@ impl Git<'_> {
     }
 
     pub fn pristine(&self) -> Result<Option<String>, Fail> {
-        if self.head()?.as_deref() != Some(DEV) {
+        if self.head()?.as_deref() != Some(OsStr::new(DEV)) {
             return Ok(None);
         }
         let Some(oid) = self.commit(DEV)? else {
@@ -387,8 +396,13 @@ impl Git<'_> {
         Ok(Some(oid))
     }
 
-    pub fn head(&self) -> Result<Option<String>, Fail> {
-        optional_line(self.output(&["symbolic-ref", "--no-recurse", "-q", "HEAD"])?)
+    pub fn head(&self) -> Result<Option<OsString>, Fail> {
+        let out = self.output(&["symbolic-ref", "--no-recurse", "-q", "HEAD"])?;
+        match out.status.code() {
+            Some(0) => Ok(Some(OsString::from_vec(trim_line(&out.stdout).to_vec()))),
+            Some(1) => Ok(None),
+            _ => Err(git_error("read a repository reference")),
+        }
     }
 
     pub fn commit(&self, name: &str) -> Result<Option<String>, Fail> {

@@ -9,6 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::libc;
+use serde::{Deserialize, Serialize};
 
 use super::git::{Entry, Git, invalid};
 
@@ -19,6 +20,9 @@ pub(super) enum Image {
     Link(PathBuf),
     Directory,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(super) struct FileId(u64, u64);
 
 impl Image {
     pub fn from_git(git: &Git<'_>, entry: Option<&Entry>) -> io::Result<Self> {
@@ -123,32 +127,47 @@ impl Dir {
     }
 
     pub fn read_path(&self, path: &Path) -> io::Result<Image> {
+        self.read_observed(path).map(|(image, _)| image)
+    }
+
+    pub fn read_observed(&self, path: &Path) -> io::Result<(Image, Option<FileId>)> {
         match self.parent(path, false) {
-            Ok((dir, name)) => dir.read(&name),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Image::Absent),
+            Ok((dir, name)) => dir.read_with_id(&name),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((Image::Absent, None)),
             Err(error) => Err(error),
         }
     }
 
-    fn read(&self, name: &CString) -> io::Result<Image> {
+    pub(super) fn open_file(&self, name: &CString) -> io::Result<File> {
         let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
         // SAFETY: the directory descriptor and name live through openat.
         let fd = unsafe { libc::openat(self.fd(), name.as_ptr(), flags) };
-        match owned(fd) {
+        owned(fd)
+    }
+
+    fn read(&self, name: &CString) -> io::Result<Image> {
+        self.read_with_id(name).map(|(image, _)| image)
+    }
+
+    fn read_with_id(&self, name: &CString) -> io::Result<(Image, Option<FileId>)> {
+        match self.open_file(name) {
             Ok(mut file) => {
                 let md = file.metadata()?;
                 if md.is_dir() {
-                    return Ok(Image::Directory);
+                    return Ok((Image::Directory, None));
                 }
                 if !md.is_file() {
                     return Err(invalid("unsupported filesystem entry"));
                 }
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
-                Ok(Image::Regular {
-                    bytes,
-                    mode: md.permissions().mode() & 0o7777,
-                })
+                Ok((
+                    Image::Regular {
+                        bytes,
+                        mode: md.permissions().mode() & 0o7777,
+                    },
+                    Some(FileId(md.dev(), md.ino())),
+                ))
             }
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 let mut buffer = vec![0; 1024];
@@ -168,7 +187,7 @@ impl Dir {
                     }
                     if (size as usize) < buffer.len() {
                         buffer.truncate(size as usize);
-                        return Ok(Image::Link(PathBuf::from(OsString::from_vec(buffer))));
+                        return Ok((Image::Link(PathBuf::from(OsString::from_vec(buffer))), None));
                     }
                     if buffer.len() >= 65_536 {
                         return Err(invalid("symlink destination is too long"));
@@ -176,7 +195,7 @@ impl Dir {
                     buffer.resize(buffer.len() * 2, 0);
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Image::Absent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((Image::Absent, None)),
             Err(error) => Err(error),
         }
     }
@@ -400,13 +419,14 @@ fn replace_with(
     new_slot: &CStrName,
     expected: &Image,
     replacement: &Image,
+    expected_inode: Option<FileId>,
     consume_replacement: bool,
     before_move: impl Fn() -> io::Result<()>,
     before_publish: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
     let (parent, name) = root.parent(path, !matches!(replacement, Image::Absent))?;
-    let current = parent.read(&name)?;
-    let displaced = staging.read(&old_slot.0)?;
+    let (current, current_inode) = parent.read_with_id(&name)?;
+    let (displaced, displaced_inode) = staging.read_with_id(&old_slot.0)?;
     if *expected == Image::Directory {
         if displace_directory(
             root,
@@ -428,7 +448,9 @@ fn replace_with(
         {
             return Ok(());
         }
-        if &displaced != expected {
+        if &displaced != expected
+            || expected_inode.is_some_and(|inode| Some(inode) != displaced_inode)
+        {
             if current == Image::Absent {
                 let _ = before_publish()
                     .and_then(|()| verify_parent(root, path, &parent))
@@ -440,6 +462,9 @@ fn replace_with(
             return Err(invalid("another writer claimed the target"));
         }
     } else if &current == expected {
+        if expected_inode.is_some_and(|inode| Some(inode) != current_inode) {
+            return Err(invalid("target inode changed before replacement"));
+        }
         match current {
             Image::Absent => (),
             _ => {
@@ -447,7 +472,10 @@ fn replace_with(
                 verify_parent(root, path, &parent)?;
                 parent.move_to(&name, staging, &old_slot.0)?;
                 verify_parent(root, path, &parent)?;
-                if &staging.read(&old_slot.0)? != expected {
+                let (moved, moved_inode) = staging.read_with_id(&old_slot.0)?;
+                if &moved != expected
+                    || expected_inode.is_some_and(|inode| Some(inode) != moved_inode)
+                {
                     // Restore by exclusive link only; the recovered inode
                     // stays private if a writer has already claimed the path.
                     let _ = before_publish()
@@ -506,6 +534,7 @@ pub(super) fn replace_exact(
         new,
         expected,
         replacement,
+        None,
         false,
         || Ok(()),
         || Ok(()),
@@ -518,7 +547,7 @@ pub(super) fn replace_consuming(
     staging: &Dir,
     old_slot: &CStrName,
     new_slot: &CStrName,
-    expected: &Image,
+    (expected, expected_inode): (&Image, Option<FileId>),
     replacement: &Image,
 ) -> io::Result<()> {
     replace_with(
@@ -529,6 +558,7 @@ pub(super) fn replace_consuming(
         new_slot,
         expected,
         replacement,
+        expected_inode,
         true,
         || Ok(()),
         || Ok(()),
@@ -556,6 +586,7 @@ pub(super) fn replace_at_boundary(
         new,
         expected,
         replacement,
+        None,
         false,
         before_move,
         before_publish,
@@ -629,6 +660,41 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(live).unwrap(), b"competing file");
         assert_eq!(fs::read(stage.path().join("previous")).unwrap(), b"before");
+    }
+
+    #[test]
+    fn same_bytes_on_a_competing_inode_are_preserved_during_displacement() {
+        let world = tempfile::tempdir().unwrap();
+        let root = private_dir(world.path(), "root").unwrap();
+        let stage = private_dir(world.path(), "stage").unwrap();
+        let original = bytes(b"before");
+        let replacement = bytes(b"after");
+        let live = root.path().join("target");
+        let competitor = root.path().join("competing");
+        write_private(&live, &original).unwrap();
+        write_private(&competitor, &original).unwrap();
+        write_private(&stage.path().join("replacement"), &replacement).unwrap();
+        let root_dir = Dir::open(root.path()).unwrap();
+        let path = Path::new("target");
+        let (_, original_inode) = root_dir.read_observed(path).unwrap();
+        let competing_inode = fs::metadata(&competitor).unwrap().ino();
+        let error = replace_with(
+            &root_dir,
+            path,
+            &Dir::open(stage.path()).unwrap(),
+            &CStrName::new("previous").unwrap(),
+            &CStrName::new("replacement").unwrap(),
+            &original,
+            &replacement,
+            original_inode,
+            true,
+            || fs::rename(&competitor, &live),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&live).unwrap(), b"before");
+        assert_eq!(fs::metadata(&live).unwrap().ino(), competing_inode);
     }
 
     #[test]

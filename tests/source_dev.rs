@@ -3108,6 +3108,64 @@ copies_case!(
 );
 
 copies_case!(
+    active new_declared_directory_copy_updates_matching_existing_leaf_after_pre_hook,
+    true,
+    |f, a, _b, config| {
+        let config = format!("{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\" }}\n");
+        let pre = r#"cat "$HOME/generated" > dir/leaf
+if [ -e "$HOME/.tree/replacement" ]; then
+    mv -f "$HOME/.tree/replacement" "$HOME/.tree/leaf"
+fi"#;
+        let post = "cat \"$HOME/.tree/leaf\" > \"$HOME/post\"";
+        a.source("config.toml", hooks(&config, pre, post));
+        a.source("dir/leaf", "native generated\n");
+        a.target(".tree/leaf", "native generated\n");
+        let source = a.root.join("dir/leaf");
+        let deployed = a.home.join(".tree/leaf");
+        assert_eq!(read(&source), read(&deployed));
+        assert_eq!(mode(&source), mode(&deployed));
+        assert!(f.git(a.root, &["ls-tree", "-r", "HEAD", "--", "dir/leaf"]).is_empty());
+
+        a.target("generated", "sync generated\n");
+        let receipt = a.sync();
+        assert_eq!(read(&source), "sync generated\n");
+        assert_eq!(read(&deployed), "sync generated\n");
+        assert_eq!(read(&a.home.join("post")), "sync generated\n");
+        assert!(
+            !receipt.lines().any(|line| {
+                line.contains(".tree/leaf") && line.to_ascii_lowercase().contains("kept")
+            }),
+            "{receipt}"
+        );
+
+        // The validated pre-hook renames this new inode over the observed leaf.
+        let replacement = a.home.join(".tree/replacement");
+        let original_inode = fs::metadata(&deployed).unwrap().ino();
+        let deployed_mode = mode(&deployed);
+        a.target(".tree/replacement", "sync generated\n");
+        let replacement_inode = fs::metadata(&replacement).unwrap().ino();
+        assert_ne!(original_inode, replacement_inode);
+        assert_eq!(mode(&replacement), deployed_mode);
+        assert_eq!(read(&replacement), read(&deployed));
+
+        a.target("generated", "next source\n");
+        let receipt = a.sync();
+        assert_eq!(read(&source), "next source\n");
+        assert!(!replacement.exists(), "pre-hook must rename the replacement");
+        assert_eq!(fs::metadata(&deployed).unwrap().ino(), replacement_inode);
+        assert_eq!(read(&deployed), "sync generated\n");
+        assert_eq!(mode(&deployed), deployed_mode);
+        assert_eq!(read(&a.home.join("post")), "sync generated\n");
+        assert!(
+            receipt.lines().any(|line| {
+                line.contains(".tree/leaf") && line.to_ascii_lowercase().contains("kept")
+            }),
+            "{receipt}"
+        );
+    }
+);
+
+copies_case!(
     active unchanged_adopted_directory_copy_preserves_deployed_permissions,
     false,
     |f, a, _b, config| {

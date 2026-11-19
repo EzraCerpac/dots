@@ -1255,7 +1255,7 @@ fn failed_history_save(f: &Repo, output: Option<&Path>, diagnostic: &str) -> [St
     reports
 }
 
-sync_case!(unchanged_long_native_failure_keeps_receipt_readable, || {
+sync_case!(active unchanged_long_native_failure_keeps_receipt_readable, || {
     let f = Repo::new();
     let failure = f.scratch.join("long-failure");
     script(
@@ -1410,7 +1410,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_real_gitleaks_names_only_rule_path_and_line,
+    active unchanged_real_gitleaks_names_only_rule_path_and_line,
     || {
         let f = Repo::new();
         fs::remove_file(f.tools.join("gitleaks")).unwrap();
@@ -2698,7 +2698,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_real_hook_failure_preserves_phase_and_exit_without_private_output,
+    active unchanged_real_hook_failure_preserves_phase_and_exit_without_private_output,
     true,
     |_f, a, _b, config| {
         let private = "echo FIXTURE_PRIVATE_HOOK; printf '%s\\n' FIXTURE_PRIVATE_HOOK_ERR 'diff --git a/a b/a' '+FIXTURE_PRIVATE_HOOK_PATCH' >&2; exit 7";
@@ -3279,7 +3279,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_dirty_copy_survives_incoming_source_and_retry,
+    active unchanged_dirty_copy_survives_incoming_source_and_retry,
     false,
     |f, a, b, _config| {
         const DIRTY: &str = "my dirty copy\n";
@@ -3517,7 +3517,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
+    active unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
     false,
     |_f, a, _b, config| {
         fs::remove_file(a.home.join(".copied")).unwrap();

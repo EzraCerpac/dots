@@ -1725,7 +1725,6 @@ fn unchanged_shared_dev_already_in_main_allows_each_publication_mode() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_non_github_repository_exits_before_checking_publication_tools() {
     let fixture = Publication::new(None, false);
     let origin = format!("file://{}", fixture.bare.display());
@@ -1747,7 +1746,6 @@ fn new_non_github_repository_exits_before_checking_publication_tools() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_invalid_repository_setting_exits_two_before_tool_probes() {
     for config in [
         "[vars]\ndots_source_repo = \"invalid fixture setting\"\n",
@@ -1761,7 +1759,6 @@ fn new_invalid_repository_setting_exits_two_before_tool_probes() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_rejects_absent_unsafe_or_mismatched_raw_origins_before_tool_probes() {
     let credential = "P07_FIXTURE_PASSWORD_CANARY";
     let credential_url = format!("https://fixture-user:{credential}@github.com/{REPOSITORY}.git");
@@ -1817,7 +1814,6 @@ fn new_publish_rejects_absent_unsafe_or_mismatched_raw_origins_before_tool_probe
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_checks_effective_fetch_and_every_push_url_before_contact() {
     for variant in ["fetch-rewrite", "push-rewrite", "multiple-push-urls"] {
         let fixture = Publication::new(None, false);

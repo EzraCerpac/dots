@@ -13,6 +13,8 @@ use crate::{
     targets::{Scope, Targets},
 };
 
+const GITHUB_RELEASE_PREFIX: &str = "https://github.com/";
+
 pub(super) fn complete(
     words: &[Word],
     cursor: Cursor,
@@ -276,6 +278,16 @@ impl<'a> State<'a> {
     }
 
     fn available(&self, arg: &Arg) -> bool {
+        if arg.get_long() == Some("asset") {
+            match self.positionals.as_slice() {
+                [] => {}
+                [request]
+                    if request
+                        .as_bytes()
+                        .starts_with(GITHUB_RELEASE_PREFIX.as_bytes()) => {}
+                _ => return false,
+            }
+        }
         let id = arg.get_id();
         self.seen.iter().all(|seen| {
             if seen.arg.get_id() == id {
@@ -552,7 +564,7 @@ fn command_names(result: &mut Vec<Candidate>, command: &Command, prefix: &str) {
 }
 
 fn add_prefixes(result: &mut Vec<Candidate>, prefix: &str, used: &[&OsStr], asset: bool) {
-    let github = "https://github.com/";
+    let github = GITHUB_RELEASE_PREFIX;
     if (!asset || used.is_empty()) && !used.contains(&OsStr::new(github)) {
         push_match(result, prefix, github, "GitHub release", false);
     }

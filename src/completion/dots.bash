@@ -44,9 +44,14 @@ _dots_complete() {
                                     [[ $ch == "'" ]] && break
                                     next=${line:i+1:1}
                                     if [[ $ch == \\ && $next == c && -n ${line:i+2:1} && ${line:i+2:1} != "'" ]]; then
-                                        printf -v control '%d' "'${line:i+2:1}"
-                                        printf -v escape '\\%03o' "$((control & 31))"
-                                        ansi+=$escape
+                                        if [[ ${line:i+2:1} == '?' ]]; then
+                                            # Bash 3.2 and newer versions decode this differently.
+                                            ansi+=$'\c?'
+                                        else
+                                            printf -v control '%d' "'${line:i+2:1}"
+                                            printf -v escape '\\%03o' "$((control & 31))"
+                                            ansi+=$escape
+                                        fi
                                         ((i+=2))
                                     else
                                         ansi+=$ch

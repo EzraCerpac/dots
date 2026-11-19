@@ -987,16 +987,19 @@ pre-dotfiles = "printf 'generated\\n' > source"
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
-fn rejected_variant_blocks_its_dependent_by_declaration_name() {
+fn rejected_group_blocks_its_dependent_by_group_name() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
-'~/predecessor-alias' = { mode = "copy", source = "predecessor.txt", variants = [{ profile = "default", target = "~/predecessor" }] }
-'~/consumer' = { mode = "copy", source = "consumer.txt", depends = ["~/predecessor-alias"] }
+'~/consumer' = { mode = "copy", source = "consumer.txt", depends = ["prerequisite"] }
 '~/independent' = { mode = "copy", source = "independent.txt" }
+[dotfile_groups.prerequisite]
+root = "tree"
+target = "~/predecessor"
+mode = "copy"
 [bootstrap.hooks]
 pre-dotfiles = '''
 if test -e "$HOME/reject"; then
-    sed 's/source = "predecessor.txt"/source = "other.txt"/' config.toml > new-config
+    sed 's/root = "tree"/root = "other-tree"/' config.toml > new-config
     mv new-config config.toml
 fi
 '''
@@ -1004,35 +1007,34 @@ fi
     );
     let git = Git::new(&ctx, ctx.root.path());
     let root = git.root();
-    for name in ["predecessor", "consumer", "independent", "other"] {
-        fs::write(
-            root.join(format!("{name}.txt")),
-            format!("original {name}\n"),
-        )
-        .unwrap();
+    for directory in ["tree", "other-tree"] {
+        fs::create_dir(root.join(directory)).unwrap();
+    }
+    for name in [
+        "tree/leaf",
+        "consumer.txt",
+        "independent.txt",
+        "other-tree/leaf",
+    ] {
+        fs::write(root.join(name), format!("original {name}\n")).unwrap();
     }
     git.get(["add", "."]).unwrap();
-    fixture_commit(&git, "dependency alias fixture");
+    fixture_commit(&git, "named group dependency fixture");
     let first = shared_mise_sync(&ctx);
     assert!(first.issues.is_empty(), "{:?}", first.issues);
     let home = fixture.path().join("home");
     assert_eq!(
-        fs::read(home.join("predecessor")).unwrap(),
-        b"original predecessor\n"
+        fs::read(home.join("predecessor/leaf")).unwrap(),
+        b"original tree/leaf\n"
     );
     assert_eq!(
         fs::read(home.join("consumer")).unwrap(),
-        b"original consumer\n"
+        b"original consumer.txt\n"
     );
-    assert!(!home.join("predecessor-alias").exists());
 
     fs::write(home.join("reject"), "").unwrap();
-    for name in ["predecessor", "consumer", "independent"] {
-        fs::write(
-            root.join(format!("{name}.txt")),
-            format!("updated {name}\n"),
-        )
-        .unwrap();
+    for name in ["tree/leaf", "consumer.txt", "independent.txt"] {
+        fs::write(root.join(name), format!("updated {name}\n")).unwrap();
     }
     let receipt = shared_mise_sync(&ctx);
     assert!(
@@ -1054,19 +1056,19 @@ fi
     assert!(
         fs::read_to_string(root.join("config.toml"))
             .unwrap()
-            .contains("source = \"other.txt\"")
+            .contains("root = \"other-tree\"")
     );
     assert_eq!(
-        fs::read(home.join("predecessor")).unwrap(),
-        b"original predecessor\n"
+        fs::read(home.join("predecessor/leaf")).unwrap(),
+        b"original tree/leaf\n"
     );
     assert_eq!(
         fs::read(home.join("consumer")).unwrap(),
-        b"original consumer\n"
+        b"original consumer.txt\n"
     );
     assert_eq!(
         fs::read(home.join("independent")).unwrap(),
-        b"updated independent\n"
+        b"updated independent.txt\n"
     );
 }
 

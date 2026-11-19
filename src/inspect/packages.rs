@@ -138,6 +138,14 @@ impl Scope {
             .is_some_and(|names| names.contains(package))
     }
 
+    pub(crate) fn declared_names(&self, manager: &str) -> impl Iterator<Item = &str> {
+        self.declarations
+            .get(manager)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+
     pub fn includes(&self, manager: &str) -> bool {
         self.managers.contains(manager)
     }

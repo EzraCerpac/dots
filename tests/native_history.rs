@@ -1875,6 +1875,85 @@ exec "$FIXTURE_MISE" "$@"
 }
 
 #[test]
+fn new_interrupted_pull_accepts_only_equivalent_rewrites() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let origin = format!("file://{}", remote.display());
+    seed.configure(&origin, &origin, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let mut changed = DEFAULT.to_vec();
+    changed[0] = b'P';
+    for (bytes, mode, legacy, resumes) in [
+        (DEFAULT, 0o600, false, true),
+        (changed.as_slice(), 0o600, false, false),
+        (DEFAULT, 0o640, false, false),
+        (DEFAULT, 0o600, true, false),
+    ] {
+        let fixture = Fixture::new();
+        fixture.configure(&origin, &origin, &key, std::slice::from_ref(&public));
+        fixture.write(DEFAULT, 0o600);
+        let wrapper = fixture.script(
+            "interrupt-pull-before-write",
+            r#"#!/bin/sh
+case " $* " in
+  *" bootstrap dotfiles pull "*) exit 93 ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+        );
+        let interrupted = fixture
+            .dots(&["restore"], &remote)
+            .env("DOTS_MISE_BIN", wrapper)
+            .env("FIXTURE_MISE", &fixture.mise)
+            .output()
+            .unwrap();
+        assert_eq!(
+            interrupted.status.code(),
+            Some(1),
+            "{}",
+            messages(&interrupted)
+        );
+        let marker = fixture.store().join("dots-restore-pending");
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        let file = &mut journal["progress"]["Pulling"]["live"]
+            [fixture.active().canonicalize().unwrap().to_str().unwrap()];
+        let digest = file["sha256"].as_str().expect("saved content digest");
+        assert_eq!(digest.len(), 64);
+        if legacy {
+            file.as_object_mut().unwrap().remove("sha256");
+            fs::write(&marker, serde_json::to_vec(&journal).unwrap()).unwrap();
+        }
+        let head = fixture.tip(&fixture.store(), "HEAD");
+        let old_inode = fs::metadata(fixture.active()).unwrap().ino();
+        let replacement = fixture.world.home().join("replacement");
+        fs::write(&replacement, bytes).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(mode)).unwrap();
+        fs::rename(replacement, fixture.active()).unwrap();
+        assert_ne!(fs::metadata(fixture.active()).unwrap().ino(), old_inode);
+
+        let result = fixture.dots(&["restore"], &remote).output().unwrap();
+        if resumes {
+            assert!(result.status.success(), "{}", messages(&result));
+            assert!(!marker.exists());
+            assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+            assert_restore_undo(&fixture, "rollback", DEFAULT);
+        } else {
+            assert_eq!(result.status.code(), Some(1), "{}", messages(&result));
+            assert!(messages(&result).contains("changed after restore started"));
+            assert!(marker.exists());
+            assert_eq!(fixture.tip(&fixture.store(), "HEAD"), head);
+            assert_eq!(fs::read(fixture.active()).unwrap(), bytes);
+            assert_eq!(fs::metadata(fixture.active()).unwrap().mode() & 0o777, mode);
+        }
+        assert_eq!(seed.tip(&remote, REF), tip);
+    }
+}
+
+#[test]
 fn new_restore_with_each_approved_identity_and_native_undo_recovers_the_live_default() {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");

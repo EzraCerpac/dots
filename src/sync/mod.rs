@@ -702,12 +702,12 @@ fn synchronize(
             } else {
                 "dev up to date"
             };
-            // The verified dev tip includes the local snapshot, either
-            // through the peer's earlier update or through this push.
-            receipt.saved.clear();
             receipt.outcome = if already_shared == 0 {
                 outcome.into()
             } else {
+                // The snapshot was already present in the verified remote tip.
+                // An ordinary push still reports the files saved locally.
+                receipt.saved.clear();
                 let unit = if already_shared == 1 { "file" } else { "files" };
                 format!("already shared {already_shared} {unit} · {outcome}")
             };

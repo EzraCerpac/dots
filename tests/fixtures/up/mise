@@ -45,6 +45,12 @@ case "${1-}" in
         case "$2" in
             jq) command -v jq ;;
             dots) printf 'manager lookup\n' >> calls; exit 1 ;;
+            ruby)
+                [ -f block-ruby-lookup ] || exit 1
+                [ "${MISE_ENV-}" = laptop,host-fixture,extra ] || exit 79
+                printf '%s\n' "$$" > ruby-ready
+                exec /bin/sleep 30
+                ;;
             *) exit 1 ;;
         esac
         ;;
@@ -117,6 +123,10 @@ case "${1-}" in
                 shift 2
                 printf 'packages %s\n' "$*" >> calls
                 printf '%s\t%s\n' "$3" "${MISE_SYSTEM_PACKAGES_MANAGERS-}" >> package-scopes
+                if [ -f block-mas-worker ] && [ "$3" = mas ] && [ "$1" = apply ]; then
+                    printf '%s\n' "$$" > mas-ready
+                    exec /bin/sleep 30
+                fi
                 if [ -f prepare-brew-mas ]; then
                     if [ "$3" = brew ] && [ "${5-}" = brew:mas ] && [ "$1" = apply ]; then
                         mkdir -p fixture-brew-prefix/bin

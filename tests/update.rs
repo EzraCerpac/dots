@@ -198,7 +198,6 @@ fn brew_up(fixture: &Fixture, kind: &str, expected: i32) -> Value {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn unchanged_brew_formula_reports_only_verified_changes() {
     let fixture = Fixture::new();
     fixture.recipe("managed-brew", BREW_RECIPE);
@@ -219,7 +218,6 @@ fn unchanged_brew_formula_reports_only_verified_changes() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn unchanged_brew_cask_reports_verified_install_and_upgrade() {
     let fixture = Fixture::new();
     fixture.recipe("managed-brew", BREW_RECIPE);
@@ -267,7 +265,6 @@ fn unchanged_brew_recipe_without_a_change_sink_can_install() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_tool_snapshot_reports_installed_active_deltas() {
     let fixture = Fixture::new();
     fixture.write(
@@ -300,7 +297,6 @@ fn unchanged_tool_snapshot_reports_installed_active_deltas() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_standalone_mise_snapshot_uses_its_own_version() {
     let fixture = Fixture::new();
     assert_eq!(
@@ -310,7 +306,6 @@ fn unchanged_standalone_mise_snapshot_uses_its_own_version() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_unavailable_standalone_version_has_no_false_change() {
     let fixture = Fixture::new();
     fixture.write("fail-version", "");
@@ -319,7 +314,6 @@ fn unchanged_unavailable_standalone_version_has_no_false_change() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_hook_and_exception_report_the_four_change_meanings() {
     let fixture = Fixture::new();
     fixture.write("fail-version", "");
@@ -350,7 +344,6 @@ printf '%s\tnot installed\t1\n%s\t1\t2\n%s\t3\t\n%s\t4\t4\n' \
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_package_apply_keeps_an_explicit_absent_only_scope() {
     let fixture = Fixture::new();
     fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'pacman:retired' = { state = 'absent' }\n");
@@ -371,7 +364,6 @@ fn unchanged_package_apply_keeps_an_explicit_absent_only_scope() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_mixed_hold_and_pin_preserves_the_manager_state() {
     let fixture = Fixture::new();
     fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'apt:held' = 'latest'\n'apt:pinned' = '2'\n");
@@ -398,7 +390,6 @@ fn unchanged_mixed_hold_and_pin_preserves_the_manager_state() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_pre_checkpoint_failure_stops_before_sync_and_updates() {
     let fixture = Fixture::new();
     fixture.write("fail-checkpoint", "");
@@ -438,7 +429,7 @@ fn seed_sync_fixture(fixture: &Fixture) -> String {
 }
 
 #[test]
-#[ignore = "P-06, P-08"]
+#[ignore = "local-only source mode (#77)"]
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
     let seed = seed_sync_fixture(&fixture);
@@ -519,7 +510,6 @@ fi
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn new_app_store_overlaps_tools_and_joins_before_standalone_mise() {
     let fixture = store_fixture();
     fixture.write("expect-store-overlap", "");
@@ -540,7 +530,6 @@ fn new_app_store_overlaps_tools_and_joins_before_standalone_mise() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn new_app_store_defers_expired_authorization_without_reprompting() {
     let fixture = store_fixture();
     fixture.write("expire-authorization", "");
@@ -563,7 +552,6 @@ fn new_app_store_defers_expired_authorization_without_reprompting() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn unchanged_failed_manager_does_not_block_healthy_packages() {
     let fixture = Fixture::new();
     fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'apt:bad' = 'latest'\n'pacman:good' = 'latest'\n");
@@ -587,7 +575,6 @@ fn unchanged_failed_manager_does_not_block_healthy_packages() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_unresolved_bare_blocks_filtering_but_keeps_unfiltered_managers() {
     let fixture = Fixture::new();
     fixture.write("config.toml", "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'bare' = 'latest'\n'apt:held' = 'latest'\n'pacman:good' = 'latest'\n");
@@ -642,7 +629,6 @@ fn new_unresolved_bare_blocks_filtering_but_keeps_unfiltered_managers() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn unchanged_app_store_tool_preparation_replaces_a_stale_shim_in_scope() {
     let fixture = store_fixture();
     let shim = fixture.bin.join("mas");
@@ -669,7 +655,6 @@ fn unchanged_app_store_tool_preparation_replaces_a_stale_shim_in_scope() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn unchanged_app_store_with_missing_tool_and_x64_mise_defers() {
     let fixture = store_fixture();
     fs::remove_file(fixture.bin.join("mas")).unwrap();
@@ -682,7 +667,6 @@ fn unchanged_app_store_with_missing_tool_and_x64_mise_defers() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_manager_discovery_reuses_the_supervised_configuration_listing() {
     let fixture = Fixture::new();
     fixture.write(
@@ -697,7 +681,6 @@ fn new_manager_discovery_reuses_the_supervised_configuration_listing() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_cancel_reaps_the_configuration_probe_and_its_child() {
     let fixture = Fixture::new();
     fixture.write("block-config-lookup", "");
@@ -710,7 +693,6 @@ fn new_cancel_reaps_the_configuration_probe_and_its_child() {
 
 #[test]
 #[cfg(target_os = "macos")]
-#[ignore = "P-06"]
 fn new_held_app_store_work_skips_authorization_and_tool_preparation() {
     for tool_missing in [false, true] {
         let fixture = store_fixture();
@@ -740,7 +722,6 @@ fn declared_fixture_package(name: &str) -> Value {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_filtered_bare_cask_fails_before_discarding_its_options() {
     let fixture = Fixture::new();
     fixture.write(
@@ -793,7 +774,6 @@ fn new_filtered_bare_cask_fails_before_discarding_its_options() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_qualified_cask_pass_cannot_reinstall_an_excluded_bare_dependency() {
     for held in [false, true] {
         let fixture = Fixture::new();
@@ -857,7 +837,6 @@ fn new_qualified_cask_pass_cannot_reinstall_an_excluded_bare_dependency() {
 }
 
 #[test]
-#[ignore = "P-06"]
 fn new_failed_grouped_status_skips_unconfirmed_bare_only_managers() {
     let fixture = Fixture::new();
     fixture.write(
@@ -969,4 +948,156 @@ fn cancel_blocked_update(fixture: &Fixture, args: &[&str], marker: &str, detache
     assert_eq!(fixture.calls().matches("checkpoint inventory").count(), 1);
     assert!(!fixture.calls().contains("self-update"));
     report
+}
+
+fn update_sync_evidence(fixture: &Fixture, expected_receipts: usize) -> Value {
+    let output = fixture.command().args(["--plain", "up"]).output().unwrap();
+    assert_exit(&output, 0);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("dots sync: "))
+            .count(),
+        expected_receipts,
+        "{text}"
+    );
+    fixture.read_report()
+}
+
+fn saved_sync_receipt(fixture: &Fixture) -> Option<Value> {
+    let path = fixture.world.home().join(".local/state/dots/receipts");
+    if !path.exists() {
+        return None;
+    }
+    let mut files = fs::read_dir(path).unwrap();
+    let first = files.next()?.unwrap();
+    assert!(files.next().is_none());
+    Some(
+        serde_json::from_slice::<Value>(&fs::read(first.path()).unwrap()).unwrap()["receipt"]
+            .clone(),
+    )
+}
+
+#[test]
+#[ignore = "local-only source mode (#77)"]
+fn new_up_embedded_sync_local_only_does_not_emit_or_save_receipt() {
+    let fixture = Fixture::new();
+    seed_sync_fixture(&fixture);
+    let report = update_sync_evidence(&fixture, 0);
+    assert_eq!(report["stages"][1]["outcome"], "skipped");
+    assert_eq!(report["stages"][1]["issues"], serde_json::json!([]));
+    assert!(saved_sync_receipt(&fixture).is_none());
+    assert_eq!(fixture.calls().matches("checkpoint inventory").count(), 2);
+}
+
+#[test]
+#[ignore = "P-08"]
+fn new_up_embedded_sync_records_load_problem_once_and_continues() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\ndots_source_repo = 'example/unconfigured'\n",
+    );
+    seed_sync_fixture(&fixture);
+    let report = update_sync_evidence(&fixture, 1);
+    let receipt = saved_sync_receipt(&fixture).unwrap();
+    let stage = &report["stages"][1];
+    assert_eq!(stage["outcome"], receipt["stage_outcome"]);
+    assert_eq!(stage["outcome"], "deferred");
+    let issues = stage["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["diagnostic"], receipt["issues"][0]["diagnostic"]);
+    assert_eq!(issues[0]["next"], receipt["issues"][0]["next_action"]);
+    assert_eq!(stage["changes"], serde_json::json!([]));
+    assert!(fixture.calls().contains("install tools"));
+}
+
+#[test]
+#[ignore = "P-08"]
+fn new_up_embedded_sync_records_the_actual_adopted_revision_once() {
+    let fixture = Fixture::new();
+    let before = seed_sync_fixture(&fixture);
+    let remote = format!("file://{}", fixture.world.bare_remote("origin").display());
+    sync_fixture_git(&fixture, &["remote", "add", "origin", &remote]);
+    sync_fixture_git(&fixture, &["push", "--quiet", "origin", "HEAD:dev"]);
+    sync_fixture_git(&fixture, &["switch", "--quiet", "-c", "publisher"]);
+    fixture.write("incoming.txt", "fixture from origin\n");
+    sync_fixture_git(&fixture, &["add", "incoming.txt"]);
+    sync_fixture_git(&fixture, &["commit", "--quiet", "-m", "Incoming fixture"]);
+    let after = sync_fixture_git(&fixture, &["rev-parse", "HEAD"]);
+    sync_fixture_git(&fixture, &["push", "--quiet", "origin", "HEAD:dev"]);
+    sync_fixture_git(&fixture, &["switch", "--quiet", "dev"]);
+    fixture.executable(
+        &fixture.bin.join("gitleaks"),
+        r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--report-path" ]; then
+        shift
+        case "$1" in "${HOME%/*}"/*) printf '[]' > "$1" ;; *) exit 75 ;; esac
+        exit 0
+    fi
+    shift
+done
+exit 76
+"#,
+    );
+
+    let report = update_sync_evidence(&fixture, 1);
+    let receipt = saved_sync_receipt(&fixture).unwrap();
+    assert_eq!(receipt["stage_outcome"], "completed", "{receipt}");
+    let stage = &report["stages"][1];
+    assert_eq!(stage["outcome"], receipt["stage_outcome"]);
+    assert_eq!(stage["issues"], serde_json::json!([]));
+    assert_eq!(
+        receipt["adopted_revision"],
+        serde_json::json!([&before, &after])
+    );
+    assert_eq!(
+        stage["changes"],
+        serde_json::json!([
+            {"item":"configuration revision", "before":before, "after":after}
+        ])
+    );
+    assert_eq!(sync_fixture_git(&fixture, &["rev-parse", "HEAD"]), after);
+    assert_eq!(
+        fs::read_to_string(fixture.world.root().join("incoming.txt")).unwrap(),
+        "fixture from origin\n"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn new_cancel_stops_a_blocking_ruby_lookup_before_updates() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "config.toml",
+        "[vars]\ndots_profiles = 'laptop'\n[tools]\n'github:EzraCerpac/dots' = 'latest'\n",
+    );
+    fixture.write("miserc.toml", "env = ['laptop', 'host-fixture', 'extra']\n");
+    seed_sync_fixture(&fixture);
+    fixture.write("block-ruby-lookup", "");
+    let report = cancel_blocked_update(&fixture, &["--plain", "up"], "ruby-ready", false);
+    let last = report["stages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["label"], "Inspect declared packages");
+    assert_eq!(last["outcome"], "cancelled");
+    assert!(!fixture.calls().contains("install tools"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn new_cancel_reaps_the_detached_app_store_worker_before_later_stages() {
+    let fixture = store_fixture();
+    seed_sync_fixture(&fixture);
+    fixture.write("block-mas-worker", "");
+    let report = cancel_blocked_update(&fixture, &["--plain", "up", "--mas"], "mas-ready", true);
+    let store = report["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["label"] == "Mac App Store updates")
+        .unwrap();
+    assert_eq!(store["alongside"], true);
+    assert_eq!(store["outcome"], "cancelled");
+    assert!(!fixture.world.root().join("authorization-prompt").exists());
 }

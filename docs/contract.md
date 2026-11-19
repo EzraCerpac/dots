@@ -7,7 +7,7 @@ Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish or
 Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
 Amended 2026-11-18: sync diagnostics and hook-generated inputs, backup publication verification and history format checks, diverged publish approval, and update report replay.
 Amended 2026-11-19: restore checkpoint encryption and validated sync pre-hook context.
-Amended 2026-11-19: source sync write and publication guarantees, native history handoff, and outgoing history audit coverage.
+Amended 2026-11-19: source sync writes and publication, native history recovery, trusted recipient fragments, outgoing history audits, and resuming a suspended terminal session.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -363,6 +363,7 @@ Configuration commands, `dots test` and `dots mise` exit with their child's stat
 `dots up` and `dots bootstrap` exit 0 when every stage completed, was skipped or was deferred, and 1 when any stage failed.
 `dots sync` with valid arguments exits 0 every time, including a missing configuration, a missing mise or gitleaks, and a stopped run; its receipt carries the problem.
 `dots sync` with invalid arguments exits 2.
+If Ctrl-Z suspends `dots` in a session without a job-control shell, send `SIGCONT` to the `dots` process from another session to resume it.
 Ctrl-C cancels the entire process group of every active stage, such as an App Store stage running alongside others with `--mas`.
 Once a cancellation begins, no stage starts, whatever its place in the order.
 Ctrl-C still cancels while descendants a stage owns drain its output after its leading process has exited.
@@ -1237,6 +1238,8 @@ Backup uses one native sync and performs no publication retry or force push.
 - It requires an existing recovery identity and never generates one.
 - Restore uses only fetch-side remote traffic. It never runs `dots backup`, pushes or publishes during restore.
 - **New in 1.0:** before any native restore operation that can capture a checkpoint, including fetch, `dots` requires a nonempty recipient list from history configuration that native mise trusts at system or global scope, and `history.allow_plaintext_history = false`.
+  A recipient supplied only by a trusted system or global `conf.d` fragment satisfies the recipient check.
+  Project-only recipients are excluded from this check.
   If either condition fails, restore exits 2 before capture or target installation.
   The diagnostic names the failed condition and tells the user to configure history recipients or disable plaintext history, as applicable, without showing key material.
 - As in 0.4.0, native mise applies the fetched history to the actual targets and may save local undo checkpoints of their live contents before overwriting them.

@@ -39,7 +39,7 @@ Beyond the local quickstart, the programs you need depend on what you run.
 
 | Program | Needed for |
 | --- | --- |
-| Git | `init`, `backup`, `restore`, `bootstrap` and `publish`. Sync and the sync step of `up` need Git 2.43 or newer. |
+| Git | `init`, `add FILE`, `backup`, `restore`, `bootstrap` and `publish`. Sync and the sync step of `up` need Git 2.43 or newer. |
 | [gitleaks](https://github.com/gitleaks/gitleaks) | Sharing changes, `dots publish`, and showing patches in `dots sync --last` |
 | [age](https://age-encryption.org), age-keygen | Encrypted bootstrap bundles and encrypted settings history |
 | `gh` | The optional remote offer in `dots init`; `dots publish` |
@@ -56,7 +56,59 @@ dots init
 dots up
 ```
 
-> **TODO (I-01):** Run these two commands with the 1.0 binary in a pristine fixture (empty `HOME`, mise and Git only, no configuration) and paste their actual output here.
+<details>
+<summary>Output of a first run on a fresh machine</summary>
+
+From the hosted first-run check of `rust` at `4f39a55`: `dots` 1.0.0-rc.1 on Alpine with mise 2026.11.9 and Git, no terminal, with an empty home directory under `/tmp`.
+
+```text
+created configuration directory /tmp/dots-first-run.XXDblMdB/home/.config/mise
+created config.toml
+created dots/
+created dots/hooks/
+created dots/hooks/update.d/
+created dots/hooks/bootstrap.d/
+created dots/commands/
+created dots/exceptions/
+created dots/README.md
+created dots/exceptions.tsv
+created dots/retired-dotfiles
+created dots/retired-declarations
+created .gitleaks.toml
+created .gitignore
+created profile default
+created machine ID 9413e1032403
+created Git repository
+created seed commit bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3 on main and dev
+
+No remote yet. To share this configuration, create an empty repository and run
+git -C '/tmp/dots-first-run.XXDblMdB/home/.config/mise' remote add origin URL
+git -C '/tmp/dots-first-run.XXDblMdB/home/.config/mise' push --no-follow-tags --recurse-submodules=no origin 'bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3^{commit}:refs/heads/main' 'bef27f09a2e3e81d7af8a8fe8b5a9bedccef54c3^{commit}:refs/heads/dev'
+These publish only the seed. Later changes are shared with dots sync, which scans them first.
+==> Pre-update settings checkpoint
+Pre-update settings checkpoint: skipped
+Sync configuration (no remote configured): skipped
+==> Reload configuration
+Reload configuration: completed
+==> Inspect declared packages
+Inspect declared packages: completed
+==> Install declared mise tools
+Install declared mise tools: completed
+==> Upgrade declared mise tools
+Upgrade declared mise tools: completed
+==> Standalone mise
+Standalone mise: completed
+==> dots manager
+dots manager: skipped
+==> Post-update settings checkpoint
+Post-update settings checkpoint: skipped
+dots up: Complete (exit 0)
+Details and logs · dots up --last
+```
+
+</details>
+
+> **TODO (I-01):** Replace this output with the released 1.0 binary's once it exists.
 
 `dots init` sets up the configuration:
 
@@ -64,7 +116,7 @@ dots up
 - It creates missing files and adds `dots_profiles = "default"` under `[vars]` if the existing `config.toml` lacks that setting. It preserves the rest of the file.
 - It keeps a valid saved profile and machine ID. For a fresh setup, it selects `default` if listed (otherwise the first listed profile) and derives the machine ID from the hostname. Both selections stay on this machine.
 - In a new repository it makes one seed commit on branches `main` and `dev`, with `dev` checked out. An existing repository keeps its branches and history; `init` reports anything sync would stop on, with its fix.
-- In the run that creates the seed, a terminal with `gh` signed in gets an offer to create a private GitHub repository. The default is no. For a pristine seed, the printed push uses the verified commit ID. For any other repository without an `origin`, follow the printed remote-add and `dots sync` instructions so outgoing commits are scanned.
+- In the run that creates the seed, while the seed is untouched, a terminal with `gh` signed in gets an offer to create a private GitHub repository. The default is no. For a pristine seed, the printed push uses the verified commit ID. For any other repository without an `origin`, follow the printed remote-add and `dots sync` instructions so outgoing commits are scanned.
 
 `dots up` checks for tracked settings to checkpoint, then syncs and updates eligible software.
 In local-only mode (no `origin` and no `dots_source_repo`), it skips sync. Updating tools or standalone mise can still use the network.
@@ -77,7 +129,7 @@ dots plan                                    # mise's bootstrap plan; installs n
 dots up                                      # checkpoint, sync and update eligible software
 dots apply                                   # apply declared dotfiles and templates locally
 dots up --last                               # print the saved report and return its exit status
-dots reports                                  # list recent completed reports, newest first
+dots reports                                 # list recent completed reports, newest first
 dots sync                                    # share your edits and take the other machines'
 dots sync --last                             # replay the last sync receipt
 
@@ -95,12 +147,16 @@ Adopting an existing regular file under your home directory moves it into the co
 Run `dots` or `dots help` to list the built-in commands and your configuration's own commands.
 `dots root` prints the configuration directory and `dots profile` prints the selected profile.
 
-In an interactive update, the current step and its result stay in ordinary terminal scrollback.
+`dots up` writes ordinary terminal scrollback: a `==>` line when each step starts, one line with its result, and a final line such as `dots up: Complete (exit 0)`.
 Answer a hook’s or installer’s prompt directly in the terminal.
-At the end, “Needs attention” lists issues and what to do next.
+When something went wrong, “Needs attention” lists each issue with a `Next:` action, and the run still exits 0 unless a step failed.
 For a failed step that owned the terminal, its output is in your scrollback. With `--plain` or without a terminal, hook and recipe failures include a private log path.
+`dots up --last` replays only that final report, not the live step output.
 
 ## Sharing between machines
+
+> **TODO (P-08):** The current `rust` build does not share yet: `dots sync` exits 1 and the sync step of `dots up` is deferred, both naming P-08.
+> Check this section against the merged P-08 build and add a real receipt.
 
 When sharing is configured, `dots sync` and the sync stage of `dots up` use two branches: `dev`, which every machine runs, and `main`, which you change through pull requests.
 
@@ -116,7 +172,8 @@ See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order o
 ## Optional, later
 
 - `dots publish [--all | --bookmark NAME]` opens a pull request to `main` from a separate colocated JJ workspace of a configuration hosted on GitHub. Updating an existing pull request keeps its base.
-- `dots backup` publishes this machine's encrypted app settings to a separate private repository; `dots restore` fetches them back after safety checks.
+- `dots backup` saves a local checkpoint of this machine's encrypted app settings, then publishes it to a separate private repository. It reports publication only after reading the checkpoint back from that repository; otherwise it says the checkpoint stayed local.
+- `dots restore` fetches those settings back after safety checks and never pushes. It may save encrypted undo checkpoints of the files it replaces locally; the next `dots backup` publishes them.
 - [`dots bootstrap`](docs/contract.md#dots-bootstrap) sets up the local machine. `dots remote HOST --profile P` sets up a machine over SSH and leaves its mise history settings alone.
   With history enabled, the target stores unencrypted tracked files in plaintext in its local history. Set `encrypt = true` on those files or disable history on the target to avoid that.
   Before publishing, `dots backup` checks the outgoing checkpoints for plaintext and respects mise's `allow_plaintext_history` opt-in.

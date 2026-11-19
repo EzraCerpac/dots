@@ -409,6 +409,38 @@ fn validated_crlf_config_deploys_the_copy() {
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn ordinary_crlf_sources_deploy_as_checked_out() {
+    let (fixture, ctx) = shared_mise_fixture(
+        "[dotfiles]\n'~/copied' = { mode = 'copy', source = 'source' }\n'~/linked' = { mode = 'symlink', source = 'source' }\n",
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    let source = git.root().join("source");
+    let lf = b"first\nsecond\n";
+    let crlf = b"first\r\nsecond\r\n";
+    fs::write(git.root().join(".gitattributes"), "source text eol=crlf\n").unwrap();
+    fs::write(&source, lf).unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "filtered dotfile source fixture");
+    assert_eq!(git.get(["show", "HEAD:source"]).unwrap(), lf);
+
+    fs::remove_file(&source).unwrap();
+    git.get(["checkout-index", "--", "source"]).unwrap();
+    assert_eq!(fs::read(&source).unwrap(), crlf);
+    assert!(git.get(["status", "--porcelain"]).unwrap().is_empty());
+
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    let home = fixture.path().join("home");
+    assert_eq!(fs::read(&source).unwrap(), crlf);
+    assert_eq!(fs::read(home.join("copied")).unwrap(), crlf);
+    let link = home.join("linked");
+    assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(link.canonicalize().unwrap(), source);
+    assert_eq!(fs::read(link).unwrap(), crlf);
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn rendered_variant_preserves_declaring_rules() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]

@@ -204,6 +204,7 @@ pub(super) fn validate(
         scratch.live.root(),
         selection.active_environments(),
     )?;
+    materialize_sources(scratch, revision, tree, &root, &apply)?;
     probe(run, &root, MiseProbe::DotfilePreview, true)?;
     let private = Dir::open(&root)?;
     let mut configs = BTreeMap::new();
@@ -254,9 +255,7 @@ fn materialize(
         if local(path) {
             return Err(invalid("configuration tracks a machine-local file"));
         }
-        let image = if is_mise_config(path)
-            || (path.starts_with("conf.d") && path.extension().is_some_and(|ext| ext == "toml"))
-        {
+        let image = if checkout_config(path) {
             Image::checkout(&scratch.git, revision, path, Some(entry))?
         } else {
             Image::from_git(&scratch.git, Some(entry))?
@@ -274,6 +273,39 @@ fn materialize(
         }
     }
     Ok(documents)
+}
+
+fn checkout_config(path: &Path) -> bool {
+    is_mise_config(path)
+        || (path.starts_with("conf.d") && path.extension().is_some_and(|ext| ext == "toml"))
+}
+
+fn materialize_sources(
+    scratch: &Scratch<'_>,
+    revision: &str,
+    tree: &Tree,
+    root: &Path,
+    apply: &ApplyPlan,
+) -> io::Result<()> {
+    let sources: BTreeSet<_> = apply
+        .sources()
+        .filter_map(|source| source.strip_prefix(scratch.live.root()).ok())
+        .collect();
+    // Apply checkout filters to the selected source files and directory
+    // leaves. Other incoming files are still prepared during checkout.
+    for (path, entry) in tree {
+        if checkout_config(path)
+            || !matches!(entry.mode.as_str(), "100644" | "100755")
+            || !sources.iter().any(|source| path.starts_with(source))
+        {
+            continue;
+        }
+        let image = Image::checkout(&scratch.git, revision, path, Some(entry))?;
+        let destination = root.join(path);
+        fs::remove_file(&destination)?;
+        write_private(&destination, &image)?;
+    }
+    Ok(())
 }
 
 pub(super) fn overlay_environments(run: &Run<'_>, root: &Path) -> io::Result<String> {

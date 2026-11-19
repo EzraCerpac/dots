@@ -89,6 +89,13 @@ impl ApplyPlan {
             observed,
         })
     }
+
+    pub fn sources(&self) -> impl Iterator<Item = &Path> {
+        self.targets
+            .iter()
+            .filter(|target| !matches!(target.mode.as_str(), "track" | "track-local"))
+            .filter_map(Target::effective_source)
+    }
 }
 
 fn remap_path(path: &mut PathBuf, overlay: &Path, live: &Path) {
@@ -544,9 +551,7 @@ impl Copies {
         let filesystem = Dir::open(Path::new("/"))?;
         let sealed_sources = validated
             .apply
-            .targets
-            .iter()
-            .filter_map(Target::effective_source)
+            .sources()
             .filter_map(|source| {
                 let relative = source.strip_prefix(git.root()).ok()?;
                 Some((source.to_owned(), relative))

@@ -828,7 +828,6 @@ fn zipped(name: &str, contents: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_finds_a_redacted_secret_one_archive_level_deep() {
     for terminal in [false, true] {
         assert_archive_finding_before_preview(terminal);
@@ -884,7 +883,6 @@ fn assert_archive_finding_before_preview(terminal: bool) {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_allows_a_clean_one_level_archive_to_reach_confirmation() {
     let fixture = Publication::new(None, false);
     fs::write(
@@ -899,7 +897,6 @@ fn new_publish_allows_a_clean_one_level_archive_to_reach_confirmation() {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_allows_native_success_without_a_skip_signal() {
     let fixture = Publication::new(None, false);
     fs::write(fixture.workspace.join("opaque.bin"), [0, 129, 254, 7]).unwrap();
@@ -914,7 +911,6 @@ fn new_publish_allows_native_success_without_a_skip_signal() {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmation() {
     for terminal in [false, true] {
         assert_archive_skip_before_preview(terminal);

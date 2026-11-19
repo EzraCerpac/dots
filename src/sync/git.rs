@@ -166,12 +166,18 @@ impl<'a> Git<'a> {
     }
 
     pub fn commit(&self, tree: &str, parents: &[&str], message: &str) -> io::Result<String> {
+        let git = || {
+            let mut cmd = self.command(["-c", "commit.gpgSign=false"])?;
+            cmd.env("LC_ALL", "C");
+            Ok::<_, io::Error>(cmd)
+        };
         let command = || {
-            let mut cmd = self.command(["-c", "commit.gpgSign=false", "commit-tree", tree])?;
+            let mut cmd = git()?;
+            cmd.args(["commit-tree", tree]);
             for parent in parents {
                 cmd.args(["-p", parent]);
             }
-            cmd.args(["-m", message]).env("LC_ALL", "C");
+            cmd.args(["-m", message]);
             Ok::<_, io::Error>(cmd)
         };
         let mut output = self.output_command(command()?)?;
@@ -184,9 +190,9 @@ impl<'a> Git<'a> {
                 == Some(1)
         {
             let mut cmd = command()?;
-            crate::process::fill_commit_identity(&mut cmd, |args| {
-                let mut probe = self.command(args)?;
-                probe.env("LC_ALL", "C");
+            crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {
+                let mut probe = git()?;
+                probe.args(["var", ident]).envs(defaults.iter().copied());
                 self.output_command(probe)
             })?;
             output = self.output_command(cmd)?;

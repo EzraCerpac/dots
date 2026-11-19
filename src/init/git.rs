@@ -160,12 +160,15 @@ impl Git<'_> {
             "write the seed tree",
         )?)?;
 
-        let mut cmd = self.command(self.root)?;
-        cmd.args(["-c", "user.useConfigOnly=true"]);
-        crate::process::fill_commit_identity(&mut cmd, |args| {
-            let mut probe = vec!["-c", "user.useConfigOnly=true"];
-            probe.extend_from_slice(args);
-            self.output(&probe)
+        let seed_command = || {
+            let mut git = self.command(self.root)?;
+            git.args(["-c", "user.useConfigOnly=true"]);
+            Ok::<_, Fail>(git)
+        };
+        let mut cmd = seed_command()?;
+        crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {
+            let mut probe = seed_command()?;
+            output(probe.args(["var", ident]).envs(defaults.iter().copied()))
         })?;
         let oid = line(input(
             cmd.args(["commit-tree", "--no-gpg-sign", &tree, "-F", "-"]),

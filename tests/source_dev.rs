@@ -2438,6 +2438,13 @@ fn new_sync_supplies_missing_commit_identity_without_writing_config() {
         &shim,
         &format!(
             r#"
+identity() {{
+    if {{ [ -z "$2" ] && [ "${{FIXTURE_CONFIGURED_NAME:-}}" != 1 ]; }} ||
+       {{ [ -z "$3" ] && [ -z "${{EMAIL:-}}" ] && [ "${{FIXTURE_CONFIGURED_EMAIL:-}}" != 1 ]; }}; then
+        printf '%s identity unknown\nfatal: fixture cannot infer identity\n' "$1" >&2
+        exit 128
+    fi
+}}
 case " $* " in
   *" write-tree "*)
     if [ "${{FIXTURE_SNAPSHOT_ERROR:-}}" = 1 ]; then
@@ -2445,31 +2452,39 @@ case " $* " in
         */snapshot.index) printf 'fixture index error\nsecond diagnostic line\n' >&2; exit 1 ;;
       esac
     fi ;;
-  *" var GIT_AUTHOR_IDENT "*|*" var GIT_COMMITTER_IDENT "*|*" commit-tree "*)
-    if [ -z "${{GIT_AUTHOR_EMAIL:-}}" ] || [ -z "${{GIT_COMMITTER_EMAIL:-}}" ]; then
-        printf 'Author identity unknown\nfatal: unable to auto-detect email address\n' >&2
-        exit 128
-    fi ;;
+  *" var GIT_AUTHOR_IDENT "*)
+    case " $* " in *" -c commit.gpgSign=false "*) ;; *) exit 98 ;; esac
+    identity Author "${{GIT_AUTHOR_NAME:-}}" "${{GIT_AUTHOR_EMAIL:-}}" ;;
+  *" var GIT_COMMITTER_IDENT "*)
+    case " $* " in *" -c commit.gpgSign=false "*) ;; *) exit 98 ;; esac
+    identity Committer "${{GIT_COMMITTER_NAME:-}}" "${{GIT_COMMITTER_EMAIL:-}}" ;;
+  *" commit-tree "*)
+    identity Author "${{GIT_AUTHOR_NAME:-}}" "${{GIT_AUTHOR_EMAIL:-}}"
+    identity Committer "${{GIT_COMMITTER_NAME:-}}" "${{GIT_COMMITTER_EMAIL:-}}" ;;
 esac
 exec {} "$@"
 "#,
             sh(&real)
         ),
     );
-    let sync = |fail| {
-        dots_zero(
-            f.dots(&f.a, &["--plain", "sync"])
-                .env("FIXTURE_SNAPSHOT_ERROR", fail)
-                .env_remove("EMAIL")
-                .env_remove("GIT_AUTHOR_NAME")
-                .env_remove("GIT_AUTHOR_EMAIL")
-                .env_remove("GIT_COMMITTER_NAME")
-                .env_remove("GIT_COMMITTER_EMAIL"),
-        )
+    let sync = |fail, configured_name, configured_email, email: Option<&str>| {
+        let mut sync = f.dots(&f.a, &["--plain", "sync"]);
+        sync.env("FIXTURE_SNAPSHOT_ERROR", fail)
+            .env("FIXTURE_CONFIGURED_NAME", configured_name)
+            .env("FIXTURE_CONFIGURED_EMAIL", configured_email)
+            .env_remove("EMAIL")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
+        if let Some(email) = email {
+            sync.env("EMAIL", email);
+        }
+        dots_zero(&mut sync)
     };
     let before = f.remote();
     f.write(&f.a, "text", "new public bytes\n");
-    let failed = sync("1");
+    let failed = sync("1", "0", "0", None);
     has(
         &failed,
         "Could not snapshot local edits: fixture index error",
@@ -2478,13 +2493,49 @@ exec {} "$@"
     assert_eq!(f.remote(), before);
     assert_eq!(f.tip(&f.a), before);
 
-    for name in ["dots", "Fixture Configured Name"] {
-        if name != "dots" {
-            f.git(&f.a, &["config", "user.name", name]);
-            f.write(&f.a, "text", "a second edit\n");
+    for (content, setting, email, expected) in [
+        ("no identity", None, None, "dots <dots@localhost>"),
+        (
+            "name only",
+            Some(("user.name", "Fixture Name")),
+            None,
+            "Fixture Name <dots@localhost>",
+        ),
+        (
+            "configured email",
+            Some(("user.email", "config@example.invalid")),
+            None,
+            "dots <config@example.invalid>",
+        ),
+        (
+            "EMAIL only",
+            None,
+            Some("env@example.invalid"),
+            "dots <env@example.invalid>",
+        ),
+    ] {
+        if let Some((key, value)) = setting {
+            f.git(&f.a, &["config", key, value]);
         }
+        f.write(&f.a, "text", format!("{content}\n"));
         let config = fs::read(f.a.join(".git/config")).unwrap();
-        has(&sync("0"), "pushed dev");
+        has(
+            &sync(
+                "0",
+                if setting.is_some_and(|(key, _)| key == "user.name") {
+                    "1"
+                } else {
+                    "0"
+                },
+                if setting.is_some_and(|(key, _)| key == "user.email") {
+                    "1"
+                } else {
+                    "0"
+                },
+                email,
+            ),
+            "pushed dev",
+        );
         assert_eq!(fs::read(f.a.join(".git/config")).unwrap(), config);
         assert!(!global.exists());
         assert_eq!(
@@ -2492,9 +2543,13 @@ exec {} "$@"
                 &f.origin,
                 &["log", "-1", "--format=%an <%ae>%n%cn <%ce>", "dev"]
             ),
-            format!("{name} <dots@localhost>\n{name} <dots@localhost>")
+            format!("{expected}\n{expected}"),
+            "{content}"
         );
-        assert_eq!(f.blob("dev", "text"), read(&f.a.join("text")).trim());
+        assert_eq!(f.blob("dev", "text"), content);
+        if let Some((key, _)) = setting {
+            f.git(&f.a, &["config", "--unset", key]);
+        }
     }
 }
 

@@ -258,6 +258,74 @@ fn write_executable(path: &Path, script: &str) {
 }
 
 #[test]
+fn new_init_uses_git_identity_under_the_seed_commit_policy() {
+    let mut failures = Vec::new();
+    for (case, config, email, expected) in [
+        (
+            "EMAIL only",
+            "",
+            Some("env@example.invalid"),
+            "dots <dots@localhost>",
+        ),
+        (
+            "configured name",
+            "[user]\nname = Fixture Name\n",
+            None,
+            "Fixture Name <dots@localhost>",
+        ),
+        (
+            "configured email",
+            "[user]\nemail = config@example.invalid\n",
+            None,
+            "dots <config@example.invalid>",
+        ),
+        ("neither", "", None, "dots <dots@localhost>"),
+        (
+            "config only",
+            "[user]\nuseConfigOnly = true\n",
+            None,
+            "dots <dots@localhost>",
+        ),
+    ] {
+        let world = World::new();
+        let root = fresh(&world);
+        let global = world.home().join(".gitconfig");
+        fs::write(&global, config).unwrap();
+        let mut command = fixture_dots(&world);
+        command.arg("init").arg(&root);
+        if let Some(email) = email {
+            command.env("EMAIL", email);
+        }
+        let output = command.output().unwrap();
+        if !output.status.success() {
+            failures.push((
+                case,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+            continue;
+        }
+        assert_eq!(
+            git(
+                &world,
+                &root,
+                &["show", "-s", "--format=%an <%ae>%n%cn <%ce>"]
+            ),
+            format!("{expected}\n{expected}"),
+            "{case}"
+        );
+        assert_eq!(fs::read_to_string(global).unwrap(), config, "{case}");
+        let local_config = fs::read_to_string(root.join(".git/config")).unwrap();
+        assert!(!local_config.contains("[user]"), "{case}");
+        assert!(
+            git(&world, &root, &["status", "--porcelain"]).is_empty(),
+            "{case}"
+        );
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
 fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     let world = World::new();
     let root = fresh(&world);

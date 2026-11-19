@@ -449,6 +449,21 @@ pub struct Adoption {
     original: Option<Entry>,
 }
 
+fn is_credential_path(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "~/.netrc"
+            | "~/.git-credentials"
+            | "~/.aws/credentials"
+            | "~/.config/gh/hosts.yml"
+            | "~/.docker/config.json"
+            | "~/.pgpass"
+    ) || key
+        .strip_prefix("~/.ssh/id_")
+        .is_some_and(|name| !name.contains('/') && !name.ends_with(".pub"))
+}
+
 pub fn prepare_add(
     ctx: &Ctx,
     run: &Run<'_>,
@@ -459,6 +474,12 @@ pub fn prepare_add(
         return Err(Fail::usage(format!(
             "Cannot adopt {:?} because template openers make the dotfile declaration unreadable.",
             paths.key
+        )));
+    }
+    if is_credential_path(&paths.key) {
+        return Err(Fail::usage(format!(
+            "{} holds credentials and was not added because dotfiles are shared through Git.",
+            paths.target.display()
         )));
     }
     let original = preflight_add(ctx, run, &paths, config)?;

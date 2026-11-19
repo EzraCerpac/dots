@@ -160,35 +160,16 @@ impl Git<'_> {
             "write the seed tree",
         )?)?;
 
-        let mut cmd = self.command(self.root)?;
-        cmd.args(["-c", "user.useConfigOnly=true"]);
-        for (kind, key, email_env, name_env) in [
-            ("AUTHOR", "author", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME"),
-            (
-                "COMMITTER",
-                "committer",
-                "GIT_COMMITTER_EMAIL",
-                "GIT_COMMITTER_NAME",
-            ),
-        ] {
-            if !self
-                .output(&[
-                    "-c",
-                    "user.useConfigOnly=true",
-                    "var",
-                    &format!("GIT_{kind}_IDENT"),
-                ])?
-                .status
-                .success()
-            {
-                cmd.env_remove(name_env).env_remove(email_env).args([
-                    "-c",
-                    &format!("{key}.name=dots"),
-                    "-c",
-                    &format!("{key}.email=dots@localhost"),
-                ]);
-            }
-        }
+        let seed_command = || {
+            let mut git = self.command(self.root)?;
+            git.args(["-c", "user.useConfigOnly=true"]);
+            Ok::<_, Fail>(git)
+        };
+        let mut cmd = seed_command()?;
+        crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {
+            let mut probe = seed_command()?;
+            output(probe.args(["var", ident]).envs(defaults.iter().copied()))
+        })?;
         let oid = line(input(
             cmd.args(["commit-tree", "--no-gpg-sign", &tree, "-F", "-"]),
             SEED_MESSAGE,

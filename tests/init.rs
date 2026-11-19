@@ -258,13 +258,88 @@ fn write_executable(path: &Path, script: &str) {
 }
 
 #[test]
+fn new_init_uses_git_identity_under_the_seed_commit_policy() {
+    let mut failures = Vec::new();
+    for (case, config, email, expected) in [
+        (
+            "EMAIL only",
+            "",
+            Some("env@example.invalid"),
+            "dots <dots@localhost>",
+        ),
+        (
+            "configured name",
+            "[user]\nname = Fixture Name\n",
+            None,
+            "Fixture Name <dots@localhost>",
+        ),
+        (
+            "configured email",
+            "[user]\nemail = config@example.invalid\n",
+            None,
+            "dots <config@example.invalid>",
+        ),
+        ("neither", "", None, "dots <dots@localhost>"),
+        (
+            "config only",
+            "[user]\nuseConfigOnly = true\n",
+            None,
+            "dots <dots@localhost>",
+        ),
+    ] {
+        let world = World::new();
+        let root = fresh(&world);
+        let global = world.home().join(".gitconfig");
+        fs::write(&global, config).unwrap();
+        let mut command = fixture_dots(&world);
+        command.arg("init").arg(&root);
+        if let Some(email) = email {
+            command.env("EMAIL", email);
+        }
+        let output = command.output().unwrap();
+        if !output.status.success() {
+            failures.push((
+                case,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+            continue;
+        }
+        assert_eq!(
+            git(
+                &world,
+                &root,
+                &["show", "-s", "--format=%an <%ae>%n%cn <%ce>"]
+            ),
+            format!("{expected}\n{expected}"),
+            "{case}"
+        );
+        assert_eq!(fs::read_to_string(global).unwrap(), config, "{case}");
+        let local_config = fs::read_to_string(root.join(".git/config")).unwrap();
+        assert!(!local_config.contains("[user]"), "{case}");
+        assert!(
+            git(&world, &root, &["status", "--porcelain"]).is_empty(),
+            "{case}"
+        );
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
 fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     let world = World::new();
     let root = fresh(&world);
     fs::remove_file(world.home().join(".gitconfig")).unwrap();
     let mut command = fixture_dots(&world);
     enable_fake_gh(&world, &mut command);
-    let output = success(command.arg("init").arg(&root).output().unwrap());
+    let output = success(
+        command
+            .env("DOTS_ROOT", &root)
+            .arg("init")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(output.lines().last(), Some("Next: dots up"));
     let id = git(&world, &root, &["rev-parse", "HEAD"]);
     // 0.5.0 declares gitleaks and age in a fresh scaffold.
     let config = git(&world, &root, &["show", "HEAD:config.toml"]);
@@ -357,6 +432,31 @@ fn new_seed_excludes_ignored_modified_linked_and_executable_files() {
     );
     let seed = git(&world, &root, &["rev-parse", "HEAD"]);
     assert!(seed_push(&output, &seed), "{output}");
+}
+
+#[test]
+fn new_adoption_and_init_share_the_hostname_fallback() {
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    let machine_id = |root: &Path| {
+        let config = fs::read_to_string(root.join("config.local.toml")).unwrap();
+        let doc = toml_edit::Document::parse(config).unwrap();
+        doc["env"]["SETUP_MACHINE_ID"].as_str().unwrap().to_owned()
+    };
+    let expected = machine_id(&root);
+    let mut callback = fixture_dots(&world);
+    callback
+        .args(["bootstrap", "persist-selected"])
+        .env("SETUP_PROFILE", "laptop")
+        .env("DOTS_BOOTSTRAP_ADOPT", "1");
+    success(callback.output().unwrap());
+    assert_eq!(machine_id(world.root()), expected);
+
+    callback.env("DOTS_BOOTSTRAP_RESTORE", "replacement");
+    let result = callback.output().unwrap();
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert_eq!(machine_id(world.root()), expected);
 }
 
 #[test]
@@ -752,7 +852,7 @@ fn new_explicit_directory_works_with_an_impossible_ambient_root() {
     let world = World::new();
     let blocker = world.home().join("ordinary-file");
     fs::write(&blocker, b"keep this file").unwrap();
-    let root = fresh(&world);
+    let root = fresh(&world).with_file_name("fresh config's $(exit 99)");
     let output = success(
         fixture_dots(&world)
             .current_dir(root.parent().unwrap())
@@ -766,6 +866,23 @@ fn new_explicit_directory_works_with_an_impossible_ambient_root() {
         output.contains("outside the active configuration root"),
         "{output}"
     );
+    let command = output
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("Next: DOTS_ROOT=")
+        .unwrap();
+    let selected = success(
+        world
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "dots() {{ printf '%s\\n%s\\n' \"$DOTS_ROOT\" \"$1\"; }}; DOTS_ROOT={command}"
+            ))
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(selected, format!("{}\nup\n", root.display()));
     assert_eq!(git(&world, &root, &["branch", "--show-current"]), "dev");
     assert_eq!(fs::read(blocker).unwrap(), b"keep this file");
     assert!(!world.root().join(".git").exists());

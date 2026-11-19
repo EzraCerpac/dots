@@ -11,6 +11,7 @@ const DEV: &str = "refs/heads/dev";
 const MAIN: &str = "refs/heads/main";
 const NETWORK_BUDGET: Duration = Duration::from_secs(60);
 
+#[derive(PartialEq, Eq)]
 pub(super) struct Origin {
     fetch: String,
     push: String,

@@ -165,6 +165,41 @@ impl<'a> Git<'a> {
         oid(self.text(args)?.as_bytes())
     }
 
+    pub fn commit(&self, tree: &str, parents: &[&str], message: &str) -> io::Result<String> {
+        let git = || {
+            let mut cmd = self.command(["-c", "commit.gpgSign=false"])?;
+            cmd.env("LC_ALL", "C");
+            Ok::<_, io::Error>(cmd)
+        };
+        let command = || {
+            let mut cmd = git()?;
+            cmd.args(["commit-tree", tree]);
+            for parent in parents {
+                cmd.args(["-p", parent]);
+            }
+            cmd.args(["-m", message]);
+            Ok::<_, io::Error>(cmd)
+        };
+        let mut output = self.output_command(command()?)?;
+        if !output.status.success()
+            && identity_unknown(&first_stderr(&output))
+            && self
+                .output(["config", "--get", "user.useConfigOnly"])?
+                .status
+                .code()
+                == Some(1)
+        {
+            let mut cmd = command()?;
+            crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {
+                let mut probe = git()?;
+                probe.args(["var", ident]).envs(defaults.iter().copied());
+                self.output_command(probe)
+            })?;
+            output = self.output_command(cmd)?;
+        }
+        oid(checked(output)?.trim_ascii())
+    }
+
     pub fn tree(&self, revision: &str) -> io::Result<Tree> {
         let output = self.get(["ls-tree", "-r", "-z", revision])?;
         let mut tree = Tree::new();
@@ -287,8 +322,44 @@ pub(super) fn checked(output: Output) -> io::Result<Vec<u8>> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(invalid("Git subprocess did not succeed"))
+        let reason = first_stderr(&output);
+        if reason.is_empty() {
+            Err(invalid("Git subprocess did not succeed"))
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+        }
     }
+}
+
+fn first_stderr(output: &Output) -> String {
+    let line = output
+        .stderr
+        .split(|&byte| byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    // Strip userinfo before truncating: the separating @ can be beyond byte 512.
+    let text = String::from_utf8_lossy(line);
+    let mut pieces = text.split("://");
+    let mut safe = pieces.next().unwrap_or_default().to_owned();
+    for piece in pieces {
+        let end = piece
+            .find(['/', '?', '#', ' ', '\t', '\r'])
+            .unwrap_or(piece.len());
+        let start = piece[..end].rfind('@').map_or(0, |at| at + 1);
+        safe.push_str("://");
+        safe.push_str(&piece[start..]);
+    }
+    let line = safe.as_bytes();
+    String::from_utf8_lossy(&line[..line.len().min(512)])
+        .trim_end()
+        .to_owned()
+}
+
+pub(super) fn identity_unknown(reason: &str) -> bool {
+    matches!(
+        reason,
+        "Author identity unknown" | "Committer identity unknown"
+    )
 }
 
 pub(super) fn invalid(message: &'static str) -> io::Error {

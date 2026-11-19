@@ -21,32 +21,52 @@ fi
 docker run --rm -i --mount "type=bind,src=$seed,dst=/seed,readonly" \
   alpine:3.23 sh -eu <<'SH'
 set -- git ca-certificates
-if [ -f /seed/install.sh ]; then set -- "$@" curl; fi
+if [ -f /seed/install.sh ]; then set -- "$@" curl openssh-server openssh-client expect; fi
 apk add --no-cache "$@"
 adduser -D smoke
+if [ -f /seed/install.sh ]; then
+    # Use real SSH against a private bare repo inside the container.
+    printf '%s\n' 'smoke:unused-fixture-password' | chpasswd
+    mkdir -p /run/sshd /home/smoke/.ssh
+    chmod 700 /home/smoke/.ssh
+    ssh-keygen -q -N '' -t ed25519 -f /tmp/dots-ssh-host
+    ssh-keygen -q -N '' -t ed25519 -f /home/smoke/.ssh/fixture
+    cp /home/smoke/.ssh/fixture.pub /home/smoke/.ssh/authorized_keys
+    printf '[127.0.0.1]:2222 %s\n' "$(cut -d ' ' -f 1,2 /tmp/dots-ssh-host.pub)" > /home/smoke/.ssh/known_hosts
+    git init --bare --initial-branch=main /srv/dotfiles.git
+    git init --bare --initial-branch=master /srv/template.git
+    chown -R smoke:smoke /home/smoke/.ssh /srv/dotfiles.git /srv/template.git
+    /usr/sbin/sshd -f /dev/null -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no -p 2222 -h /tmp/dots-ssh-host
+fi
 su -l smoke <<'SMOKE'
 set -eu
 fixture=$(mktemp -d /tmp/dots-first-run.XXXXXXXX)
-export HOME="$fixture/home" TMPDIR="$fixture/tmp"
-export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
-export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
-export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
-export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
-export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
-export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
-export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
-export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
-export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
-export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
-export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
-export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
-mkdir -p "$HOME/.local/bin" "$TMPDIR"
-export PATH="$HOME/.local/bin:/usr/bin:/bin"
+machine() {
+    unset DOTS_ROOT DOTS_MISE_BIN SETUP_PROFILE SETUP_MACHINE_ID
+    unset MISE_GLOBAL_CONFIG_FILE MISE_CONFIG_FILE MISE_TRUSTED_CONFIG_PATHS
+    export HOME="$fixture/$1" TMPDIR="$fixture/$1/tmp"
+    export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+    export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
+    export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
+    export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
+    export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
+    export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
+    export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
+    export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
+    export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
+    export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
+    export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
+    export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
+    mkdir -p "$HOME/.local/bin" "$TMPDIR"
+    export PATH="$HOME/.local/bin:/usr/bin:/bin"
+    cd "$HOME"
+}
+machine a
 if command -v python3 || command -v node; then
     echo 'Fresh-container fixture unexpectedly contains Python or Node' >&2
     exit 1
 fi
-cd "$HOME"
 if [ -f /seed/install.sh ]; then
     set -o pipefail
     test ! -e "$MISE_CONFIG_DIR"
@@ -56,23 +76,18 @@ if [ -f /seed/install.sh ]; then
     fi
     MISE_VERSION=$(cat /seed/mise-version)
     DOTS_VERSION=$(cat /seed/dots-version)
-    export MISE_VERSION DOTS_VERSION
+    export MISE_VERSION DOTS_VERSION MISE_SELF_UPDATE_AVAILABLE=0 SHELL=/bin/sh
     curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz > "$fixture/installer.log"
     cat "$fixture/installer.log"
-    test ! -e "$MISE_CONFIG_DIR"
+    test "$(cat "$fixture/installer.log")" = 'dots init'
+    test ! -e "$MISE_CONFIG_DIR/config.toml"
     test -x "$HOME/.local/bin/mise"
     tar -xOzf /seed/dots.tar.gz bin/dots > "$fixture/expected-dots"
-    tool="http:dots[url=file:///seed/dots.tar.gz]@$DOTS_VERSION"
-    cmp "$fixture/expected-dots" "$(mise which --tool "$tool" dots)"
-    if command -v dots; then exit 1; fi
-
-    setup=$(sed -n '/^dots is installed\. In a terminal, run:$/ { n; p; }' "$fixture/installer.log")
-    test -n "$setup"
-    sh -ec "$setup"
     test "$(readlink "$HOME/.local/bin/dots")" = "$MISE_SHIMS_DIR/dots"
     cmp "$fixture/expected-dots" "$(mise which dots)"
     test "$(sh -c 'command -v dots')" = "$HOME/.local/bin/dots"
     test "$(sh -c 'dots --version')" = "dots $DOTS_VERSION (mise)"
+    sh -ec "$(cat "$fixture/installer.log")"
 
     test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
     test "$(git -C "$MISE_CONFIG_DIR" rev-parse main)" = "$(git -C "$MISE_CONFIG_DIR" rev-parse dev)"
@@ -83,6 +98,182 @@ if [ -f /seed/install.sh ]; then
     test -x "$(mise which age)"
     test -x "$(mise which gitleaks)"
     test -z "$(git -C "$MISE_CONFIG_DIR" status --porcelain)"
+
+    (
+        machine tty
+        export DOTS_MISE_BIN="$fixture/a/.local/bin/mise" PATH="$HOME/bin:/usr/bin:/bin"
+        mkdir "$HOME/bin"
+        cat > "$HOME/bin/gh" <<'GH'
+#!/bin/sh
+case "$*" in
+    'auth status --hostname github.com') exit 0 ;;
+    'api --hostname github.com user --jq .login') printf '%s\n' fixture ;;
+    *) touch "$HOME/unexpected-github-call"; exit 1 ;;
+esac
+GH
+        chmod +x "$HOME/bin/gh"
+        expect <<'EXPECT'
+set timeout 90
+spawn sh -o pipefail -c {curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz}
+expect {
+    -exact {Create a private GitHub repository fixture/dotfiles and push the seed to it? [y/N]} { send -- "n\r" }
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+expect { eof {} timeout { exit 1 } }
+exit [lindex [wait] 3]
+EXPECT
+        test ! -e "$HOME/unexpected-github-call"
+    )
+
+    export GIT_SSH_COMMAND='ssh -i /home/smoke/.ssh/fixture -o UserKnownHostsFile=/home/smoke/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes'
+    export SMOKE_ORIGIN=ssh://smoke@127.0.0.1:2222/srv/dotfiles.git
+    git -C "$MISE_CONFIG_DIR" remote add origin "$SMOKE_ORIGIN"
+    git -C "$MISE_CONFIG_DIR" push origin main
+    awk -v origin="$SMOKE_ORIGIN" '
+        /^\[vars\]$/ { print; print "dots_source_repo = \"" origin "\""; next }
+        /^dots_profiles = / { print "dots_profiles = \"default laptop\""; next }
+        1
+    ' \
+        "$MISE_CONFIG_DIR/config.toml" > "$fixture/pinned-config"
+    cat "$fixture/pinned-config" > "$MISE_CONFIG_DIR/config.toml"
+    printf 'first machine bytes\n' > "$fixture/initial"
+    cp "$fixture/initial" "$HOME/.dots-smoke"
+    dots add "$HOME/.dots-smoke"
+    dots sync > "$fixture/publish.log"
+    cat "$fixture/publish.log"
+    initial=$(git -C /srv/dotfiles.git rev-parse refs/heads/dev)
+    git -C /srv/dotfiles.git show "$initial:dotfiles/.dots-smoke" | cmp "$fixture/initial" -
+
+    export SMOKE_MISE="$HOME/.local/bin/mise"
+    mkdir "$fixture/bin"
+    cp "$SMOKE_MISE" "$fixture/bin/mise"
+    cat > "$fixture/bin/curl" <<'CURL'
+#!/bin/sh
+case "$*" in
+    '-fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh')
+        exec /usr/bin/curl -fsSL file:///seed/install.sh ;;
+    '-fsSL https://mise.run')
+        printf '%s\n' '#!/bin/sh' 'cp "$SMOKE_MISE" "$MISE_INSTALL_PATH"' ;;
+    *) exec /usr/bin/curl "$@" ;;
+esac
+CURL
+    chmod +x "$fixture/bin/curl"
+    machine b
+    export PATH="$fixture/bin:/usr/bin:/bin"
+    printf '%s\n' '#!/bin/sh' 'echo 2026.10.1' > "$HOME/.local/bin/mise"
+    chmod +x "$HOME/.local/bin/mise"
+    test "$(command -v mise)" = "$fixture/bin/mise"
+    test "$(mise --version | cut -d ' ' -f1)" = "${MISE_VERSION#v}"
+    unset MISE_YES
+
+    expect_status() {
+        wanted=$1 logfile=$2
+        shift 2
+        actual=0
+        "$@" > "$logfile" 2>&1 || actual=$?
+        if [ "$actual" -ne "$wanted" ]; then cat "$logfile"; exit 1; fi
+    }
+    adopt() {
+        curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz --from "$SMOKE_ORIGIN" "$@"
+    }
+    expect_status 2 "$fixture/no-profile.log" adopt
+    cmp "$SMOKE_MISE" "$HOME/.local/bin/mise"
+    grep -F 'Declared profiles: default, laptop' "$fixture/no-profile.log"
+    grep -Fx 'Rerun with a declared profile:' "$fixture/no-profile.log"
+    grep '^curl -fsSL ' "$fixture/no-profile.log" > "$fixture/choose-profile"
+    test "$(wc -l < "$fixture/choose-profile" | tr -d ' ')" -eq 1
+    test ! -e "$HOME/.dots-smoke"
+    printf 'same checkout\n' > "$MISE_CONFIG_DIR/.git/retry-marker"
+    printf '# keep this local config\n' > "$MISE_CONFIG_DIR/config.local.toml"
+    printf 'keep this live change\n' > "$HOME/local-note"
+    printf 'keep this checkout change\n' > "$MISE_CONFIG_DIR/local-note"
+
+    git -C "$MISE_CONFIG_DIR" remote set-url origin "${SMOKE_ORIGIN}.other"
+    cp "$MISE_CONFIG_DIR/.git/config" "$fixture/other-config"
+    expect_status 1 "$fixture/other-origin.log" sh "$fixture/choose-profile"
+    grep -Fx "dots installer: Move the Git checkout at $MISE_CONFIG_DIR away or drop --from to keep it." "$fixture/other-origin.log"
+    cmp "$fixture/other-config" "$MISE_CONFIG_DIR/.git/config"
+    git -C "$MISE_CONFIG_DIR" remote set-url origin "$SMOKE_ORIGIN"
+
+    expect_status 2 "$fixture/typo.log" adopt --profile typo
+    grep -F 'Declared profiles: default, laptop' "$fixture/typo.log"
+    grep -Fx 'Rerun with a declared profile:' "$fixture/typo.log"
+    grep '^curl -fsSL ' "$fixture/typo.log" > "$fixture/retry"
+    cmp "$fixture/choose-profile" "$fixture/retry"
+    expect_status 2 "$fixture/no-consent.log" sh "$fixture/retry"
+    grep -Fx 'Adoption needs a terminal or MISE_YES=1.' "$fixture/no-consent.log"
+    test ! -e "$HOME/.dots-smoke"
+    (
+        export MISE_YES=1
+        expect_status 2 "$fixture/yes-typo.log" adopt --profile typo
+    )
+    grep -F " | env 'MISE_YES=1' " "$fixture/yes-typo.log"
+
+    export SMOKE_RETRY="$fixture/retry"
+    if ! expect <<'EXPECT' > "$fixture/interrupted.log"
+set timeout 180
+spawn sh $env(SMOKE_RETRY)
+expect {
+    -re {apply [^\r\n]*\.dots-smoke\?} { send -- "\003"; expect { eof {} timeout { exit 1 } } }
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+exit [expr {[lindex [wait] 3] != 130}]
+EXPECT
+    then cat "$fixture/interrupted.log"; exit 1; fi
+    grep -F 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh' "$fixture/interrupted.log"
+    test ! -e "$HOME/.dots-smoke"
+    MISE_YES=1 sh "$fixture/retry" > "$fixture/retry.log" 2>&1
+    grep -Fx "Next: '$HOME/.local/bin/dots' up" "$fixture/retry.log"
+    test "$(tail -1 "$fixture/retry.log")" = "export PATH=\"\$HOME/.local/bin:\$PATH\""
+    if grep -q '^Moved ' "$fixture/retry.log"; then exit 1; fi
+    test "$(cat "$MISE_CONFIG_DIR/.git/retry-marker")" = 'same checkout'
+    grep -Fx '# keep this local config' "$MISE_CONFIG_DIR/config.local.toml"
+    test "$(cat "$HOME/local-note")" = 'keep this live change'
+    test "$(cat "$MISE_CONFIG_DIR/local-note")" = 'keep this checkout change'
+    rm "$MISE_CONFIG_DIR/local-note"
+    export PATH="$fixture/bin:$HOME/.local/bin:/usr/bin:/bin"
+    test "$(git -C "$MISE_CONFIG_DIR" config --local --get remote.origin.url)" = "$SMOKE_ORIGIN"
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
+    cmp "$fixture/initial" "$HOME/.dots-smoke"
+    sh -c 'dots up' > "$fixture/b-first-up.log"
+    cat "$fixture/b-first-up.log"
+    grep -Fx 'Sync configuration: completed' "$fixture/b-first-up.log"
+
+    machine a
+    printf 'second machine bytes\n' > "$fixture/updated"
+    cat "$fixture/updated" > "$HOME/.dots-smoke"
+    dots sync > "$fixture/republish.log"
+    cat "$fixture/republish.log"
+    updated=$(git -C /srv/dotfiles.git rev-parse refs/heads/dev)
+    test "$initial" != "$updated"
+    git -C /srv/dotfiles.git show "$updated:dotfiles/.dots-smoke" | cmp "$fixture/updated" -
+
+    machine b
+    cmp "$fixture/initial" "$HOME/.dots-smoke"
+    sh -c 'dots up' > "$fixture/b-second-up.log"
+    cat "$fixture/b-second-up.log"
+    grep -Fx 'Sync configuration: completed' "$fixture/b-second-up.log"
+    test "$(git -C "$MISE_CONFIG_DIR" rev-parse HEAD)" = "$updated"
+    cmp "$fixture/updated" "$HOME/.dots-smoke"
+
+    template_origin=${SMOKE_ORIGIN%/*}/template.git
+    machine a
+    git -C "$MISE_CONFIG_DIR" push "$template_origin" refs/heads/main
+    test "$(git -C /srv/template.git symbolic-ref HEAD)" = refs/heads/master
+    test -z "$(git -C /srv/template.git for-each-ref refs/heads/master)"
+    test -z "$(git -C /srv/template.git for-each-ref refs/heads/dev)"
+    machine template
+    export PATH="$fixture/bin:$PATH"
+    curl -fsSL file:///seed/install.sh |
+        MISE_YES=1 sh -s -- --archive /seed/dots.tar.gz --from "$template_origin"
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = main
+    sh -c 'dots up' > "$fixture/template-up.log"
+    cat "$fixture/template-up.log"
+    grep -Fx 'Sync configuration: completed' "$fixture/template-up.log"
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
+    test "$(git -C /srv/template.git rev-parse refs/heads/dev)" = "$(git -C "$MISE_CONFIG_DIR" rev-parse HEAD)"
 else
     cp /seed/mise /seed/dots "$HOME/.local/bin/"
     dots init </dev/null

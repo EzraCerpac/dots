@@ -23,7 +23,7 @@ pub(super) fn allows_plaintext(output: Output) -> Result<bool, Fail> {
         (true, b"false") => Ok(false),
         _ => Err(refusal(
             "could not read mise's effective history.allow_plaintext_history setting",
-            "Check the setting with `mise settings get history.allow_plaintext_history` and retry backup",
+            "Check the setting with `dots mise settings get history.allow_plaintext_history` and retry backup",
         )),
     }
 }

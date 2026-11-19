@@ -17,7 +17,33 @@ use nix::libc;
 use crate::config_commands::{ExecutableOrigin, PIN_PREFIX};
 use crate::{Ctx, Fail};
 
-pub(crate) use mise::{config_paths, mise_binary, quiet_probe, tool_path, validate_selection};
+pub(crate) use mise::{
+    config_paths, mise_binary, quiet_probe, require_mise, tool_path, validate_selection,
+};
+
+pub(crate) fn fill_commit_identity<E>(
+    command: &mut Command,
+    mut probe: impl FnMut(&str, &[(&str, &str)]) -> Result<std::process::Output, E>,
+) -> Result<(), E> {
+    for [ident, name, email] in [
+        ["GIT_AUTHOR_IDENT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"],
+        [
+            "GIT_COMMITTER_IDENT",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ],
+    ] {
+        let defaults = [(name, "dots"), (email, "dots@localhost")];
+        // A single default can succeed only if Git can resolve the other field.
+        for trial in [&[][..], &defaults[..1], &defaults[1..], &defaults] {
+            if probe(ident, trial)?.status.success() {
+                command.envs(trial.iter().copied());
+                break;
+            }
+        }
+    }
+    Ok(())
+}
 
 const HOOK_ENV: &[&str] = &[
     "DOTS_CHANGES",

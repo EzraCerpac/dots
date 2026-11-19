@@ -116,7 +116,14 @@ fn persist_selected(ctx: &Ctx) -> Result<u8, Fail> {
     let profile = selected
         .profile
         .ok_or_else(|| Fail::usage("select a bootstrap profile with SETUP_PROFILE or MISE_ENV"))?;
-    let machine = selected.machine_id.map_or_else(auto_id, Ok)?;
+    let machine = selected
+        .machine_id
+        .or_else(|| {
+            (ctx.env.get("DOTS_BOOTSTRAP_ADOPT") == Some(OsStr::new("1")))
+                .then(crate::init::hostname_machine_id)
+                .flatten()
+        })
+        .map_or_else(auto_id, Ok)?;
     let origin = private::persistence_origin(ctx)?;
     selection::persist(
         &ctx.root,

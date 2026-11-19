@@ -24,9 +24,15 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn files(self, root: &Root, caller: &Path) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
+    fn files(
+        self,
+        root: &Root,
+        caller: &Path,
+        partial: bool,
+    ) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
         let path = match self {
-            Self::Active => return passive::active_files(root),
+            Self::Active if partial => return passive::active_files(root),
+            Self::Active => return passive::checked_active_files(root),
             Self::Base => root.path().join("config.toml"),
             Self::Profile(profile) => {
                 if !passive::profiles(root)?.contains(&profile) {
@@ -156,7 +162,7 @@ impl Targets {
     ) -> Result<Self, Fail> {
         let scoped = scope != Scope::Active;
         let holds = Exceptions::read(root)?;
-        let mut all = Self::read_declarations(scope.files(root, caller), partial)?;
+        let mut all = Self::read_declarations(scope.files(root, caller, partial), partial)?;
         if !scoped || all.targets.keys().any(|id| id.starts_with("github:")) {
             match Env::current().and_then(|env| env.state_dir()) {
                 Ok(state) => all.add_ownership(

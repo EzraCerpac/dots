@@ -2177,6 +2177,8 @@ fn wrong_checkout(shape: &str, oracle_diagnostic: &str, diagnostic: &str) {
         }
         "main" => {
             f.git(&f.a, &["switch", "-q", "main"]);
+            f.write(&f.a, "unpublished-main", "do not move local main\n");
+            f.commit(&f.a, "Unpublished main change");
         }
         "jj" => fs::create_dir(f.a.join(".jj")).unwrap(),
         "legacy" => f.write(&f.a, ".git/dots-dev.json", "{}"),
@@ -2204,6 +2206,160 @@ sync_case!(active unchanged_detached_head_stops_cleanly, || {
 sync_case!(active unchanged_main_checkout_stops_cleanly, || {
     wrong_checkout("main", "main", "Git HEAD on a dev branch");
 });
+
+#[test]
+fn new_sync_selects_dev_from_a_clean_main_clone() {
+    let f = Repo::new();
+    let dev = f.publish("from-dev", "published on dev\n");
+    let clone = f.scratch.join("fresh");
+    f.git(
+        &f.scratch,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "main",
+            &format!("file://{}", f.origin.display()),
+            clone.to_str().unwrap(),
+        ],
+    );
+    f.seed_identity(&clone);
+    let main = f.dev_or_head(&clone);
+    assert_ne!(main, dev);
+    f.write(&clone, "untracked", "keep local work\n");
+    let refusal = f.sync(&clone);
+    has(&refusal, "Git HEAD on a dev branch");
+    absent(&refusal, "Switched this checkout from main to dev");
+    assert_eq!(f.dev_or_head(&clone), main);
+    assert_eq!(read(&clone.join("untracked")), "keep local work\n");
+    assert_eq!(f.remote(), dev);
+    fs::remove_file(clone.join("untracked")).unwrap();
+
+    f.git(&clone, &["branch", "dev", "main"]);
+    has(&f.sync(&clone), "Git HEAD on a dev branch");
+    assert_eq!(f.dev_or_head(&clone), main);
+    assert_eq!(f.tip(&clone), main);
+    f.git(&clone, &["branch", "-d", "dev"]);
+    let receipt = f.sync(&clone);
+    has(&receipt, "dev up to date");
+    assert_eq!(
+        receipt
+            .matches("Switched this checkout from main to dev")
+            .count(),
+        1
+    );
+    has(&f.replay(&clone), "Switched this checkout from main to dev");
+    absent(&f.sync(&clone), "Switched this checkout from main to dev");
+    assert_eq!(f.git(&clone, &["branch", "--show-current"]), "dev");
+    assert_eq!(f.tip(&clone), dev);
+    assert_eq!(f.git(&clone, &["rev-parse", "main"]), main);
+    assert_eq!(read(&clone.join("from-dev")), "published on dev\n");
+    f.clean(&clone);
+}
+
+#[test]
+fn new_sync_keeps_main_when_dev_removes_the_saved_profile() {
+    let f = Repo::new();
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    let main = f.dev_or_head(&f.a);
+    let invalid = f.publish(
+        "config.toml",
+        f.config.replace("laptop selected", "selected"),
+    );
+    f.git(&f.a, &["fetch", "origin"]);
+    let local = "[env]\nSETUP_PROFILE = 'laptop'\nSETUP_MACHINE_ID = 'fixture'\n";
+    f.write(&f.a, "config.local.toml", local);
+    f.clean(&f.a);
+    let receipt = dots_zero(
+        f.dots(&f.a, &["--plain", "sync"])
+            .env_remove("SETUP_PROFILE"),
+    );
+    assert_eq!(
+        f.git(&f.a, &["branch", "--show-current"]),
+        "main",
+        "{receipt}"
+    );
+    assert_eq!(f.dev_or_head(&f.a), main);
+    assert_eq!(read(&f.a.join("config.toml")), f.config);
+    assert_eq!(read(&f.a.join("config.local.toml")), local);
+    assert_eq!(f.remote(), invalid);
+    f.clean(&f.a);
+    has(&receipt, "configuration failed validation");
+    absent(&receipt, "Switched this checkout from main to dev");
+}
+
+#[test]
+fn new_sync_keeps_main_when_dev_names_another_origin() {
+    let f = Repo::new();
+    let other = f.world.bare_remote("other-source.git");
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    let main = f.dev_or_head(&f.a);
+    let dev = f.publish(
+        "config.toml",
+        f.config.replace(
+            &format!("file://{}", f.origin.display()),
+            &format!("file://{}", other.display()),
+        ),
+    );
+    f.git(&f.a, &["fetch", "origin"]);
+    let transport = deny_transport(&f);
+    let receipt = f.sync(&f.a);
+    has(&receipt, "origin is missing, unsafe, or differs");
+    absent(&receipt, "Switched this checkout from main to dev");
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "main");
+    assert_eq!(f.dev_or_head(&f.a), main);
+    assert_eq!(read(&f.a.join("config.toml")), f.config);
+    assert!(!transport.exists());
+    assert_eq!(f.remote(), dev);
+    assert!(f.git(&other, &["for-each-ref"]).is_empty());
+}
+
+#[test]
+fn new_sync_creates_dev_when_origin_only_has_main() {
+    let f = Repo::new();
+    f.git(&f.origin, &["update-ref", "-d", "refs/heads/dev"]);
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    f.git(&f.a, &["update-ref", "-d", "refs/remotes/origin/dev"]);
+    let main = f.dev_or_head(&f.a);
+    let concurrent = f.git(
+        &f.a,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "Concurrent main commit",
+        ],
+    );
+    let marker = sh(&f.scratch.join("main-changed-during-validation"));
+    let hook = f.validation_hook(&format!(
+        "if [ ! -e {marker} ]; then\n  git -C {} update-ref refs/heads/main {concurrent} {main}\n  touch {marker}\nfi",
+        sh(&f.a)
+    ));
+    let stopped = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
+    has(&stopped, "Source checkout changed before switching to dev");
+    absent(&stopped, "Switched this checkout from main to dev");
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "main");
+    assert_eq!(f.dev_or_head(&f.a), concurrent);
+    assert_eq!(f.git(&f.a, &["branch", "--list", "dev"]), "");
+    f.clean(&f.a);
+    f.git(&f.a, &["update-ref", "refs/heads/main", &main, &concurrent]);
+    let receipt = f.sync(&f.a);
+    has(&receipt, "pushed dev");
+    assert_eq!(
+        receipt
+            .matches("Switched this checkout from main to dev")
+            .count(),
+        1
+    );
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "dev");
+    assert_eq!(f.tip(&f.a), f.git(&f.origin, &["rev-parse", "main"]));
+    assert_eq!(f.remote(), f.tip(&f.a));
+}
 sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
     wrong_checkout("jj", ".jj", "JJ workspace");
 });
@@ -2257,11 +2413,145 @@ sync_case!(
                 .env_remove("GIT_COMMITTER_EMAIL"),
         );
         has(&receipt, "identity");
+        if !f.oracle {
+            has(&receipt, "Could not snapshot local edits: Author identity unknown");
+            has(&receipt, "git config --global user.name");
+            has(&receipt, "git config --global user.email");
+        }
         assert_eq!(f.tip(&f.a), before);
         assert_eq!(f.remote(), before);
         assert_eq!(read(&f.a.join("text")), "needs a commit\n");
     }
 );
+
+#[test]
+fn new_sync_supplies_missing_commit_identity_without_writing_config() {
+    let f = Repo::new();
+    let global = f.world.home().join(".gitconfig");
+    fs::remove_file(&global).unwrap();
+    f.git(&f.a, &["config", "--unset", "user.name"]);
+    f.git(&f.a, &["config", "--unset", "user.email"]);
+    let shim = f.tools.join("git");
+    let real = fs::read_link(&shim).unwrap();
+    fs::remove_file(&shim).unwrap();
+    script(
+        &shim,
+        &format!(
+            r#"
+identity() {{
+    if {{ [ -z "$2" ] && [ "${{FIXTURE_CONFIGURED_NAME:-}}" != 1 ]; }} ||
+       {{ [ -z "$3" ] && [ -z "${{EMAIL:-}}" ] && [ "${{FIXTURE_CONFIGURED_EMAIL:-}}" != 1 ]; }}; then
+        printf '%s identity unknown\nfatal: fixture cannot infer identity\n' "$1" >&2
+        exit 128
+    fi
+}}
+case " $* " in
+  *" write-tree "*)
+    if [ "${{FIXTURE_SNAPSHOT_ERROR:-}}" = 1 ]; then
+      case "${{GIT_INDEX_FILE:-}}" in
+        */snapshot.index) printf 'fixture index error\nsecond diagnostic line\n' >&2; exit 1 ;;
+      esac
+    fi ;;
+  *" var GIT_AUTHOR_IDENT "*)
+    case " $* " in *" -c commit.gpgSign=false "*) ;; *) exit 98 ;; esac
+    identity Author "${{GIT_AUTHOR_NAME:-}}" "${{GIT_AUTHOR_EMAIL:-}}" ;;
+  *" var GIT_COMMITTER_IDENT "*)
+    case " $* " in *" -c commit.gpgSign=false "*) ;; *) exit 98 ;; esac
+    identity Committer "${{GIT_COMMITTER_NAME:-}}" "${{GIT_COMMITTER_EMAIL:-}}" ;;
+  *" commit-tree "*)
+    identity Author "${{GIT_AUTHOR_NAME:-}}" "${{GIT_AUTHOR_EMAIL:-}}"
+    identity Committer "${{GIT_COMMITTER_NAME:-}}" "${{GIT_COMMITTER_EMAIL:-}}" ;;
+esac
+exec {} "$@"
+"#,
+            sh(&real)
+        ),
+    );
+    let sync = |fail, configured_name, configured_email, email: Option<&str>| {
+        let mut sync = f.dots(&f.a, &["--plain", "sync"]);
+        sync.env("FIXTURE_SNAPSHOT_ERROR", fail)
+            .env("FIXTURE_CONFIGURED_NAME", configured_name)
+            .env("FIXTURE_CONFIGURED_EMAIL", configured_email)
+            .env_remove("EMAIL")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
+        if let Some(email) = email {
+            sync.env("EMAIL", email);
+        }
+        dots_zero(&mut sync)
+    };
+    let before = f.remote();
+    f.write(&f.a, "text", "new public bytes\n");
+    let failed = sync("1", "0", "0", None);
+    has(
+        &failed,
+        "Could not snapshot local edits: fixture index error",
+    );
+    absent(&failed, "second diagnostic line");
+    assert_eq!(f.remote(), before);
+    assert_eq!(f.tip(&f.a), before);
+
+    for (content, setting, email, expected) in [
+        ("no identity", None, None, "dots <dots@localhost>"),
+        (
+            "name only",
+            Some(("user.name", "Fixture Name")),
+            None,
+            "Fixture Name <dots@localhost>",
+        ),
+        (
+            "configured email",
+            Some(("user.email", "config@example.invalid")),
+            None,
+            "dots <config@example.invalid>",
+        ),
+        (
+            "EMAIL only",
+            None,
+            Some("env@example.invalid"),
+            "dots <env@example.invalid>",
+        ),
+    ] {
+        if let Some((key, value)) = setting {
+            f.git(&f.a, &["config", key, value]);
+        }
+        f.write(&f.a, "text", format!("{content}\n"));
+        let config = fs::read(f.a.join(".git/config")).unwrap();
+        has(
+            &sync(
+                "0",
+                if setting.is_some_and(|(key, _)| key == "user.name") {
+                    "1"
+                } else {
+                    "0"
+                },
+                if setting.is_some_and(|(key, _)| key == "user.email") {
+                    "1"
+                } else {
+                    "0"
+                },
+                email,
+            ),
+            "pushed dev",
+        );
+        assert_eq!(fs::read(f.a.join(".git/config")).unwrap(), config);
+        assert!(!global.exists());
+        assert_eq!(
+            f.git(
+                &f.origin,
+                &["log", "-1", "--format=%an <%ae>%n%cn <%ce>", "dev"]
+            ),
+            format!("{expected}\n{expected}"),
+            "{content}"
+        );
+        assert_eq!(f.blob("dev", "text"), content);
+        if let Some((key, _)) = setting {
+            f.git(&f.a, &["config", "--unset", key]);
+        }
+    }
+}
 
 struct RunningSync {
     child: Option<std::process::Child>,
@@ -4309,6 +4599,45 @@ sync_case!(
     }
 );
 
+#[test]
+fn new_missing_configured_scanner_suggests_up_but_broken_scanner_does_not() {
+    let f = Repo::new();
+    let before = f.remote();
+    // Model mise's passive tool metadata, including the missing installation.
+    script(
+        &f.mise,
+        &format!(
+            "if [ \"$*\" = 'tool --json gitleaks' ]; then\n  printf '%s\\n' '{{\"config_source\":{{}}}}'\n  exit 0\nfi\n{MISE_FIXTURE}"
+        ),
+    );
+    f.write(
+        &f.a,
+        "config.toml",
+        format!("{}\n[tools]\ngitleaks = 'latest'\n", f.config),
+    );
+    f.write(&f.a, "text", "still local\n");
+    let scanner = f.tools.join("gitleaks");
+    fs::remove_file(&scanner).unwrap();
+    let mut sync = f.dots(&f.a, &["--plain", "sync"]);
+    sync.env("PATH", f.scanner_fixture_path());
+    for with_shim in [false, true] {
+        if with_shim {
+            symlink(&f.mise, &scanner).unwrap();
+        }
+        let receipt = dots_zero(&mut sync);
+        has(&receipt, "gitleaks not found");
+        has(&receipt, "Run dots up");
+        assert_eq!(f.remote(), before);
+        assert_eq!(f.tip(&f.a), before);
+    }
+    fs::remove_file(&scanner).unwrap();
+    script(&scanner, "exit 127");
+    let broken = dots_zero(&mut sync);
+    has(&broken, "the gitleaks scan failed");
+    absent(&broken, "dots up");
+    assert_eq!(f.remote(), before);
+}
+
 sync_case!(
     active unchanged_partial_checkout_filter_failure_retries_without_republishing,
     || {
@@ -4652,4 +4981,178 @@ fn new_file_adoption_below_home_shares_and_preserves_source_guard() {
         approved.trim()
     );
     assert_eq!(fs::read_link(&target).unwrap(), source);
+}
+
+#[test]
+fn new_flagged_adopted_file_stays_local_with_its_declaration() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let held = f.world.home().join("withheld.txt");
+    let allowed = f.world.home().join("allowed.txt");
+    put(&held, "FIXTURE_SCAN_MATCH\n");
+    put(&allowed, "allowed content\n");
+    dots_zero(f.dots(&f.a, &["add"]).arg(&held).arg(&allowed));
+    let declaring = ["config.laptop.toml", "config.toml"]
+        .into_iter()
+        .find(|name| {
+            fs::read_to_string(f.a.join(name))
+                .is_ok_and(|text| text.contains("dotfiles/withheld.txt"))
+        })
+        .expect("dots add wrote a declaration for the flagged file");
+    let config = f.a.join(declaring);
+    let local = format!("{}\n# unrelated config edit\n", read(&config));
+    put(&config, &local);
+    f.write(&f.a, "text", "unrelated edit\n");
+
+    let receipt = f.sync(&f.a);
+    has(&receipt, "pushed dev");
+    has(&receipt, "gitleaks flagged");
+    has(&receipt, "dotfiles/withheld.txt:1");
+    absent(&receipt, "FIXTURE_SCAN_MATCH");
+    let replay = f.replay(&f.a);
+    has(&replay, "dotfiles/withheld.txt:1");
+    absent(&replay, "FIXTURE_SCAN_MATCH");
+    let shared = f.blob("dev", declaring);
+    has(&shared, "dotfiles/allowed.txt");
+    has(&shared, "# unrelated config edit");
+    absent(&shared, "withheld.txt");
+    absent(&f.tree(), "withheld.txt");
+    assert_eq!(f.blob("dev", "dotfiles/allowed.txt"), "allowed content");
+    assert_eq!(f.blob("dev", "text"), "unrelated edit");
+    assert_eq!(read(&config), local);
+    assert_eq!(
+        fs::read_link(&held).unwrap(),
+        f.a.join("dotfiles/withheld.txt")
+    );
+    assert_eq!(read(&held), "FIXTURE_SCAN_MATCH\n");
+
+    put(&f.a.join("dotfiles/withheld.txt"), "safe replacement\n");
+    has(&f.sync(&f.a), "pushed dev");
+    has(&f.blob("dev", declaring), "dotfiles/withheld.txt");
+    assert_eq!(f.blob("dev", "dotfiles/withheld.txt"), "safe replacement");
+    f.clean(&f.a);
+}
+
+#[test]
+fn new_flagged_copy_declaration_stays_local_while_other_edits_share() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let config = format!(
+        "{}\n[dotfiles]\n'~/.copy-target' = {{ source = './copy-source', mode = 'copy' }}\n'~/.allowed-copy' = {{ source = 'fine', mode = 'copy' }}\n",
+        f.config
+    );
+    f.write(&f.a, "config.toml", &config);
+    f.write(&f.a, "copy-source", "FIXTURE_SCAN_MATCH\n");
+    f.write(&f.a, "fine", "allowed content\n");
+    let live = f.sync(&f.a);
+    has(&live, "pushed dev");
+    has(&live, "gitleaks flagged");
+    has(&live, "copy-source:1");
+    absent(&live, "FIXTURE_SCAN_MATCH");
+    assert_eq!(f.blob("dev", "fine"), "allowed content");
+    absent(&f.tree(), "copy-source");
+    let shared = f.blob("dev", "config.toml");
+    absent(&shared, "copy-target");
+    has(&shared, "allowed-copy");
+    assert_eq!(read(&f.a.join("config.toml")), config);
+    assert_eq!(read(&f.a.join("copy-source")), "FIXTURE_SCAN_MATCH\n");
+    assert!(!f.world.home().join(".copy-target").exists());
+}
+
+#[test]
+fn new_flagged_retarget_restores_the_published_declaration() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let original = format!(
+        "{}\n[dotfiles]\n'~/.retarget' = {{ source = 'original', mode = 'copy' }}\n",
+        f.config
+    );
+    f.write(&f.a, "original", "published bytes\n");
+    f.write(&f.a, "config.toml", &original);
+    let before = f.commit(&f.a, "Publish original declaration");
+    f.git(&f.a, &["push", "origin", "dev"]);
+
+    let retarget = format!(
+        "{}\n# unrelated edit\n",
+        original.replace("source = 'original'", "source = 'held'")
+    );
+    f.write(&f.a, "config.toml", &retarget);
+    f.write(&f.a, "held", "FIXTURE_SCAN_MATCH\n");
+    f.write(&f.a, "fine", "ordinary edit\n");
+    let receipt = f.sync(&f.a);
+    has(&receipt, "held:1");
+    absent(&receipt, "FIXTURE_SCAN_MATCH");
+    assert!(
+        !f.git(&f.origin, &["rev-list", "--objects", "--all"])
+            .lines()
+            .any(|line| line.ends_with(" held"))
+    );
+    assert_eq!(read(&f.a.join("held")), "FIXTURE_SCAN_MATCH\n");
+    assert_eq!(read(&f.a.join("config.toml")), retarget);
+    assert_ne!(f.remote(), before, "{receipt}");
+    let shared = f.blob("dev", "config.toml");
+    has(&shared, "source = 'original'");
+    has(&shared, "# unrelated edit");
+    absent(&shared, "source = 'held'");
+    assert_eq!(f.blob("dev", "fine"), "ordinary edit");
+}
+
+#[test]
+fn new_sync_reports_the_runtime_mise_version_error_once() {
+    let f = Repo::new();
+    script(&f.mise, "printf '2026.11.7\\n'");
+    let output = finish(
+        f.dots(&f.a, &["mise", "config", "ls"])
+            .env_remove("SETUP_PROFILE"),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let error = std::str::from_utf8(&output.stderr)
+        .unwrap()
+        .trim()
+        .trim_start_matches("dots: ");
+    has(error, "2026.11.7");
+    has(error, env!("DOTS_MINIMUM_MISE"));
+    for branch in ["dev", "main"] {
+        f.git(&f.a, &["switch", branch]);
+        let live = f.sync(&f.a);
+        assert_eq!(live.matches(error).count(), 1, "{live}");
+        assert_eq!(f.replay(&f.a).matches(error).count(), 1);
+        absent(&live, "Switched this checkout from main to dev");
+        assert_eq!(f.git(&f.a, &["branch", "--show-current"]), branch);
+    }
+}
+
+#[test]
+fn new_snapshot_error_strips_url_userinfo_before_display_and_replay() {
+    let f = Repo::new();
+    let filter = f.scratch.join("reject-clean");
+    let credential = "fixture-token".repeat(48);
+    script(
+        &filter,
+        &format!(
+            "echo 'filter failed: https://user:{credential}@example.invalid/path ssh://name@mirror.invalid/repo' >&2\nexit 1"
+        ),
+    );
+    f.git(&f.a, &["config", "filter.fixture.clean", &sh(&filter)]);
+    f.git(&f.a, &["config", "filter.fixture.required", "true"]);
+    put(&f.a.join(".git/info/attributes"), "text filter=fixture\n");
+    f.write(&f.a, "text", "an edit\n");
+    let printed = f.sync(&f.a);
+    let directory = f.world.home().join(".local/state/dots/receipts");
+    let saved = fs::read_dir(directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    for receipt in [printed, read(&saved), f.replay(&f.a)] {
+        absent(&receipt, "fixture-token");
+        has(
+            &receipt,
+            "filter failed: https://example.invalid/path ssh://mirror.invalid/repo",
+        );
+    }
 }

@@ -641,7 +641,7 @@ fn requires_parent_component(pattern: &[u8]) -> bool {
     false
 }
 
-fn is_mise_config(path: &Path) -> bool {
+pub(super) fn is_mise_config(path: &Path) -> bool {
     path.components().count() == 1
         && path.to_str().is_some_and(|name| {
             name == "miserc.toml"

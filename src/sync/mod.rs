@@ -6,7 +6,7 @@ pub mod lock;
 mod merge;
 mod remote;
 mod snapshot;
-mod source;
+pub(crate) mod source;
 mod validation;
 
 #[cfg(test)]
@@ -161,10 +161,16 @@ fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
     {
         return Ok(None);
     }
-    if let Some(problem) = shared_shape_problem(&checkout) {
+    if !(origin.is_some() && can_select_dev(&checkout))
+        && let Some(problem) = shared_shape_problem(&checkout)
+    {
         return Err(problem);
     }
     Ok(origin.map(|_| Shared { dir, common }))
+}
+
+fn can_select_dev(shape: &CheckoutShape) -> bool {
+    !shape.git_too_old && shape.head.as_deref() == Some(OsStr::new("refs/heads/main"))
 }
 
 fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
@@ -359,7 +365,7 @@ fn synchronize(
             "Wait for it to finish, then rerun dots sync.",
         ))?;
     let checked_shape = shape(&git).or_note("Could not recheck the Git checkout", GIT)?;
-    if let Some(problem) = shape_problem(&checked_shape) {
+    if let Some(problem) = protected_shape_problem(&checked_shape) {
         return Err(problem);
     }
     if checked_shape.common_dir != shared.common {
@@ -379,6 +385,50 @@ fn synchronize(
                 "Move Git metadata outside the worktree or into .git, then rerun dots sync.",
             ));
         }
+    }
+    let checked_shape = if can_select_dev(&checked_shape)
+        && !checkout::has_pending(&shared.dir)
+        && !dotfiles::has_pending(&shared.dir)
+    {
+        let verify_dirs = || {
+            let (dir, common) = repository_dirs(&git).or_note(NOT_GIT, GUIDE)?;
+            if dir != shared.dir || common != shared.common {
+                return Err(Note::new(
+                    "The Git directories changed during preflight",
+                    GIT,
+                ));
+            }
+            Ok(())
+        };
+        verify_dirs()?;
+        dense_index(&git)?;
+        let before = git
+            .id(["rev-parse", "--verify", "HEAD^{commit}"])
+            .or_note("Could not verify the main revision", GIT)?;
+        let selected = source::select_dev(
+            |args| {
+                git.output(args)
+                    .map_err(|_| Fail::new(1, "could not run Git"))
+            },
+            || match read_origin(ctx, &git) {
+                Ok(Some(_)) => crate::config::selection::read(&ctx.root, &ctx.env).map(drop),
+                _ => Err(Fail::new(1, "could not verify Git origin")),
+            },
+        )
+        .or_note("Could not switch the clean main checkout to dev", GIT)?;
+        verify_dirs()?;
+        if selected == Outcome::Completed {
+            let after = dev_tip(&git).or_note("Could not verify the selected dev revision", GIT)?;
+            if before != after {
+                receipt.adopted_revision = Some((before, after));
+            }
+        }
+        shape(&git).or_note("Could not recheck the Git checkout", GIT)?
+    } else {
+        checked_shape
+    };
+    if let Some(problem) = shape_problem(&checked_shape) {
+        return Err(problem);
     }
     dense_index(&git)?;
     if let Some(recovery) = finish_pending(run, &git, &shared.dir, receipt)? {
@@ -936,16 +986,20 @@ fn scan_candidate(
             return Err(ScanError::Failed);
         }
         candidate = scratch
-            .omit(before, &candidate, &rejected)
+            .omit(before, &candidate, &mut rejected)
             .map_err(|_| ScanError::Failed)?;
     }
 }
 
 fn scan_note(error: ScanError) -> Note {
     match error {
-        ScanError::Missing => Note::new(
+        ScanError::Missing { declared } => Note::new(
             "NOT SHARED: gitleaks not found; local edits kept on disk, nothing pushed",
-            "Install gitleaks and rerun dots sync.",
+            if declared {
+                "Run dots up to install the configured gitleaks, then rerun dots sync."
+            } else {
+                "Install gitleaks and rerun dots sync."
+            },
         ),
         ScanError::Failed => Note::new(
             "NOT SHARED: the gitleaks scan failed; nothing pushed",

@@ -394,17 +394,6 @@ pub(super) fn validate_update(
     validate_remote(ctx, run, &checkout, &remote, expected)
 }
 
-fn reference(ctx: &Ctx, run: &Run<'_>, name: &str) -> Result<Option<String>, Fail> {
-    let output = git_text(ctx, run, ["rev-parse", "--verify", "--quiet", name])?;
-    if output.status.code() == Some(1) {
-        return Ok(None);
-    }
-    Ok(Some(text(
-        output,
-        "could not inspect bootstrap source refs",
-    )?))
-}
-
 pub(super) fn prepare(ctx: &Ctx, run: &Run<'_>, vars: &Vars) -> Result<Outcome, Fail> {
     if !ctx.root.path().join(".git").exists() {
         return Ok(Outcome::Skipped);
@@ -435,52 +424,20 @@ pub(super) fn prepare(ctx: &Ctx, run: &Run<'_>, vars: &Vars) -> Result<Outcome, 
             "the configuration's Git origin does not match dots_source_repo",
         ));
     }
-    // Only a clean clone at its fetched main tip is eligible. No fetch is needed.
-    let Some(head) = reference(ctx, run, "HEAD")? else {
-        return Ok(Outcome::Skipped);
-    };
-    if reference(ctx, run, "refs/remotes/origin/main")?.as_deref() != Some(head.as_str())
-        || !text(
-            git_text(ctx, run, ["status", "--porcelain", "--untracked-files=all"])?,
-            "could not check the bootstrap source for local edits",
-        )?
-        .is_empty()
-    {
-        return Ok(Outcome::Skipped);
-    }
-    // Switching can run Git's normal checkout hook. Ensure the configured
-    // destination still agrees with the source before invoking it.
-    validate_destination(
-        ctx,
-        run,
-        &url,
-        vars.source_repo.as_ref().unwrap_or(&origin_setting),
-        true,
-    )?;
-    let mut command = git(ctx)?;
-    command.args(["switch", "--quiet", "--no-guess", "--no-overwrite-ignore"]);
-    match (
-        reference(ctx, run, "refs/heads/dev")?,
-        reference(ctx, run, "refs/remotes/origin/dev")?,
-    ) {
-        (Some(local), Some(remote)) if local == remote => {
-            command.arg("dev");
-        }
-        (Some(local), None) if local == head => {
-            command.arg("dev");
-        }
-        (Some(_), _) => return Ok(Outcome::Skipped),
-        (None, Some(_)) => {
-            command.args(["--track", "-c", "dev", "refs/remotes/origin/dev"]);
-        }
-        (None, None) => {
-            command.args(["-c", "dev"]);
-        }
-    }
-    text(
-        run.probe(command)
-            .map_err(|_| Fail::new(1, "could not run git to select dev"))?,
-        "could not switch the clean bootstrap source checkout to dev",
-    )?;
-    Ok(Outcome::Completed)
+    crate::sync::source::select_dev(
+        |args| {
+            let mut command = git(ctx)?;
+            command.args(args);
+            probe(run, command)
+        },
+        || {
+            validate_destination(
+                ctx,
+                run,
+                &url,
+                vars.source_repo.as_ref().unwrap_or(&origin_setting),
+                true,
+            )
+        },
+    )
 }

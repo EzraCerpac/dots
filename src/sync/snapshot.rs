@@ -8,16 +8,19 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tempfile::TempDir;
+use toml_edit::{DocumentMut, Item, Value};
 
 use crate::{process::Cwd, run::Run};
 
 use super::guard::private_dir;
 
-use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative, split};
+use super::git::{
+    Entry, Git, Tree, checked, index_row, invalid, local, oid, records, relative, split,
+};
 
 #[derive(Debug)]
 pub(super) enum ScanError {
-    Missing,
+    Missing { declared: bool },
     Failed,
 }
 
@@ -136,11 +139,12 @@ impl<'a> Scratch<'a> {
         &self,
         base: &str,
         candidate: &str,
-        rejected: &BTreeSet<PathBuf>,
+        rejected: &mut BTreeSet<PathBuf>,
     ) -> io::Result<String> {
         let before = self.git.tree(base)?;
         let after = self.git.tree(candidate)?;
         let mut index_info = Vec::new();
+        self.omit_adoptions(base, &before, &after, rejected, &mut index_info)?;
         for path in after.keys().filter(|path| overlaps(rejected, path)) {
             index_row(&mut index_info, path, None, base.len());
         }
@@ -165,6 +169,96 @@ impl<'a> Scratch<'a> {
         }
     }
 
+    fn omit_adoptions(
+        &self,
+        base: &str,
+        before: &Tree,
+        after: &Tree,
+        rejected: &mut BTreeSet<PathBuf>,
+        index: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if !rejected.iter().any(|path| path.starts_with("dotfiles")) {
+            return Ok(());
+        }
+        let staged = self.live.get([
+            "diff",
+            "--cached",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            base,
+            "--",
+        ])?;
+        for (path, entry) in after {
+            let old = before.get(path);
+            if !super::validation::is_mise_config(path)
+                || overlaps(rejected, path)
+                || Some(entry) == old
+                || !matches!(entry.mode.as_str(), "100644" | "100755")
+            {
+                continue;
+            }
+            let mut doc = self.config_blob(entry)?;
+            let old = old
+                .map(|entry| self.config_blob(entry))
+                .transpose()?
+                .unwrap_or_default();
+            let old = old.get("dotfiles").and_then(Item::as_table_like);
+            let Some(declarations) = doc.get_mut("dotfiles").and_then(Item::as_table_like_mut)
+            else {
+                continue;
+            };
+            let omit: Vec<_> = declarations
+                .iter()
+                .filter_map(|(target, item)| {
+                    let source = item.as_inline_table()?;
+                    let relative = source.get("source")?.as_str()?;
+                    let target_path = target.strip_prefix("~/")?;
+                    (source.len() == 2
+                        && source.get("mode").and_then(Value::as_str) == Some("symlink")
+                        && relative.strip_prefix("dotfiles/") == Some(target_path)
+                        && rejected.contains(Path::new(relative))
+                        && !old.is_some_and(|table| table.contains_key(target)))
+                    .then(|| target.to_owned())
+                })
+                .collect();
+            if omit.is_empty() {
+                continue;
+            }
+            // Keep an intentionally staged version whole in the real index.
+            if records(&staged).any(|raw| raw == path.as_os_str().as_bytes()) {
+                rejected.insert(path.clone());
+                continue;
+            }
+            for target in omit {
+                declarations.remove(&target);
+            }
+            if declarations.is_empty() && old.is_none() {
+                doc.remove("dotfiles");
+            }
+            let mut blob = tempfile::tempfile_in(self.dir.path())?;
+            write!(blob, "{doc}")?;
+            blob.rewind()?;
+            let output = self
+                .git
+                .output_with_stdin(["hash-object", "-w", "--stdin"], Stdio::from(blob))?;
+            let entry = Entry {
+                mode: entry.mode.clone(),
+                oid: oid(checked(output)?.trim_ascii())?,
+            };
+            index_row(index, path, Some(&entry), base.len());
+        }
+        Ok(())
+    }
+
+    fn config_blob(&self, entry: &Entry) -> io::Result<DocumentMut> {
+        let bytes = self.git.get(["cat-file", "blob", &entry.oid])?;
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| invalid("could not read adopted declaration"))
+    }
+
     pub fn scan(
         &self,
         run: &Run<'_>,
@@ -180,9 +274,20 @@ impl<'a> Scratch<'a> {
             write!(&mut revs, " ^{excluded}^{{commit}}").map_err(|_| ScanError::Failed)?;
         }
         revs.push_str(" --");
+        let scanner = run.tool("gitleaks");
+        if scanner.is_symlink()
+            && scanner.canonicalize().ok().is_some_and(|target| {
+                crate::process::mise_binary(&run.ctx().env)
+                    .ok()
+                    .and_then(|mise| mise.canonicalize().ok())
+                    == Some(target)
+            })
+        {
+            return Err(missing_scanner(run));
+        }
         let mut cmd = run
             .ctx()
-            .command(run.tool("gitleaks"), Cwd::Root)
+            .command(scanner, Cwd::Root)
             .map_err(|_| ScanError::Failed)?;
         let git_environment = self
             .live
@@ -243,7 +348,7 @@ impl<'a> Scratch<'a> {
             .probe_detached(cmd, Duration::from_secs(60))
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {
-                    ScanError::Missing
+                    missing_scanner(run)
                 } else {
                     ScanError::Failed
                 }
@@ -257,6 +362,23 @@ impl<'a> Scratch<'a> {
         }
         Ok(findings)
     }
+}
+
+fn missing_scanner(run: &Run<'_>) -> ScanError {
+    let declared = crate::process::Mise::new(run.ctx())
+        .and_then(|mise| mise.command_active(["tool", "--json", "gitleaks"]))
+        .ok()
+        .and_then(|mut cmd| {
+            cmd.env("MISE_NO_HOOKS", "1")
+                .env("MISE_NO_ENV", "1")
+                .env("MISE_OFFLINE", "1")
+                .env("MISE_SAFE", "1");
+            run.probe_detached(cmd, Duration::from_secs(3)).ok()
+        })
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        .is_some_and(|tool| tool["config_source"].is_object());
+    ScanError::Missing { declared }
 }
 
 enum RuleNames {
@@ -566,7 +688,7 @@ path = '^(Side|Merge) marker\.txt$'
         let scratch = scratch(&git);
         let run = Run::begin(&ctx, Sink::Unreported);
         let found = match scratch.scan(&run, &merged, &[&base]) {
-            Err(ScanError::Missing) => return,
+            Err(ScanError::Missing { .. }) => return,
             result => result.unwrap(),
         };
         assert_eq!(

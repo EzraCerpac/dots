@@ -172,8 +172,8 @@ See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order o
 ## Optional, later
 
 - `dots publish [--all | --bookmark NAME]` opens a pull request to `main` from a separate colocated JJ workspace of a configuration hosted on GitHub. Updating an existing pull request keeps its base.
-- `dots backup` saves a local checkpoint of this machine's encrypted app settings, then publishes it to a separate private repository. It reports publication only after reading the checkpoint back from that repository; otherwise it says the checkpoint stayed local.
-- `dots restore` fetches those settings back after safety checks and never pushes. It may save encrypted undo checkpoints of the files it replaces locally; the next `dots backup` publishes them.
+- `dots backup` saves a local checkpoint of this machine's encrypted app settings, then publishes it to a separate private repository. It reports publication only when the remote host branch contains the saved checkpoint. If reconciliation is still pending, the checkpoint stays local and backup points to `mise dot status`; if the readback cannot verify publication, whether it was published is unknown, even if a push happened, and backup says to check the private history remote. Both exit 1.
+- `dots restore` fetches those settings back after safety checks and never pushes. It may save encrypted undo checkpoints of the files it replaces locally; a later explicit `dots backup` that succeeds publishes them.
 - [`dots bootstrap`](docs/contract.md#dots-bootstrap) sets up the local machine. `dots remote HOST --profile P` sets up a machine over SSH and leaves its mise history settings alone.
   With history enabled, the target stores unencrypted tracked files in plaintext in its local history. Set `encrypt = true` on those files or disable history on the target to avoid that.
   Before publishing, `dots backup` checks the outgoing checkpoints for plaintext and respects mise's `allow_plaintext_history` opt-in.

@@ -468,7 +468,11 @@ impl Recovery<'_, '_, '_> {
         if matches!(journal.progress, Progress::Prepared | Progress::Fetching(_)) {
             // A fetch never starts applying the incoming files. Observe again
             // for this invocation, while keeping later apply phases pinned.
-            self.paths.check_binding(&journal.paths, false)?;
+            if !journal.initial && matches!(journal.progress, Progress::Fetching(_)) {
+                journal.paths = self.paths.binding().clone();
+            } else {
+                self.paths.check_binding(&journal.paths, false)?;
+            }
             journal.progress = Progress::Fetching(self.pin_fetch_paths()?);
             write_journal(self.store, &journal)?;
         }
@@ -1569,7 +1573,7 @@ fn journal_round_trips_above_four_mib() {
         device: metadata.dev(),
         inode: metadata.ino(),
         seed: "1".repeat(40),
-        initial: true,
+        initial: false,
         progress: Progress::Fetching(live.clone()),
         obsolete_scope: None,
         previous: None,
@@ -1586,7 +1590,8 @@ pub(super) fn is_fetching(store: &Path) -> bool {
         return false;
     };
     read_journal(store).is_ok_and(|record| {
-        matches!(record.progress, Progress::Fetching(_))
+        !record.initial
+            && matches!(record.progress, Progress::Fetching(_))
             && record.obsolete_scope.is_none()
             && match_journal_directory(&record, &metadata).is_ok()
     })

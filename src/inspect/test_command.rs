@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use crate::process::{Mise, is_executable};
 use crate::report::Command;
-use crate::run::{Issue, Outcome, Policy, Run, StageId, exit_code};
+use crate::run::{Issue, Outcome, Run, StageId};
 use crate::{Ctx, Fail};
 
 pub fn test(ctx: &Ctx, args: &[OsString]) -> Result<u8, Fail> {
@@ -55,7 +55,6 @@ fn run_tests(ctx: &Ctx, run: &Run<'_>, stage: StageId, args: &[OsString]) -> Res
             format!("{} is missing or not executable", script.display()),
         ));
     }
-    run.run(stage, mise.exec(&script, args)?, Policy::Ordinary)
-        .map(exit_code)
-        .map_err(|error| Fail::new(1, format!("cannot run {}: {error}", script.display())))
+    let command = mise.exec(&script, args)?;
+    super::run_command(run, stage, command, &script.display().to_string())
 }

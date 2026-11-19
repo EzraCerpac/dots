@@ -38,12 +38,12 @@ struct Origin {
 }
 
 impl Target {
-    fn matches(&self, expected: &Self) -> bool {
+    fn matches(&self, expected: &Self, hook_permissions: bool) -> bool {
         self.target == expected.target
             && self.mode == expected.mode
             && self.source == expected.source
             && self.origin == expected.origin
-            && self.permissions == expected.permissions
+            && (hook_permissions || self.permissions == expected.permissions)
             && self.omitted == expected.omitted
     }
 
@@ -636,6 +636,7 @@ impl Copies {
         if !apply_pre_hooks(run, git, &validated.apply, receipt) {
             return Ok(());
         }
+        let hook_permissions = !hooks_disabled(run) && !validated.apply.configs.pre.is_empty();
         let active = status_at(run, git.root(), false)?;
         let active_configs = Configs::read_at(run, git.root(), false)?;
 
@@ -652,7 +653,10 @@ impl Copies {
                 continue;
             }
             let path = absolute_target(run, &target.target)?;
-            if !active.iter().any(|selected| selected.matches(target)) {
+            let Some(selected) = active
+                .iter()
+                .find(|selected| selected.matches(target, hook_permissions))
+            else {
                 path_issue(
                     receipt,
                     "Kept a dotfile whose validated selector changed",
@@ -661,14 +665,14 @@ impl Copies {
                 );
                 results.insert(path, false);
                 continue;
-            }
+            };
             let declaration = configs.definition(run, target, &path);
             let definition = declaration.map(|decl| decl.item.clone());
             let group = declaration
                 .and_then(|decl| decl.group)
                 .or_else(|| configs.group(run, target, &path));
-            if configs.declaration_signature(run, target, &path)
-                != active_configs.declaration_signature(run, target, &path)
+            if configs.declaration_signature(run, target, &path, hook_permissions)
+                != active_configs.declaration_signature(run, selected, &path, hook_permissions)
             {
                 path_issue(
                     receipt,
@@ -698,7 +702,7 @@ impl Copies {
             jobs.insert(
                 path,
                 (
-                    target,
+                    selected,
                     definition,
                     depends,
                     group.map(|(name, _)| name.to_owned()),
@@ -1749,6 +1753,20 @@ fn declarations_in(doc: &DocumentMut) -> Vec<Declaration<'_>> {
     entries
 }
 
+fn omit_permissions(item: &mut Item) {
+    if let Some(table) = item.as_table_like_mut() {
+        table.remove("permissions");
+        if let Some(variants) = table.get_mut("variants").and_then(Item::as_array_mut) {
+            for variant in variants
+                .iter_mut()
+                .filter_map(toml_edit::Value::as_inline_table_mut)
+            {
+                variant.remove("permissions");
+            }
+        }
+    }
+}
+
 impl Configs {
     fn read_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Self> {
         #[derive(Deserialize)]
@@ -1898,14 +1916,30 @@ impl Configs {
         run: &Run<'_>,
         target: &Target,
         path: &Path,
+        hook_permissions: bool,
     ) -> (Option<String>, Option<String>) {
         let declaration = self.definition(run, target, path);
         let group = declaration
             .and_then(|declaration| declaration.group)
             .or_else(|| self.group(run, target, path));
+        let signature = |item: &Item, group: bool| {
+            if !hook_permissions {
+                return item.to_string();
+            }
+            let mut item = item.clone();
+            omit_permissions(&mut item);
+            if group
+                && let Some(entries) = item.get_mut("entries").and_then(Item::as_table_like_mut)
+            {
+                for (_, entry) in entries.iter_mut() {
+                    omit_permissions(entry);
+                }
+            }
+            item.to_string()
+        };
         (
-            declaration.map(|declaration| declaration.item.to_string()),
-            group.map(|(_, item)| item.to_string()),
+            declaration.map(|declaration| signature(declaration.item, false)),
+            group.map(|(_, item)| signature(item, true)),
         )
     }
 

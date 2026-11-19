@@ -120,12 +120,13 @@ Machine-local files stay out of the repository, and encrypted settings history l
 
 ## Development
 
-This repository is the Rust crate `dots-cli`, which builds the `dots` binary; `mise.toml` pins Rust 1.100.0.
+This repository is the Rust crate `dots-cli`, which builds the `dots` binary.
+Build and test it with Cargo, using the Rust toolchain that `mise.toml` pins, 1.100.0, which `mise install` installs:
 
 ```sh
 mise install
-mise run build
-mise run test
+cargo build --locked
+cargo test --locked
 ```
 
 `dots test` is something else: it runs your configuration's own `tests/run`.

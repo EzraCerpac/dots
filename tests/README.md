@@ -29,7 +29,7 @@ fn unchanged_help_without_configuration() {
 
 ## Run and count cases
 
-Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`; `mise run test` does the same with the Rust that `mise.toml` pins.
+Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`, using the Rust toolchain that `mise.toml` pins.
 `dots test` is something else: it runs a configuration's own `tests/run`, not these suites.
 
 ```sh
@@ -40,7 +40,8 @@ cargo test --locked --test contract -- --list
 On DriehuisNAS, run each test command through `mise run nas:build --`.
 
 In CI, a pull request into `main` that changes code runs the full Linux set and ARM macOS.
-Intel macOS and the v0.4.0 oracle coverage run only on pushes to `main` and on tags.
+Intel macOS runs on pushes to `main` and on tags.
+The archived v0.4.0 oracle jobs run only on code pushes to `main` and on tags, on x86_64 Linux and ARM macOS, and only those jobs install the legacy prerequisites.
 
 Name a case `unchanged_` when v0.4.0 passes it too,
 and `new_` when it covers behaviour that v0.4.0 lacks.

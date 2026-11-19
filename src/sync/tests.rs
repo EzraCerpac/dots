@@ -485,6 +485,131 @@ fn ordinary_crlf_sources_deploy_as_checked_out() {
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn native_copy_deployment_supplies_the_provisional_baseline() {
+    use crate::run::{Run, Sink};
+    use std::os::unix::fs::PermissionsExt;
+
+    let a = b"committed A\n";
+    let b = b"native B\n";
+    let c = b"source C\n";
+    for case in ["source", "copy", "two-sided", "mode", "late"] {
+        let (fixture, ctx) = shared_mise_fixture(
+            "[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source', permissions = '0644' }\n",
+        );
+        let git = Git::new(&ctx, ctx.root.path());
+        let source = git.root().join("source");
+        let target = fixture.path().join("home/deployed");
+        fs::write(&source, a).unwrap();
+        git.get(["add", "."]).unwrap();
+        fixture_commit(&git, "native copy baseline A");
+
+        fs::write(&source, b).unwrap();
+        let native = Run::begin(&ctx, Sink::Unreported);
+        let command = super::validation::command(
+            &native,
+            git.root(),
+            ["bootstrap", "dotfiles", "apply", "--yes"],
+            false,
+        )
+        .unwrap();
+        let deployed = native.probe(command).unwrap();
+        assert!(
+            deployed.status.success(),
+            "native apply returned {}",
+            deployed.status
+        );
+        let _ = native.end(0);
+        assert_eq!(fs::read(&target).unwrap(), b);
+        assert_eq!(git.get(["show", "HEAD:source"]).unwrap(), a);
+        let records = fixture.path().join("mise-state/dotfiles/targets");
+        let record = fs::read_dir(records)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "toml"))
+            .unwrap();
+        let native_record = fs::read(&record).unwrap();
+
+        let copy_edit = b"edited copy\n";
+        let late_edit = b"late competing copy\n";
+        if case != "copy" {
+            fs::write(&source, c).unwrap();
+        }
+        match case {
+            "copy" => fs::write(&target, copy_edit).unwrap(),
+            "two-sided" => fs::write(&target, a).unwrap(),
+            "mode" => {
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "late" => {
+                let hook = git.root().join(".git/hooks/pre-push");
+                fs::write(
+                    &hook,
+                    "#!/bin/sh\nprintf 'late competing copy\\n' > \"$HOME/deployed\"\n",
+                )
+                .unwrap();
+                fs::set_permissions(hook, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => (),
+        }
+        let receipt = shared_mise_sync(&ctx);
+        let (expected_source, expected_target, issue): (&[u8], &[u8], _) = match case {
+            "copy" => (copy_edit, copy_edit, None),
+            "two-sided" => (c, a, Some("Both the copy and source changed")),
+            "mode" => (c, b, Some("Kept a locally changed copy mode")),
+            "late" => (c, late_edit, Some("Kept a changed or unmanaged dotfile")),
+            _ => (c, c, None),
+        };
+        match issue {
+            Some(message) => assert!(
+                receipt
+                    .issues
+                    .iter()
+                    .any(|issue| issue.diagnostic.contains(message)),
+                "{case}: {:?}",
+                receipt.issues
+            ),
+            None => assert!(receipt.issues.is_empty(), "{case}: {:?}", receipt.issues),
+        }
+        assert_eq!(fs::read(&source).unwrap(), expected_source, "{case}");
+        assert_eq!(fs::read(&target).unwrap(), expected_target, "{case}");
+        let remote = git.at(&fixture.path().join("bare-origin"));
+        assert_eq!(
+            remote.get(["show", "refs/heads/dev:source"]).unwrap(),
+            expected_source,
+            "{case}"
+        );
+        if case == "mode" {
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        if case == "source" {
+            // Native B still exists on disk as metadata. It cannot override
+            // the confirmed sync deployment C if the user writes B again.
+            assert_eq!(fs::read(&record).unwrap(), native_record);
+            fs::write(&target, b).unwrap();
+            fs::write(&source, b"source D\n").unwrap();
+            let stale = shared_mise_sync(&ctx);
+            assert!(
+                stale.issues.iter().any(|issue| issue
+                    .diagnostic
+                    .contains("Both the copy and source changed")),
+                "{:?}",
+                stale.issues
+            );
+            assert_eq!(fs::read(&target).unwrap(), b);
+            assert_eq!(fs::read(&source).unwrap(), b"source D\n");
+            assert_eq!(
+                remote.get(["show", "refs/heads/dev:source"]).unwrap(),
+                b"source D\n"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn rendered_variant_preserves_declaring_rules() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]

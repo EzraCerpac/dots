@@ -198,7 +198,13 @@ impl KnownCopy {
         )
     }
 
-    fn matches(&self, observed: &Image, base: &Image, mode: Option<u32>) -> bool {
+    fn matches(
+        &self,
+        observed: &Image,
+        base: &Image,
+        mode: Option<u32>,
+        native: Option<&str>,
+    ) -> bool {
         if let (
             Some(digest),
             Image::Regular {
@@ -209,6 +215,8 @@ impl KnownCopy {
         {
             <[u8; 32]>::from(Sha256::digest(bytes)) == digest
                 && mode.is_none_or(|mode| mode == *actual)
+        } else if let Some(native) = native {
+            matches_native_copy(observed, native, mode)
         } else {
             same_copy(observed, base, mode)
         }
@@ -297,6 +305,15 @@ fn native_deployments(run: &Run<'_>) -> io::Result<BTreeMap<PathBuf, String>> {
 }
 
 impl Copies {
+    fn native_baseline(&self, target: &Path, known: &KnownCopy) -> Option<&str> {
+        // Native apply does not know about later guarded sync writes. An
+        // existing native digest may only fill in a provisional Git baseline.
+        self.deployments
+            .get(target)
+            .filter(|_| known.deployed.is_none())
+            .map(String::as_str)
+    }
+
     pub fn load(dir: &Path) -> io::Result<Self> {
         match File::open(dir.join(STATE)) {
             Ok(file) => {
@@ -444,10 +461,26 @@ impl Copies {
                 };
                 self.observed.insert(path.clone(), deployed.clone());
                 let live = root.read_path(leaf)?;
-                if record.matches(&deployed, &common, record.mode) || live == deployed {
+                let native_digest = if path == destination {
+                    self.native_baseline(&path, &record)
+                } else {
+                    None
+                };
+                let expected_mode = match (&live, native_digest) {
+                    (Image::Regular { mode, .. }, Some(_)) => {
+                        Some(copy_mode(*mode, target.permissions.as_deref())?)
+                    }
+                    _ => record.mode,
+                };
+                if record.matches(&deployed, &common, expected_mode, native_digest)
+                    || live == deployed
+                {
                     continue;
                 }
-                if record.matches(&deployed, &common, None) {
+                let unverified_mode = native_digest.is_some()
+                    && matches!(&deployed, Image::Regular { mode, .. } if
+                        expected_mode.is_some_and(|expected| expected != *mode));
+                if unverified_mode || record.matches(&deployed, &common, None, native_digest) {
                     path_issue(
                         receipt,
                         "Kept a locally changed copy mode",
@@ -456,7 +489,16 @@ impl Copies {
                     );
                     continue;
                 }
-                if !live.git_eq(&common) {
+                let source_unchanged = match native_digest {
+                    Some(digest) => {
+                        matches_native_copy(&live, digest, None)
+                            && matches!((&live, &common),
+                                (Image::Regular { mode: live, .. }, Image::Regular { mode: base, .. })
+                                    if (live ^ base) & 0o100 == 0)
+                    }
+                    None => live.git_eq(&common),
+                };
+                if !source_unchanged {
                     path_issue(
                         receipt,
                         "Both the copy and source changed",
@@ -861,7 +903,7 @@ impl Copies {
         let copy_is_edited = match previous_copy {
             Some(copy) if current != Image::Absent => {
                 let common = copy.source_image(git, validated.revision())?;
-                !copy.matches(&current, &common, copy.mode)
+                !copy.matches(&current, &common, copy.mode, None)
             }
             _ => false,
         };
@@ -1091,7 +1133,18 @@ impl Copies {
                     .map_or(current == Image::Absent, |before| *before == current);
                 let manageable = match (&current, known, &baseline) {
                     (Image::Absent, _, _) => true,
-                    (_, Some(known), Some(base)) => known.matches(&current, base, known.mode),
+                    (_, Some(known), Some(base)) => {
+                        let next = next_baseline
+                            .as_ref()
+                            .filter(|next| path == destination && next.source == known.source);
+                        let native = next.and_then(|_| self.native_baseline(&path, known));
+                        let mode = if native.is_some() {
+                            next.and_then(|next| next.mode)
+                        } else {
+                            known.mode
+                        };
+                        known.matches(&current, base, mode, native)
+                    }
                     (Image::Regular { bytes, .. }, None, _)
                         if self.deployments.contains_key(&path) =>
                     {
@@ -1453,6 +1506,11 @@ fn same_copy(current: &Image, base: &Image, mode: Option<u32>) -> bool {
     }
 }
 
+fn matches_native_copy(current: &Image, digest: &str, mode: Option<u32>) -> bool {
+    matches!(current, Image::Regular { bytes, mode: actual }
+        if mode.is_none_or(|mode| mode == *actual) && copy_digest(bytes) == digest)
+}
+
 fn status_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Vec<Target>> {
     let output = validation::probe(run, root, validation::MiseProbe::DotfileStatus, preview)?;
     serde_json::from_slice::<Status>(&output)
@@ -1631,13 +1689,18 @@ fn read_copy(source: &Path, permissions: Option<&str>) -> io::Result<Image> {
     if !metadata.is_file() {
         return Err(invalid("copy source is not a regular file"));
     }
-    let mode = match permissions {
-        Some(value) => u32::from_str_radix(value, 8).map_err(io::Error::other)? & 0o777,
-        None => metadata.permissions().mode() & 0o777,
-    };
+    let mode = copy_mode(metadata.permissions().mode(), permissions)?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
     Ok(Image::Regular { bytes, mode })
+}
+
+fn copy_mode(source_mode: u32, permissions: Option<&str>) -> io::Result<u32> {
+    let mode = match permissions {
+        Some(value) => u32::from_str_radix(value, 8).map_err(io::Error::other)?,
+        None => source_mode,
+    };
+    Ok(mode & 0o777)
 }
 
 #[derive(Default)]

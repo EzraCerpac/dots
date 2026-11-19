@@ -136,10 +136,15 @@ Sync never force-pushes, skips validation or writes conflict markers into live f
 - `dots` guards its own checkout and file writes against intervening edits: a file edited during the run is left alone and reported with a recovery action.
 - Before a fresh snapshot, sync finishes an interrupted checkout, index installation or `dev` update only while the checkout, index and `dev` still match the recorded recovery state.
   Otherwise it keeps the competing `dev` tip or edits, the private original files and the pending recovery record, and reports the recorded revisions, the recovery paths and how to reconcile before you rerun.
-- What happens when the Git index changed under an interrupted checkout depends on whether that checkout had started writing.
-  If it had not, nothing was written, so sync discards the pending record and reports **Not saved**; review your staging and sync again.
-  If it had, sync moves the whole journal, original files included, to a private recovery directory and reports that directory with the recorded before and after revisions.
-  Keep your edits, reconcile the index and checkout against those revisions and any recovery copies, then sync again.
+- When the Git index changed under an interrupted checkout, act on the line the receipt prints, because it says what sync actually did:
+  - `Not saved: the Git index changed before checkout started` means nothing had been written, so sync dropped the pending record.
+    Review your staging and sync again.
+  - `Guarded checkout parked at`, followed by a private directory and the recorded revisions, means the checkout had started writing, so sync moved its journal, original files included, into that directory.
+    Keep your edits, reconcile the index and checkout against those revisions and any recovery copies, then sync again.
+  - `A guarded checkout is pending; sync kept your files`, with the recorded revisions when sync has them, means the journal was not moved, and a checkout that had started stays pending for the next run.
+    Reconcile the index and checkout against the printed revisions and any recovery copies, then sync again.
+
+  A `dots` build that cannot park a journal reports a started checkout this last way.
 - When sync takes over or displaces an existing copied dotfile, it verifies the displaced file and creates the replacement only at an empty path.
   When another writer claims the path, sync leaves it alone and prints where the moved file is.
 - The original inode stays at a printed private path on the same filesystem, so an editor that still has it open can finish saving.
@@ -211,7 +216,7 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | Not shared: a secret was found | gitleaks flagged a new edit. It stays on disk and off `dev`. Take the secret out, or for a false positive add a reviewed allowlist entry to `.gitleaks.toml` or `.gitleaksignore`, then sync again. |
 | Not shared: the scan could not run | Nothing was pushed, and your edits are still on disk. When the candidate's scan passed and only the outgoing scan failed, the clean commit already sits on local `dev`. Install or repair gitleaks, then sync again. |
 | Staged and unstaged edits differ | A path headed for the clean candidate has a staged version that differs from its unstaged one. Use Git to commit, unstage or discard one of them, then sync again. |
-| Not saved | Another Git command held the index or `dev`, so local edits were not recorded; incoming work may still have arrived. Sync again once that command finishes; remove a lock left by a crashed Git command by hand. The same issue appears when the index changed before an interrupted checkout started writing; review your staging and sync again. |
+| Not saved | Another Git command held the index or `dev`, so local edits were not recorded; incoming work may still have arrived. Sync again once that command finishes; remove a lock left by a crashed Git command by hand. When the line says the Git index changed before checkout started, nothing was written and the pending record is gone; review your staging and sync again. |
 | Not pushed: an unsafe outgoing commit | An unpushed commit on `dev` contains a finding, or once tracked a machine-local file. Rewrite that commit out of the unpublished part of `dev` by hand (no published branch contains it), then sync again. |
 | Not shared: the push was rejected | `origin` refused the conditional push, for its own reason such as credentials or branch protection, or because `dev` kept moving through every retry. Local work stays saved on `dev`; check `origin` and sync again. |
 | Push unconfirmed | Sync could not tell whether `origin` accepted the push, for example after an error or the 60-second limit, so it stopped before any retry, checkout or apply and counts nothing as shared. The live and replayed receipts give the candidate commit and the expected old `dev` commit, or `(absent)`. Compare `refs/heads/dev` at `origin`'s push URL with both before running sync again. |
@@ -220,8 +225,8 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | Invalid merged configuration | Combined with this machine's local files, the merged configuration fails mise's checks, so nothing was pushed or applied. Fix the error here or upstream, then sync again. |
 | Late edit | A file changed while sync was writing, so sync did not touch it. Sync again. |
 | Blocked path | Local material sits where an incoming tracked path goes. Move it somewhere safe, sync again, then compare it with what arrived. |
-| Checkout pending | A checkout, index or `dev` update was interrupted, or `dev` moved during it. While the recorded state still matches, the next run finishes it first. Otherwise sync keeps the competing tip or edits and the recovery copies, and prints the recorded revisions and recovery paths; reconcile them, then sync again. |
-| Guarded checkout parked | The index changed after an interrupted checkout had started writing, so sync moved its journal and original files to the printed private directory and gave the recorded before and after revisions. Keep your edits, reconcile the index and checkout with those revisions and recovery copies, then sync again. |
+| Checkout pending | A checkout, index or `dev` update was interrupted, or `dev` moved during it. While the recorded state still matches, the next run finishes it first. Otherwise sync keeps the competing tip or edits and the recovery copies, and prints the recorded revisions and recovery paths; reconcile them, then sync again. A started checkout whose index changed is reported this way whenever sync leaves its journal in place. |
+| Guarded checkout parked | The receipt names a private directory and the recorded before and after revisions: the index changed after an interrupted checkout had started writing, and sync moved its journal and original files into that directory. Keep your edits, reconcile the index and checkout with those revisions and recovery copies, then sync again. |
 | History not saved | A tracked entry lacks `encrypt = true`, or the checkpoint failed. Correct the declaration or the mise error shown, then sync again. |
 | Copy kept | A deployed copy differs from what sync expected, or another writer claimed it, so sync left it in place and may print where a displaced file is. Compare the copy with its source, put the version you want in the source, then sync again. |
 | Apply or reload failed | The configuration moved forward, but dotfiles were not applied or a reload command failed. Fix the error shown and run the command sync prints. |

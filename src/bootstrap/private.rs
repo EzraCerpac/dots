@@ -340,9 +340,7 @@ pub(super) fn enroll(
                 "age-keygen returned an invalid public recipient",
             ));
         }
-        if !recipients.iter().any(|entry| entry == key) {
-            recipients.push(key.to_owned());
-        }
+        recipients.push(key.to_owned());
     }
     if public.is_empty() {
         return Err(Fail::new(

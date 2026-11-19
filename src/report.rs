@@ -10,6 +10,9 @@ use tempfile::Builder;
 
 use crate::Env;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Command {
@@ -79,6 +82,7 @@ pub struct Issue {
     pub diagnostic: String,
     pub next: String,
     pub tail: Option<String>,
+    #[serde(default, with = "log_path")]
     pub log: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_exit: Option<u8>,
@@ -93,6 +97,45 @@ impl Issue {
             log: None,
             terminal_exit: None,
         }
+    }
+}
+
+mod log_path {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        path: &Option<PathBuf>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match path.as_deref().map(Path::as_os_str) {
+            Some(path) => match path.to_str() {
+                Some(text) => serializer.serialize_some(text),
+                None => serializer.serialize_some(path.as_bytes()),
+            },
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<PathBuf>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredPath {
+            Text(String),
+            Bytes(Vec<u8>),
+        }
+
+        Ok(
+            Option::<StoredPath>::deserialize(deserializer)?.map(|path| match path {
+                StoredPath::Text(text) => text.into(),
+                StoredPath::Bytes(bytes) => OsString::from_vec(bytes).into(),
+            }),
+        )
     }
 }
 
@@ -209,6 +252,16 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
+const SAVED_PREFIX: &str = "saved-";
+
+fn publication_order(name: &str) -> Option<u64> {
+    let (order, _) = name
+        .strip_suffix(".json")?
+        .strip_prefix(SAVED_PREFIX)?
+        .split_once('-')?;
+    order.parse().ok()
+}
+
 pub(crate) fn save(env: &Env, report: &Report, log_id: Option<&str>) -> io::Result<()> {
     #[derive(Serialize)]
     struct Stored<'a> {
@@ -226,7 +279,24 @@ pub(crate) fn save(env: &Env, report: &Report, log_id: Option<&str>) -> io::Resu
         .file_name()
         .and_then(|name| name.to_str())
         .expect("ASCII generated name");
-    let final_path = dir.join(format!("{}-{token}.json", report.finished_at_ms));
+    // Lock allocation through publication. A save that stops before publication
+    // leaves no final filename to count.
+    let guard = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&dir)?;
+    guard.lock()?;
+    // Retention keeps recent reports, including the highest published order.
+    let mut last = 0;
+    for entry in fs::read_dir(&dir)? {
+        if let Some(order) = entry?.file_name().to_str().and_then(publication_order) {
+            last = last.max(order);
+        }
+    }
+    let order = last
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("saved report publication order exhausted"))?;
+    let final_path = dir.join(format!("{SAVED_PREFIX}{order}-{token}.json"));
     pending.persist_noclobber(final_path)?;
     Ok(())
 }
@@ -265,8 +335,9 @@ pub fn list(env: &Env, command: Option<Command>) -> io::Result<Vec<Entry>> {
         }
     }
     reports.sort_unstable_by(|a, b| {
-        b.finished_at_ms
-            .cmp(&a.finished_at_ms)
+        publication_order(&b.id.0)
+            .cmp(&publication_order(&a.id.0))
+            .then_with(|| b.finished_at_ms.cmp(&a.finished_at_ms))
             .then_with(|| b.id.0.cmp(&a.id.0))
     });
     Ok(reports)

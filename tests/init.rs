@@ -266,6 +266,11 @@ fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     enable_fake_gh(&world, &mut command);
     let output = success(command.arg("init").arg(&root).output().unwrap());
     let id = git(&world, &root, &["rev-parse", "HEAD"]);
+    let config = git(&world, &root, &["show", "HEAD:config.toml"]);
+    let config = toml_edit::Document::parse(config).unwrap();
+    for tool in ["gitleaks", "age"] {
+        assert_eq!(config["tools"][tool].as_str(), Some("latest"));
+    }
     assert_eq!(git(&world, &root, &["branch", "--show-current"]), "dev");
     assert_eq!(git(&world, &root, &["rev-parse", "main"]), id);
     assert_eq!(
@@ -317,7 +322,7 @@ fn new_seed_excludes_ignored_modified_linked_and_executable_files() {
     let world = World::new();
     let root = fresh(&world);
     fs::create_dir_all(root.join("dots")).unwrap();
-    let custom = "[vars]\ndots_profiles = \"server default\"\n";
+    let custom = "[vars]\ndots_profiles = \"server default\"\n\n[tools]\ngitleaks = '8.28.0'\nage = '1.2.1'\n";
     fs::write(root.join("config.toml"), custom).unwrap();
     fs::write(root.join("untracked.txt"), "synthetic private fixture\n").unwrap();
     let executable = root.join("dots/retired-dotfiles");

@@ -157,6 +157,8 @@ jobs:
           printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"
 
       - name: Run unchanged black-box scenarios against the archive
+        env:
+          DOTS_TEST_ORACLE: v0.4.0
         run: |
           export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
           for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do

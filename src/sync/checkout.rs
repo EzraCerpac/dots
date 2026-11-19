@@ -104,16 +104,15 @@ impl SnapshotIndex {
                 Err(TryLockError::Error(error)) => return Err(error),
             }
         }
-        // Persist the identifying name before a competing process can see
-        // index.lock. Never reclaim an index lock created by Git.
-        File::open(directory)?.sync_all()?;
-        let lock = directory.join("index.lock");
-        link_index_lock(&anchor, &lock)?;
         let mut guard = Self {
             owner,
-            lock,
+            lock: directory.join("index.lock"),
             bytes: Vec::new(),
         };
+        // Own cleanup before any fallible work. Another thread may have
+        // forked with a duplicate of the locked file description.
+        File::open(directory)?.sync_all()?;
+        link_index_lock(&anchor, &guard.lock)?;
         git.ensure_dense_index()?;
         guard.bytes = index_snapshot(directory)?;
         Ok(guard)
@@ -133,7 +132,7 @@ impl Drop for SnapshotIndex {
             let _ = fs::remove_file(&self.lock);
         }
         // A child between fork and exec can briefly inherit the descriptor.
-        let _ = self.owner.unlock();
+        let _ = super::lock::unlock(&self.owner);
     }
 }
 

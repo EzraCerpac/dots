@@ -495,6 +495,7 @@ impl<'a> Supervisor<'a> {
             probe,
             probe_stop_check: (probe && terminal::controlling_terminal().is_some())
                 .then(Instant::now),
+            awaiting_foreground: false,
             leader_exit: None,
             last_output: Instant::now(),
             group_empty_since: None,
@@ -713,6 +714,7 @@ struct Running<'a> {
     budget: Option<ProbeBudget>,
     probe: bool,
     probe_stop_check: Option<Instant>,
+    awaiting_foreground: bool,
     leader_exit: Option<Instant>,
     last_output: Instant,
     group_empty_since: Option<Instant>,
@@ -749,6 +751,11 @@ impl Running<'_> {
         let mut state = supervisor.state();
         let observation = self.observe(&mut state, self.job_control || self.probe)?;
         let exited = matches!(observation, Observed::Exited);
+        if self.awaiting_foreground && state.cancel.is_none() && (!exited || !drained) {
+            drop(state);
+            self.promote_group()?;
+            return Ok(None);
+        }
         if state.cancel.is_none()
             && (matches!(observation, Observed::Running) || exited && !drained)
             && self.probe_group_stopped()?
@@ -1079,24 +1086,23 @@ impl Running<'_> {
 
     fn promote_group(&mut self) -> io::Result<()> {
         let group = -self.entry.target;
-        if terminal::controlling_terminal().is_none() {
-            return if self.probe {
-                Err(io::Error::other(
+        let Some(mut job) = TerminalJob::start(self.supervisor.ctx, Some(group))? else {
+            // An early fg can promote a running job without sending SIGCONT.
+            // Leave the reader stopped while the supervisor awaits the tty.
+            self.awaiting_foreground = terminal::controlling_terminal().is_some();
+            if self.probe && !self.awaiting_foreground {
+                return Err(io::Error::other(
                     "probe stopped without a controlling terminal",
-                ))
-            } else {
-                Ok(())
-            };
+                ));
+            }
+            return Ok(());
+        };
+        job.enter()?;
+        self.awaiting_foreground = !job.owns_foreground();
+        if self.awaiting_foreground {
+            return Ok(());
         }
-        // The shell may foreground dots before we observe its reader stop.
-        // If it has not, stop dots too so an ordinary fg can promote it.
-        if foreground_terminal().is_none() {
-            terminal::suspend_caller()?;
-        }
-        if let Some(mut job) = TerminalJob::start(self.supervisor.ctx, Some(group))? {
-            job.enter()?;
-            self.terminal = Some(job);
-        }
+        self.terminal = Some(job);
         terminal::continue_group(group)
     }
 

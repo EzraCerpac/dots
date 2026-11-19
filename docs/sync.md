@@ -19,7 +19,8 @@ Each run works out afresh whether the configuration is shared, from the `dots_so
 A local-only `dots sync` prints a one-line receipt saying how to add a remote, and skips the shared pipeline: it saves no history, captures no copies, and makes no network call, scan or commit.
 A checkout or guarded dotfile write that an earlier shared run left pending is still finished first, even without `origin`, and the receipt says what it finished.
 When the configuration is local-only and nothing is pending, `dots up` skips its sync stage with one line and no sync receipt, still runs its own checkpoints, and needs no attention for it.
-`dots apply` works locally whichever mode applies.
+In either mode, `dots up` applies the declared dotfiles.
+To apply one target yourself, run `dots mise bootstrap dotfiles apply TARGET`.
 
 Once a configuration names a remote or has an `origin`, it is shared, never local-only.
 If that remote is unreachable, the receipt says sync is offline, and the work waits for a later run.

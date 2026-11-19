@@ -121,7 +121,7 @@ fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
     let git = Git::new(ctx, ctx.root.path());
     let checkout = shape(&git).map_err(|_| {
         Note::new(
-            "Git is unavailable or the configuration is outside a Git checkout",
+            "Git is unavailable or the configuration is outside a Git repository",
             GUIDE,
         )
     })?;
@@ -153,10 +153,22 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
         "Could not read config.toml or its repository settings",
         CONFIG,
     )?;
-    Origin::load(git, vars.source_repo).or_note(
-        "origin is missing, unsafe, or differs from the configured repository",
-        REMOTE,
-    )
+    let github = vars
+        .source_repo
+        .as_ref()
+        .and_then(|repo| repo.github())
+        .filter(|name| name.len() <= 140)
+        .map(str::to_owned);
+    Origin::load(git, vars.source_repo).map_err(|_| {
+        let diagnostic = match github {
+            Some(name) => {
+                format!("origin is missing, unsafe, or differs from configured repository {name}")
+                    .into()
+            }
+            None => "origin is missing, unsafe, or differs from the configured repository".into(),
+        };
+        Note(diagnostic, REMOTE)
+    })
 }
 
 pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display) -> Receipt {
@@ -428,10 +440,16 @@ fn synchronize(
     }
     copies
         .capture(run, &git, &shared.dir, &before, &base, receipt)
-        .or_note(
-            "Could not inspect deployed copies or record their recovery state",
-            RERUN,
-        )?;
+        .map_err(|error| {
+            let diagnostic = "Could not inspect deployed copies or record their recovery state";
+            match error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<validation::ProbeFailure>())
+            {
+                Some(failure) => Note(format!("{diagnostic} ({failure})").into(), RERUN),
+                None => Note::new(diagnostic, RERUN),
+            }
+        })?;
 
     active(run)?;
     let unscanned = scratch.capture(&before).or_note(

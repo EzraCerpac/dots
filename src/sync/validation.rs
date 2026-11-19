@@ -5,7 +5,7 @@ use std::io::{self, Seek, Write};
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 use serde::Deserialize;
 use toml_edit::{Document, DocumentMut, Item, Key, Table};
@@ -155,7 +155,7 @@ pub(super) fn validate(
     let selected_root = config::Root::resolve(&env).map_err(io::Error::other)?;
     config::Vars::read(&selected_root).map_err(io::Error::other)?;
     let selection = config::selection::read(&selected_root, &env).map_err(io::Error::other)?;
-    let config = probe(run, &root, ["config", "ls", "--json"], true)?;
+    let config = probe(run, &root, MiseProbe::ConfigList, true)?;
     #[derive(Deserialize)]
     struct Entry {
         path: PathBuf,
@@ -204,19 +204,7 @@ pub(super) fn validate(
         scratch.live.root(),
         selection.active_environments(),
     )?;
-    probe(
-        run,
-        &root,
-        [
-            "bootstrap",
-            "dotfiles",
-            "apply",
-            "--dry-run",
-            "--force",
-            "--yes",
-        ],
-        true,
-    )?;
+    probe(run, &root, MiseProbe::DotfilePreview, true)?;
     let private = Dir::open(&root)?;
     let mut configs = BTreeMap::new();
     for file in files {
@@ -351,22 +339,69 @@ pub(super) fn command(
     Ok(cmd)
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum MiseProbe {
+    ConfigList,
+    DotfileStatus,
+    DotfilePreview,
+}
+
+impl MiseProbe {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::ConfigList => &["config", "ls", "--json"],
+            Self::DotfileStatus => &["bootstrap", "dotfiles", "status", "--json"],
+            Self::DotfilePreview => &[
+                "bootstrap",
+                "dotfiles",
+                "apply",
+                "--dry-run",
+                "--force",
+                "--yes",
+            ],
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ConfigList => "mise config ls",
+            Self::DotfileStatus => "mise bootstrap dotfiles status",
+            Self::DotfilePreview => "mise bootstrap dotfiles apply --dry-run",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ProbeFailure {
+    operation: &'static str,
+    status: ExitStatus,
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.status)
+    }
+}
+
+impl std::error::Error for ProbeFailure {}
+
 pub(super) fn probe(
     run: &Run<'_>,
     root: &Path,
-    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    operation: MiseProbe,
     preview: bool,
 ) -> io::Result<Vec<u8>> {
     if run.cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
-    let output = run.probe(command(run, root, args, preview)?)?;
+    let output = run.probe(command(run, root, operation.args(), preview)?)?;
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(invalid(
-            "mise rejected the configuration or dotfile operation",
-        ))
+        Err(io::Error::other(ProbeFailure {
+            operation: operation.name(),
+            status: output.status,
+        }))
     }
 }
 

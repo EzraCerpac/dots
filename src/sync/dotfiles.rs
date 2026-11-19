@@ -1433,12 +1433,7 @@ fn same_copy(current: &Image, base: &Image, mode: Option<u32>) -> bool {
 }
 
 fn status_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Vec<Target>> {
-    let output = validation::probe(
-        run,
-        root,
-        ["bootstrap", "dotfiles", "status", "--json"],
-        preview,
-    )?;
+    let output = validation::probe(run, root, validation::MiseProbe::DotfileStatus, preview)?;
     serde_json::from_slice::<Status>(&output)
         .map(|status| status.files)
         .map_err(io::Error::other)
@@ -1678,7 +1673,7 @@ impl Configs {
         struct Config {
             path: PathBuf,
         }
-        let bytes = validation::probe(run, root, ["config", "ls", "--json"], preview)?;
+        let bytes = validation::probe(run, root, validation::MiseProbe::ConfigList, preview)?;
         let configs: Vec<Config> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         let mut result = Self::default();
         for config in configs {

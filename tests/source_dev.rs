@@ -4020,3 +4020,108 @@ copies_case!(
         );
     }
 );
+
+#[test]
+#[ignore = "requires real mise and gitleaks in a private World"]
+fn new_file_adoption_below_home_shares_and_preserves_source_guard() {
+    let world = IsolatedWorld::new();
+    let root = world.home().join(".config/mise");
+    fs::create_dir_all(&root).unwrap();
+    let real_mise = executable_on_path(&world.git(), "mise").expect("real mise on fixture PATH");
+    let real_gitleaks =
+        executable_on_path(&world.git(), "gitleaks").expect("real gitleaks on fixture PATH");
+    let mise = world.native_mise_adapter(&real_mise);
+    let tools = world.root().with_file_name("adoption-tools");
+    fs::create_dir(&tools).unwrap();
+    symlink(real_gitleaks, tools.join("gitleaks")).unwrap();
+    symlink(
+        executable_on_path(&world.git(), "git").unwrap(),
+        tools.join("git"),
+    )
+    .unwrap();
+    let path =
+        std::env::join_paths([tools.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let dots = || {
+        let mut cmd = world.dots();
+        cmd.current_dir(&root)
+            .env("DOTS_ROOT", &root)
+            .env("MISE_CONFIG_DIR", &root)
+            .env("MISE_TRUSTED_CONFIG_PATHS", &root)
+            .env("DOTS_MISE_BIN", &mise)
+            .env("PATH", &path);
+        cmd
+    };
+    let git = |cwd: &Path, args: &[&str]| success(world.git().current_dir(cwd).args(args));
+    dots_zero(dots().arg("init").arg(&root));
+    assert_eq!(git(&root, &["branch", "--show-current"]), "dev");
+    let remote = world.bare_remote("adoption.git");
+    git(&root, &["config", "user.name", "Dots fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    git(
+        &root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", remote.display()),
+        ],
+    );
+    git(&root, &["push", "origin", "main", "dev"]);
+    let target = world.home().join(".config/example/settings.toml");
+    let source_key = "dotfiles/.config/example/settings.toml";
+    let source = root.join(source_key);
+    put(&target, "[settings]\nname = 'adopted-synthetic-file'\n");
+    dots_zero(dots().arg("add").arg(&target));
+    assert_eq!(fs::read_link(&target).unwrap(), source);
+    assert_eq!(read(&source), read(&target));
+
+    let sync = || dots_zero(dots().args(["--plain", "sync"]));
+    let first = sync();
+    assert_eq!(
+        git(
+            &remote,
+            &[
+                "show",
+                "refs/heads/dev:dotfiles/.config/example/settings.toml"
+            ]
+        ),
+        "[settings]\nname = 'adopted-synthetic-file'"
+    );
+    assert_eq!(git(&root, &["status", "--porcelain=v1"]), "");
+    let revision = git(&remote, &["rev-parse", "refs/heads/dev"]);
+    let repeat = sync();
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/dev"]), revision);
+    let selector_issue = "Kept a dotfile whose validated selector changed";
+    absent(&first, selector_issue);
+    absent(&repeat, selector_issue);
+    let declaring = ["config.default.toml", "config.toml"]
+        .into_iter()
+        .find(|name| {
+            fs::read_to_string(root.join(name)).is_ok_and(|text| text.contains(source_key))
+        })
+        .expect("actual declaration written by dots add");
+    let cfg = root.join("config.toml");
+    let before = read(&cfg);
+    let hook = format!(
+        "\n[bootstrap.hooks]\npre-dotfiles = '''\ncp \"$HOME/control-config.toml\" {}\nprintf 'changed\\n' > \"$HOME/control-hook-ran\"\n'''\n",
+        sh(&root.join(declaring))
+    );
+    put(&cfg, format!("{before}{hook}"));
+    put(
+        &root.join("dotfiles/control.toml"),
+        "[settings]\nname = 'rejected-synthetic-source'\n",
+    );
+    let approved = read(&root.join(declaring));
+    let alternate = approved.replace(source_key, "dotfiles/control.toml");
+    assert_ne!(approved, alternate);
+    put(&world.home().join("control-config.toml"), &alternate);
+    let control = sync();
+    has(&control, selector_issue);
+    assert_eq!(read(&world.home().join("control-hook-ran")), "changed\n");
+    assert_eq!(read(&root.join(declaring)), alternate);
+    assert_eq!(
+        git(&remote, &["show", &format!("refs/heads/dev:{declaring}")]),
+        approved.trim()
+    );
+    assert_eq!(fs::read_link(&target).unwrap(), source);
+}

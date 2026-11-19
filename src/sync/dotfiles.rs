@@ -1534,9 +1534,19 @@ fn matches_native_copy(current: &Image, digest: &str, mode: Option<u32>) -> bool
 
 fn status_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Vec<Target>> {
     let output = validation::probe(run, root, validation::MiseProbe::DotfileStatus, preview)?;
-    serde_json::from_slice::<Status>(&output)
-        .map(|status| status.files)
-        .map_err(io::Error::other)
+    let mut status: Status = serde_json::from_slice(&output).map_err(io::Error::other)?;
+    if let Some(home) = run.ctx().env.home() {
+        for row in &mut status.files {
+            // Mise abbreviates the top-level source for display. Expand it
+            // lexically so the preview prefix can be remapped before comparison.
+            if let Some(source) = &mut row.source
+                && let Ok(relative) = source.strip_prefix("~")
+            {
+                *source = home.join(relative);
+            }
+        }
+    }
+    Ok(status.files)
 }
 
 fn absolute_target(run: &Run<'_>, path: &Path) -> io::Result<PathBuf> {

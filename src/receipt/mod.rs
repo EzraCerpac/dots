@@ -134,12 +134,34 @@ pub fn emit(ctx: &Ctx, receipt: &Receipt, display: Display) -> Result<(), Fail> 
     })
 }
 
+pub(crate) fn startup_failure(error: &Fail) {
+    let mut receipt = Receipt::new(None, "not pushed");
+    receipt.stage_outcome = Outcome::Deferred;
+    receipt.issues.push(Issue {
+        diagnostic: format!("Could not start sync: {error}"),
+        next_action: "Run from an existing directory with DOTS_ROOT set to the configuration checkout, then rerun dots sync.".into(),
+    });
+    write_stdout(&metadata(&receipt, false));
+    warn_save_failure();
+}
+
+pub(crate) fn warn_save_failure() {
+    let _ = writeln!(
+        io::stderr().lock(),
+        "dots sync: could not save the sync receipt for replay"
+    );
+}
+
+pub(crate) fn no_receipt() {
+    write_stdout("No sync receipt for this checkout.\n");
+}
+
 pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
     let root = ctx.root.path();
     let receipt = match store::load(&ctx.env, root) {
         Ok(Some(receipt)) => receipt,
         Ok(None) => {
-            write_stdout("No sync receipt for this checkout.\n");
+            no_receipt();
             return Ok(0);
         }
         Err(error) => {
@@ -147,7 +169,7 @@ pub fn last(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
                 io::stderr().lock(),
                 "dots sync: could not read the latest receipt: {error}"
             );
-            write_stdout("No sync receipt for this checkout.\n");
+            no_receipt();
             return Ok(0);
         }
     };

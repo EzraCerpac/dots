@@ -177,7 +177,6 @@ fn unchanged_help_and_command_lookup_work_without_dots_directory() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_exceptions_work_without_dots_directory() {
     let world = World::new();
     minimal_config(&world, "[vars]\ndots_profiles = \"laptop server\"\n");
@@ -196,10 +195,13 @@ while [ "$#" -ge 2 ]; do
 done
 case "$*" in
     --version) printf '2026.11.9\n' ;;
-    'bootstrap dotfiles paths --json') printf '{"entries":[]}\n' ;;
-    'bootstrap dotfiles status --json'|'bootstrap packages status --json'|'ls --json') printf '{}\n' ;;
+    'bootstrap dotfiles paths --json'|'bootstrap dotfiles --local paths --json')
+        printf '{"entries":[],"invalid":[]}\n' ;;
+    'bootstrap packages status --json'|'ls --current --json') printf '{}\n' ;;
+    'config ls --json') printf '[{"path":"%s/config.toml"}]\n' "$DOTS_ROOT" ;;
     install*|upgrade*) ;;
-    self-update*) : > "${0%/*}/mise-self-update-ran" ;;
+    'self-update --help') ;;
+    'self-update --yes --no-plugins') : > "${0%/*}/mise-self-update-ran" ;;
     which*) exit 1 ;;
     *) printf 'unexpected mise request: %s\n' "$*" >&2; exit 1 ;;
 esac
@@ -215,10 +217,16 @@ esac
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_up_works_without_dots_directory() {
     let world = World::new();
     minimal_config(&world, "[vars]\ndots_profiles = \"laptop server\"\n");
+    for args in [
+        &["init", "-q", "-b", "dev"][..],
+        &["add", "config.toml"],
+        &["commit", "-qm", "Seed local-only configuration"],
+    ] {
+        success(run(world.git(), args));
+    }
     let stdout = success(run(update_mise(&world), &["--plain", "up"]));
     let plain = stdout.to_ascii_lowercase();
     assert!(
@@ -235,7 +243,6 @@ fn new_up_works_without_dots_directory() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_up_names_missing_profiles_setting_and_file() {
     let world = World::new();
     minimal_config(&world, "# No profiles\n");

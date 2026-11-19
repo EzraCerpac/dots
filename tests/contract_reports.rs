@@ -169,6 +169,98 @@ fn assert_no_repository(message: &str) {
 }
 
 #[test]
+fn new_valid_sync_reports_an_unusable_root_without_saving() {
+    let world = World::new();
+    let file = world.base().join("regular-file");
+    fs::write(&file, "keep fixture file\n").unwrap();
+    let blocked = file.join("configuration");
+    let launch = |args: &[&str]| {
+        world
+            .dots()
+            .env("DOTS_ROOT", &blocked)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [&["sync"][..], &["--plain", "sync"]] {
+        let output = launch(args);
+        assert_code(&output, 0);
+        let receipt = text(&output.stdout);
+        assert!(receipt.contains("Could not start sync:"), "{receipt}");
+        assert!(receipt.contains("regular-file/configuration"), "{receipt}");
+        assert!(
+            receipt.contains("DOTS_ROOT") && receipt.contains("rerun dots sync"),
+            "{receipt}"
+        );
+        assert!(receipt.contains("not pushed"), "{receipt}");
+        assert_eq!(
+            receipt
+                .lines()
+                .filter(|line| line.starts_with("dots sync:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text(&output.stderr),
+            "dots sync: could not save the sync receipt for replay\n"
+        );
+    }
+    for args in [&["--plain", "sync", "unexpected"][..], &["status"]] {
+        let output = launch(args);
+        assert_code(&output, 2);
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
+    assert!(!state(&world).join("receipts").exists());
+    assert!(!state(&world).join("reports").exists());
+    assert_eq!(fs::read_to_string(file).unwrap(), "keep fixture file\n");
+
+    fs::write(
+        world.root().join("config.toml"),
+        "[vars]\ndots_profiles = 'laptop'\n",
+    )
+    .unwrap();
+    git(&world, &["init", "-q", "-b", "dev"]);
+    git(&world, &["add", "config.toml"]);
+    git(&world, &["commit", "-qm", "Other checkout"]);
+    let other = world.dots().arg("sync").output().unwrap();
+    assert_code(&other, 0);
+    assert!(text(&other.stdout).contains("local-only"), "{other:?}");
+    let receipts = state(&world).join("receipts");
+    let prior = fs::read_dir(&receipts)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let saved = fs::read(&prior).unwrap();
+
+    let tools = world.home().join("replay-tools");
+    for tool in ["git", "mise", "gitleaks", "less"] {
+        executable(
+            &tools.join(tool),
+            "#!/bin/sh\nprintf 'unexpected child\n' >> \"$HOME/replay-child-ran\"\nexit 88\n",
+        );
+    }
+    for args in [&["sync", "--last"][..], &["--plain", "sync", "--last"]] {
+        let output = world
+            .dots()
+            .env("DOTS_ROOT", &blocked)
+            .env("PATH", &tools)
+            .env("DOTS_MISE_BIN", tools.join("mise"))
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_code(&output, 0);
+        assert_eq!(text(&output.stdout), "No sync receipt for this checkout.\n");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+    assert!(!world.home().join("replay-child-ran").exists());
+    assert_eq!(fs::read_dir(receipts).unwrap().count(), 1);
+    assert_eq!(fs::read(prior).unwrap(), saved);
+}
+
+#[test]
 #[ignore = "P-08"]
 fn unchanged_piped_sync_replays_metadata_without_syncing() {
     let world = World::new();

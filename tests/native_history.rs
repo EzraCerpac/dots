@@ -2544,6 +2544,10 @@ fn new_initialize_preserves_the_displaced_history_and_a_failed_clone_leaves_it_i
     seed.configure(&origin, &origin, &key, &recipients);
     seed.seed(&remote, FIRST);
     let fixture = Fixture::new();
+    let previous = format!(
+        "file://{}",
+        fixture.world.bare_remote("previous.git").display()
+    );
     let wrong = format!(
         "file://{}",
         fixture.world.root().join("no-bare-remote").display()
@@ -2551,22 +2555,32 @@ fn new_initialize_preserves_the_displaced_history_and_a_failed_clone_leaves_it_i
     fixture.configure(&wrong, &wrong, &key, &recipients);
     fixture.write(DEFAULT, 0o600);
     ok(&mut fixture.mise(&["bootstrap", "dotfiles", "save"]));
+    let store = fixture.store();
+    let history = store.parent().unwrap();
+    // An old store connected to the requested URL would use established restore.
     ok(fixture
-        .git(Some(&fixture.store()))
-        .args(["config", "remote.origin.url", &wrong]));
-    let original = fixture.tip(&fixture.store(), "HEAD");
+        .git(Some(&store))
+        .args(["config", "remote.origin.url", &previous]));
+    let original = fixture.tip(&store, "HEAD");
     let failed = fixture
         .dots(&["restore", "--initialize-history"], &remote)
         .output()
         .unwrap();
     assert_eq!(failed.status.code(), Some(1), "{}", messages(&failed));
-    assert_eq!(fixture.tip(&fixture.store(), "HEAD"), original);
+    assert!(
+        messages(&failed).contains("could not stage the selected remote history branch"),
+        "{}",
+        messages(&failed)
+    );
+    assert_eq!(fixture.tip(&store, "HEAD"), original);
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+    assert!(!store.join("dots-restore-pending").exists());
+    assert!(!history.join(".dots-restore-install").exists());
     fixture.configure(&origin, &origin, &key, &recipients);
     let no_flag = fixture.dots(&["restore"], &remote).output().unwrap();
     assert_eq!(no_flag.status.code(), Some(2), "{}", messages(&no_flag));
+    assert!(messages(&no_flag).contains("local history is connected elsewhere"));
     ok(&mut fixture.dots(&["restore", "--initialize-history"], &remote));
-    let store = fixture.store();
-    let history = store.parent().unwrap();
     let backup = fs::read_dir(history)
         .unwrap()
         .find_map(|entry| {

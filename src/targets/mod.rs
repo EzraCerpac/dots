@@ -243,6 +243,9 @@ impl Targets {
                     .entry(id.to_string())
                     .or_insert_with(|| Target::new(&id, kind));
                 target.aliases.extend(names::aliases(key));
+                if id.starts_with("github:") && id != key {
+                    target.aliases.extend(names::aliases(&id));
+                }
                 target.declarations.push(Declaration {
                     path: path.to_owned(),
                     key: key.into(),

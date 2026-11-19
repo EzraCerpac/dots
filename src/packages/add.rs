@@ -96,7 +96,7 @@ fn install(
             return Err(Fail::usage(format!("{key} is supported on macOS only")));
         }
         native::validate_name(manager, name)?;
-        verify_manager_enabled(&mise, manager)?;
+        verify_manager_enabled(&mise, run, id, manager)?;
         let mut declaration = package_value(&edit.doc.document, &key, version.as_deref())?;
         let dir = tempfile::tempdir()
             .map_err(|error| Fail::new(1, format!("could not stage {key}: {error}")))?;
@@ -141,7 +141,7 @@ fn install(
                 if let Some(recipe) = exceptions.held_by(&key) {
                     return Err(held(&key, recipe));
                 }
-                verify_manager_enabled(&mise, "brew-cask")?;
+                verify_manager_enabled(&mise, run, id, "brew-cask")?;
                 if let Some(cask) = edit::entry(&edit.doc.document, PACKAGES, &key)? {
                     if edit::entry(&edit.doc.document, PACKAGES, &original)?.is_some()
                         && cask.to_string() != declaration.to_string()
@@ -267,14 +267,40 @@ fn finish_install(
         }
         return Err(error);
     }
+    if section == PACKAGES {
+        let path = edit.path.clone();
+        let saved = (|| {
+            let current = Edit::open(&path)?;
+            for affected in std::iter::once(key).chain(replace) {
+                let before = edit::entry(&edit.doc.document, section, affected)?.map(Item::to_string);
+                let now = edit::entry(&current.doc.document, section, affected)?.map(Item::to_string);
+                if before != now {
+                    return Err(Fail::new(1, format!("the declaration for {affected} changed during installation")));
+                }
+            }
+            record_install(current, section, key, declaration, replace)
+        })().map_err(|error| Fail::new(1, format!("installed {key} but could not record it in {}; reconcile the declaration: {error}", path.display())))?;
+        if saved {
+            println!("Recorded {key}");
+        }
+    } else {
+        record_install(edit, section, key, declaration, replace)?;
+    }
+    Ok(())
+}
+
+fn record_install(
+    mut edit: Edit,
+    section: &[&str],
+    key: &str,
+    declaration: Item,
+    replace: Option<&str>,
+) -> Result<bool, Fail> {
     if let Some(old) = replace {
         edit::delete(&mut edit.doc.document, section, old)?;
     }
     edit::put(&mut edit.doc.document, section, key, declaration)?;
-    if edit.install()?.is_some() && section == PACKAGES {
-        println!("Recorded {key}");
-    }
-    Ok(())
+    Ok(edit.install()?.is_some())
 }
 
 fn ask_to_record(
@@ -304,8 +330,33 @@ fn ask_to_record(
     Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn verify_manager_enabled(mise: &Mise<'_>, manager: &str) -> Result<(), Fail> {
-    let settings = mise.json(["settings", "ls", "--all", "--json", "system_packages"])?;
+fn verify_manager_enabled(
+    mise: &Mise<'_>,
+    run: &Run<'_>,
+    id: StageId,
+    manager: &str,
+) -> Result<(), Fail> {
+    let command = mise.command_in_run(
+        run,
+        ["settings", "ls", "--all", "--json", "system_packages"],
+    )?;
+    let output = run.probe_for(id, command).map_err(|error| {
+        Fail::new(
+            1,
+            format!("could not query mise system package settings: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(Fail::new(
+            1,
+            format!(
+                "could not query mise system package settings ({})",
+                output.status
+            ),
+        ));
+    }
+    let settings: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| Fail::new(1, "mise returned invalid system package settings JSON"))?;
     if let Some(allowed) = settings["system_packages"]["managers"].as_array()
         && !allowed.iter().any(|value| value.as_str() == Some(manager))
     {

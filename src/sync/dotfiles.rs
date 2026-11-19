@@ -192,6 +192,10 @@ struct KnownCopy {
 }
 
 impl KnownCopy {
+    fn accepts_native_baseline(&self) -> bool {
+        self.deployed.is_none() || self.native_epoch.is_some()
+    }
+
     fn source_image(&self, git: &Git<'_>, revision: &str) -> io::Result<Image> {
         Image::checkout(
             git,
@@ -214,7 +218,7 @@ impl KnownCopy {
             }
             // Legacy guarded records do not say when mise last deployed.
             // An extant but undated native record may only corroborate them.
-            if self.deployed.is_none() || self.native_epoch.is_some() {
+            if self.accepts_native_baseline() {
                 return true;
             }
         }
@@ -1301,7 +1305,7 @@ impl Copies {
                         } else {
                             None
                         };
-                        let mode = if native.is_some() && known.native_epoch.is_some() {
+                        let mode = if native.is_some() && known.accepts_native_baseline() {
                             next.and_then(|next| next.mode).or(known.mode)
                         } else {
                             known.mode

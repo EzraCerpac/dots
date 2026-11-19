@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# The case functions are called by name in run_case.
+# shellcheck disable=SC2329
+set -euo pipefail
+
+if [[ ${GITHUB_ACTIONS:-} != true || ${RUNNER_ENVIRONMENT:-} != github-hosted ||
+      ${RUNNER_OS:-} != macOS || ${RUNNER_ARCH:-} != ARM64 || $(uname -sm) != 'Darwin arm64' ]]; then
+    echo 'This check requires a disposable GitHub-hosted ARM macOS runner.' >&2
+    exit 1
+fi
+
+release=${1:?missing release artifact directory}
+version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+archive="dots-$version-darwin-arm64.tar.gz"
+scratch=$(mktemp -d "${RUNNER_TEMP:?}/dots-scaffold.XXXXXXXX")
+scratch=$(cd "$scratch" && pwd -P)
+trap 'rm -rf -- "$scratch"' EXIT
+(cd "$release" && awk -v archive="$archive" '$2 == archive' SHA256SUMS | shasum -a 256 -c)
+tar -xzf "$release/$archive" -C "$scratch" bin/dots
+dots="$scratch/bin/dots"
+brew=/opt/homebrew/bin/brew
+export PATH="$scratch/bin:/opt/homebrew/bin:$PATH"
+export DOTS_MISE_BIN
+DOTS_MISE_BIN=$(command -v mise)
+printf 'Candidate %s from %s\n' "$("$dots" --version)" "$archive"
+
+init_case() {
+    local state="$scratch/$1"
+    export HOME="$state/home" TMPDIR="$state/tmp"
+    export XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_DATA_HOME="$HOME/.local/share" XDG_STATE_HOME="$HOME/.local/state"
+    export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
+    export DOTS_ROOT="$XDG_CONFIG_HOME/mise" DOTS_SKILL_LINKS=0
+    export MISE_CEILING_PATHS="$state" MISE_TRUSTED_CONFIG_PATHS="$DOTS_ROOT" MISE_YES=1
+    export MISE_SYSTEM_CONFIG_DIR="$state/mise-system/config" MISE_SYSTEM_DATA_DIR="$state/mise-system/data"
+    export MISE_SELF_UPDATE_AVAILABLE=false
+    export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+    export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+    export HOMEBREW_CACHE="$XDG_CACHE_HOME/Homebrew" HOMEBREW_LOGS="$XDG_STATE_HOME/Homebrew"
+    export HOMEBREW_TEMP="$TMPDIR" HOMEBREW_CASK_OPTS="--appdir=$HOME/Applications"
+    mkdir -p "$HOME/Applications" "$TMPDIR" "$HOMEBREW_LOGS"
+    cd "$HOME"
+    "$dots" init </dev/null
+    readme="$DOTS_ROOT/dots/README.md"
+
+    # Only enable the example profile and avoid installing unrelated scaffold tools.
+    sed -i '' -e '/^\[tools\]$/,/^\[vars\]$/{' -e '/^\[vars\]$/!d' -e '}' \
+        -e 's/^dots_profiles = "default"$/dots_profiles = "default laptop"/' "$DOTS_ROOT/config.toml"
+    export SETUP_PROFILE=laptop
+}
+
+example_body() {
+    local path=$1 target="$DOTS_ROOT/dots/$1"
+    test ! -e "$target"
+    awk -v path="$path" -v fence='```' '
+        BEGIN { tick = substr(fence, 1, 1); marker = tick path tick }
+        index($0, marker) { named = 1 }
+        !body && named && $0 == fence "sh" { body = 1; next }
+        body && $0 == fence { found = 1; exit }
+        body { print }
+        END { if (!found) exit 1 }
+    ' "$readme" > "$target"
+    chmod +x "$target"
+}
+
+recipe() {
+    example_body "exceptions/$1"
+    awk -F '\t' -v name="$1" '$2 == name { print; count++ } END { if (count != 1) exit 1 }' \
+        "$readme" >> "$DOTS_ROOT/dots/exceptions.tsv"
+}
+
+dispatch() {
+    dots_status=0
+    "$dots" --plain "$@" </dev/null > "$HOME/dispatch.log" 2>&1 || dots_status=$?
+    cat "$HOME/dispatch.log"
+    printf 'Result: dots %s exited %s\n' "$*" "$dots_status"
+}
+
+fonts() {
+    init_case fonts
+    example_body 'hooks/update.d/50-Fonts@laptop'
+    test ! -e "$DOTS_ROOT/scripts/install-fonts"
+    printf '%s\n' 'Result: Stock scaffold has no scripts/install-fonts. Supplying a real installer, the macOS Menlo.ttc font, fontconfig and a private font configuration.'
+    "$brew" --version
+    if ! command -v fc-list >/dev/null; then
+        "$brew" install fontconfig
+    fi
+    export FONTCONFIG_FILE="$HOME/fonts.conf"
+    mkdir -p "$DOTS_ROOT/scripts" "$HOME/fonts"
+    cat > "$FONTCONFIG_FILE" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig><dir>$HOME/fonts</dir><cachedir>$XDG_CACHE_HOME/fontconfig</cachedir></fontconfig>
+EOF
+    cat > "$DOTS_ROOT/scripts/install-fonts" <<'SH'
+#!/bin/sh
+set -eu
+install -m 0644 /System/Library/Fonts/Menlo.ttc "$HOME/fonts/Menlo.ttc"
+fc-cache -f "$HOME/fonts"
+SH
+    chmod +x "$DOTS_ROOT/scripts/install-fonts"
+    fc-list > "$HOME/fonts.before"
+    test ! -s "$HOME/fonts.before"
+    dispatch up
+    test "$dots_status" -eq 0
+    cmp /System/Library/Fonts/Menlo.ttc "$HOME/fonts/Menlo.ttc"
+    fc-list > "$HOME/fonts.after"
+    count=$(wc -l < "$HOME/fonts.after" | tr -d ' ')
+    test "$count" -gt 0
+    grep -F 'Menlo' "$HOME/fonts.after"
+    grep -Fx 'Fonts: completed' "$HOME/dispatch.log"
+    grep -Fx "    updated  fonts  0 → $count" "$HOME/dispatch.log"
+    printf 'Result: Hook installed Menlo.ttc and dots reported the font count changing from 0 to %s.\n' "$count"
+}
+
+new_tap() {
+    test "$("$brew" --prefix)" = /opt/homebrew
+    "$brew" --version
+    tap="$("$brew" --repository)/Library/Taps/dots-ci/homebrew-$1"
+    test ! -e "$tap"
+    mkdir -p "$tap/Formula" "$tap/Casks"
+    git -C "$tap" init -q
+}
+
+assert_absent() {
+    local inventory
+    inventory=$("$brew" list "$1")
+    if grep -Fx "$2" <<< "$inventory"; then
+        printf 'Result: Unexpected pre-existing Homebrew package %s.\n' "$2" >&2
+        return 1
+    fi
+}
+
+app() {
+    init_case app
+    recipe example-app
+    new_tap scaffold-app
+    assert_absent --cask example-app
+    printf '%s\n' 'Result: Stock scaffold adds no source for example-app. Supplying cask 1.2.3 from a test-local tap, with an actual app bundle and hosted administrator access.'
+    sudo -n true
+    local app='Example App.app' bundle="$HOME/payload/Example App.app"
+    mkdir -p "$bundle/Contents/MacOS"
+    cp /usr/bin/true "$bundle/Contents/MacOS/Example App"
+    cat > "$bundle/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ci.dots.example-app</string>
+<key>CFBundleExecutable</key><string>Example App</string>
+<key>CFBundleName</key><string>Example App</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>1.2.3</string>
+</dict></plist>
+PLIST
+    tar -czf "$HOME/example-app.tar.gz" -C "$HOME/payload" "$app"
+    cat > "$tap/Casks/example-app.rb" <<EOF
+cask "example-app" do
+  version "1.2.3"
+  sha256 "$(shasum -a 256 "$HOME/example-app.tar.gz" | cut -d ' ' -f 1)"
+  url "file://$HOME/example-app.tar.gz"
+  name "Example App"
+  desc "App bundle for the dots scaffold CI scenario"
+  homepage "https://example.invalid"
+  app "$app"
+end
+EOF
+    if "$brew" command trust >/dev/null 2>&1; then
+        "$brew" trust --cask dots-ci/scaffold-app/example-app
+    fi
+    "$brew" info --json=v2 --cask example-app | jq -e '.casks[0].tap == "dots-ci/scaffold-app"'
+    dispatch exceptions
+    test "$dots_status" -eq 0
+    test "$("$brew" list --versions --cask example-app)" = 'example-app 1.2.3'
+    cmp "$bundle/Contents/Info.plist" "$HOME/Applications/$app/Contents/Info.plist"
+    cmp "$bundle/Contents/MacOS/Example App" "$HOME/Applications/$app/Contents/MacOS/Example App"
+    printf '%s\n' 'Result: Recipe installed example-app 1.2.3 through Homebrew and placed the expected app bundle in the private Applications directory.'
+}
+
+tool() {
+    init_case tool
+    recipe example-tool
+    new_tap scaffold-tool
+    assert_absent --formula example
+    dispatch exceptions
+    test "$dots_status" -eq 1
+    grep -F 'Manual action required: install example 1.2.3 (example plugin needs 1.2).' "$HOME/dispatch.log"
+    assert_absent --formula example
+    printf '%s\n' 'Result: Recipe refused the absent formula without installing it. Supplying real formula example 1.2.3 from a test-local tap.'
+
+    mkdir "$HOME/example-1.2.3"
+    printf '%s\n' 'dots scaffold CI formula payload' > "$HOME/example-1.2.3/fixture.txt"
+    tar -czf "$HOME/example-1.2.3.tar.gz" -C "$HOME" example-1.2.3
+    cat > "$tap/Formula/example.rb" <<EOF
+class Example < Formula
+  desc "Formula for the dots scaffold CI scenario"
+  homepage "https://example.invalid"
+  url "file://$HOME/example-1.2.3.tar.gz"
+  sha256 "$(shasum -a 256 "$HOME/example-1.2.3.tar.gz" | cut -d ' ' -f 1)"
+  def install
+    share.install "fixture.txt"
+  end
+end
+EOF
+    "$brew" install --formula dots-ci/scaffold-tool/example
+    keg=$("$brew" --prefix dots-ci/scaffold-tool/example)
+    receipt=$(shasum -a 256 "$keg/INSTALL_RECEIPT.json")
+    dispatch exceptions
+    test "$dots_status" -eq 0
+    grep -Fx 'Held: example 1.2.3 (example plugin needs 1.2).' "$HOME/dispatch.log"
+    test "$("$brew" list --versions --formula example)" = 'example 1.2.3'
+    test "$(shasum -a 256 "$keg/INSTALL_RECEIPT.json")" = "$receipt"
+    cmp "$HOME/example-1.2.3/fixture.txt" "$keg/share/fixture.txt"
+    printf '%s\n' 'Result: Recipe accepted exactly example 1.2.3 and left the real keg and receipt intact.'
+}
+
+run_case() {
+    local test_case=$1 path=$2 status log="$scratch/$1.log"
+    (
+        set -eE
+        trap 'printf "Result: Check failed at line %s (exit %s). See the case log.\n" "$LINENO" "$?" >&2' ERR
+        "$test_case"
+    ) > "$log" 2>&1
+    status=$?
+    printf '\n--- %s (check exit %s) ---\n' "$path" "$status"
+    cat "$log"
+    {
+        printf '\n### %s\n\nCheck exit %s.\n' "$path" "$status"
+        sed -n 's/^Result: /\n- /p' "$log"
+    } >> "$GITHUB_STEP_SUMMARY" || exit 1
+    if [[ "$status" -ne 0 ]]; then failed=1; fi
+}
+
+# Each case has its own root, log and exit status, even when another fails.
+printf '## Shipped scaffold examples\n\nCandidate %s at %s.\n' \
+    "$archive" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+set +e
+failed=0
+run_case fonts 'hooks/update.d/50-Fonts@laptop'
+run_case app 'exceptions/example-app'
+run_case tool 'exceptions/example-tool'
+exit "$failed"

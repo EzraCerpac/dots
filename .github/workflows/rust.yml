@@ -349,6 +349,13 @@ jobs:
       - name: Run install.sh in a fresh container with the release archive
         if: matrix.platform == 'linux-amd64'
         run: bash .github/scripts/run-first-run --installer "$RUNNER_TEMP/dots-release"
+      - name: Exercise shipped scaffold examples with native Homebrew
+        if: ${{ !cancelled() && matrix.platform == 'darwin-arm64' }}
+        run: |
+          env -i PATH="$PATH" TERM=dumb GITHUB_ACTIONS="$GITHUB_ACTIONS" GITHUB_SHA="$GITHUB_SHA" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" RUNNER_ARCH="$RUNNER_ARCH" \
+            RUNNER_TEMP="$RUNNER_TEMP" GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            bash .github/scripts/check-scaffold-examples "$RUNNER_TEMP/dots-release"
 
   ci:
     name: ci

@@ -29,6 +29,9 @@ pub struct Snapshot {
     pub stages: Vec<Stage>,
 }
 
+/// A run is the exclusive waiter for its children. The process must keep the
+/// default SIGCHLD disposition with automatic reaping disabled. Other waiters
+/// must not reap a run's children, including through `waitpid(-1, ...)`.
 pub struct Run<'a> {
     ctx: &'a Ctx,
     sink: Sink,
@@ -80,21 +83,32 @@ impl<'a> Run<'a> {
     }
 
     pub fn start(&self, label: impl Into<String>) -> StageId {
+        self.try_start(label).unwrap_or(CANCELLED_STAGE)
+    }
+
+    pub(crate) fn try_start(&self, label: impl Into<String>) -> Option<StageId> {
         self.add_stage(label.into(), false, None)
     }
 
     pub fn start_alongside(&self, label: impl Into<String>) -> StageId {
         self.add_stage(label.into(), true, None)
+            .unwrap_or(CANCELLED_STAGE)
     }
 
     /// Record a known skip in one step, with a single result line during up.
     pub fn skip(&self, label: impl Into<String>) -> StageId {
         self.add_stage(label.into(), false, Some(Outcome::Skipped))
+            .unwrap_or(CANCELLED_STAGE)
     }
 
-    fn add_stage(&self, label: String, alongside: bool, outcome: Option<Outcome>) -> StageId {
+    fn add_stage(
+        &self,
+        label: String,
+        alongside: bool,
+        outcome: Option<Outcome>,
+    ) -> Option<StageId> {
         let mut stages = self.stages.lock().expect("stage lock poisoned");
-        let Some(id) = self.supervisor.admit_stage(|| {
+        let id = self.supervisor.admit_stage(|| {
             let id = StageId(stages.values.len());
             stages.values.push(Stage {
                 id,
@@ -105,9 +119,7 @@ impl<'a> Run<'a> {
                 issues: Vec::new(),
             });
             id
-        }) else {
-            return CANCELLED_STAGE;
-        };
+        })?;
         self.update_fragment(&stages.values);
         if self.up() && !alongside {
             self.supervisor.flush_warnings();
@@ -120,7 +132,7 @@ impl<'a> Run<'a> {
                 write_stage_start(&mut output, stage)
             };
         }
-        id
+        Some(id)
     }
 
     /// Run a native child with this stage's foreground or alongside policy.
@@ -164,10 +176,6 @@ impl<'a> Run<'a> {
 
     /// Capture a noninteractive command in an owned session with a result deadline.
     ///
-    /// The process must keep the default SIGCHLD disposition with automatic
-    /// reaping disabled. This Run exclusively waits on the child until return.
-    /// An in-process caller must not install a SIGCHLD handler or reap it from
-    /// another thread, including through `waitpid(-1, ...)`.
     /// A pending OS exec handshake and mandatory cleanup can delay the return.
     pub fn probe_detached(
         &self,

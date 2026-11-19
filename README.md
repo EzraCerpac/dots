@@ -155,9 +155,6 @@ For a failed step that owned the terminal, its output is in your scrollback. Wit
 
 ## Sharing between machines
 
-> **TODO (P-08):** The current `rust` build does not share yet: `dots sync` exits 1 and the sync step of `dots up` is deferred, both naming P-08.
-> Check this section against the merged P-08 build and add a real receipt.
-
 When sharing is configured, `dots sync` and the sync stage of `dots up` use two branches: `dev`, which every machine runs, and `main`, which you change through pull requests.
 
 - A sync with valid arguments always exits 0. Its receipt says what was shared, what stayed local and what needs attention.
@@ -166,6 +163,21 @@ When sharing is configured, `dots sync` and the sync stage of `dots up` use two 
 - On the remote, sync only creates or fast-forwards `dev`, and never moves `main`.
 - Where edits conflict, `main` wins over the shared `dev`, and `dev` over this machine's work; both sides stay in history.
 - In local-only mode, sync skips the entire pipeline and says how to add a remote.
+
+For example, this receipt followed an edit to `config.toml` next to a new file holding a secret.
+It comes from `dots` 1.0.0-rc.1 at `rust` `9a35df0`, in a disposable home directory with a local bare `origin`:
+
+```text
+NOT SHARED: gitleaks flagged a local file; it stays on disk: "leak.toml:2" (generic-api-key)
+  Remove or rotate the secret before sharing this path.
+dots sync: saved 1 locally · kept 1 files on disk · pulled dev +0, main +0 · pushed dev
+Shared on dev
+  config.toml
+Saved locally
+  config.toml
+```
+
+`dots sync --last` printed the same receipt under a `Latest sync` heading.
 
 See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order of operations and how to read the outcome.
 

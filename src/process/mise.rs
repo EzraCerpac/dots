@@ -99,8 +99,7 @@ impl<'a> Mise<'a> {
         }
         #[cfg(target_os = "macos")]
         if matches!(args.as_slice(), [command, sub, ..] if command.as_ref() == "bootstrap"
-            && (matches!(sub.as_ref().to_str(), Some("status" | "packages"))
-                || active && sub.as_ref() == "plan"))
+            && matches!(sub.as_ref().to_str(), Some("status" | "packages")))
         {
             self.expose_ruby(&mut command, run)?;
         }

@@ -410,10 +410,43 @@ fn new_pre_checkpoint_failure_stops_before_sync_and_updates() {
     assert_eq!(fixture.calls(), "checkpoint inventory\n");
 }
 
+fn sync_fixture_git(fixture: &Fixture, args: &[&str]) -> String {
+    let output = fixture
+        .world
+        .git()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .args(args)
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn seed_sync_fixture(fixture: &Fixture) -> String {
+    fixture.write(
+        ".gitignore",
+        concat!(
+            "/config.local.toml\n/miserc.toml\n/config.host-*.toml\n",
+            "/locks/dots-sync\n/.setup-state/dots-sync\n/calls\n/installed\n/updated\n",
+        ),
+    );
+    sync_fixture_git(fixture, &["init", "--quiet", "--initial-branch=dev"]);
+    sync_fixture_git(fixture, &["add", "."]);
+    sync_fixture_git(fixture, &["commit", "--quiet", "-m", "Seed fixture"]);
+    sync_fixture_git(fixture, &["rev-parse", "HEAD"])
+}
+
 #[test]
 #[ignore = "P-06, P-08"]
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
+    let seed = seed_sync_fixture(&fixture);
+    assert_eq!(
+        sync_fixture_git(&fixture, &["branch", "--show-current"]),
+        "dev"
+    );
+    assert!(sync_fixture_git(&fixture, &["remote"]).is_empty());
     let output = fixture
         .command()
         .args(["--plain", "update"])
@@ -445,8 +478,11 @@ fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
         "Post-update settings checkpoint"
     );
     assert_eq!(stages.last().unwrap()["outcome"], "skipped");
-    assert_eq!(fixture.calls().matches("checkpoint inventory").count(), 2);
-    assert!(!fixture.calls().contains("checkpoint save"));
+    let calls = fixture.calls();
+    assert_eq!(calls.matches("checkpoint inventory").count(), 2);
+    assert_eq!(calls.matches("checkpoint local inventory").count(), 2);
+    assert!(!calls.contains("checkpoint save"));
+    assert_eq!(sync_fixture_git(&fixture, &["rev-parse", "HEAD"]), seed);
 }
 
 #[cfg(target_os = "macos")]

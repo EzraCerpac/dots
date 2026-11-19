@@ -82,6 +82,7 @@ case "${1-}" in
                 ;;
             dotfiles:--local)
                 [ "$*" = 'bootstrap dotfiles --local paths --json' ] || exit 1
+                printf 'checkpoint local inventory\n' >> calls
                 printf '{"entries":[],"invalid":[]}\n'
                 ;;
             dotfiles:save) printf 'checkpoint save\n' >> calls ;;

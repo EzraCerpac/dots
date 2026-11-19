@@ -61,7 +61,7 @@ impl Publication {
         fs::create_dir(log.join("mise-system")).unwrap();
         fs::create_dir(log.join("scan-bin")).unwrap();
         for name in [
-            "bash", "cat", "cmp", "dirname", "mise", "node", "python3", "readlink",
+            "bash", "cat", "dirname", "mise", "node", "python3", "readlink",
         ] {
             if let Some(tool) = executable_on_path(&world.dots(), name) {
                 let tool = if name == "mise" {
@@ -404,7 +404,13 @@ case "$1" in
                     printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-input"
                     if [ -n "${PUBLISH_SCAN_HEAD:-}" ]; then
                         "$PUBLISH_GIT" -C "$PUBLISH_WORKSPACE" cat-file blob "$PUBLISH_SCAN_HEAD:$name" > "$PUBLISH_LOG/approved-bytes"
-                        if cmp -s "$path" "$PUBLISH_LOG/approved-bytes"; then
+                        if python3 -I -S -c '
+import sys
+from pathlib import Path
+
+scanned, approved = map(Path, sys.argv[1:])
+sys.exit(scanned.read_bytes() != approved.read_bytes())
+' "$path" "$PUBLISH_LOG/approved-bytes"; then
                             printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-approved-bytes"
                         fi
                     fi
@@ -550,7 +556,8 @@ exit "$status"
     }
 
     fn read_log(&self, name: &str) -> String {
-        fs::read_to_string(self.log.join(name)).unwrap()
+        fs::read_to_string(self.log.join(name))
+            .unwrap_or_else(|error| panic!("read fixture log {name}: {error}"))
     }
 
     fn optional_log(&self, name: &str) -> String {

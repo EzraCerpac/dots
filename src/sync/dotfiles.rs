@@ -227,6 +227,7 @@ impl KnownCopy {
 pub(super) struct Copies {
     state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
+    adopted_directory_leaves: BTreeMap<PathBuf, PathBuf>,
     written: BTreeSet<PathBuf>,
     deployments: BTreeMap<PathBuf, String>,
 }
@@ -410,8 +411,9 @@ impl Copies {
                 }
                 continue;
             };
-            let native = if git.root().join(source).is_dir() {
-                Some(stage_tree(run, git_dir, &git.root().join(source), &rules)?)
+            let source_dir = git.root().join(source);
+            let native = if source_dir.is_dir() {
+                Some(stage_tree(run, git_dir, &source_dir, &rules)?)
             } else {
                 None
             };
@@ -557,6 +559,24 @@ impl Copies {
                     }
                 } else {
                     self.state = Self::load(git_dir)?.state;
+                }
+            }
+            if let Some(leaves) = native {
+                for (relative, expected) in leaves {
+                    let path = destination.join(relative);
+                    // A previously deployed leaf may first enter Git this run.
+                    // Approve its baseline only when native materialization
+                    // matches the deployed bytes and mode before hooks run.
+                    if !self.state.known.contains_key(&path)
+                        && matches!(expected, Image::Regular { .. })
+                        && filesystem
+                            .read_path(fs_relative(&path)?)
+                            .is_ok_and(|current| current == expected)
+                    {
+                        self.adopted_directory_leaves
+                            .insert(path.clone(), source_dir.clone());
+                        self.observed.insert(path, expected);
+                    }
                 }
             }
         }
@@ -1166,12 +1186,22 @@ impl Copies {
                         };
                         known.matches(&current, base, mode, native)
                     }
-                    (Image::Regular { .. }, None, _) => self
-                        .deployments
-                        .get(&path)
-                        .map_or(target.mode == "template", |digest| {
-                            matches_native_copy(&current, digest, None)
-                        }),
+                    (Image::Regular { .. }, None, _) => {
+                        (target.mode == "copy"
+                            && path != destination
+                            && self
+                                .adopted_directory_leaves
+                                .get(&path)
+                                .is_some_and(|source| {
+                                    target.effective_source() == Some(source.as_path())
+                                }))
+                            || self
+                                .deployments
+                                .get(&path)
+                                .map_or(target.mode == "template", |digest| {
+                                    matches_native_copy(&current, digest, None)
+                                })
+                    }
                     _ => false,
                 };
                 if !still_observed || !manageable {

@@ -973,7 +973,6 @@ fn decline(mut terminal: Pty) -> String {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_uses_main_removed_allowlist_before_any_prompt() {
     let fixture = Publication::with_seed(
         None,
@@ -1011,7 +1010,6 @@ fn new_diverged_all_uses_main_removed_allowlist_before_any_prompt() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_uses_main_added_allowlist_and_keeps_only_the_approved_merge() {
     let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
     outgoing_pdf(&fixture);
@@ -1065,7 +1063,6 @@ fn new_diverged_all_uses_main_added_allowlist_and_keeps_only_the_approved_merge(
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_aggregate_merge_does_not_scan_main_only_pdf() {
     let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
     fixture.change(0);
@@ -1099,7 +1096,6 @@ fn historical_merge() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_historical_merge_ignores_pdf_inherited_from_older_main_parent() {
     let fixture = historical_merge();
     fixture.change_main("later.txt", b"later reviewed main\n");
@@ -1116,7 +1112,6 @@ fn new_historical_merge_ignores_pdf_inherited_from_older_main_parent() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_historical_merge_scans_new_blob_at_the_same_main_path() {
     let fixture = historical_merge();
     let mut edited = PDF.to_vec();
@@ -1203,7 +1198,6 @@ fn new_conflict_is_screened_then_retained_only_after_merge_approval() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
     let ours = PDF_POLICY.replace("Synthetic fixture marker", "Outgoing fixture marker");
     let theirs = PDF_POLICY.replace("Synthetic fixture marker", "Reviewed fixture marker");

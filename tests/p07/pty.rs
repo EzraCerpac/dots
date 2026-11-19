@@ -60,6 +60,15 @@ impl Pty {
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
+                #[cfg(target_os = "macos")]
+                {
+                    // Opening the controlling tty makes Darwin drain pending
+                    // output on exit before closing the terminal.
+                    let tty = libc::open(c"/dev/tty".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                    if tty < 0 || libc::close(tty) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }

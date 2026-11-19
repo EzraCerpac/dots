@@ -973,11 +973,9 @@ fn unchanged_status_and_plan_do_not_probe_the_app_store() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_add_sync_up_and_repeat() {
-    let remote_config = "dots_source_repo = \"fixture/packages\"\n";
-    let a = fixture(remote_config);
-    let b = fixture(remote_config);
+    let a = fixture("");
+    let b = fixture("");
     package_backend(&a, "linux");
     package_backend(&b, "linux");
     let remote = a.bare_remote("package-origin");
@@ -999,29 +997,12 @@ fn unchanged_add_sync_up_and_repeat() {
                 .output()
                 .unwrap(),
         );
-        success(
-            world
-                .git()
-                .args([
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://github.com/fixture/packages.git",
-                ])
-                .output()
-                .unwrap(),
-        );
-        let source = format!(
-            "[url \"{}\"]\n    insteadOf = https://github.com/fixture/packages.git\n",
-            remote.display()
-        );
-        use std::io::Write as _;
-        fs::OpenOptions::new()
-            .append(true)
-            .open(world.home().join(".gitconfig"))
-            .unwrap()
-            .write_all(source.as_bytes())
-            .unwrap();
+        let setting = world.set_source_origin(&remote, "fixture/packages");
+        fs::write(
+            world.root().join("config.toml"),
+            format!("{BASE}dots_source_repo = {setting:?}\n"),
+        )
+        .unwrap();
         fs::write(world.root().join(".gitignore"), "/miserc.toml\n/config.local.toml\n/config.host-*.toml\n/mise.lock\n/mise.*.lock\n/locks/\n/.setup-state/\n").unwrap();
     };
     seed(&a);
@@ -1103,7 +1084,17 @@ chmod +x "$ASDF_INSTALL_PATH/bin/fixture-tool""#,
     let before = fs::read(a.root().join("config.toml")).unwrap();
     success(add().output().unwrap());
     assert_eq!(fs::read(a.root().join("config.toml")).unwrap(), before);
-    success(dots(&a).arg("sync").output().unwrap());
+    let receipt = success(dots(&a).arg("sync").output().unwrap());
+    let local_revision = success(a.git().args(["rev-parse", "HEAD"]).output().unwrap());
+    let published_revision = success(
+        a.git()
+            .arg("--git-dir")
+            .arg(&remote)
+            .args(["rev-parse", "refs/heads/dev"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(published_revision, local_revision, "{receipt}");
     assert!(!installed(&b, "apt:fixture-package") && !tool(&b).exists());
     success(dots(&b).args(["--verbose", "up"]).output().unwrap());
     assert!(installed(&b, "apt:fixture-package") && tool(&b).is_file());

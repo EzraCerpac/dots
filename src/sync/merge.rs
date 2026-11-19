@@ -40,7 +40,7 @@ pub(super) fn with_published(
     let neutral = git.output(args.into_iter().chain(["--messages", local, published]))?;
     let (mut tree, rows) = merge_output(&neutral)?;
     if !neutral.status.success() {
-        let binaries = binary_conflicts(rows)?;
+        let (binaries, renames) = classify_conflicts(rows, [local, published])?;
         let favored = git.output(args.into_iter().chain([
             "--name-only",
             "--no-messages",
@@ -57,10 +57,18 @@ pub(super) fn with_published(
         if !favored.status.success() && remaining.is_empty() {
             return Err(invalid("merge has no classified conflicting paths"));
         }
-        let roots = remaining
+        let mut roots = remaining
             .iter()
             .map(|path| conflict_root(path, [local, published]))
             .collect::<BTreeSet<_>>();
+        let published_tree = git.tree(published)?;
+        for rename in renames {
+            if roots.contains(&rename.suggested)
+                && published_tree.get(&rename.original) == Some(&rename.entry)
+            {
+                roots.insert(rename.original);
+            }
+        }
         let includes = |path: &Path| roots.iter().any(|root| path.starts_with(root));
         let mut index = Vec::new();
         if !remaining.is_empty() || !binaries.is_empty() {
@@ -72,11 +80,7 @@ pub(super) fn with_published(
                 index_row(&mut index, path, None, local.len());
             }
             if !remaining.is_empty() {
-                for (path, entry) in git
-                    .tree(published)?
-                    .iter()
-                    .filter(|(path, _)| includes(path))
-                {
+                for (path, entry) in published_tree.iter().filter(|(path, _)| includes(path)) {
                     index_row(&mut index, path, Some(entry), local.len());
                 }
             }
@@ -126,24 +130,32 @@ fn merge_output(
     Ok((tree, rows))
 }
 
-fn binary_conflicts<'a>(mut rows: impl Iterator<Item = &'a [u8]>) -> io::Result<Tree> {
+struct SuggestedRename {
+    suggested: PathBuf,
+    original: PathBuf,
+    entry: Entry,
+}
+
+fn classify_conflicts<'a>(
+    mut rows: impl Iterator<Item = &'a [u8]>,
+    parents: [&str; 2],
+) -> io::Result<(Tree, Vec<SuggestedRename>)> {
     let mut theirs = Tree::new();
     for row in rows.by_ref().take_while(|row| !row.is_empty()) {
         let (header, name) = split(row, b'\t')?;
         if let Some(header) = header.strip_suffix(b" 3") {
             let (mode, object) = split(header, b' ')?;
-            if matches!(mode, b"100644" | b"100755") {
-                theirs.insert(
-                    relative(name)?,
-                    Entry {
-                        mode: std::str::from_utf8(mode).map_err(io::Error::other)?.into(),
-                        oid: oid(object)?,
-                    },
-                );
-            }
+            theirs.insert(
+                relative(name)?,
+                Entry {
+                    mode: std::str::from_utf8(mode).map_err(io::Error::other)?.into(),
+                    oid: oid(object)?,
+                },
+            );
         }
     }
     let mut binaries = Tree::new();
+    let mut renames = Vec::new();
     while let Some(count) = rows.next().filter(|count| !count.is_empty()) {
         let count: usize = std::str::from_utf8(count)
             .ok()
@@ -155,17 +167,36 @@ fn binary_conflicts<'a>(mut rows: impl Iterator<Item = &'a [u8]>) -> io::Result<
             .ok_or_else(|| invalid("missing merge diagnostic type"))?;
         rows.next()
             .ok_or_else(|| invalid("missing merge diagnostic message"))?;
-        if kind == b"CONFLICT (binary)" {
+        if kind == b"CONFLICT (directory rename suggested)"
+            && let [suggested, original] = paths.as_slice()
+        {
+            let suggested = relative(suggested)?;
+            // Git can report the published stage under the suggested path,
+            // including its synthetic suffix when a directory is in the way.
+            let mut entries = theirs
+                .iter()
+                .filter(|(path, _)| conflict_root(path, parents) == suggested);
+            if let Some((_, entry)) = entries.next()
+                && entries.next().is_none()
+            {
+                renames.push(SuggestedRename {
+                    suggested,
+                    original: relative(original)?,
+                    entry: entry.clone(),
+                });
+            }
+        } else if kind == b"CONFLICT (binary)" {
             for path in paths {
                 let path = relative(path)?;
                 let entry = theirs
                     .get(&path)
+                    .filter(|entry| matches!(entry.mode.as_str(), "100644" | "100755"))
                     .ok_or_else(|| invalid("missing published binary conflict entry"))?;
                 binaries.insert(path, entry.clone());
             }
         }
     }
-    Ok(binaries)
+    Ok((binaries, renames))
 }
 
 fn conflict_root(path: &Path, parents: [&str; 2]) -> PathBuf {
@@ -196,6 +227,44 @@ mod tests {
     use crate::sync::tests::{fixture_commit, git_fixture};
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn cr12_published_rename_preserves_the_published_file_at_its_path() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let root = git.root();
+        fs::create_dir(root.join("old")).unwrap();
+        fs::write(
+            root.join("old/original"),
+            b"file renamed to the published path\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("old/neighbor"),
+            b"separate file under the moved directory\n",
+        )
+        .unwrap();
+        git.get(["add", "-A"]).unwrap();
+        let base = fixture_commit(&git, "baseline");
+        git.get(["mv", "old", "new"]).unwrap();
+        fs::create_dir(root.join("new/renamed")).unwrap();
+        fs::write(root.join("new/renamed/leaf"), b"local descendant\n").unwrap();
+        git.get(["add", "-A"]).unwrap();
+        let local = fixture_commit(&git, "move directory locally");
+        git.get(["switch", "-qc", "published", &base]).unwrap();
+        git.get(["mv", "old/original", "old/renamed"]).unwrap();
+        let published = fixture_commit(&git, "rename the file upstream");
+        let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
+        let merged = with_published(&scratch, &local, Some(&published), "dev").unwrap();
+        let tree = git.tree(&merged).unwrap();
+        let published = git.tree(&published).unwrap();
+        assert_eq!(
+            tree.get(Path::new("old/renamed")),
+            published.get(Path::new("old/renamed")),
+            "{tree:?}"
+        );
+        assert!(tree.contains_key(Path::new("new/neighbor")), "{tree:?}");
+    }
 
     #[test]
     fn published_tree_wins_binary_type_delete_and_directory_conflicts() {

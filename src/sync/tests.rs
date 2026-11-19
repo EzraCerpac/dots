@@ -904,6 +904,40 @@ fn create_only_sources_and_existing_targets_are_preserved() {
 }
 
 #[test]
+fn cr18_retirement_refuses_a_late_public_declaration() {
+    use crate::run::{Run, Sink};
+    let (_fixture, ctx) = shared_mise_fixture("");
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    let local = b"[dotfiles.example]\nsource = 'templates/retired'\n";
+    fs::write(root.join("config.local.toml"), local).unwrap();
+    fs::create_dir_all(root.join("dots")).unwrap();
+    fs::write(
+        root.join("dots/retired-declarations"),
+        "dotfiles.example\ttemplates/retired\n",
+    )
+    .unwrap();
+    git.get(["add", "."]).unwrap();
+    let revision = fixture_commit(&git, "plan the unique retirement");
+    let run = Run::begin(&ctx, Sink::Unreported);
+    let scratch = super::snapshot::Scratch::new(&git, &root.join(".git")).unwrap();
+    let tree = git.tree(&revision).unwrap();
+    let validated = super::validation::validate(&run, &scratch, &revision, &tree, &tree).unwrap();
+    assert_eq!(validated.retired.len(), 1);
+    assert!(validated.still_current(root).unwrap());
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("config.toml"))
+        .unwrap()
+        .write_all(b"\n[dotfiles.example]\nsource = 'templates/retired'\n")
+        .unwrap();
+    assert!(!validated.still_current(root).unwrap());
+    assert_eq!(fs::read(root.join("config.local.toml")).unwrap(), local);
+    let _ = run.end(0);
+}
+
+#[test]
 fn a_flagged_live_source_is_never_deployed() {
     let (fixture, ctx) =
         shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");

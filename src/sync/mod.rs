@@ -749,10 +749,10 @@ fn synchronize(
                 .or_note("Could not reconcile captured copy baselines", RERUN)?;
             if !validated
                 .still_current(git.root())
-                .or_note("Could not recheck machine-local files before apply", RERUN)?
+                .or_note("Could not recheck configuration files before apply", RERUN)?
             {
                 return Err(Note::new(
-                    "Machine-local files changed after validation; dotfiles were kept",
+                    "Configuration files changed after validation; dotfiles were kept",
                     RERUN,
                 ));
             }
@@ -785,7 +785,7 @@ fn synchronize(
             .or_note("Could not verify refreshed published history", GIT)?
         {
             return Err(Note::new(
-                "Published dev or main was removed or rewound during sync",
+                "Published history was removed or rewound during sync",
                 "Review origin's branch history and rerun dots sync.",
             ));
         }

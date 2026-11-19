@@ -50,7 +50,25 @@ impl Validated {
     }
 
     pub fn still_current(&self, root: &Path) -> io::Result<bool> {
-        Ok(self.local == local_files(root)?)
+        if self.local != local_files(root)? {
+            return Ok(false);
+        }
+        if self.retired.is_empty() {
+            return Ok(true);
+        }
+        let live = Dir::open(root)?;
+        for (path, expected) in &self.configs {
+            if !live.read_path(path)?.git_eq(expected) {
+                return Ok(false);
+            }
+        }
+        for entry in fs::read_dir(root)? {
+            let path = PathBuf::from(entry?.file_name());
+            if is_mise_config(&path) && !local(&path) && !self.configs.contains_key(&path) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn ready_to_apply(&self, git: &Git<'_>) -> io::Result<()> {
@@ -212,6 +230,11 @@ pub(super) fn validate(
     probe(run, &root, MiseProbe::DotfilePreview, true)?;
     let private = Dir::open(&root)?;
     let mut configs = BTreeMap::new();
+    if !retired.is_empty() {
+        for path in documents.keys().filter(|path| !local.contains_key(*path)) {
+            configs.insert(path.clone(), private.read_path(path)?);
+        }
+    }
     for file in files {
         let path = file.path.strip_prefix(&root).map_err(io::Error::other)?;
         if !local.contains_key(path) {
@@ -520,7 +543,7 @@ fn protect_future_hosts(root: &Path) -> io::Result<()> {
         while let Some(name) = line.strip_prefix(b"**/") {
             line = name;
         }
-        if !negated && line.contains(&b'/') {
+        if requires_parent_component(line) {
             continue;
         }
 
@@ -548,6 +571,23 @@ fn protect_future_hosts(root: &Path) -> io::Result<()> {
     } else {
         Err(invalid("merged ignore rules expose future host selectors"))
     }
+}
+
+fn requires_parent_component(pattern: &[u8]) -> bool {
+    let mut first_member = None;
+    for (index, &byte) in pattern.iter().enumerate() {
+        match (first_member, byte) {
+            (None, b'[') => {
+                let negated = matches!(pattern.get(index + 1), Some(b'!' | b'^'));
+                first_member = Some(index + 1 + usize::from(negated));
+            }
+            (Some(_), b'[' | b'\\') => return false,
+            (Some(first), b']') if index > first => first_member = None,
+            (None, b'/') => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_mise_config(path: &Path) -> bool {
@@ -684,6 +724,9 @@ pub(super) fn source_exists(root: &Path, path: &Path) -> io::Result<bool> {
 }
 
 fn retired_row(row: &str) -> Option<(String, &str)> {
+    if row.contains('\0') {
+        return None;
+    }
     let (path, source) = row.split_once('\t')?;
     let keys = Key::parse(path).ok()?;
     let [section, key] = keys.as_slice() else {
@@ -1008,5 +1051,26 @@ source = "dotfiles/duplicate"
         }
         let exact = "[dotfiles.herdr]\nsource = 'templates/herdr.tera'\n";
         assert_eq!(retirement_fixture(exact, row).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cr59_an_invalid_retirement_row_does_not_skip_its_valid_neighbor() {
+        let local = "[dotfiles.good]\nsource = 'templates/good'\n";
+        let rows = "dotfiles.bad\ttemplates/bad\0name\ndotfiles.good\ttemplates/good\n";
+        assert!(retired_row(rows.lines().next().unwrap()).is_none());
+        assert_eq!(retirement_fixture(local, rows).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cr60_nested_only_negations_preserve_root_host_protection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ignore = fixture.path().join(".gitignore");
+        for pattern in [
+            "!*/config.host-tomorrow.toml",
+            "!/subdir/**/config.host-tomorrow.toml",
+        ] {
+            fs::write(&ignore, format!("/config.host-*.toml\n{pattern}\n")).unwrap();
+            assert!(protect_future_hosts(fixture.path()).is_ok(), "{pattern}");
+        }
     }
 }

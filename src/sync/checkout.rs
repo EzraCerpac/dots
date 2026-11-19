@@ -394,8 +394,10 @@ fn prepare_leaf(
     // Let Git perform checkout filters in a private directory. Publishing
     // their result still requires the journal's guarded compare and move.
     let work = private_dir(pending, "filter-")?;
+    let output = work.path().join("checkout");
+    fs::create_dir(&output)?;
     let mut prefix = OsString::from("--prefix=");
-    prefix.push(work.path());
+    prefix.push(&output);
     prefix.push("/");
     let attributes = format!("--attr-source={revision}");
     git.indexed(&pending.join("index.after")).get([
@@ -406,7 +408,7 @@ fn prepare_leaf(
         "--".as_ref(),
         path.as_os_str(),
     ])?;
-    let mut image = Dir::open(work.path())?.read_path(path)?;
+    let mut image = Dir::open(&output)?.read_path(path)?;
     if let (Image::Regular { mode, .. }, Image::Regular { mode: old, .. }) = (&mut image, before) {
         *mode = (old & !0o111) | (*mode & 0o111);
     }
@@ -560,9 +562,13 @@ fn apply(
                 // descendant is gone, regardless of lexical order.
                 prune_empty_ancestors(&root, &stage, &plan, &old, &item, position)?;
             }
-            if expected == Image::Directory {
-                verify_directory_slot(&root, &stage, &item, &old_name, &plan)?;
-            }
+            let directory = if expected == Image::Directory {
+                Some(verify_directory_slot(
+                    &root, &stage, &item, &old_name, &plan,
+                )?)
+            } else {
+                None
+            };
             replace_exact(
                 &root,
                 &item,
@@ -571,6 +577,7 @@ fn apply(
                 &CStrName::new(&format!("new-{position}"))?,
                 &expected,
                 &replacement,
+                directory,
             )?;
             write_synced(marker, b"applied\n")?;
             paths.push(item);
@@ -663,7 +670,7 @@ fn prune_empty_ancestors(
     let unused = CStrName::new("no-directory-replacement")?;
     for (number, directory) in nested_ancestors(old, target).into_iter().enumerate() {
         let slot = format!("old-dir-{position}-{number}");
-        verify_directory_slot(root, stage, directory, &slot, plan)?;
+        let identity = verify_directory_slot(root, stage, directory, &slot, plan)?;
         if stage.read_path(Path::new(&slot))? == Image::Directory
             && root.read_path(directory)? == Image::Absent
         {
@@ -677,18 +684,19 @@ fn prune_empty_ancestors(
             &unused,
             &Image::Directory,
             &Image::Absent,
+            Some(identity),
         )?;
     }
     Ok(())
 }
 
-fn verify_directory_slot(
+fn verify_directory_slot<'a>(
     root: &Dir,
     stage: &Dir,
     live: &Path,
     slot: &str,
-    plan: &Plan,
-) -> io::Result<()> {
+    plan: &'a Plan,
+) -> io::Result<&'a Path> {
     let expected = plan
         .directories
         .get(live)
@@ -702,7 +710,7 @@ fn verify_directory_slot(
     if &observed != expected {
         return Err(invalid("another directory claimed the target"));
     }
-    Ok(())
+    Ok(expected)
 }
 
 fn disposable(entry: &DirEntry) -> io::Result<bool> {
@@ -1468,5 +1476,31 @@ mod tests {
         assert_eq!(installed.after, after);
         assert_eq!(fs::read_to_string(config).unwrap(), updated);
         assert!(matches!(load(&ctx), Loaded::LocalOnly));
+    }
+
+    #[test]
+    fn cr10_checkout_accepts_a_tracked_file_named_prepared() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        let path = git.root().join("prepared");
+        fs::write(&path, b"incoming tracked file\n").unwrap();
+        git.get(["add", "prepared"]).unwrap();
+        let after = fixture_commit(&git, "prepared is a public name");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        begin(
+            &git,
+            &dir,
+            &index_snapshot(&dir).unwrap(),
+            &before,
+            &after,
+            true,
+        )
+        .unwrap();
+        assert!(finish(&git, &dir, || false).unwrap().is_some());
+        assert_eq!(fs::read(path).unwrap(), b"incoming tracked file\n");
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
     }
 }

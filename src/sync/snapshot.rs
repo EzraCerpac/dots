@@ -63,8 +63,10 @@ impl<'a> Scratch<'a> {
             "--others",
             "--exclude-standard",
         ])?;
+        let tracked = self.live.get(["ls-files", "-z", "--cached"])?;
         let mut paths = tempfile::tempfile_in(self.dir.path())?;
-        for raw in records(&listed) {
+        let paths_to_stage: BTreeSet<_> = records(&listed).chain(records(&tracked)).collect();
+        for raw in paths_to_stage {
             if !local(&relative(raw)?) {
                 paths.write_all(raw)?;
                 paths.write_all(&[0])?;
@@ -82,6 +84,7 @@ impl<'a> Scratch<'a> {
                         "core.sparseCheckout=false",
                         "add",
                         "-A",
+                        "--force",
                         "--pathspec-from-file=-",
                         "--pathspec-file-nul",
                     ])?
@@ -627,6 +630,33 @@ path = '^(Side|Merge) marker\.txt$'
                 b"machine-local fixture"
             );
         }
+    }
+
+    #[test]
+    fn cr13_snapshot_includes_an_ignored_public_file_tracked_in_the_real_index() {
+        let (_world, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let root = git.root();
+        fs::write(root.join(".gitignore"), "/forced\n/config.local.toml\n").unwrap();
+        git.get(["add", ".gitignore"]).unwrap();
+        let before = fixture_commit(&git, "ignore fixture paths");
+        fs::write(root.join("forced"), b"intentionally staged\n").unwrap();
+        fs::write(root.join("config.local.toml"), b"local fixture\n").unwrap();
+        fs::write(root.join("ordinary"), b"ordinary independent edit\n").unwrap();
+        git.get(["add", "-f", "forced", "config.local.toml"])
+            .unwrap();
+        let index_path = root.join(".git/index");
+        let index = fs::read(&index_path).unwrap();
+        let scratch = Scratch::new(&git, &root.join(".git")).unwrap();
+        let candidate = scratch.capture(&before).unwrap();
+        let tree = git.tree(&candidate).unwrap();
+        assert!(tree.contains_key(Path::new("ordinary")));
+        assert!(!tree.contains_key(Path::new("config.local.toml")));
+        assert_eq!(fs::read(index_path).unwrap(), index);
+        assert_eq!(
+            git.get(["show", &format!("{candidate}:forced")]).unwrap(),
+            b"intentionally staged\n"
+        );
     }
 
     #[test]

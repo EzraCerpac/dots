@@ -257,7 +257,6 @@ fn unchanged_redirected_test_preserves_binary_streams_and_private_metadata() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_redirected_up_defaults_to_plain_and_verbose_shows_child_output() {
     for flag in [None, Some("--plain"), Some("--verbose")] {
         let world = fixture();
@@ -289,7 +288,6 @@ fn unchanged_redirected_up_defaults_to_plain_and_verbose_shows_child_output() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_plain_up_hook_reads_redirected_stdin() {
     let world = fixture();
     hook(
@@ -312,7 +310,6 @@ fn new_plain_up_hook_reads_redirected_stdin() {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
     let world = fixture();
     hook(
@@ -379,7 +376,6 @@ fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
     let world = fixture();
     hook(
@@ -426,7 +422,6 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_up_reports_one_config_diagnostic_when_state_is_unusable() {
     let world = fixture();
     let blocked = world.home().join("blocked-state");
@@ -533,7 +528,6 @@ fn holding_hook(world: &World) {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output() {
     let world = fixture();
     holding_hook(&world);
@@ -583,7 +577,6 @@ fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output(
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_redirected_up_ignores_window_resize() {
     let world = fixture();
     holding_hook(&world);

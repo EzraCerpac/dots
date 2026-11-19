@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, OpenOptions, Permissions};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -13,12 +13,32 @@ use crate::Fail;
 use super::failure;
 use super::repo::{Workspace, git_commit, jj_commit, object_id, stdout};
 
+pub(super) struct ScreenedPolicy {
+    _staging: tempfile::TempDir,
+    rules: PathBuf,
+}
+
+impl ScreenedPolicy {
+    pub(super) fn screen_preview(
+        &self,
+        workspace: &Workspace<'_, '_>,
+        bytes: &[u8],
+    ) -> Result<(), Fail> {
+        let staging_error =
+            |_| failure("could not privately stage the publication preview for gitleaks");
+        let mut input = tempfile::tempfile_in(&self.rules).map_err(staging_error)?;
+        input.write_all(bytes).map_err(staging_error)?;
+        input.rewind().map_err(staging_error)?;
+        workspace.gitleaks_preview(&self.rules, input)
+    }
+}
+
 pub(super) fn outgoing(
     workspace: &Workspace<'_, '_>,
     base: &str,
     head: &str,
     conflicts: bool,
-) -> Result<(), Fail> {
+) -> Result<ScreenedPolicy, Fail> {
     let staging = tempfile::Builder::new()
         .permissions(Permissions::from_mode(0o700))
         .tempdir()
@@ -59,7 +79,10 @@ pub(super) fn outgoing(
         private_dirs(&empty)?;
         workspace.gitleaks(&empty, OsStr::new("."), &rules)?;
     }
-    Ok(())
+    Ok(ScreenedPolicy {
+        _staging: staging,
+        rules,
+    })
 }
 
 fn screen_tree(

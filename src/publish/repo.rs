@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use crate::config::RepoSetting;
 use crate::process::Cwd;
@@ -654,19 +654,31 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
     }
 
     pub(super) fn gitleaks(&self, root: &Path, target: &OsStr, rules: &Path) -> Result<(), Fail> {
+        let mut cmd = self.gitleaks_command(root, rules, "dir")?;
+        cmd.arg("--").arg(target);
+        scanner::screen(cmd, scanner::OUTGOING, |cmd| self.probe(cmd, "gitleaks"))
+    }
+
+    pub(super) fn gitleaks_preview(&self, rules: &Path, input: File) -> Result<(), Fail> {
+        let cmd = self.gitleaks_command(rules, rules, "stdin")?;
+        scanner::screen(cmd, scanner::PREVIEW, |cmd| {
+            self.probe_with_stdin(cmd, "gitleaks", Stdio::from(input))
+        })
+    }
+
+    fn gitleaks_command(&self, root: &Path, rules: &Path, source: &str) -> Result<Command, Fail> {
         // The rules sandbox supplies a cwd for repository-relative data
         // paths. Active rules and all transitive extensions are absolute
         // snapshots outside its scanned subtree.
         let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(root))?;
-        cmd.args(scanner::ARGS);
-        cmd.arg("--config")
+        cmd.arg(source)
+            .args(scanner::ARGS)
+            .arg("--config")
             .arg(rules.join(".gitleaks.toml"))
             .arg("--gitleaks-ignore-path")
             .arg(rules)
-            .env("TMPDIR", rules)
-            .arg("--")
-            .arg(target);
-        scanner::screen(cmd, |cmd| self.probe(cmd, "gitleaks"))
+            .env("TMPDIR", rules);
+        Ok(cmd)
     }
 
     pub(super) fn save_bookmark(&self, name: &str, commit: &str) -> Result<(), Fail> {
@@ -828,11 +840,15 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
     }
 
     fn probe(&self, cmd: Command, program: &str) -> Result<Output, Fail> {
+        self.probe_with_stdin(cmd, program, Stdio::null())
+    }
+
+    fn probe_with_stdin(&self, cmd: Command, program: &str, input: Stdio) -> Result<Output, Fail> {
         if self.run.cancelled() {
             return Err(Fail::new(130, "publication was interrupted"));
         }
         self.run
-            .probe(cmd)
+            .probe_with_stdin(cmd, input)
             .map_err(|error| spawn_failure(program, error))
     }
 }

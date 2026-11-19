@@ -7,6 +7,7 @@ Amended 2026-11-18: restore undo checkpoints, package pass scope, and publish or
 Amended 2026-11-18: report listing and exit status, the init seed commit message, GitHub app ownership, pull request bases, update output modes, scan policy and archive coverage, lockfile protection, checkpoint capture, and local versus published settings history.
 Amended 2026-11-18: sync diagnostics and hook-generated inputs, backup publication verification and history format checks, diverged publish approval, and update report replay.
 Amended 2026-11-19: restore checkpoint encryption and validated sync pre-hook context.
+Amended 2026-11-19: source sync write and publication guarantees, native history handoff, and outgoing history audit coverage.
 
 This document is the reference for what `dots` 1.0 does as seen from outside: commands, files, settings, environment, output and exit codes.
 Every statement describes 1.0.
@@ -536,43 +537,54 @@ Package, tool and standalone mise changes come from comparing state before and a
    A native save failure reports a bounded, vetted reason and directs the user to retry the local checkpoint with `dots sync`.
 2. Captures edits to copied dotfiles: when the deployed copy changed and its source still matches the last common version, the deployed bytes become the source.
    When both the copy and the source changed, both stay as they are and sync reports it.
-3. Stages every tracked or unignored public edit as a candidate commit, leaving machine-local files out, without moving `dev` or the index.
+3. Stages every tracked or unignored public edit as a candidate commit, leaving machine-local files out, without moving `dev` or the real index.
+   Sync preserves existing staging and refuses ambiguous staged edits.
 4. Scans the candidate with gitleaks before `dev` or the index advances.
    As in 0.4.0, sync uses the checkout's live gitleaks rules and ignore entries, so a local exception governs the scan of the change that adds it.
-   The native Git scan covers outgoing commit diffs, including merge diffs against their first parent.
+   The native Git scan covers outgoing commit diffs, including merge diffs against their first parent, and checks which commits are already present across all published branches.
    A flagged file stays on disk and out of the candidate, and the remaining candidate is scanned again; only a clean candidate becomes `dev`.
-   Without a working gitleaks, or when a scan fails, the candidate is dropped, the edits stay on disk, and nothing is shared or pushed.
+   A rejected candidate never reaches `dev`, the real index or the push, and its edits stay on disk.
+   Without a working gitleaks, or when a scan fails, nothing is shared or pushed.
    A flagged commit already in local history that no published branch contains, or one that ever tracked a machine-local file, blocks the push; sync never rewrites the branch to remove it.
 5. Fetches `dev` and `main`, or continues offline.
-6. Merges local work with `origin/dev`, then with `origin/main`, outside the live files.
+6. Plans the merge of local work with `origin/dev`, then with `origin/main`, without changing the live checkout.
    On a conflicting hunk, `main` wins over `dev` and `dev` wins over local work.
    Binary, file-type and delete conflicts take the published file whole.
    Both parents stay in history, so the losing version is recoverable.
 7. Validates the merged configuration with this machine's local files; an invalid result is neither pushed nor applied.
-8. Pushes by creating or fast-forwarding `origin/dev` only, conditional on the remote tip it validated, and retries a lost race up to three times.
+8. Pushes the exact validated candidate OID to `refs/heads/dev` at the checked push destination, conditional on the expected old OID or branch absence, and only to create or fast-forward the branch.
+   It retries up to three times only after confirming a moving-tip race without withdrawal of published history.
    If published history disappears during a retry, sync keeps local work and applies nothing from the withdrawn history.
    A push that takes longer than 60 seconds is stopped, and Git never prompts for credentials.
+   Clear Git porcelain success for that ref update is sufficient to report it shared.
+   **Changed from 0.4.0:** if an attempted push has an indeterminate outcome, sync stops before retrying or applying, and reports publication as unconfirmed in the live and replayed receipts.
+   The issue gives the candidate OID and the expected old remote `dev` OID or absence, and tells the user to compare `refs/heads/dev` at the push endpoint.
 9. Updates the checkout and applies dotfiles under the guarded rules below.
 
 #### Guarded checkout and copies
 
-- Before writing, sync checks incoming paths for local obstructions, including ignored files, directories and symlinks; a blocked path stops the checkout, and unrelated edits are still shared.
-- A file edited during the run is never overwritten; sync reports it and asks for a rerun.
-- An interrupted checkout, index installation or branch update is finished by the next run before it takes a new snapshot.
-- A regular copied dotfile is replaced only after moving the current target aside and confirming the bytes are the expected ones; the replacement is created only at an empty path.
+- Before writing, sync checks incoming paths for local obstructions, including ignored files, directories and symlinks.
+- A blocked path stops the checkout, and unrelated edits can still be shared if publication is confirmed.
+- Dots guards its checkout and its own writes against intervening edits and reports competing changes with a recovery action.
+- Before a fresh snapshot, sync finishes an interrupted checkout, index installation or `dev` update only while the checkout, index and `dev` still match the recorded recovery state.
+  Otherwise it preserves the competing tip or edits, private originals and pending recovery, and reports the recorded before and after revisions, actual recovery paths and how to reconcile and rerun.
+- When dots takes over or displaces an existing file, it verifies the displaced file and installs the replacement exclusively at an empty path.
 - When another writer claims the path, sync leaves it alone and prints where the moved file is.
-- After a replacement, the previous file stays at a printed private path, so an editor that still has it open can finish saving.
+- The original inode stays at a printed private path on the same filesystem, so an editor that still has it open can finish saving.
 - For a directory copy, sync verifies the bytes and permissions of each leaf it replaces; edited and unmanaged files stay.
 - When the deployed mode of a leaf cannot be verified, the leaf is updated only if its current mode can stay.
 - Recovery files stay on the same filesystem as the target; when that is impossible, sync reports the path and keeps both versions.
-- Other targets are applied in dependency order with the usual mise hooks, and matching reload commands run once, after the writes.
+- Other targets are applied in dependency order with the usual mise hooks.
+- Ordinary template and inline installs use native mise apply on the live targets.
+  Mise 2026.11.9 can overwrite a file another writer creates between native planning and installation, losing that file.
+- Sync uses native reload matching and runs matching reload commands once after the writes in that run, reporting failures with a next action.
 - As in 0.4.0, a validated pre-hook runs with the real configuration checkout as its working directory and `DOTS_ROOT` pointing to that checkout.
   Public source or configuration edits it generates stay there for the next ordinary screened sync.
   In the same run, already validated entries use the generated source bytes and permissions, honour `create_if_missing`, and can consume the output of a successful declared dependency.
   A kept or failed dependency blocks its dependent.
-  The same write guards protect competing edits, and an omitted input, changed selector, target, source path or operation, or a newly introduced hook cannot authorize an additional write.
+  Dots' own writes remain guarded, and an omitted input, changed selector, target, source path or operation, or a newly introduced hook cannot authorize an additional write.
 
-Sync never force-pushes, skips validation, discards uncommitted edits or writes conflict markers into live files.
+Sync never force-pushes, skips validation or writes conflict markers into live files.
 Each issue carries a diagnostic and a recovery action.
 
 #### Receipt
@@ -586,7 +598,7 @@ Each issue carries a diagnostic and a recovery action.
 - **New in 1.0:** live and saved sync receipts exclude raw child stderr and may include vetted scanner metadata such as rule, path and line.
 - A missing gitleaks gives a receipt such as `dots sync: kept 2 files on disk · pulled dev +1, main +0 · not pushed`, led by the issue `NOT SHARED: gitleaks not found; local edits kept on disk, nothing pushed` and the action to install it.
 
-`dots sync --last` replays the latest receipt for this checkout from the recorded Git revisions, without the network and without mise.
+`dots sync --last` only replays the latest receipt for this checkout from the recorded Git revisions, without the network and without mise.
 It spends up to three seconds screening patches and keeps up to 1 MiB for the pager.
 A patch is shown only when gitleaks returns a clean JSON report for both file versions and for the displayed text; otherwise the file is listed without its patch.
 Binary, encrypted and unverified changes are listed as file entries.
@@ -1145,6 +1157,8 @@ Tracked files end at mode 0600.
 When running history operations, `dots` keeps verbatim transport errors out of its output and saved reports and does not forward Git trace or mise log-file overrides.
 Native mise owns its `history/sync.json` health record, whose `last_error` may contain a verbatim transport error.
 `dots` leaves this record untouched.
+Dots checks its own preconditions before launching mise and classifies the native result, with a host branch check after successful backup sync.
+Mise owns stale-operation recovery during native fetch and sync, including a record left by another native mise process crashing between the precheck and capture.
 
 ### Enrollment
 
@@ -1186,7 +1200,12 @@ It stops with exit status 2 at the first failed check:
 6. Every effective push URL of the history store, after Git's URL rewrites, matches `dots_state_repo` and is not the source repository.
 
 Then it saves a checkpoint locally.
-**New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in every local checkpoint reachable from the history branch that the destination host branch lacks.
+**New in 1.0:** before publishing, `dots backup` audits the actual tracked payloads in at least every checkpoint reachable from the local history branch whose presence on the validated destination host branch it cannot prove.
+Stock OpenSSH works with a provisioned identity.
+With a custom opaque SSH launcher, including one configured in Git, the guard audits the full local ancestry without a branch query and may refuse a checkpoint already present remotely.
+Native sync and the readback after success can still use the configured launcher.
+For HTTP(S), remote ancestry counts only when the branch query is bound to the validated destination.
+The destination checks still apply, and a malformed remote-helper URL is refused.
 A current unencrypted declaration still fails check 4 with exit 2 before the local save or any remote contact.
 With mise's default `history.allow_plaintext_history = false`, a plaintext or unreadable payload or a malformed encrypted wrapper or envelope stops backup with exit 1 before native sync, and no history is sent.
 The historical audit checks format alone and requires no retired private key.
@@ -1199,6 +1218,7 @@ Backup reads the effective `[settings.history]` setting with `mise settings get 
 Only a successful `true` skips this audit; native sync still applies its own checks.
 If the setting cannot be read as a boolean, backup stops before sync.
 Only native `mise bootstrap dotfiles sync` publishes to the state repository.
+If native sync exits nonzero after the local save, backup exits 1, reports that the checkpoint was saved locally and publication is unconfirmed, keeps native stderr private and skips readback.
 Version 0.4.0 printed `Settings backup published.` on native exit 0 even when conflicts still awaited reconciliation.
 **New in 1.0:** after a successful native sync, backup reads back the validated remote host branch once and reports publication only if the saved checkpoint equals its tip or is an ancestor of it.
 If reconciliation is pending and the checkpoint is absent, backup exits 1, says the checkpoint was kept locally and directs the user to `mise dot status`.
@@ -1216,7 +1236,7 @@ Backup uses one native sync and performs no publication retry or force push.
 - Restore never activates, stops or restarts the watcher.
 - It requires an existing recovery identity and never generates one.
 - Restore uses only fetch-side remote traffic. It never runs `dots backup`, pushes or publishes during restore.
-- **New in 1.0:** before any native restore operation that can capture a checkpoint, including fetch, `dots` requires a nonempty recipient configuration and `history.allow_plaintext_history = false`.
+- **New in 1.0:** before any native restore operation that can capture a checkpoint, including fetch, `dots` requires a nonempty recipient list from history configuration that native mise trusts at system or global scope, and `history.allow_plaintext_history = false`.
   If either condition fails, restore exits 2 before capture or target installation.
   The diagnostic names the failed condition and tells the user to configure history recipients or disable plaintext history, as applicable, without showing key material.
 - As in 0.4.0, native mise applies the fetched history to the actual targets and may save local undo checkpoints of their live contents before overwriting them.
@@ -1230,11 +1250,14 @@ Backup uses one native sync and performs no publication retry or force push.
 - A new store is staged and validated as a bare clone before it is installed.
   On first restore, mise applies the fetched remote state as the initial checkpoint, using its native conflict checks.
 - An interrupted first restore resumes on the next run instead of treating the new store as established.
+- Restore retains its pre-fetch observation of live files through fallback and retry.
+  If it cannot prove recovery is safe, it preserves later edits and both the dots and native recovery journals.
 - A completed restore leaves no staging clone or pending marker.
 - An existing unconnected store is replaced only with `--initialize-history`.
   The old store moves to a private sibling directory and is kept.
   If preparing the replacement fails, the old store stays in place.
 - It refreshes this machine's identity and recipients, sets the active encrypted tracked files for this machine to mode 0600, and sets history sync to `manual`.
+  As in 0.4.0, the refresh preserves local recipients and appends the selected identity's public keys in `config.local.toml`, without promoting project-only recipients.
 - It needs Git, Git authentication for the state repository, and the age identity to be present, and installs nothing.
 
 ## Environment variables

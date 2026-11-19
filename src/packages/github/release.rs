@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, Read, Seek, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use glob::Pattern;
@@ -9,16 +9,20 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use toml_edit::Item;
 use ureq::{
-    Agent, Body, Error,
-    http::{Response, Uri},
+    Agent, Body, Error, RequestBuilder,
+    http::{Response, Uri, header::LOCATION},
+    typestate::WithoutBody,
 };
 
 use crate::{Ctx, Fail, run::Run};
 
-use super::{Platform, digest_hex, failure, repo_name, tool_options};
+use super::{Platform, archive::Format, digest_hex, failure, repo_name, tool_options};
 
 const MAX_METADATA: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
+const GITHUB_API: &str = "https://api.github.com";
+const MAX_REDIRECTS: u32 = 10;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) struct Client {
     agent: Agent,
@@ -52,7 +56,8 @@ impl Client {
             .map(|token| token.to_string_lossy().into_owned());
         let agent = Agent::config_builder()
             .https_only(true)
-            .timeout_global(Some(Duration::from_secs(60)))
+            .max_redirects(0)
+            .timeout_global(Some(REQUEST_TIMEOUT))
             .user_agent("dots")
             .build()
             .into();
@@ -60,16 +65,7 @@ impl Client {
     }
 
     pub fn latest(&self, repo: &str, run: &Run<'_>) -> Result<(String, Release), Fail> {
-        check_cancellation(run)?;
-        let response = self.get(
-            &format!("https://api.github.com/repos/{repo}/releases/latest"),
-            "application/vnd.github+json",
-            self.token.as_deref(),
-        ).map_err(|err| match err {
-            Error::StatusCode(404) => failure(format!("{repo} has no accessible stable GitHub release; source builds are not supported")),
-            Error::StatusCode(status) => failure(format!("GitHub release lookup for {repo} failed (HTTP {status}); check GitHub access")),
-            _ => failure(format!("could not reach the GitHub release API for {repo}")),
-        })?;
+        let response = self.lookup(repo, run)?;
         let mut metadata = Vec::new();
         response
             .into_body()
@@ -104,6 +100,45 @@ impl Client {
         Ok((canonical, release))
     }
 
+    fn lookup(&self, repo: &str, run: &Run<'_>) -> Result<Response<Body>, Fail> {
+        let mut url = format!("{GITHUB_API}/repos/{repo}/releases/latest");
+        let unreachable = || failure(format!("could not reach the GitHub release API for {repo}"));
+        let started = Instant::now();
+        for _ in 0..=MAX_REDIRECTS {
+            check_cancellation(run)?;
+            let remaining = REQUEST_TIMEOUT.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            let response = self
+                .request(&url, "application/vnd.github+json")
+                .config()
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+                .map_err(|err| match err {
+                    Error::StatusCode(404) => failure(format!(
+                        "{repo} has no accessible stable GitHub release; source builds are not supported"
+                    )),
+                    Error::StatusCode(status) => failure(format!(
+                        "GitHub release lookup for {repo} failed (HTTP {status}); check GitHub access"
+                    )),
+                    _ => unreachable(),
+                })?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            url = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(lookup_redirect)
+                .ok_or_else(|| failure("GitHub release lookup redirected outside its HTTPS API"))?
+                .to_string();
+        }
+        Err(unreachable())
+    }
+
     pub fn download(&self, repo: &str, asset: &Asset, run: &Run<'_>) -> Result<File, Fail> {
         check_cancellation(run)?;
         validate_download_url(repo, &asset.browser_download_url)?;
@@ -130,8 +165,13 @@ impl Client {
             )
         };
 
+        // Downloads can redirect to signed storage URLs. ureq removes Authorization.
         let response = self
-            .get(&url, accept, self.token.as_deref())
+            .request(&url, accept)
+            .config()
+            .max_redirects(MAX_REDIRECTS)
+            .build()
+            .call()
             .map_err(|err| match err {
                 Error::StatusCode(status) => failure(format!(
                     "GitHub release archive download failed (HTTP {status})"
@@ -175,16 +215,26 @@ impl Client {
         Ok(file)
     }
 
-    fn get(&self, url: &str, accept: &str, token: Option<&str>) -> Result<Response<Body>, Error> {
+    fn request(&self, url: &str, accept: &str) -> RequestBuilder<WithoutBody> {
         let request = self.agent.get(url).header("Accept", accept);
-        // ureq strips Authorization on redirects, including signed storage URLs.
-        let request = if let Some(token) = token {
-            request.header("Authorization", format!("Bearer {token}"))
-        } else {
-            request
-        };
-        request.call()
+        match &self.token {
+            Some(token) => request.header("Authorization", format!("Bearer {token}")),
+            None => request,
+        }
     }
+}
+
+fn lookup_redirect(location: &str) -> Option<Uri> {
+    let uri: Uri = if location.starts_with('/') && !location.starts_with("//") {
+        format!("{GITHUB_API}{location}").parse().ok()?
+    } else {
+        location.parse().ok()?
+    };
+    (uri.scheme_str() == Some("https")
+        && uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case("api.github.com")))
+    .then_some(uri)
 }
 
 fn check_cancellation(run: &Run<'_>) -> Result<(), Fail> {
@@ -239,10 +289,15 @@ impl Release {
             );
         } else {
             let mut best = None;
+            let mut unsupported = None;
             for asset in &self.assets {
                 let Some(score) = score(&asset.name, platform) else {
                     continue;
                 };
+                if let Err(error) = Format::detect(&asset.name) {
+                    unsupported.get_or_insert(error);
+                    continue;
+                }
                 if best.is_none_or(|best| score > best) {
                     candidates.clear();
                     best = Some(score);
@@ -251,23 +306,11 @@ impl Release {
                     candidates.push(asset);
                 }
             }
-            let zip_stems: Vec<_> = candidates
-                .iter()
-                .filter_map(|asset| {
-                    asset
-                        .name
-                        .to_ascii_lowercase()
-                        .strip_suffix(".zip")
-                        .map(str::to_owned)
-                })
-                .collect();
-            candidates.retain(|asset| {
-                !asset
-                    .name
-                    .to_ascii_lowercase()
-                    .strip_suffix(".dmg")
-                    .is_some_and(|stem| zip_stems.iter().any(|zip| zip == stem))
-            });
+            if candidates.is_empty()
+                && let Some(error) = unsupported
+            {
+                return Err(error);
+            }
         }
         let [asset] = candidates.as_slice() else {
             let names = if candidates.is_empty() {
@@ -411,12 +454,9 @@ fn score(name: &str, platform: Platform) -> Option<u8> {
         "sbom",
         "intoto",
         "provenance",
-    ]) || [
-        ".sig", ".asc", ".msi", ".exe", ".deb", ".rpm", ".apk", ".pkg",
-    ]
-    .iter()
-    .any(|suffix| name.ends_with(suffix))
-        || (name.ends_with(".dmg") && platform.os != "macos")
+    ]) || [".sig", ".asc", ".exe"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
         || os_families
             .iter()
             .any(|(os, tokens)| *os != platform.os && has(tokens))
@@ -531,6 +571,67 @@ mod tests {
             release.select(None, LINUX).unwrap().name,
             "Tool-linux-x86-64.tar.gz"
         );
+    }
+
+    #[test]
+    fn automatic_selection_prefers_a_supported_asset_to_a_more_specific_installer() {
+        let mixed = release(&["Tool-macos-arm64.dmg", "Tool-macos-universal.zip"]);
+        assert_eq!(
+            mixed.select(None, MAC).unwrap().name,
+            "Tool-macos-universal.zip"
+        );
+        let explicit = mixed
+            .select(Some(&Pattern::new("*.dmg").unwrap()), MAC)
+            .unwrap();
+        assert!(super::super::archive::Format::detect(&explicit.name).is_err());
+        let unsupported = release(&["Tool-macos-arm64.dmg"]);
+        assert!(
+            unsupported
+                .select(None, MAC)
+                .err()
+                .unwrap()
+                .diagnostic
+                .contains("unsupported installer format")
+        );
+    }
+
+    #[test]
+    fn client_keeps_redirect_credentials_only_for_the_official_https_authority() {
+        use crate::{Env, Flags, config::Root};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path();
+        let env = Env {
+            vars: super::super::test_env::private_environment(path, path, path)
+                .into_iter()
+                .collect(),
+            cwd: path.to_owned(),
+        };
+        let ctx = Ctx {
+            root: Root::resolve(&env).unwrap(),
+            env,
+            flags: Flags::default(),
+        };
+        let client = Client::new(&ctx);
+        assert!(client.agent.config().https_only());
+        assert_eq!(client.agent.config().max_redirects(), 0);
+        assert_eq!(
+            client.agent.config().redirect_auth_headers(),
+            ureq::config::RedirectAuthHeaders::Never
+        );
+        let moved = "/repositories/42/releases/latest";
+        let expected = format!("{GITHUB_API}{moved}");
+        for location in [moved, &expected] {
+            assert_eq!(lookup_redirect(location).unwrap().to_string(), expected);
+        }
+        for location in [
+            "http://api.github.com/repositories/42/releases/latest",
+            "https://api.github.com:8080/repositories/42/releases/latest",
+            "https://downloads.example/releases/latest",
+            "//downloads.example/releases/latest",
+        ] {
+            assert!(lookup_redirect(location).is_none(), "{location}");
+        }
     }
 
     #[test]

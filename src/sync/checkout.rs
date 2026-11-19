@@ -47,6 +47,7 @@ pub(super) struct Interrupted {
     pub path: Option<PathBuf>,
     pub backups: Vec<PathBuf>,
     pub moved_dev: Option<(String, String)>,
+    pub recorded_revisions: Option<Box<(String, String)>>,
 }
 
 fn fingerprints_match(path: &Path, other: &Path) -> io::Result<bool> {
@@ -469,8 +470,10 @@ fn apply(
     write_index: impl Fn(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<Installed> {
     let plan: Plan = serde_json::from_reader(File::open(pending.join("plan.json"))?)?;
-    oid(plan.before.as_bytes())?;
-    oid(plan.after.as_bytes())?;
+    progress.recorded_revisions = Some(Box::new((
+        oid(plan.before.as_bytes())?,
+        oid(plan.after.as_bytes())?,
+    )));
     let shape = super::shape(git).map_err(io::Error::other)?;
     if super::shape_problem(&shape).is_some() {
         return Err(invalid("checkout shape changed"));
@@ -815,6 +818,11 @@ pub(super) fn finish(
         Err(_) => {
             if has_pending(directory) {
                 progress.backups = recovery_paths(&pending);
+            }
+            // Omit revisions when the interrupted operation never started
+            // or its journal has since been retired.
+            if !fs::symlink_metadata(pending.join("started")).is_ok_and(|marker| marker.is_file()) {
+                progress.recorded_revisions = None;
             }
             Err(progress)
         }

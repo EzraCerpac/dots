@@ -114,6 +114,39 @@ impl World {
         remote
     }
 
+    /// Connect a checkout to the local bare repository using a source setting
+    /// supported by the selected executable. v0.4.0 accepts only GitHub slugs.
+    pub fn set_source_origin(&self, bare: &Path, github_slug: &str) -> String {
+        use std::io::Read;
+
+        let url = format!("file://{}", bare.display());
+        let mut prefix = [0; 2];
+        fs::File::open(&self.dots_bin)
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        let (setting, origin) = if prefix == *b"#!" {
+            let origin = format!("https://github.com/{github_slug}");
+            let rewrite = format!("url.{url}.insteadOf");
+            let output = self
+                .git()
+                .args(["config", &rewrite, &origin])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            (github_slug.to_owned(), origin)
+        } else {
+            (url.clone(), url)
+        };
+        let output = self
+            .git()
+            .args(["remote", "add", "origin", &origin])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        setting
+    }
+
     pub fn command(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
         // Even when TMPDIR is inside a checkout, Git must stay inside this world.
         let git_ceiling =

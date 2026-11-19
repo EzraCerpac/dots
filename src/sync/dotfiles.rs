@@ -192,6 +192,27 @@ struct KnownCopy {
 }
 
 impl KnownCopy {
+    fn accepts_native_baseline(&self) -> bool {
+        self.deployed.is_none() || self.native_epoch.is_some()
+    }
+
+    fn native_baseline<'a>(&self, native: Option<&'a NativeDeployment>) -> Option<&'a str> {
+        // Native may supersede a guarded write, even by writing older bytes.
+        native
+            .filter(|native| {
+                self.deployed.is_none()
+                    || self.native_epoch.is_none()
+                    || native.supersedes(self.native_epoch)
+            })
+            .map(|native| native.digest.as_str())
+    }
+
+    fn provisional_native_mode(&self, native: &NativeDeployment) -> Option<u32> {
+        self.mode.filter(|_| {
+            self.deployed.is_none() && self.native_epoch == Some(NativeEpoch::Present(native.epoch))
+        })
+    }
+
     fn source_image(&self, git: &Git<'_>, revision: &str) -> io::Result<Image> {
         Image::checkout(
             git,
@@ -214,7 +235,7 @@ impl KnownCopy {
             }
             // Legacy guarded records do not say when mise last deployed.
             // An extant but undated native record may only corroborate them.
-            if self.deployed.is_none() || self.native_epoch.is_some() {
+            if self.accepts_native_baseline() {
                 return true;
             }
         }
@@ -390,19 +411,6 @@ impl Copies {
             })
     }
 
-    fn native_baseline(&self, target: &Path, known: &KnownCopy) -> Option<&str> {
-        // A native record predating a guarded sync write is stale. A later
-        // native deployment takes precedence even if it wrote older bytes.
-        self.deployments
-            .get(target)
-            .filter(|native| {
-                known.deployed.is_none()
-                    || known.native_epoch.is_none()
-                    || native.supersedes(known.native_epoch)
-            })
-            .map(|native| native.digest.as_str())
-    }
-
     fn pending_capture(&self, target: &Path) -> bool {
         self.state
             .captured
@@ -564,14 +572,18 @@ impl Copies {
                     self.observed_directory_inodes.insert(path.clone(), inode);
                 }
                 let live = root.read_path(leaf)?;
-                let native_digest = if path == destination {
-                    self.native_baseline(&path, &record)
+                let deployment = if path == destination {
+                    self.deployments.get(&path)
                 } else {
                     None
                 };
+                let native_digest = record.native_baseline(deployment);
                 let expected_mode = match (&live, native_digest) {
                     (Image::Regular { mode, .. }, Some(_)) => {
-                        Some(copy_mode(*mode, target.permissions.as_deref())?)
+                        match deployment.and_then(|native| record.provisional_native_mode(native)) {
+                            Some(mode) => Some(mode),
+                            None => Some(copy_mode(*mode, target.permissions.as_deref())?),
+                        }
                     }
                     _ => record
                         .mode
@@ -580,6 +592,16 @@ impl Copies {
                             _ => None,
                         }),
                 };
+                if record.deployed.is_none()
+                    && let (Image::Regular { .. }, Some(native), Some(mode)) =
+                        (&live, deployment, expected_mode)
+                {
+                    // Keep the old declaration's mode when an incoming source
+                    // switch prevents another capture, including after retry.
+                    let known = self.state.known.get_mut(&path).expect("copy was recorded");
+                    known.mode = Some(mode);
+                    known.native_epoch = Some(NativeEpoch::Present(native.epoch));
+                }
                 if record.matches(&deployed, &common, expected_mode, native_digest)
                     || live == deployed
                 {
@@ -1070,7 +1092,7 @@ impl Copies {
         let copy_is_edited = match previous_copy {
             Some(copy) if current != Image::Absent => {
                 let common = copy.source_image(git, validated.revision())?;
-                let native = self.native_baseline(path, copy);
+                let native = copy.native_baseline(self.deployments.get(path));
                 !copy.matches(&current, &common, copy.mode, native)
             }
             None if absent && current != Image::Absent => self
@@ -1333,17 +1355,26 @@ impl Copies {
                         let next = next_baseline
                             .as_ref()
                             .filter(|next| path == destination && next.source == known.source);
-                        let native = if path == destination {
-                            self.native_baseline(&path, known)
+                        let deployment = if path == destination {
+                            self.deployments.get(&path)
                         } else {
                             None
                         };
-                        let mode = if native.is_some() && known.native_epoch.is_some() {
-                            next.and_then(|next| next.mode).or(known.mode)
+                        let native = known.native_baseline(deployment);
+                        let mode = if native.is_some() && known.accepts_native_baseline() {
+                            let next_mode = next.and_then(|next| next.mode);
+                            if known.deployed.is_none() {
+                                deployment
+                                    .and_then(|native| known.provisional_native_mode(native))
+                                    .or(next_mode)
+                            } else {
+                                next_mode.or(known.mode)
+                            }
                         } else {
                             known.mode
                         };
-                        known.matches(&current, base, mode, native)
+                        (native.is_none() || known.deployed.is_some() || mode.is_some())
+                            && known.matches(&current, base, mode, native)
                     }
                     (Image::Regular { .. }, None, _) => {
                         (target.mode == "copy"

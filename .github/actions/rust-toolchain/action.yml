@@ -14,10 +14,12 @@ runs:
       shell: bash
       env:
         TARGET: ${{ inputs.target }}
+        COMPONENTS: ${{ inputs.components }}
       run: |
         version="$(sed -n 's/^rust = "\([^"]*\)"$/\1/p' mise.toml)"
         test -n "$version"
         printf 'rust=%s\n' "$version" >> "$GITHUB_OUTPUT"
+        printf 'components=%s\n' "${COMPONENTS//,/-}" >> "$GITHUB_OUTPUT"
         case "$TARGET" in
           *-linux-musl) host="${TARGET%musl}gnu" ;;
           *) host="$TARGET" ;;
@@ -28,7 +30,7 @@ runs:
       uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.rustup/toolchains/${{ steps.versions.outputs.toolchain }}
-        key: rustup-v1-${{ inputs.target }}-${{ steps.versions.outputs.rust }}-${{ inputs.components }}
+        key: rustup-v1-${{ inputs.target }}-${{ steps.versions.outputs.rust }}-${{ steps.versions.outputs.components }}
 
     - name: Install Rust and configure the linker
       shell: bash
@@ -62,5 +64,5 @@ runs:
     - name: Cache Cargo dependencies and build output
       uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       with:
-        shared-key: ${{ inputs.target }}-${{ inputs.components }}
+        shared-key: ${{ inputs.target }}-${{ steps.versions.outputs.components }}
         cache-bin: false

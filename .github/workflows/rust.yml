@@ -128,5 +128,6 @@ jobs:
               "$(jq -r '.extended.result' <<< "$RESULTS")" "$RUST" "$FULL"
             printf '| Legacy and secrets | %s | Legacy suites for legacy changes (%s). Secret scan for non-docs changes (%s). |\n' \
               "$(jq -r '."legacy-and-secrets".result' <<< "$RESULTS")" "$LEGACY" "$NON_DOCS"
+            printf '\nFirst-run smoke and both v0.4.0 oracles are selected on full-matrix Rust runs.\n'
           } >> "$GITHUB_STEP_SUMMARY"
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"

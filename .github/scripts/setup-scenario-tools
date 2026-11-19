@@ -52,6 +52,19 @@ for spec in "jj@$jj_version" "gitleaks@$gitleaks_version"; do
   install -m 0755 "$(provision_mise which "$tool" --tool "$spec")" "$prefix/bin/$tool"
 done
 
+if [[ "$mise_platform" == macos-* ]]; then
+  # The upstream app carries a relocatable universal CLI and its support files.
+  # Bundle them so the test shards can use Fish without contacting Homebrew.
+  fish_version=4.9.3
+  fish_archive="fish-$fish_version.app.zip"
+  curl -fsSL --retry 3 "https://github.com/fish-shell/fish-shell/releases/download/$fish_version/$fish_archive" -o "$fish_archive"
+  printf '%s  %s\n' 3619fa92d540ed0dff4816594429290550d21b92226e0523457e5f0242c5e9a8 "$fish_archive" | shasum -a 256 -c
+  fish_prefix="fish-$fish_version.app/Contents/Resources/base/usr/local"
+  unzip -q "$fish_archive" "$fish_prefix/*"
+  mv "$fish_prefix" "$prefix/fish"
+  "$prefix/fish/bin/fish" --version
+fi
+
 # Prove fixture PATH still works when HOME and mise state are replaced,
 # including when a library case launches mise and then a child on that PATH.
 mkdir "$scratch/home" "$scratch/tmp"

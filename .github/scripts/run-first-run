@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+trap 'printf "### First-run smoke test\n\nElapsed time: %ss.\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
 archive=$1
 seed="$RUNNER_TEMP/dots-first-run"
 mkdir -p "$seed"

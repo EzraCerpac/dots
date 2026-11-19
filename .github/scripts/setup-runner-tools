@@ -16,9 +16,4 @@ case "${RUNNER_OS:-}" in
       }
     fi
     ;;
-  macOS)
-    if ! command -v fish >/dev/null; then
-      HOMEBREW_NO_AUTO_UPDATE=1 brew install fish
-    fi
-    ;;
 esac

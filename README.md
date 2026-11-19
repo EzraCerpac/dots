@@ -48,7 +48,7 @@ With `--from` and `--profile`, the installer clones that repository instead of r
 <details>
 <summary>Other ways to install</summary>
 
-<!-- TODO (D-01, G-2): Verify these routes against the published 0.5.0 artifacts. -->
+<!-- TODO (G-2): Verify these routes against the published 0.5.0 artifacts. -->
 <!-- TODO (C-01): Add a Cargo install route once dots-cli is published. -->
 
 Once 0.5.0 is released, these will also work; until then the Homebrew tap installs 0.4.0.
@@ -120,13 +120,17 @@ Machine-local files stay out of the repository, and encrypted settings history l
 
 ## Development
 
-This repository is the Rust crate `dots-cli`, which builds the `dots` binary; `mise.toml` pins Rust 1.100.0.
+This repository is the Rust crate `dots-cli`, which builds the `dots` binary.
+`mise.toml` pins Rust 1.100.0, and `mise install` installs it.
+`mise exec` then runs Cargo and rustc from that toolchain, even when mise is not activated in your shell:
 
 ```sh
 mise install
-mise run build
-mise run test
+mise exec -- cargo build --locked
+mise exec -- cargo test --locked -- --test-threads 1
 ```
+
+The full test suite also needs real scenario tools on your `PATH`; [the test guide](tests/README.md#prerequisites) lists them.
 
 `dots test` is something else: it runs your configuration's own `tests/run`.
 [The contract](docs/contract.md) is the reference for everything `dots` does.

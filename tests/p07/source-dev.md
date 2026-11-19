@@ -1,5 +1,7 @@
 # Source-dev scenarios
 
+This is a historical record of the P-07 translation. D-01 removed the legacy suites it cites, so their paths and line numbers refer to oracle `f5c8a0e`, and `docs/contract.md` line numbers refer to the contract as it stood when P-07 was written. The Rust suites it names are the tests that run today.
+
 The legacy suite has 99 top-level cases at oracle v0.4.0, `f5c8a0e`. The Rust integration suite runs the public executable selected by Q-01 World.
 
 The oracle requires a GitHub-shaped origin. Its private fixture checkout redirects that literal origin to the World bare repository via a local Git rewrite. The Rust fixture gives the same bare repository a literal matching `file://` origin. Both restrict Git to file transport. Each fixture uses private configuration, home, state, temporary files and a restricted tool path.

@@ -27,7 +27,40 @@ fn unchanged_help_without_configuration() {
 }
 ```
 
+## Prerequisites
+
+`mise.toml` pins only Rust.
+Run Cargo as `mise exec -- cargo ...`, so that Cargo and rustc both come from that toolchain without activating mise in your shell.
+
+The suites also run real programs inside their fixtures: `bash`, `zsh`, `fish`, `git` 2.43 or newer, `jq`, `age`, `age-keygen`, `mise` and `gitleaks`.
+The receipt suite, for example, stops when no real `gitleaks` is on `PATH`.
+A fixture replaces `HOME`, the XDG and mise directories and the Git configuration, but starts from the caller's `PATH`, and some suites drop mise shim directories from it.
+So put each tool's real executable in a directory on `PATH` before running Cargo, rather than relying on mise shims or shell activation.
+CI does this with `.github/scripts/setup-scenario-tools`, which installs pinned `mise`, `age`, `age-keygen`, `gitleaks` and `fish` under one prefix and puts its `bin` directories on `PATH`.
+
+These are test needs only: what the `dots` executable needs at run time is listed in [Platforms and programs](../docs/contract.md#platforms-and-programs).
+The archived v0.4.0 oracle jobs also need `node`, `python3` and `uv`; ordinary runs do not.
+
 ## Run and count cases
+
+Run everything with `cargo test --locked -- --test-threads 1`, or one suite with `cargo test --locked --test SUITE`, through `mise exec` as above.
+`dots test` is something else: it runs a configuration's own `tests/run`, not these suites.
+The library tests have terminal and signal fixtures that must not overlap, so the full local run is serial.
+CI serializes only the library tests, and runs the binaries, integration suites and doctests separately.
+
+```sh
+mise exec -- cargo test --locked -- --test-threads 1
+mise exec -- cargo test --locked --test contract
+mise exec -- cargo test --locked --test contract -- --list
+mise exec -- cargo test --locked --lib -- --test-threads 1
+```
+
+On DriehuisNAS, run each test command through `mise run nas:build --`.
+
+In CI, a pull request into `main` that changes code runs the Linux tests and one ARM macOS test job, and skips packaging.
+A pull request that touches `packaging/**`, `.github/workflows/**`, `.github/scripts/**`, `.github/actions/**`, `Cargo.toml` or `Cargo.lock`, and every code push to `main` and every tag, takes the full route instead.
+The full route adds sharded ARM and Intel macOS tests, the archived v0.4.0 oracle jobs on x86_64 Linux and ARM macOS, all four package jobs and real install checks.
+Only the oracle jobs install the legacy prerequisites.
 
 Name a case `unchanged_` when v0.4.0 passes it too,
 and `new_` when it covers behaviour that v0.4.0 lacks.
@@ -35,33 +68,10 @@ While Rust does not have the feature yet, mark the case `#[ignore = "P-NN"]` wit
 and take the mark off once that implementation lands.
 `DOTS_BIN`, set to an absolute path, chooses a different executable;
 when it is unset, Cargo provides `dots`.
-The v0.4.0 oracle is a release or archive of commit `f5c8a0e`.
-Point `DOTS_BIN` at that archive's `bin/dots` by absolute path, and also set `DOTS_TEST_ORACLE=v0.4.0`,
-which tells the supervisor fixture to expect the archive's `dots-up` renderer next to it.
-
-```sh
-mise run test -- --test contract
-DOTS_TEST_ORACLE=v0.4.0 DOTS_BIN=/absolute/path/to/v0.4.0/bin/dots mise run test -- unchanged_ -- --include-ignored
-mise run test -- --test contract -- --list
-```
-
-To smoke-test a verified, unpacked archive by hand, give `tests/support/oracle-probe`
-the absolute path to that archive's `bin/dots` as its only argument.
-The `dots-up` renderer must sit beside it.
-The probe builds a fresh private environment for both executables, even for their
-informational flags, and never uses the caller's `HOME`.
-
-```sh
-tests/support/oracle-probe /absolute/path/to/v0.4.0/bin/dots
-```
-
-On DriehuisNAS, run each test command through `mise run nas:build --`.
 
 Every suite has an `inventory/<suite>.tsv` file whose header is
 `unchanged<TAB>new<TAB>dropped`, followed by one row of integer counts.
 Take the `unchanged_` and `new_` counts from the Cargo listing, ignored cases included.
-For each legacy case you drop, add its `Class.test_method` identifier and a concrete reason
-to `inventory/<suite>-dropped.tsv`, whose header is `legacy_case<TAB>reason`.
+A case from the retired legacy suites that was dropped in translation is listed in `inventory/<suite>-dropped.tsv`,
+by its `Class.test_method` identifier and a concrete reason, under the header `legacy_case<TAB>reason`.
 The dropped count is the number of entries in that file.
-The first counts covered only the initial translations and the cases dropped explicitly;
-every other legacy case is still pending.

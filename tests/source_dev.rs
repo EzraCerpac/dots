@@ -202,6 +202,7 @@ struct Repo {
     mise: PathBuf,
     mise_real: Option<PathBuf>,
     gitleaks_real: Option<PathBuf>,
+    oracle: bool,
     config: String,
 }
 
@@ -251,6 +252,7 @@ impl Repo {
             mise,
             mise_real,
             gitleaks_real,
+            oracle,
             config,
         };
         for item in fs::read_dir(&fixture.a).unwrap() {
@@ -595,7 +597,7 @@ macro_rules! sync_case {
 }
 
 sync_case!(
-    unchanged_clean_checkout_has_one_receipt_and_no_changes,
+    active unchanged_clean_checkout_has_one_receipt_and_no_changes,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -632,7 +634,7 @@ sync_case!(unchanged_offline_commit_is_saved_then_shared, || {
     has(&f.replay(&f.a), "shared on dev");
 });
 
-sync_case!(unchanged_reviewed_main_is_shared_and_received, || {
+sync_case!(active unchanged_reviewed_main_is_shared_and_received, || {
     let f = Repo::new();
     let reviewed = f.reviewed("reviewed", "reviewed change\n");
     has(&f.sync(&f.a), "pushed");
@@ -646,7 +648,7 @@ sync_case!(unchanged_reviewed_main_is_shared_and_received, || {
 });
 
 sync_case!(
-    unchanged_missing_dev_reports_files_from_created_branch,
+    active unchanged_missing_dev_reports_files_from_created_branch,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -670,7 +672,7 @@ fn publish_during_validation(f: &Repo, revision: &str) -> PathBuf {
 }
 
 sync_case!(
-    unchanged_accepted_push_reports_only_replaced_remote_tip,
+    active unchanged_accepted_push_reports_only_replaced_remote_tip,
     || {
         let f = Repo::new();
         f.write(&f.a, "first-queued", "queued first\n");
@@ -750,7 +752,7 @@ sync_case!(
     }
 );
 
-sync_case!(unchanged_git_metadata_is_never_snapshotted, || {
+sync_case!(active unchanged_git_metadata_is_never_snapshotted, || {
     let f = Repo::new();
     let before = f.remote();
     let metadata = f.a.join("metadata");
@@ -766,7 +768,7 @@ sync_case!(unchanged_git_metadata_is_never_snapshotted, || {
     absent(&f.tree(), "metadata");
 });
 
-sync_case!(unchanged_public_edit_push_excludes_private_files, || {
+sync_case!(active unchanged_public_edit_push_excludes_private_files, || {
     let f = Repo::new();
     f.write(&f.a, "new", "ordinary public edit\n");
     f.write(&f.a, "config.local.toml", "[env]\nPRIVATE=\"yes\"\n");
@@ -848,7 +850,7 @@ sync_case!(unchanged_sync_refuses_unencrypted_history, || {
     );
 });
 
-sync_case!(unchanged_remote_change_arrives_on_disk, || {
+sync_case!(active unchanged_remote_change_arrives_on_disk, || {
     let f = Repo::new();
     let upstream = f.publish("remote", "from peer\n");
     f.sync(&f.a);
@@ -859,7 +861,7 @@ sync_case!(unchanged_remote_change_arrives_on_disk, || {
     f.clean(&f.a);
 });
 
-sync_case!(unchanged_independent_hunks_merge_on_both_machines, || {
+sync_case!(active unchanged_independent_hunks_merge_on_both_machines, || {
     let f = Repo::new();
     f.write(&f.a, "text", TEXT.replacen("one", "ONE", 1));
     f.publish("text", TEXT.replace("seven", "SEVEN"));
@@ -873,8 +875,12 @@ sync_case!(unchanged_independent_hunks_merge_on_both_machines, || {
     f.clean(&f.b);
 });
 
+fn merged_conflict(f: &Repo, receipt: &str) {
+    has(receipt, if f.oracle { "conflict" } else { "pushed dev" });
+}
+
 sync_case!(
-    unchanged_published_hunk_wins_and_local_hunk_remains_recoverable,
+    active unchanged_published_hunk_wins_and_local_hunk_remains_recoverable,
     || {
         let f = Repo::new();
         let local = TEXT.replace("one", "mine").replace("seven", "my tail");
@@ -882,7 +888,7 @@ sync_case!(
         let losing = f.commit(&f.a, "Local conflict");
         let peer = f.publish("text", TEXT.replace("one", "theirs"));
         let receipt = f.sync(&f.a);
-        has(&receipt, "conflict");
+        merged_conflict(&f, &receipt);
         assert_eq!(read(&f.a.join("text")), local.replace("mine", "theirs"));
         assert_eq!(f.blob(&losing, "text"), local.trim_end());
         f.check_ancestor(&losing, "dev");
@@ -891,14 +897,14 @@ sync_case!(
     }
 );
 
-sync_case!(unchanged_binary_conflict_uses_the_published_file, || {
+sync_case!(active unchanged_binary_conflict_uses_the_published_file, || {
     let f = Repo::new();
     f.publish("blob", [0, 1, 2]);
     f.sync(&f.a);
     f.write(&f.a, "blob", [0, 9, 9]);
     let losing = f.commit(&f.a, "Local binary");
     f.publish("blob", [0, 7, 7]);
-    has(&f.sync(&f.a), "conflict");
+    merged_conflict(&f, &f.sync(&f.a));
     assert_eq!(fs::read(f.a.join("blob")).unwrap(), [0, 7, 7]);
     f.check_ancestor(&losing, "dev");
 });
@@ -908,28 +914,29 @@ fn file_directory_conflict(published: &str, local: &str) {
     f.publish(published, "published\n");
     f.write(&f.a, local, "local\n");
     let local_tip = f.commit(&f.a, "Local conflict");
-    has(&f.sync(&f.a), "conflict");
+    merged_conflict(&f, &f.sync(&f.a));
     assert_eq!(read(&f.a.join(published)), "published\n");
     assert_eq!(f.blob(&local_tip, local), "local");
     f.check_ancestor(&local_tip, "dev");
     f.clean(&f.a);
 }
 
-sync_case!(unchanged_published_file_wins_over_local_directory, || {
+sync_case!(active unchanged_published_file_wins_over_local_directory, || {
     file_directory_conflict("collision", "collision/child");
 });
 
-sync_case!(unchanged_published_directory_wins_over_local_file, || {
+sync_case!(active unchanged_published_directory_wins_over_local_file, || {
     file_directory_conflict("collision/child", "collision");
 });
 
 sync_case!(
-    unchanged_offline_count_includes_new_snapshot_after_external_ref_move,
+    active unchanged_offline_count_includes_new_snapshot_after_external_ref_move,
     || {
         let f = Repo::new();
         let tip = f.publish("upstream", "updated remotely\n");
         f.git(&f.a, &["fetch", "-q", "origin", "dev"]);
-        f.git(&f.a, &["update-ref", "refs/heads/dev", &tip]);
+        let task = detached_worktree(&f);
+        f.git(&task, &["update-ref", "refs/heads/dev", &tip]);
         f.write(&f.a, "local", "queued offline\n");
         f.origin_offline();
         let receipt = f.sync(&f.a);
@@ -937,8 +944,15 @@ sync_case!(
             &f.a,
             &["rev-list", "--count", "dev", "^origin/dev", "^origin/main"],
         );
-        assert_ne!(count, "0");
-        has(&receipt, &format!("{count} commit"));
+        assert_ne!(count, "0", "{receipt}");
+        if f.oracle {
+            has(&receipt, &format!("{count} commit"));
+        } else {
+            has(&receipt, "saved 1 locally");
+            has(&receipt, "offline");
+            assert_eq!(f.git(&f.a, &["show", "dev:local"]), "queued offline");
+            assert_eq!(read(&f.a.join("upstream")), "updated remotely\n");
+        }
     }
 );
 
@@ -949,7 +963,7 @@ fn one_push_race(f: &Repo, update: &str) {
     ));
 }
 
-sync_case!(unchanged_push_race_merges_peer_and_local_edits, || {
+sync_case!(active unchanged_push_race_merges_peer_and_local_edits, || {
     let f = Repo::new();
     one_push_race(&f, "echo raced > raced");
     f.write(&f.a, "local", "local\n");
@@ -1071,7 +1085,7 @@ sync_case!(unchanged_only_repeated_races_report_a_moving_branch, || {
 });
 
 sync_case!(
-    unchanged_retry_reapplies_main_priority_after_racing_dev,
+    active unchanged_retry_reapplies_main_priority_after_racing_dev,
     || {
         let f = Repo::new();
         let main = f.reviewed("text", TEXT.replace("one", "reviewed"));
@@ -1352,7 +1366,7 @@ sync_case!(
     }
 );
 
-sync_case!(unchanged_no_working_scanner_shares_nothing, || {
+sync_case!(active unchanged_no_working_scanner_shares_nothing, || {
     let f = Repo::new();
     let before = f.remote();
     // A found-but-broken executable exercises the same fail-closed guarantee
@@ -1481,18 +1495,17 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_edit_during_validation_survives_and_unrelated_work_shares,
+    active unchanged_edit_during_validation_survives_and_unrelated_work_shares,
     || {
         let f = Repo::new();
         f.publish("text", "incoming remote edit\n");
         f.write(&f.a, "local", "share this\n");
         let hook = f.validation_hook(&format!("echo late > {}", sh(&f.a.join("text"))));
         let receipt = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
-        has(&receipt, "late edit");
-        has(&receipt, "text");
+        guarded_path_issue(&f, &receipt, "late edit", "text", "text");
         assert_eq!(read(&f.a.join("text")), "late\n");
         assert_eq!(f.blob("dev", "local"), "share this");
-        has(&f.sync(&f.a), "conflict");
+        merged_conflict(&f, &f.sync(&f.a));
         assert_eq!(read(&f.a.join("text")), "incoming remote edit\n");
         f.clean(&f.a);
     }
@@ -1518,7 +1531,11 @@ fn index_lock_inbound(linked: bool) {
     put(&lock, "");
     let receipt = f.sync(&root);
     has(&receipt, "index");
-    has(&receipt, "locked");
+    if f.oracle {
+        has(&receipt, "locked");
+    } else {
+        has(&receipt, "could not reserve the full Git index");
+    }
     assert!(lock.exists());
     assert!(!root.join("remote").exists());
     assert_eq!(f.tip(&root), before);
@@ -1534,17 +1551,25 @@ fn index_lock_inbound(linked: bool) {
 }
 
 sync_case!(
-    unchanged_checkout_respects_an_existing_git_index_lock,
+    active unchanged_checkout_respects_an_existing_git_index_lock,
     || {
         index_lock_inbound(false);
     }
 );
 sync_case!(
-    unchanged_linked_worktree_respects_its_own_index_lock,
+    active unchanged_linked_worktree_respects_its_own_index_lock,
     || {
         index_lock_inbound(true);
     }
 );
+
+fn recorded_checkout_issue(f: &Repo, root: &Path, receipt: &str, before: &str, after: &str) {
+    for report in [receipt, &f.replay(root)] {
+        has(report, "guarded checkout is pending");
+        has(report, &format!("recorded revisions {before} to {after}"));
+        has(report, "reconcile");
+    }
+}
 
 fn ref_lock_recovery(linked: bool) {
     let f = Repo::new();
@@ -1566,10 +1591,15 @@ fn ref_lock_recovery(linked: bool) {
     put(&lock, "fixture owns this ref lock\n");
     let receipt = f.sync(&root);
     has(&receipt, "dev");
-    assert!(
-        receipt.contains("could not update dev") || receipt.to_ascii_lowercase().contains("lock"),
-        "sync did not report the held dev ref: {receipt}"
-    );
+    if f.oracle {
+        assert!(
+            receipt.contains("could not update dev")
+                || receipt.to_ascii_lowercase().contains("lock"),
+            "sync did not report the held dev ref: {receipt}"
+        );
+    } else {
+        recorded_checkout_issue(&f, &root, &receipt, &before, &incoming);
+    }
     assert_eq!(read(&lock), "fixture owns this ref lock\n");
     assert_eq!(f.tip(&root), before);
     assert_eq!(f.remote(), incoming);
@@ -1593,17 +1623,34 @@ fn ref_lock_recovery(linked: bool) {
 }
 
 sync_case!(
-    unchanged_ref_lock_interrupted_checkout_retries_accepted_commit,
+    active unchanged_ref_lock_interrupted_checkout_retries_accepted_commit,
     || {
         ref_lock_recovery(false);
     }
 );
 sync_case!(
-    unchanged_linked_worktree_interruption_retries_accepted_commit,
+    active unchanged_linked_worktree_interruption_retries_accepted_commit,
     || {
         ref_lock_recovery(true);
     }
 );
+
+fn guarded_path_issue(
+    f: &Repo,
+    receipt: &str,
+    oracle_reason: &str,
+    oracle_path: &str,
+    incoming: &str,
+) {
+    if f.oracle {
+        has(receipt, oracle_reason);
+        has(receipt, oracle_path);
+    } else {
+        has(receipt, "obstructed or edited");
+        has(receipt, incoming);
+        has(receipt, "rerun dots sync");
+    }
+}
 
 fn obstruction(shape: &str) {
     let f = Repo::new();
@@ -1632,8 +1679,7 @@ fn obstruction(shape: &str) {
     f.publish(incoming, "incoming\n");
     f.write(&f.a, "unrelated", "share this\n");
     let receipt = f.sync(&f.a);
-    has(&receipt, "blocked");
-    has(&receipt, blocked);
+    guarded_path_issue(&f, &receipt, "blocked", blocked, incoming);
     assert_eq!(f.blob("dev", "unrelated"), "share this");
     match shape {
         "symlink parent" => assert_eq!(fs::read_link(&path).unwrap(), Path::new("missing")),
@@ -1646,20 +1692,20 @@ fn obstruction(shape: &str) {
     f.clean(&f.a);
 }
 
-sync_case!(unchanged_ignored_file_blocks_incoming_checkout, || {
+sync_case!(active unchanged_ignored_file_blocks_incoming_checkout, || {
     obstruction("file");
 });
-sync_case!(unchanged_ignored_directory_blocks_incoming_checkout, || {
+sync_case!(active unchanged_ignored_directory_blocks_incoming_checkout, || {
     obstruction("directory");
 });
 sync_case!(
-    unchanged_ignored_symlink_parent_blocks_incoming_checkout,
+    active unchanged_ignored_symlink_parent_blocks_incoming_checkout,
     || {
         obstruction("symlink parent");
     }
 );
 sync_case!(
-    unchanged_ignored_child_blocks_replacement_of_directory,
+    active unchanged_ignored_child_blocks_replacement_of_directory,
     || {
         obstruction("ignored child");
     }
@@ -1683,7 +1729,7 @@ fn assert_spelling(f: &Repo, expected: &str) {
     f.clean(&f.a);
 }
 
-sync_case!(unchanged_case_only_rename_advances_cleanly, || {
+sync_case!(active unchanged_case_only_rename_advances_cleanly, || {
     let f = Repo::new();
     let incoming = rename_case(&f, "text", "Text");
     f.sync(&f.a);
@@ -1692,7 +1738,7 @@ sync_case!(unchanged_case_only_rename_advances_cleanly, || {
 });
 
 sync_case!(
-    unchanged_interrupted_case_renames_keep_accepted_tip_and_contents,
+    active unchanged_interrupted_case_renames_keep_accepted_tip_and_contents,
     || {
         let f = Repo::new();
         let lock = f.git_dir(&f.a).join("refs/heads/dev.lock");
@@ -1700,10 +1746,16 @@ sync_case!(
             ("text", "Text", TEXT),
             ("Text", "text", "incoming contents\n"),
         ] {
+            let before = f.tip(&f.a);
             f.write(&f.b, from, body);
             let incoming = rename_case(&f, from, to);
             put(&lock, "");
-            has(&f.sync(&f.a), "could not update dev");
+            let receipt = f.sync(&f.a);
+            if f.oracle {
+                has(&receipt, "could not update dev");
+            } else {
+                recorded_checkout_issue(&f, &f.a, &receipt, &before, &incoming);
+            }
             fs::remove_file(&lock).unwrap();
             f.sync(&f.a);
             assert_eq!(f.tip(&f.a), incoming);
@@ -1722,17 +1774,28 @@ fn reject_snapshot_with_lock(name: &str) {
     put(&lock, "");
     let receipt = f.sync(&f.a);
     fs::remove_file(lock).unwrap();
-    has(&receipt, "not saved");
+    if f.oracle {
+        has(&receipt, "not saved");
+    } else {
+        has(&receipt, "saved 0 locally");
+        has(&receipt, "not pushed");
+        if name == "index.lock" {
+            has(&receipt, "could not reserve the full Git index");
+        } else {
+            has(&receipt, "guarded checkout is pending");
+            absent(&receipt, "recorded revisions");
+        }
+    }
     assert_eq!(f.tip(&f.a), before);
     assert_eq!(f.remote(), before);
     assert_eq!(read(&f.a.join("text")), "edit remains on disk\n");
     assert_eq!(f.git(&f.a, &["status", "--porcelain"]), "M text");
 }
 
-sync_case!(unchanged_local_snapshot_ref_lock_preserves_edits, || {
+sync_case!(active unchanged_local_snapshot_ref_lock_preserves_edits, || {
     reject_snapshot_with_lock("refs/heads/dev.lock");
 });
-sync_case!(unchanged_local_snapshot_index_lock_preserves_edits, || {
+sync_case!(active unchanged_local_snapshot_index_lock_preserves_edits, || {
     reject_snapshot_with_lock("index.lock");
 });
 
@@ -1753,7 +1816,7 @@ fn detached_worktree(f: &Repo) -> PathBuf {
 }
 
 sync_case!(
-    unchanged_change_published_by_linked_worktree_is_merged,
+    active unchanged_change_published_by_linked_worktree_is_merged,
     || {
         let f = Repo::new();
         let task = detached_worktree(&f);
@@ -1791,25 +1854,38 @@ fn external_dev_move(edit: bool) {
     f.clean(&f.a);
 }
 
-sync_case!(unchanged_external_dev_move_preserves_local_edits, || {
+sync_case!(active unchanged_external_dev_move_preserves_local_edits, || {
     external_dev_move(true);
 });
-sync_case!(unchanged_external_dev_move_updates_clean_worktree, || {
+sync_case!(active unchanged_external_dev_move_updates_clean_worktree, || {
     external_dev_move(false);
 });
 
 sync_case!(
-    unchanged_stale_staged_index_preserves_current_commit_and_unstaged_edit,
+    active unchanged_stale_staged_index_preserves_current_commit_and_unstaged_edit,
     || {
         let f = Repo::new();
         f.write(&f.a, "text", "changed\n");
         f.sync(&f.a);
+        let published = f.remote();
         f.git(&f.a, &["checkout", "HEAD~1", "--", "text"]);
         f.write(&f.a, "other", "unstaged edit\n");
-        f.sync(&f.a);
-        assert_eq!(f.blob("dev", "other"), "unstaged edit");
-        assert_eq!(read(&f.a.join("text")), "changed\n");
-        f.clean(&f.a);
+        let receipt = f.sync(&f.a);
+        if f.oracle {
+            assert_eq!(f.blob("dev", "other"), "unstaged edit");
+            assert_eq!(read(&f.a.join("text")), "changed\n");
+            f.clean(&f.a);
+        } else {
+            has(&receipt, "could not verify the index against the current dev ref");
+            has(&receipt, "rerun dots sync");
+            assert_eq!(f.tip(&f.a), published);
+            assert_eq!(f.remote(), published);
+            assert_eq!(f.blob("dev", "text"), "changed");
+            assert_eq!(f.git(&f.a, &["show", ":text"]), TEXT.trim_end());
+            assert_eq!(read(&f.a.join("text")), TEXT);
+            assert_eq!(read(&f.a.join("other")), "unstaged edit\n");
+            assert_eq!(f.git(&f.a, &["status", "--porcelain"]), "M  text\n?? other");
+        }
     }
 );
 
@@ -1867,7 +1943,7 @@ sync_case!(unchanged_wrong_origin_stops_cleanly, || {
 });
 
 sync_case!(
-    unchanged_snapshot_error_exits_zero_and_keeps_worktree_bytes,
+    active unchanged_snapshot_error_exits_zero_and_keeps_worktree_bytes,
     || {
         let f = Repo::new();
         let before = f.tip(&f.a);
@@ -2017,7 +2093,7 @@ fn block_validation(f: &Repo) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 sync_case!(
-    unchanged_concurrent_sync_skips_and_dead_holder_is_reclaimed,
+    active unchanged_concurrent_sync_skips_and_dead_holder_is_reclaimed,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -2232,22 +2308,38 @@ sync_case!(unchanged_retirement_waits_until_files_advance, || {
 const RETIRE_LATE_EDIT: &str = "[[dotfiles.fixture.variants]]\nos = \"linux\"\n";
 
 sync_case!(
-    unchanged_retirement_preserves_local_file_edited_during_validation,
+    active unchanged_retirement_preserves_local_file_edited_during_validation,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
         let local = format!("{KEEP_LOCAL}{RETIRED_DECLARATION}");
         setup_retirement(&f, true, LOCAL, &local);
+        let edited = f.scratch.join("local-edit-during-validation");
+        let marker = sh(&edited);
         let hook = f.validation_hook(&format!(
-            "cat >> {} <<'LATE'\n{RETIRE_LATE_EDIT}LATE",
+            "if [ -e {marker} ]; then exit 0; fi\ncat >> {} <<'LATE'\n{RETIRE_LATE_EDIT}LATE\n: > {marker}",
             sh(&f.a.join(LOCAL))
         ));
         let receipt = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
-        has(&receipt, "config.local.toml");
-        has(&receipt, "changed");
+        assert!(edited.exists(), "fixture edit did not run: {receipt}");
+        if f.oracle {
+            has(&receipt, "config.local.toml");
+            has(&receipt, "changed");
+        } else {
+            has(&receipt, "not pushed");
+            has(&receipt, "rerun dots sync");
+        }
         assert_eq!(read(&f.a.join(LOCAL)), format!("{local}{RETIRE_LATE_EDIT}"));
         assert!(f.a.join("templates/fixture.tera").exists());
-        has(&f.sync(&f.a), "invalid");
+        let retry = f.sync(&f.a);
+        if f.oracle {
+            has(&retry, "invalid");
+        } else {
+            has(&retry, "profile and machine selection could not be read");
+            has(&retry, "not pushed");
+            assert_eq!(read(&f.a.join(LOCAL)), format!("{local}{RETIRE_LATE_EDIT}"));
+            assert!(f.a.join("templates/fixture.tera").exists());
+        }
         f.write(&f.a, LOCAL, &local);
         has(&f.sync(&f.a), "retired");
         assert_eq!(read(&f.a.join(LOCAL)), KEEP_LOCAL);
@@ -2502,7 +2594,7 @@ macro_rules! copies_case {
 }
 
 copies_case!(
-    unchanged_second_copy_edit_is_captured_while_incoming_checkout_stays_blocked,
+    active unchanged_second_copy_edit_is_captured_while_incoming_checkout_stays_blocked,
     false,
     |f, a, _b, _config| {
         f.write(&f.a, ".git/info/exclude", "/obstruction\n");
@@ -2511,7 +2603,13 @@ copies_case!(
         for change in ["first capture\n", "second capture\n"] {
             a.target(".copied", change);
             let receipt = a.sync();
-            has(&receipt, "blocked");
+            if f.oracle {
+                has(&receipt, "blocked");
+            } else {
+                has(&receipt, "obstructed or edited");
+                has(&receipt, "obstruction");
+                has(&receipt, "rerun dots sync");
+            }
             assert_eq!(read(&f.a.join("obstruction")), "private obstruction\n");
             assert_eq!(read(&f.a.join("copy.txt")), change);
             assert_eq!(f.blob("dev", "copy.txt"), change.trim_end());
@@ -2972,9 +3070,9 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_excluded_directory_leaf_can_be_an_independent_template,
+    active unchanged_excluded_directory_leaf_can_be_an_independent_template,
     false,
-    |_f, a, _b, config| {
+    |f, a, _b, config| {
         let config = format!(
             "{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\", exclude = [\"custom\"] }}\n\"~/.tree/custom\" = {{ source = \"child.tera\", mode = \"template\" }}\n"
         );
@@ -2987,11 +3085,19 @@ copies_case!(
         a.sync();
         assert_eq!(read(&a.home.join(".tree/custom")), "sync child\n");
         assert_eq!(read(&a.home.join(".tree/general")), "copied\n");
+        let published = f.remote();
         a.source(
             "config.toml",
             config.replace(", exclude = [\"custom\"]", ""),
         );
-        has(&a.sync(), "invalid");
+        let receipt = a.sync();
+        if f.oracle {
+            has(&receipt, "invalid");
+        } else {
+            has(&receipt, "could not inspect deployed copies");
+            has(&receipt, "not pushed");
+            assert_eq!(f.remote(), published);
+        }
         assert_eq!(read(&a.home.join(".tree/custom")), "sync child\n");
     }
 );
@@ -3310,7 +3416,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_diverged_copy_and_source_preserve_both_versions,
+    active unchanged_diverged_copy_and_source_preserve_both_versions,
     false,
     |f, a, _b, _config| {
         a.target(".copied", "local target\n");
@@ -3318,7 +3424,14 @@ copies_case!(
         a.source("unrelated", "share this\n");
         let receipt = a.sync();
         has(&receipt, ".copied");
-        has(&receipt, "also changed");
+        has(
+            &receipt,
+            if f.oracle {
+                "also changed"
+            } else {
+                "both the copy and source changed"
+            },
+        );
         assert_eq!(read(&a.home.join(".copied")), "local target\n");
         assert_eq!(f.blob("dev", "copy.txt"), "local source");
         assert_eq!(f.blob("dev", "unrelated"), "share this");
@@ -3765,7 +3878,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_missing_scanner_blocks_candidate_before_local_snapshot,
+    active unchanged_missing_scanner_blocks_candidate_before_local_snapshot,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -3787,7 +3900,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_partial_checkout_filter_failure_retries_without_republishing,
+    active unchanged_partial_checkout_filter_failure_retries_without_republishing,
     || {
         let f = Repo::new();
         let before = f.tip(&f.a);

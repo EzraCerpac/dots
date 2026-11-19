@@ -68,6 +68,138 @@ fn unchanged_rejects_a_github_release_page_as_a_repository() {
 }
 
 #[test]
+fn new_nested_command_keeps_the_original_mise_installation_with_a_different_data_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let baseline = dots(&world);
+    let original_data = world.home().join("original-data");
+    let installed = original_data.join("installs/fixture/1/bin/dots");
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    support::stage_executable(baseline.get_program(), &installed).unwrap();
+
+    let commands = world.root().join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    let command = commands.join("nested-version");
+    fs::write(
+        &command,
+        r#"#!/bin/sh
+set -eu
+case "$(command -v dots)" in
+    "$TMPDIR"/dots-run-*/dots) ;;
+    *) exit 97 ;;
+esac
+export MISE_DATA_DIR="$HOME/changed-data"
+exec dots --version
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |arg| {
+        let output = world
+            .command(&installed)
+            .envs(
+                baseline
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .env("MISE_DATA_DIR", &original_data)
+            .arg(arg)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let direct = run("--version");
+    assert!(direct.trim_end().ends_with("(mise)"), "{direct}");
+    assert_eq!(run("nested-version"), direct);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "downloads a public fixture release from GitHub"]
+fn new_nested_github_app_add_records_the_durable_homebrew_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let baseline = dots(&world);
+    let prefix = world.home().join("brew with spaces");
+    let keg = prefix.join("Cellar/dots/fixture/bin/dots");
+    fs::create_dir_all(keg.parent().unwrap()).unwrap();
+    support::stage_executable(baseline.get_program(), &keg).unwrap();
+    let stable = prefix.join("bin/dots");
+    fs::create_dir(stable.parent().unwrap()).unwrap();
+    symlink(&keg, &stable).unwrap();
+    let mise = world.home().join("mise");
+    fs::write(
+        &mise,
+        r#"#!/bin/sh
+set -eu
+test "$1 $2 $3 $4" = "install --raw -- github:sindresorhus/plash"
+test -f "$MISE_CONFIG_DIR/mise.toml"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&mise, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let commands = world.root().join("dots/commands");
+    fs::create_dir_all(&commands).unwrap();
+    for (name, script) in [
+        ("nested-app", "#!/bin/sh\nset -eu\nexec dots nested-add\n"),
+        (
+            "nested-add",
+            r#"#!/bin/sh
+set -eu
+case "$(command -v dots)" in
+    "$TMPDIR"/dots-run-*/dots) ;;
+    *) exit 97 ;;
+esac
+printf '%s\n' "$(command -v dots)" > "$HOME/nested-dots"
+exec dots add --base --asset 'Plash.2.16.0.-.macOS.15.zip' https://github.com/sindresorhus/Plash
+"#,
+        ),
+    ] {
+        let command = commands.join(name);
+        fs::write(&command, script).unwrap();
+        fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = world
+        .command(&stable)
+        .envs(
+            baseline
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .env("DOTS_MISE_BIN", mise)
+        .arg("nested-app")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pinned = fs::read_to_string(world.home().join("nested-dots")).unwrap();
+    assert!(!std::path::Path::new(pinned.trim_end()).exists());
+    let config: toml_edit::DocumentMut = fs::read_to_string(world.root().join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let hook = config["tools"]["github:sindresorhus/plash"]["postinstall"]["run"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        hook,
+        format!(
+            "'{}' install-release-app sindresorhus/plash",
+            stable.display()
+        )
+    );
+}
+
+#[test]
 fn new_callback_preflight_needs_no_dots_configuration() {
     let world = World::new();
     fs::remove_file(world.root().join("config.toml")).unwrap();

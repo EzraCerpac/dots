@@ -1241,6 +1241,112 @@ fn new_file_removal_refuses_another_spelling_of_the_same_source() {
 }
 
 #[test]
+fn new_interrupted_file_adoption_names_the_source_declaration_and_staged_link() {
+    use sha2::{Digest, Sha256};
+
+    let world = fixture(
+        "\n[dotfiles]\n\"~/settings\" = { source = \"dotfiles/settings\", mode = \"symlink\" }\n",
+    );
+    let config = world.root().join("config.toml");
+    let target = world.home().join("settings");
+    let source = world.root().join("dotfiles/settings");
+    fs::write(&target, "contents").unwrap();
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::copy(&target, &source).unwrap();
+    let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
+    let prefix = u64::from_be_bytes(digest[..8].try_into().unwrap());
+    let staging = target.with_file_name(format!(".dots-file-{prefix:016x}-fixture"));
+    fs::create_dir(&staging).unwrap();
+    let link = staging.join("original");
+    symlink(&source, &link).unwrap();
+
+    let before = fs::read(&config).unwrap();
+    let error = failed(
+        dots(&world)
+            .args(["add", "--base"])
+            .arg(&target)
+            .output()
+            .unwrap(),
+        2,
+    );
+    for path in [&source, &config, &link] {
+        assert!(error.contains(path.to_str().unwrap()), "{error}");
+    }
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert_eq!(fs::read(&target).unwrap(), b"contents");
+    assert_eq!(fs::read(&source).unwrap(), b"contents");
+    assert_eq!(fs::read_link(link).unwrap(), source);
+}
+
+#[test]
+fn new_file_adoption_refuses_a_variant_target_in_a_host_file() {
+    let world = fixture("");
+    let config = world.root().join("config.toml");
+    let host = world.root().join("config.host-other.toml");
+    fs::write(
+        &host,
+        r#"[dotfiles]
+"~/other" = { source = "dotfiles/other", variants = [{ target = "~/settings" }] }
+"#,
+    )
+    .unwrap();
+    let target = world.home().join("settings");
+    fs::write(&target, "contents").unwrap();
+    let before = fs::read(&config).unwrap();
+    let error = failed(
+        dots(&world)
+            .args(["add", "--base"])
+            .arg(&target)
+            .output()
+            .unwrap(),
+        2,
+    );
+    assert!(error.contains(host.to_str().unwrap()), "{error}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(fs::symlink_metadata(target).unwrap().is_file());
+    assert!(!world.root().join("dotfiles/settings").exists());
+}
+
+#[test]
+fn new_file_removal_refuses_a_variant_target_in_an_inactive_profile() {
+    let world = fixture("");
+    let config = world.root().join("config.toml");
+    let target = world.home().join("settings");
+    fs::write(&target, "contents").unwrap();
+    success(
+        dots(&world)
+            .args(["add", "--base"])
+            .arg(&target)
+            .output()
+            .unwrap(),
+    );
+    let profile = world.root().join("config.server.toml");
+    fs::write(
+        &profile,
+        r#"[dotfiles."~/other"]
+source = "dotfiles/other"
+[[dotfiles."~/other".variants]]
+target = "~/settings"
+"#,
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let source = fs::read_link(&target).unwrap();
+    let error = failed(
+        dots(&world)
+            .args(["remove", "--base"])
+            .arg(&target)
+            .output()
+            .unwrap(),
+        2,
+    );
+    assert!(error.contains(profile.to_str().unwrap()), "{error}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert_eq!(fs::read_link(target).unwrap(), source);
+    assert_eq!(fs::read(source).unwrap(), b"contents");
+}
+
+#[test]
 fn new_interrupted_file_removal_names_parked_entries_and_the_declaration() {
     use sha2::{Digest, Sha256};
     let world = fixture("");

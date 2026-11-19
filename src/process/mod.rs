@@ -13,6 +13,7 @@ use std::process::{Command, ExitStatus};
 
 use nix::libc;
 
+use crate::config_commands::{ExecutableOrigin, PIN_PREFIX};
 use crate::{Ctx, Fail};
 
 pub(crate) use mise::{config_paths, mise_binary, quiet_probe, validate_selection};
@@ -66,9 +67,10 @@ impl Ctx {
                     temp.as_path()
                 };
                 let directory = tempfile::Builder::new()
-                    .prefix("dots-run-")
+                    .prefix(PIN_PREFIX)
                     .tempdir_in(temp)?;
                 let source = std::env::current_exe()?.canonicalize()?;
+                ExecutableOrigin::from_executable(&source, &self.env)?.write(directory.path())?;
                 let pinned = directory.path().join("dots");
                 // A version can be pruned while a child of this run is still active.
                 if fs::hard_link(&source, &pinned).is_err() {

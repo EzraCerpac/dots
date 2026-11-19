@@ -196,7 +196,7 @@ fn references(ctx: &Ctx, paths: &Paths) -> Result<Vec<(PathBuf, bool)>, Fail> {
         if let Some(table) = edit::table(&doc, DOTFILES)? {
             for (key, item) in table.iter() {
                 let target = declared(&paths.home, &paths.home, key, &path)?;
-                if same_name(&target, &paths.target) || uses_source(item, root, paths, &path)? {
+                if same_name(&target, &paths.target) || uses_paths(item, root, paths, &path)? {
                     let exact = key == paths.key
                         && item.as_table_like().is_some_and(|record| {
                             record.len() == 2
@@ -252,7 +252,7 @@ fn same_name(first: &Path, second: &Path) -> bool {
     false
 }
 
-fn uses_source(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
+fn uses_paths(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
     fn matches(value: &str, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
         let declared = declared(root, &paths.home, value, config)?;
         if same_name(&declared, &paths.source) {
@@ -272,6 +272,14 @@ fn uses_source(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result
         paths: &Paths,
         config: &Path,
     ) -> Result<bool, Fail> {
+        if let Some(target) = table.get("target").and_then(Item::as_str)
+            && same_name(
+                &declared(&paths.home, &paths.home, target, config)?,
+                &paths.target,
+            )
+        {
+            return Ok(true);
+        }
         if let Some(source) = table.get("source").and_then(Item::as_str)
             && matches(source, root, paths, config)?
         {
@@ -391,9 +399,10 @@ fn preflight_add(
         ));
     }
     if source.is_some() {
-        return Err(refusal(
-            &paths.source,
-            "source already exists; reconcile the file and source before retrying",
+        return Err(reconcile(
+            paths,
+            &records,
+            "source already exists; reconcile the adoption before retrying",
         ));
     }
     if let Some((file, _)) = records.first() {

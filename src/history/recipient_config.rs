@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use crate::Fail;
@@ -8,66 +8,57 @@ use crate::Fail;
 use super::{invalid, native::Native};
 
 const KEY: &str = "history.encryption.recipients";
+const MISSING_KEY: &[u8] = b"mise ERROR Key not found: history.encryption.recipients in ";
 
 pub(super) fn read(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fail> {
     let root = native.ctx.root.path();
     let home = native.home()?;
     let env = |key| native.ctx.env.get(key).filter(|value| !value.is_empty());
-    let resolve = |path: &Path| match path.strip_prefix("~/") {
-        Ok(suffix) => home.join(suffix),
-        Err(_) => root.join(path),
+    let path_env = |name| {
+        let path = Path::new(env(name)?);
+        Some(match path.strip_prefix("~/") {
+            Ok(suffix) => home.join(suffix),
+            Err(_) => root.join(path),
+        })
     };
-    let args = ["--no-config", "config", "get", "--file"];
-    let command = native.mise(&args)?;
-    let environments = command
-        .get_envs()
-        .find_map(|(key, value)| (key == "MISE_ENV").then_some(value?.to_str()?))
-        .unwrap_or_default();
-    let system = match env("MISE_SYSTEM_CONFIG_FILE") {
-        Some(path) => vec![resolve(Path::new(path))],
-        None => {
-            let dir = env("MISE_SYSTEM_CONFIG_DIR")
-                .or_else(|| env("MISE_SYSTEM_DIR"))
-                .map_or_else(|| PathBuf::from("/etc/mise"), |dir| resolve(Path::new(dir)));
-            files(&dir, environments)?
-        }
+    let envs = native.selection()?.active_environments();
+    let enabled = ["1", "y", "yes", "true", "on"];
+    let scoped = env("MISE_ENV_CONF_D")
+        .is_some_and(|value| enabled.iter().any(|flag| value.eq_ignore_ascii_case(flag)));
+    let system = if let Some(file) = path_env("MISE_SYSTEM_CONFIG_FILE") {
+        vec![file]
+    } else {
+        let dir = path_env("MISE_SYSTEM_CONFIG_DIR")
+            .or_else(|| path_env("MISE_SYSTEM_DIR"))
+            .unwrap_or_else(|| PathBuf::from("/etc/mise"));
+        files(&dir, &envs, scoped)?
     };
     let mut nonempty = false;
     let mut last = BTreeSet::new();
-    for path in system.into_iter().chain(files(root, environments)?) {
-        if path.extension().is_none_or(|ext| ext != "toml") {
+    for file in system.into_iter().chain(files(root, &envs, scoped)?) {
+        if file.extension().is_none_or(|extension| extension != "toml")
+            || !optional(fs::metadata(&file), &file)?.is_some_and(|meta| meta.is_file())
+        {
             continue;
         }
-        let fail = |reason: &str| {
-            invalid(format!(
-                "could not read history recipients in {} ({reason})",
-                path.display()
-            ))
-        };
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == ErrorKind::NotFound => continue,
-            Err(error) => return Err(fail(&error.kind().to_string())),
-        }
-        let mut cmd = native.mise(&args)?;
-        cmd.arg(&path)
-            .arg(KEY)
-            .env("GIT_ALLOW_PROTOCOL", "")
-            .env("NO_COLOR", "1");
+        let fail = |reason: &str| invalid(format!("{}: {reason}", file.display()));
+        let mut cmd = native.mise(&["--no-config", "config", "get", "--file"])?;
+        cmd.arg(&file).arg(KEY).envs([
+            ("GIT_ALLOW_PROTOCOL", ""),
+            ("MISE_FRIENDLY_ERROR", "1"),
+            ("NO_COLOR", "1"),
+        ]);
         let output = native
             .probe(cmd, "could not run mise config get")
             .map_err(|_| fail("could not run mise config get"))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             if output.status.code() == Some(1)
                 && output.stdout.is_empty()
-                && stderr.lines().next().is_some_and(|line| {
-                    line.starts_with("mise ERROR Key not found: history.encryption.recipients in ")
-                })
+                && output.stderr.starts_with(MISSING_KEY)
             {
                 continue;
             }
+            let stderr = String::from_utf8_lossy(&output.stderr);
             let reason = if stderr.contains("TOML parse error") {
                 "mise reported a TOML parse error".to_owned()
             } else if stderr.contains("Permission denied") {
@@ -86,43 +77,73 @@ pub(super) fn read(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fail> {
             "no verified history recipient configuration; configure [history.encryption].recipients and retry dots restore",
         ));
     }
-    // Only the last declaration informs refresh timing. Restore writes its own
-    // identity and existing local recipients, and mise validates capture policy.
+    // This list only informs refresh timing. Restore writes its local recipients.
     Ok(last)
 }
 
-fn files(dir: &Path, environments: &str) -> Result<Vec<PathBuf>, Fail> {
-    let conf_d = dir.join("conf.d");
-    let error = |err: std::io::Error| {
-        invalid(format!(
-            "could not list history config files in {} ({})",
-            conf_d.display(),
-            err.kind()
-        ))
-    };
-    let mut paths = match fs::read_dir(&conf_d) {
-        Ok(entries) => entries
-            .map(|entry| entry.map(|entry| entry.path()).map_err(error))
-            .collect::<Result<Vec<_>, _>>()?,
-        Err(err) if err.kind() == ErrorKind::NotFound => vec![],
-        Err(err) => return Err(error(err)),
-    };
-    paths.retain(|path| {
-        path.file_name()
-            .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
-    });
-    paths.sort();
-    let profiles = environments
-        .split(',')
-        .filter(|name| !name.is_empty() && !name.contains(['/', '\\']));
-    for local in ["", ".local"] {
-        let suffixes =
-            std::iter::once(String::new()).chain(profiles.clone().map(|name| format!(".{name}")));
-        for profile in suffixes {
-            paths.extend(
-                ["config", "mise"].map(|base| dir.join(format!("{base}{profile}{local}.toml"))),
-            );
+fn files(dir: &Path, envs: &str, scoped: bool) -> Result<Vec<PathBuf>, Fail> {
+    let conf = dir.join("conf.d");
+    let (mut flat, mut folders) = (BTreeSet::new(), BTreeSet::new());
+    for entry in optional(fs::read_dir(&conf), &conf)?.into_iter().flatten() {
+        let entry = entry.map_err(|err| fs_error(&conf, err))?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            folders.insert(path);
+        } else if path.extension().is_some_and(|ext| ext == "toml") {
+            flat.insert(path);
         }
     }
-    Ok(paths)
+    let mut files: Vec<_> = flat
+        .iter()
+        .filter(|path| !scoped || fragment_env(path).is_none())
+        .cloned()
+        .collect();
+    let envs = envs
+        .split(',')
+        .filter(|name| !name.is_empty() && !name.contains(['/', '\\']));
+    for local in [false, true] {
+        for env in std::iter::once(None).chain(envs.clone().map(Some)) {
+            if let Some(name) = env.filter(|_| scoped) {
+                files.extend(
+                    flat.iter()
+                        .filter(|path| fragment_env(path) == Some((name, local)))
+                        .cloned(),
+                );
+            }
+            let mut suffix = env.map_or_else(String::new, |name| format!(".{name}"));
+            if local {
+                suffix.push_str(".local");
+            }
+            let mise = format!("mise{suffix}.toml");
+            files.extend(folders.iter().map(|folder| folder.join(&mise)));
+            files.extend([dir.join(format!("config{suffix}.toml")), dir.join(mise)]);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    files.retain(|file| seen.insert(file.clone()));
+    Ok(files)
+}
+
+fn fragment_env(path: &Path) -> Option<(&str, bool)> {
+    let stem = path.file_stem()?.to_str()?;
+    let (stem, local) = stem
+        .strip_suffix(".local")
+        .map_or((stem, false), |stem| (stem, true));
+    let (name, env) = stem.split_once('.')?;
+    (!name.is_empty() && !env.is_empty()).then_some((env, local))
+}
+
+fn optional<T>(result: io::Result<T>, path: &Path) -> Result<Option<T>, Fail> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(fs_error(path, err)),
+    }
+}
+
+fn fs_error(path: &Path, err: io::Error) -> Fail {
+    invalid(format!("{}: {}", path.display(), err.kind()))
 }

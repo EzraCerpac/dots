@@ -917,6 +917,11 @@ exec "$FIXTURE_GIT" "$@"
 
 #[test]
 fn new_established_restore_can_undo_after_the_configured_recipient_changes() {
+    established_restore_can_undo(false);
+    established_restore_can_undo(true);
+}
+
+fn established_restore_can_undo(folder_override: bool) {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");
     let (selected, public) = seed.key("selected");
@@ -930,18 +935,57 @@ fn new_established_restore_can_undo_after_the_configured_recipient_changes() {
     ok(&mut fixture.dots(&["restore"], &remote));
     assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
 
-    let config = fixture.world.root().join("config.local.toml");
-    let mut contents: toml_edit::DocumentMut =
-        fs::read_to_string(&config).unwrap().parse().unwrap();
-    contents["history"]["encryption"]["recipients"] = toml_edit::value(
-        [other_public.as_str()]
-            .into_iter()
-            .collect::<toml_edit::Array>(),
-    );
-    fs::write(&config, contents.to_string()).unwrap();
+    let root = fixture.world.root();
+    let local = root.join("config.local.toml");
+    let folder = if folder_override {
+        remove_local_history_encryption(&fixture);
+        history_fragment(root, "10-selected.toml", std::slice::from_ref(&public));
+        let path = history_fragment(
+            root,
+            "replacement/mise.toml",
+            std::slice::from_ref(&other_public),
+        );
+        let original = fs::read(&path).unwrap();
+        Some((path, original))
+    } else {
+        let mut contents: toml_edit::DocumentMut =
+            fs::read_to_string(&local).unwrap().parse().unwrap();
+        contents["history"]["encryption"]["recipients"] = toml_edit::value(
+            [other_public.as_str()]
+                .into_iter()
+                .collect::<toml_edit::Array>(),
+        );
+        fs::write(&local, contents.to_string()).unwrap();
+        None
+    };
     seed.seed(&remote, SECOND);
-    ok(&mut fixture.dots(&["restore"], &remote));
+    let verify_refresh = fixture.script(
+        "verify-refresh",
+        r#"#!/bin/sh
+if [ "$*" = "bootstrap dotfiles sync --fetch-only" ]; then
+    recipients=$("$FIXTURE_MISE" --no-config config get --file "$FIXTURE_LOCAL_CONFIG" history.encryption.recipients) || exit 98
+    case "$recipients" in
+        *"$FIXTURE_SELECTED"*) ;;
+        *) exit 98 ;;
+    esac
+fi
+exec "$FIXTURE_MISE" "$@"
+"#,
+    );
+    ok(fixture
+        .dots(&["restore"], &remote)
+        .env("DOTS_MISE_BIN", verify_refresh)
+        .env("FIXTURE_MISE", &fixture.mise)
+        .env("FIXTURE_LOCAL_CONFIG", &local)
+        .env("FIXTURE_SELECTED", &public));
     assert_eq!(fs::read(fixture.active()).unwrap(), SECOND);
+    if let Some((path, original)) = folder {
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+    assert_eq!(
+        contains(&fs::read(local).unwrap(), other_public.as_bytes()),
+        !folder_override
+    );
 
     let store = fixture.store();
     let head = fixture.tip(&store, "refs/heads/main");
@@ -989,9 +1033,8 @@ fn remove_local_history_encryption(fixture: &Fixture) -> PathBuf {
 }
 
 fn history_fragment(dir: &Path, name: &str, recipients: &[String]) -> PathBuf {
-    let dir = dir.join("conf.d");
-    fs::create_dir_all(&dir).unwrap();
-    let fragment = dir.join(name);
+    let fragment = dir.join("conf.d").join(name);
+    fs::create_dir_all(fragment.parent().unwrap()).unwrap();
     fs::write(
         &fragment,
         format!("[history.encryption]\nrecipients = {recipients:?}\n"),
@@ -1043,7 +1086,12 @@ fn new_restore_accepts_trusted_history_fragments() {
         } else {
             target.world.root()
         };
-        let fragment = history_fragment(dir, "50-history.toml", &recipients);
+        let name = if system {
+            "history/mise.laptop.local.toml"
+        } else {
+            "50-history.laptop.toml"
+        };
+        let fragment = history_fragment(dir, name, &recipients);
         let original_fragment = fs::read(&fragment).unwrap();
         let original_local = fs::read(&local).unwrap();
         target.write(DEFAULT, 0o600);
@@ -1054,11 +1102,40 @@ fn new_restore_accepts_trusted_history_fragments() {
                 "# Tera syntax in a comment: {{ config_root }}\n",
             )
             .unwrap();
-            fs::write(&fragment, "[fixture-secret-marker\n").unwrap();
-            let refused = target.dots(&["restore"], &remote).output().unwrap();
+            let inactive = fragment.with_file_name("90-history.work.toml");
+            fs::rename(&fragment, &inactive).unwrap();
+            let refused = target
+                .dots(&["restore"], &remote)
+                .env("MISE_ENV_CONF_D", "1")
+                .output()
+                .unwrap();
+            assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+            assert!(messages(&refused).contains("configure [history.encryption].recipients"));
+            assert!(!target.store().exists());
+            fs::rename(&inactive, &fragment).unwrap();
+
+            fs::write(&inactive, "[fixture-secret-marker\n").unwrap();
+            let status_state = target.world.home().join("fragment-status");
+            ok(target
+                .mise(&["bootstrap", "dotfiles", "status", "--json"])
+                .env("MISE_STATE_DIR", &status_state)
+                .env("MISE_ENV_CONF_D", "1"));
+            let active = target
+                .command(&target.mise)
+                .args(["-E", "work", "bootstrap", "dotfiles", "status", "--json"])
+                .env("MISE_STATE_DIR", &status_state)
+                .env("MISE_ENV_CONF_D", "1")
+                .output()
+                .unwrap();
+            assert_eq!(active.status.code(), Some(1), "{}", messages(&active));
+            let refused = target
+                .dots(&["restore"], &remote)
+                .env("MISE_FRIENDLY_ERROR", "0")
+                .output()
+                .unwrap();
             assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
             let diagnostic = messages(&refused);
-            assert!(diagnostic.contains("50-history.toml"), "{diagnostic}");
+            assert!(diagnostic.contains("90-history.work.toml"), "{diagnostic}");
             assert!(
                 diagnostic.contains("mise reported a TOML parse error"),
                 "{diagnostic}"
@@ -1070,10 +1147,15 @@ fn new_restore_accepts_trusted_history_fragments() {
             assert!(!target.store().exists());
             assert_eq!(fs::read(target.active()).unwrap(), DEFAULT);
             assert_eq!(fs::read(&local).unwrap(), original_local);
-            fs::write(&fragment, &original_fragment).unwrap();
         }
 
-        ok(&mut target.dots(&["restore"], &remote));
+        let alias = target.world.home().join("legacy-config.toml");
+        fs::write(&alias, "[history.encryption]\nrecipients = []\n").unwrap();
+        ok(target
+            .dots(&["restore"], &remote)
+            .env("MISE_ENV_CONF_D", "1")
+            .env("MISE_CONFIG_FILE", &alias)
+            .env("MISE_FRIENDLY_ERROR", "0"));
         assert_eq!(fs::read(target.active()).unwrap(), FIRST);
         assert_eq!(fs::read(&fragment).unwrap(), original_fragment);
         let written = fs::read(local).unwrap();

@@ -56,7 +56,8 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    When sync would replace an existing file in a directory copy, it compares the file with the source previously deployed at that path.
    If both bytes and permissions match, sync treats the file as deployed regardless of who created it and updates it to the new source without reporting it as kept.
    If the bytes or verified permissions differ at the target, including a change detected after the initial comparison, sync leaves the file there and reports it as kept.
-   If an editor writes to the original file after sync has moved it aside, the edit survives at the printed private recovery path even when the replacement is already at the target.
+   If sync detects an edit to the moved original before installing its replacement, it restores the edited original at the target when possible.
+   If the replacement is already installed or the original cannot be restored, sync keeps the original and its edits at the printed private recovery path.
    When the deployed mode cannot be verified, sync updates the file only if its bytes match the previously deployed source and its current mode can stay.
    Unmatched local files stay in place.
    Mise runs the usual hooks and applies the other targets in dependency order.

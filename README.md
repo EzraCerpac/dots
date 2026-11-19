@@ -6,7 +6,7 @@
 - **One ordinary [mise](https://mise.jdx.dev) configuration** holds the tools, packages and dotfiles of every Mac and Linux machine you use, with a profile for each kind of machine.
   There is no new language to learn, and if you stop using `dots`, your configuration is still plain mise TOML.
 - **Add software from many sources** with `dots add`: mise tools, Homebrew, apt, dnf, pacman, apk, the Mac App Store and apps from GitHub releases, as each platform supports them.
-- **Share between machines** with `dots sync`, which scans your changes for secrets before anything leaves the machine.
+- **Share between machines** with `dots sync`, which scans your changes for secrets before pushing configuration changes.
 - **Set up a new machine from your own configuration** with one command, over SSH from a machine you already have.
 - **Works with your coding agent.** `dots` links its built-in agent skill when it finds Claude Code or Codex.
   Your own skills are ordinary files: adopt them with `dots add` and they sync like any dotfile; `dots` does not install them for you.
@@ -19,18 +19,20 @@ dots sync                              # scan and share your edits, take the oth
 dots remote HOST --profile P           # set up another machine from your configuration's repository
 ```
 
+<!-- TODO (A-03): Record the released 0.5.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal. -->
+
 ## Install
 
 <!-- TODO: A-07 installer -->
-<!--
-Draft of the recommended route; the installer URL is pending until A-07 publishes install.sh at a project-owned endpoint.
-curl -fsSL INSTALLER_URL | sh
-curl -fsSL INSTALLER_URL | sh -s -- --from OWNER/NAME --profile P
--->
+<!-- The published installer URL is pending; once A-07 publishes install.sh at a project-owned endpoint, show its one-line form here. -->
 
 `dots` 0.5.0 is not released yet.
-**Planned for 0.5.0:** one line that runs the project's `install.sh`, which installs mise first when it is missing.
-The same installer will take `--from REPO --profile P` to set the machine up from your configuration.
+**Planned for 0.5.0, not available yet:** the recommended install is the project's `install.sh`, which installs mise first when it is missing, then `dots`.
+Once the script is available, the same script will also set this machine up from your configuration:
+
+```sh
+sh install.sh --from OWNER/NAME --profile laptop
+```
 
 <details>
 <summary>Other ways to install</summary>
@@ -40,6 +42,8 @@ Until 0.5.0, build the current release candidate from source, with Rust 1.100 or
 ```sh
 cargo install --locked --git https://github.com/EzraCerpac/dots --branch rust dots-cli
 ```
+
+<!-- TODO (D-01, C-01, G-2): Verify these alternatives against the published 0.5.0 artifacts. -->
 
 Once 0.5.0 is released, any of these will also work; until then the Homebrew tap installs 0.4.0.
 
@@ -57,8 +61,8 @@ cargo install dots-cli --locked
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
 Once your configuration declares them, for example with `dots add --base gitleaks age`, `dots up` installs and updates them through mise.
 <!-- TODO: A-08 scaffold tools -->
-JJ and `gh` are needed only for `dots publish`; with `gh` signed in, `dots init` can also offer to create a GitHub repository.
-`dots status` lists the programs it finds, and [Platforms and programs](docs/contract.md#platforms-and-programs) lists what each action needs.
+JJ and `gh` are needed only for `dots publish`; `gh` also enables an optional offer in `dots init`.
+[Platforms and programs](docs/contract.md#platforms-and-programs) lists what each action needs.
 
 ## Start
 
@@ -67,10 +71,11 @@ dots init
 dots up
 ```
 
-`dots init` creates a configuration in mise's configuration directory, normally `~/.config/mise`, with a Git repository on branches `main` and `dev`.
+`dots init` creates a configuration in mise's configuration directory, normally `~/.config/mise`, and when there is no Git repository, one on branches `main` and `dev`.
 It keeps an existing `config.toml` and only adds what `dots` needs.
-In a terminal with `gh` signed in, a fresh `dots init` offers to create a private GitHub repository; otherwise it prints the commands to add a remote.
-Without a remote, everything works on this machine alone; see [adding a remote](docs/sync.md#adding-a-remote) when you want to share.
+When it creates the repository in a terminal with `gh` signed in, and `dots_source_repo` is unset or names the proposed one, it offers to create a private GitHub repository; the default is no.
+Otherwise, without `origin`, it prints how to add a remote.
+Until there is a remote, the configuration stays on this machine; see [adding a remote](docs/sync.md#adding-a-remote).
 [`dots init`](docs/contract.md#dots-init-dir) has the details.
 
 ## Day to day

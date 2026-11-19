@@ -62,7 +62,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
     pub fn mise(&self, args: &[&str]) -> Result<Command, Fail> {
         let selected = self.selection()?;
         let environments = selected.active_environments();
-        let mise = Mise::with_selection(self.ctx, selected)?;
+        let mise = Mise::with_selection_in_run(self.run, selected)?;
         let mut cmd = mise.command(args)?;
         // Backup and restore use the managed layers. Update checkpoints must
         // see the same effective overrides for inventory and native save.

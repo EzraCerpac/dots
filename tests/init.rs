@@ -264,7 +264,14 @@ fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     fs::remove_file(world.home().join(".gitconfig")).unwrap();
     let mut command = fixture_dots(&world);
     enable_fake_gh(&world, &mut command);
-    let output = success(command.arg("init").arg(&root).output().unwrap());
+    let output = success(
+        command
+            .env("DOTS_ROOT", &root)
+            .arg("init")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(output.lines().last(), Some("Next: dots up"));
     let id = git(&world, &root, &["rev-parse", "HEAD"]);
     // 0.5.0 declares gitleaks and age in a fresh scaffold.
     let config = git(&world, &root, &["show", "HEAD:config.toml"]);
@@ -342,7 +349,6 @@ fn new_seed_excludes_ignored_modified_linked_and_executable_files() {
     );
 
     let output = success(init(&world, &root));
-    assert_eq!(output.lines().last(), Some("Next: dots up"));
     assert_eq!(
         git(&world, &root, &["ls-tree", "-r", "--name-only", "HEAD"]),
         ".gitignore\ndots/exceptions.tsv\ndots/retired-declarations"
@@ -778,7 +784,7 @@ fn new_explicit_directory_works_with_an_impossible_ambient_root() {
     let world = World::new();
     let blocker = world.home().join("ordinary-file");
     fs::write(&blocker, b"keep this file").unwrap();
-    let root = fresh(&world);
+    let root = fresh(&world).with_file_name("fresh config's $(exit 99)");
     let output = success(
         fixture_dots(&world)
             .current_dir(root.parent().unwrap())
@@ -792,6 +798,23 @@ fn new_explicit_directory_works_with_an_impossible_ambient_root() {
         output.contains("outside the active configuration root"),
         "{output}"
     );
+    let command = output
+        .lines()
+        .last()
+        .unwrap()
+        .strip_prefix("Next: DOTS_ROOT=")
+        .unwrap();
+    let selected = success(
+        world
+            .command("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "dots() {{ printf '%s\\n%s\\n' \"$DOTS_ROOT\" \"$1\"; }}; DOTS_ROOT={command}"
+            ))
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(selected, format!("{}\nup\n", root.display()));
     assert_eq!(git(&world, &root, &["branch", "--show-current"]), "dev");
     assert_eq!(fs::read(blocker).unwrap(), b"keep this file");
     assert!(!world.root().join(".git").exists());

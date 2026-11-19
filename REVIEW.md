@@ -43,7 +43,7 @@ Authorization belongs in the foreground before the worker starts. Expired author
 - `dots` runs on macOS and Linux, including Linux under WSL; native Windows is not supported.
 - Supported mise is 2026.11.8 or newer; do not raise behaviour of older releases.
   Before claiming a mise command behaves a certain way, run it or say the claim is unverified.
-- Git is needed for `init`, `sync`, `backup`, `restore`, `bootstrap` and `publish`; sync needs Git 2.43 or newer.
+- Git is needed for `init`, `add FILE`, `sync`, `backup`, `restore`, `bootstrap` and `publish`; sync needs Git 2.43 or newer.
   gitleaks, age, `gh`, JJ, ssh and native package managers are needed only by the actions that use them.
 - CI installs every tool the tests use.
 

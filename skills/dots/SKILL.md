@@ -37,7 +37,7 @@ Run them only when the user asks for that action, and otherwise say which comman
 `dots up`, `dots sync`, `dots apply`, `dots add`, `dots remove`, `dots init`, `dots bootstrap`, `dots remote`, `dots backup`, `dots restore`, `dots publish`, `dots profile --profile PROFILE --machine-id ID`, `dots exceptions`, `dots retire-dotfiles`, `dots enroll-history`.
 `dots mise ARGS...` and configuration commands do whatever they run.
 
-In shared mode, `dots sync` and the sync stage of `dots up` can publish eligible edits to `dev` once scanning, validation and remote checks pass; the checkout and dotfiles update only after the remote confirms `dev`.
+In shared mode, `dots sync` and the sync stage of `dots up` can publish eligible edits to `dev` once scanning, validation and remote checks pass; incoming checkout changes and dotfile application wait until the remote confirms `dev`.
 Do not run them while someone else has uncommitted edits there, and do not leave half-finished edits there yourself.
 
 ## Profiles
@@ -49,7 +49,7 @@ Put a declaration in the narrowest file that fits: shared tools in `config.toml`
 
 ## Add or remove software
 
-Prefer `dots add`, which installs first and records only what worked:
+Use `dots add` to install and record software. If installation fails in a terminal, it can still record the declaration for retry with your confirmation.
 
 ```sh
 dots add ripgrep                       # the selected profile's config.PROFILE.toml
@@ -78,7 +78,7 @@ dots remove ~/.config/app/config.toml    # put the file back and drop the declar
 ```
 
 `dots add FILE` adopts a regular file inside `HOME`, outside the configuration: it copies it to `dotfiles/REL`, declares `"~/REL" = { source = "dotfiles/REL", mode = "symlink" }` in the selected file, and replaces the original with a link.
-It refuses a file that is already declared, a source path in use, and a selected file other than `config.toml` or a listed `config.PROFILE.toml`.
+Repeating an exact adoption succeeds. A new adoption requires Git and refuses a conflicting declaration, a source path in use, and a selected file other than `config.toml` or a listed `config.PROFILE.toml`.
 `dots remove FILE` replaces the link with a regular file holding the source's current bytes and mode, so edits made through the link stay, then removes the declaration and the source.
 
 For per-machine values or restricted targets, declare by hand:
@@ -102,12 +102,12 @@ App-written files that must not be shared in plain text go in encrypted settings
 
 - Use `encrypt = true` for each tracked entry. During `dots remote`, the SSH target keeps its own mise history settings. With history enabled, it stores a tracked file's payload in plaintext locally if the file is unencrypted.
   Enable encryption on the declaration or disable history on the target to avoid local plaintext.
-- Before `dots backup` invokes mise's native sync, it checks the tracked payloads in every local checkpoint on the history branch that the remote lacks. A later declaration edit cannot encrypt data in an older checkpoint.
+- Before `dots backup` invokes mise's native sync, it checks the tracked payloads in at least every checkpoint whose presence on the destination host branch it cannot prove. With an opaque SSH launcher, that includes the whole local ancestry. A later declaration edit cannot encrypt data in an older checkpoint.
   The publication check respects mise's `allow_plaintext_history` opt-in.
 - List each machine that keeps the file as its own `{ profile = "host-my-laptop" }` variant.
   Never rename or remove an existing variant: it names that machine's stream in history.
 - `dots restore` fetches private history and uses mise to apply it to the actual tracked files.
-  Before a fetch or other operation that can capture live content, restore requires a nonempty recipient configuration and plaintext history disabled.
+  Before a fetch or other operation that can capture live content, restore requires a nonempty recipient list in system or global configuration that native mise trusts, and requires plaintext history to be disabled.
   Mise chooses the recipients of each new age-encrypted undo checkpoint, which must be decryptable by the identity in use.
   An incoming checkpoint can have different recipients. Restore can use the replacement identity after the old private key is lost.
   If both sides changed the same lines, restore exits 1 and keeps the live edit.
@@ -149,8 +149,8 @@ Make them executable (`chmod +x`), keep them safe to rerun, and check their synt
 - `dots up --last` prints the saved update report and returns its recorded exit status.
   Captured stages have private logs under `${XDG_STATE_HOME:-~/.local/state}/dots/`. A failed step that had the terminal gives its exit status and next action, with its output in scrollback.
 - `dots sync --last` replays the last sync receipt.
-  When it reports a push as unconfirmed, compare `refs/heads/dev` at `origin` with the candidate and expected commits it prints before running sync again.
-  The [sync guide](https://github.com/EzraCerpac/dots/blob/main/docs/sync.md) explains each kind of sync issue.
+  When it reports a push as unconfirmed, compare `refs/heads/dev` at the push URL of `origin` with the candidate and expected commits it prints before running sync again.
+  The [sync guide](https://github.com/EzraCerpac/dots/blob/rust/docs/sync.md) explains each kind of sync issue.
 - `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
 - Run `dots` for help, including the configuration's commands.
 

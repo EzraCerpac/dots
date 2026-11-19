@@ -85,7 +85,7 @@ When Git `HEAD` follows `dev` and another worktree moves `dev`, JJ re-parents it
 2. **Capture.** When a deployed copy of a dotfile changed and its source still matches the last common version, the deployed bytes become the source.
    When both changed, both stay as they are and sync reports it.
 3. **Candidate.** Builds a candidate commit from every tracked or unignored public edit, leaving machine-local files out, without moving `dev` or the real index.
-   Existing staging is preserved; a path whose staged and unstaged versions differ stops sync until you reconcile them.
+   Sync preserves existing staging. If the clean candidate would commit a path whose staged and unstaged versions differ, reconcile them before sharing it.
 4. **Scan.** Scans the candidate with gitleaks before `dev` or the index advances.
    A flagged file stays on disk and out of the candidate, and the rest is scanned again; only a clean candidate becomes `dev`.
    A rejected candidate never reaches `dev`, the real index or the push, and its edits stay on disk.
@@ -131,8 +131,8 @@ Sync never force-pushes, skips validation or writes conflict markers into live f
 ## The receipt
 
 Every finished shared sync, including the one inside `dots up`, prints a receipt and records it privately for replay.
-A clean run prints one line summarizing local work, incoming changes and the push.
-Otherwise the receipt leads with each issue and its next action, then that summary, any recovery copies, and up to five paths per group:
+A one-line summary describes local work, incoming changes and the push.
+Issues and their next actions come before the summary. Any recovery copies and nonempty path groups follow it, with up to five paths per group in live output:
 
 - **Shared on dev**: files that differ between the previously published `dev` and the commit the remote confirmed.
 - **Saved locally**: files this run committed on this machine's `dev`; after a confirmed push they can also appear under **Shared on dev**.
@@ -145,9 +145,10 @@ Piped output, `--plain` output and saved reports carry metadata only, never file
 When recording the receipt fails, sync still prints this run's receipt, warns that it could not save it for replay, and exits 0; `dots sync --last` may then show an earlier sync or none.
 
 `dots sync --last` only replays the latest receipt for this checkout from the recorded Git revisions, without the network and without mise.
-It lists every path in each group, including when piped.
+Piped and `--plain` replay list every path in each group.
 On a terminal it opens a pager holding up to 1 MiB, with each file's patch only when the same screening is clean; otherwise it lists the file and counts the omitted patches.
-Binary, encrypted and unverified changes are always listed as file entries.
+The pager limit also applies to path listings. If the pager is unavailable or fails, replay prints the metadata to stdout.
+Binary, encrypted and unverified changes appear as file entries.
 Receipts written by releases before 1.0 are ignored.
 
 ## Issues and what to do
@@ -158,8 +159,8 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | Issue | What it means and what to do |
 | --- | --- |
 | Not shared: a secret was found | gitleaks flagged a new edit, which stays on disk and out of `dev`. Remove the secret, or add a reviewed allowlist entry to `.gitleaks.toml` or `.gitleaksignore` for a false positive, then sync again. |
-| Not shared: the scan could not run | gitleaks is missing or failed, so nothing was committed or pushed and your edits stay on disk. Install or fix gitleaks and sync again. |
-| Staged and unstaged edits differ | A path has different staged and unstaged versions, so sync cannot tell which one to share. Commit, unstage or discard one with Git, then sync again. |
+| Not shared: the scan could not run | No push took place and your edits stay on disk. If the candidate passed its scan before the outgoing scan failed, its clean commit is already on local `dev`. Install or fix gitleaks and sync again. |
+| Staged and unstaged edits differ | A path the clean candidate would commit has different staged and unstaged versions. Commit, unstage or discard one with Git, then sync again. |
 | Not saved | Another Git command held the index or `dev`, so local edits were not recorded; incoming work may still have arrived. Sync again once that command finishes; remove a lock left by a crashed Git command by hand. |
 | Not pushed: an unsafe outgoing commit | An unpushed commit on `dev` contains a finding, or once tracked a machine-local file. Rewrite that commit out of the unpublished part of `dev` by hand (no published branch contains it), then sync again. |
 | Not shared: the push was rejected | `origin` refused the conditional push, for its own reason such as credentials or branch protection, or because `dev` kept moving through every retry. Local work stays saved on `dev`; check `origin` and sync again. |
@@ -173,7 +174,7 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | History not saved | A tracked entry is not `encrypt = true`, or the checkpoint failed. Fix the declaration or the reported mise error and sync again. |
 | Copy kept | A deployed copy differs from what sync expected, or another writer claimed it, so sync left it in place and may print where a displaced file is. Compare the copy with its source, put the version you want in the source, then sync again. |
 | Apply or reload failed | The configuration advanced but dotfiles were not applied, or a reload command failed. Fix the reported error and run the command sync prints. |
-| Retired declaration removed | Sync removed exactly one retired table from a machine-local file and kept a backup at the printed path. Nothing to do unless you had customized that table. |
+| Retired declaration removed | Sync kept the original machine-local file at the printed recovery path before removing its matching retired tables. Nothing to do unless you had customized that table. |
 | Stopped or skipped | The checkout has the wrong shape or a foreign `origin`, a Git operation is in progress, another sync or publish is running, or Git is too old. Fix what the line names and sync again. |
 
 ## Exit status

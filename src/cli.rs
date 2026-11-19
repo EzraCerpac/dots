@@ -546,9 +546,7 @@ fn context_at(flags: Flags, directory: Option<&Path>) -> Result<Ctx, Fail> {
         None => Root::resolve(&env)?,
     };
     let ctx = Ctx { env, root, flags };
-    if let Err(error) = skill::refresh(&ctx)
-        && !error.is_unported()
-    {
+    if let Err(error) = skill::refresh(&ctx) {
         eprintln!("dots: {error}");
     }
     Ok(ctx)

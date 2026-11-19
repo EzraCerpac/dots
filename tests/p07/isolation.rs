@@ -1,13 +1,15 @@
-//! Additional private paths for P-07's real mise, Git and JJ subprocesses.
+//! Additional private paths for P-07's real mise and Git subprocesses.
 
 use crate::support::{FixtureCommand, World};
 use nix::libc;
 use std::env;
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -29,15 +31,41 @@ pub fn fixture_editor(base: &Path, candidate: &Path) -> Option<FixtureFile> {
 }
 
 fn open_fixture_file(base: &Path, candidate: &Path, access: libc::c_int) -> Option<FixtureFile> {
+    let (file, parent) = open_inside(base, candidate, access, true).ok()??;
+    let parent = parent?;
+    file.metadata()
+        .ok()?
+        .is_file()
+        .then_some(FixtureFile { file, parent })
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn open_inside(
+    base: &Path,
+    candidate: &Path,
+    access: libc::c_int,
+    required: bool,
+) -> io::Result<Option<(File, Option<File>)>> {
     const DIRECTORY: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
     const NO_FOLLOW: libc::c_int = libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let relative = candidate.strip_prefix(base).ok()?;
+    if !candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|part| part == Component::ParentDir)
+    {
+        return Err(invalid("path is not absolute and confined"));
+    }
+    let relative = candidate
+        .strip_prefix(base)
+        .map_err(|_| invalid("path is outside World"))?;
     let mut dir = OpenOptions::new()
         .read(true)
         .custom_flags(DIRECTORY | NO_FOLLOW)
-        .open(base)
-        .ok()?;
-    let owner = dir.metadata().ok()?.uid();
+        .open(base)?;
+    let owner = dir.metadata()?.uid();
     let mut entries = relative.components().peekable();
     while let Some(Component::Normal(name)) = entries.next() {
         let final_component = entries.peek().is_none();
@@ -46,26 +74,215 @@ fn open_fixture_file(base: &Path, candidate: &Path, access: libc::c_int) -> Opti
         } else {
             DIRECTORY
         };
-        let name = CString::new(name.as_bytes()).ok()?;
+        let name = CString::new(name.as_bytes())?;
         // Each component is opened beneath its already-open directory, so a
         // symlink replacement cannot redirect a subsequent open or read.
         let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | NO_FOLLOW) };
         if fd < 0 {
-            return None;
+            let error = io::Error::last_os_error();
+            return if !required && error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error)
+            };
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        let metadata = file.metadata().ok()?;
-        if metadata.uid() != owner {
-            return None;
+        if file.metadata()?.uid() != owner {
+            return Err(invalid("path has another owner"));
         }
         if final_component {
-            return metadata
-                .is_file()
-                .then_some(FixtureFile { file, parent: dir });
+            return Ok(Some((file, Some(dir))));
         }
         dir = file;
     }
-    None
+    Ok(Some((dir, None)))
+}
+
+fn check_directory(base: &Path, path: &Path) -> io::Result<()> {
+    open_inside(base, path, libc::O_RDONLY | libc::O_DIRECTORY, true).map(|_| ())
+}
+
+fn check_mise_paths(base: &Path, argv: &[OsString]) -> io::Result<()> {
+    check_directory(base, &env::current_dir()?)?;
+    for (index, arg) in argv.iter().enumerate() {
+        let bytes = arg.as_bytes();
+        let path = match bytes {
+            b"-C" | b"--cd" => Some(
+                argv.get(index + 1)
+                    .ok_or_else(|| invalid("missing mise directory"))?
+                    .as_os_str(),
+            ),
+            _ => bytes
+                .strip_prefix(b"--cd=")
+                .or_else(|| bytes.strip_prefix(b"-C"))
+                .map(OsStr::from_bytes),
+        };
+        if let Some(path) = path {
+            check_directory(base, Path::new(path))?;
+        }
+    }
+
+    const REQUIRED: &[&str] = &[
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "TMPDIR",
+        "MISE_CONFIG_DIR",
+        "MISE_DATA_DIR",
+        "MISE_STATE_DIR",
+        "MISE_CACHE_DIR",
+        "MISE_TMP_DIR",
+        "MISE_SYSTEM_DIR",
+        "MISE_SYSTEM_CONFIG_DIR",
+        "MISE_SYSTEM_CONFIG_FILE",
+        "MISE_SYSTEM_DATA_DIR",
+        "MISE_SYSTEM_INSTALLS_DIR",
+        "MISE_SYSTEM_SHIMS_DIR",
+        "MISE_INSTALLS_DIR",
+        "MISE_INSTALL_STORE_DIR",
+        "MISE_DOWNLOADS_DIR",
+        "MISE_PLUGINS_DIR",
+        "MISE_SHIMS_DIR",
+    ];
+    const OPTIONAL: &[&str] = &[
+        "DOTS_ROOT",
+        "XDG_RUNTIME_DIR",
+        "MISE_CONFIG_FILE",
+        "MISE_GLOBAL_CONFIG_FILE",
+        "MISE_GLOBAL_CONFIG_ROOT",
+        "MISE_SKILLS_DIR",
+        "BASH_ENV",
+        "ENV",
+        "MISE_LOCAL_CONFIG_FILE",
+        "MISE_LOG_FILE",
+        "MISE_SOPS_AGE_KEY_FILE",
+        "SOPS_AGE_KEY_FILE",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_TEMPLATE_DIR",
+        "GH_CONFIG_DIR",
+    ];
+    const LISTS: &[&str] = &[
+        "MISE_CEILING_PATHS",
+        "MISE_TRUSTED_CONFIG_PATHS",
+        "MISE_SHARED_INSTALL_DIRS",
+        "MISE_SYSTEM_PLUGINS_DIRS",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_DIRS",
+        "GIT_CEILING_DIRECTORIES",
+    ];
+    for &key in REQUIRED.iter().chain(OPTIONAL).chain(LISTS) {
+        let value = env::var_os(key);
+        if !REQUIRED.contains(&key) && value.as_ref().is_none_or(|path| path.is_empty()) {
+            continue;
+        }
+        let refusal = || io::Error::other(format!("{key} points outside approved fixture paths"));
+        let value = value.ok_or_else(refusal)?;
+        let paths = if LISTS.contains(&key) {
+            env::split_paths(&value).collect()
+        } else {
+            vec![PathBuf::from(value)]
+        };
+        for path in paths {
+            // Git needs the exact private parent as a ceiling when starting at base.
+            if key == "GIT_CEILING_DIRECTORIES" && base.parent() == Some(&path) {
+                check_directory(&path, &path).map_err(|_| refusal())?;
+            } else {
+                open_inside(base, &path, libc::O_RDONLY, false).map_err(|_| refusal())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_boundary(args: &[OsString], transport: &[String]) -> io::Result<i32> {
+    let [base, mode, args @ ..] = args else {
+        return Err(invalid("missing fixture boundary arguments"));
+    };
+    let base = Path::new(base);
+    // The launcher saves the tool's stdout on fd 3 and silences libtest.
+    // Restore stdout for bytes written by the fixture or the executable it runs.
+    if unsafe { libc::dup2(3, libc::STDOUT_FILENO) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::close(3) };
+    let cwd = env::current_dir()?;
+    let open = |path: &OsStr| {
+        fixture_file(base, &cwd.join(path))
+            .ok_or_else(|| invalid("input is not a confined regular file"))
+    };
+    let mut lock = None;
+    let mut command = match (mode.as_bytes(), args) {
+        (b"read", [path]) => {
+            let mut stdout = io::stdout().lock();
+            io::copy(&mut open(path)?.file, &mut stdout)?;
+            stdout.flush()?;
+            return Ok(0);
+        }
+        (b"compare", [left, right]) => {
+            let bytes = |path: &OsStr| {
+                let mut bytes = Vec::new();
+                open(path)?.file.read_to_end(&mut bytes)?;
+                Ok::<_, io::Error>(bytes)
+            };
+            return Ok(i32::from(bytes(left)? != bytes(right)?));
+        }
+        (b"mise", [program, argv @ ..]) => {
+            check_mise_paths(base, argv)?;
+            let mut command = Command::new(program);
+            command.args(argv);
+            command
+        }
+        (b"lock-and-sleep", [lock_path, pid]) => {
+            let edit = |path: &OsStr| {
+                fixture_editor(base, &cwd.join(path))
+                    .ok_or_else(|| invalid("not a confined fixture file"))
+            };
+            let held = edit(lock_path)?.file;
+            held.try_lock()?;
+            writeln!(edit(pid)?.file, "{}", std::process::id())?;
+            // Keep the locked file open in the same process across exec.
+            if unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            lock = Some(held);
+            let mut command = Command::new("sleep");
+            command.arg("68");
+            command
+        }
+        _ => return Err(invalid("unknown fixture boundary operation")),
+    };
+    command.env_remove("DOTS_FIXTURE_ARG_COUNT");
+    for key in transport {
+        command.env_remove(key);
+    }
+    let error = command.exec();
+    // If exec fails, dropping the lock here releases the fixture lifetime.
+    drop(lock);
+    Err(error)
+}
+
+#[test]
+#[ignore = "invoked by the private fixture adapters"]
+fn fixture_boundary_process() {
+    let Ok(count) = env::var("DOTS_FIXTURE_ARG_COUNT") else {
+        return;
+    };
+    let keys: Vec<_> = (0..count.parse::<usize>().unwrap())
+        .map(|index| format!("DOTS_FIXTURE_ARG_{index}"))
+        .collect();
+    let args: Vec<_> = keys.iter().map(|key| env::var_os(key).unwrap()).collect();
+    match run_boundary(&args, &keys) {
+        Ok(status) => std::process::exit(status),
+        Err(error) => {
+            eprintln!("P-07 fixture boundary refused: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 pub struct IsolatedWorld {
@@ -125,18 +342,30 @@ impl IsolatedWorld {
         command
     }
 
-    fn boundary(&self) -> String {
-        let interpreter = executable_on_path(&self.world.command("python3"), "python3")
-            .expect("P-07 fixture boundary requires python3 on PATH");
-        let program = self.private.join("native-boundary.py");
-        fs::write(&program, include_bytes!("native-boundary.py")).unwrap();
-        format!(
-            "{} -I -S {} {} {}",
-            quote(&interpreter),
-            quote(&program),
-            quote(self.world.base()),
-            quote(self.world.boundary())
+    pub fn boundary(&self) -> String {
+        let adapter = self.private.join("fixture-boundary");
+        // Use the current test executable so filtered Cargo tests and native
+        // runner archives need no separately compiled helper. Export argv as
+        // bytes to keep it out of libtest's argument parser.
+        fs::write(
+            &adapter,
+            format!(
+                r#"#!/bin/sh
+set -eu
+index=0
+for arg in {base} "$@"; do
+    export "DOTS_FIXTURE_ARG_$index=$arg"
+    index=$((index + 1))
+done
+DOTS_FIXTURE_ARG_COUNT=$index exec {test} --ignored --exact --nocapture isolation::fixture_boundary_process 3>&1 >/dev/null
+"#,
+                base = quote(self.world.base()),
+                test = quote(&env::current_exe().unwrap()),
+            ),
         )
+        .unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+        quote(&adapter)
     }
 
     #[allow(dead_code)] // Only fixtures reading a subprocess-selected input need this.

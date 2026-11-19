@@ -70,6 +70,9 @@ impl Fixture {
         let (version, _) = output
             .split_once(" (")
             .expect("dots version and install method");
+        if std::env::var_os("DOTS_BIN").is_none() {
+            assert_eq!(version, concat!("dots ", env!("CARGO_PKG_VERSION")));
+        }
         version.to_owned()
     }
 

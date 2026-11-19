@@ -1,81 +1,86 @@
 #!/usr/bin/env bash
-# Build the release assets: packaging/build-release VERSION [OUTDIR]
-#
-# For each of darwin and linux on arm64 and amd64, dots-VERSION-OS-ARCH.tar.gz
-# holds the manager's runtime files, a VERSION file and a prebuilt bin/dots-up,
-# under one top-level directory. Also writes SHA256SUMS and dots.rb, the
-# Homebrew formula rendered with those checksums. The release workflow and the
-# packaging test job both run this script. It packs the working tree's files
-# that Git tracks or would track, so a local build includes uncommitted edits.
 set -euo pipefail
 
-version="${1:-}"
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || {
-    echo 'usage: packaging/build-release VERSION [OUTDIR]   (VERSION like 0.3.0, without v)' >&2
-    exit 2
-}
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-out="${2:-$root/dist}"
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+root=$(pwd -P)
+version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]
+target=${1:?usage: packaging/build-release TARGET|assemble|assemble-pr OUTDIR}
+out=${2:?missing output directory}
 mkdir -p "$out"
-out="$(cd "$out" && pwd -P)"
+out=$(cd "$out" && pwd -P)
+
 platforms=(darwin-arm64 darwin-amd64 linux-arm64 linux-amd64)
-# Runtime files only: the Go sources, tests and CI files stay in the repository.
-runtime=(bin bootstrap completions docs init lib skills tasks LICENSE README.md)
-
-stage="$(mktemp -d "${TMPDIR:-/tmp}/dots-release.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
-
-(
-    cd "$root/dots-up"
-    go mod verify >/dev/null
+if [[ "$target" == assemble-pr ]]; then
+    platforms=(linux-arm64 linux-amd64)
+fi
+if [[ "$target" == assemble || "$target" == assemble-pr ]]; then
+    cd "$out"
     for platform in "${platforms[@]}"; do
-        CGO_ENABLED=0 GOOS="${platform%-*}" GOARCH="${platform#*-}" \
-            go build -mod=readonly -trimpath -o "$stage/dots-up-$platform" ./cmd/dots-up
-    done
-)
-
-tree="$stage/tree"
-mkdir -p "$tree"
-git -C "$root" ls-files -z --cached --others --exclude-standard -- "${runtime[@]}" | (cd "$root" && xargs -0 tar -cf - --) | tar -xf - -C "$tree"
-printf '%s\n' "$version" > "$tree/VERSION"
-
-: > "$out/SHA256SUMS"
-for platform in "${platforms[@]}"; do
-    name="dots-$version-$platform"
-    rm -rf "${stage:?}/$name"
-    cp -R "$tree" "$stage/$name"
-    install -m 0755 "$stage/dots-up-$platform" "$stage/$name/bin/dots-up"
-    (cd "$stage" && tar -cf - "$name") | gzip -n -9 > "$out/$name.tar.gz"
-    if command -v sha256sum >/dev/null 2>&1; then sum="$(sha256sum "$out/$name.tar.gz")"; else sum="$(shasum -a 256 "$out/$name.tar.gz")"; fi
-    printf '%s  %s\n' "${sum%% *}" "$name.tar.gz" >> "$out/SHA256SUMS"
-done
-
-# Render the formula from its reviewed source: the version on the version and
-# url lines, and each platform's checksum, matched by the platform comment on
-# its sha256 line.
-awk -v version="$version" -v sums="$out/SHA256SUMS" '
-    function replace(text, old, new,   at, done) {
-        while ((at = index(text, old)) > 0) {
-            done = done substr(text, 1, at - 1) new
-            text = substr(text, at + length(old))
+        archive="dots-$version-$platform.tar.gz"
+        # Validate the checksum against the exact filename verified on its native runner.
+        read -r sum name < "$archive.sha256"
+        [[ "$sum" =~ ^[0-9a-f]{64}$ && "$name" == "$archive" ]]
+        printf '%s  %s\n' "$sum" "$archive"
+    done > SHA256SUMS
+    shasum -a 256 -c SHA256SUMS
+    awk -v version="$version" -v platforms="${#platforms[@]}" '
+        NR == FNR {
+            n = split($2, fields, "-")
+            sub(/[.]tar[.]gz$/, "", fields[n])
+            sums[fields[n-1] "-" fields[n]] = $1
+            next
         }
-        return done text
-    }
-    BEGIN {
-        while ((getline line < sums) > 0) {
-            if (match(line, /(darwin|linux)-(arm64|amd64)[.]tar[.]gz$/)) {
-                sum[substr(line, RSTART, RLENGTH - 7)] = substr(line, 1, 64)
-            }
+        /^  version "/ { $0 = "  version \"" version "\"" }
+        /url "/ { gsub(/@VERSION@/, version) }
+        /sha256 "/ && ($NF in sums) {
+            sub(/"[0-9a-f]+"/, "\"" sums[$NF] "\"")
+            seen++
         }
-    }
-    /^  version "/ { template = $2; gsub(/"/, "", template) }
-    /^  version "|^ *url "/ { $0 = replace($0, template, version) }
-    /sha256 "[0-9a-f]+" # / {
-        if (!($NF in sum)) { print "build-release: no checksum for " $NF > "/dev/stderr"; exit 1 }
-        sub(/"[0-9a-f]+"/, "\"" sum[$NF] "\"")
-    }
-    { print }
-' "$root/packaging/homebrew/dots.rb" > "$out/dots.rb"
+        { print }
+        END { if (seen != platforms) exit 1 }
+    ' SHA256SUMS "$root/packaging/homebrew/dots.rb" > dots.rb
+    ruby -c dots.rb
+    exit
+fi
 
-printf 'Built dots %s in %s:\n' "$version" "$out"
-(cd "$out" && ls -1 "dots-$version"-*.tar.gz SHA256SUMS dots.rb)
+case "$target:$(uname -s):$(uname -m)" in
+    aarch64-apple-darwin:Darwin:arm64) platform=darwin-arm64; machine=arm64 ;;
+    x86_64-apple-darwin:Darwin:x86_64) platform=darwin-amd64; machine=x86_64 ;;
+    aarch64-unknown-linux-musl:Linux:aarch64) platform=linux-arm64; machine=AArch64 ;;
+    x86_64-unknown-linux-musl:Linux:x86_64) platform=linux-amd64; machine='Advanced Micro Devices X86-64' ;;
+    *) echo "Expected a native build runner for $target" >&2; exit 2 ;;
+esac
+
+.mise/rust-cargo build --release --locked --target "$target" --bin dots
+binary="${CARGO_TARGET_DIR:-target}/$target/release/dots"
+stage=$(mktemp -d "${TMPDIR:-/tmp}/dots-release.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+mkdir -p "$stage/tree/bin" "$stage/unpacked" "$stage/home" "$stage/tmp"
+install -m 0755 "$binary" "$stage/tree/bin/dots"
+archive="dots-$version-$platform.tar.gz"
+COPYFILE_DISABLE=1 tar --format=ustar -czf "$out/$archive" -C "$stage/tree" bin/dots
+
+[[ "$(tar -tzf "$out/$archive")" == bin/dots ]]
+[[ "$(tar -tvzf "$out/$archive" | awk 'NR == 1 { print $1 }')" == -rwxr-xr-x ]]
+tar -xzf "$out/$archive" -C "$stage/unpacked"
+dots="$stage/unpacked/bin/dots"
+cmp "$binary" "$dots"
+if [[ "$platform" == linux-* ]]; then
+    export LC_ALL=C
+    [[ "$(readelf -hW "$dots" | sed -n 's/^ *Class: *//p')" == ELF64 ]]
+    [[ "$(readelf -hW "$dots" | sed -n 's/^ *Machine: *//p')" == "$machine" ]]
+    readelf -lW "$dots" > "$stage/program-headers"
+    readelf -dW "$dots" > "$stage/dynamic"
+    if grep -Eq '^ *INTERP[[:space:]]' "$stage/program-headers" || grep -Fq '(NEEDED)' "$stage/dynamic"; then
+        echo "$archive must have no ELF interpreter or shared-library dependencies" >&2
+        exit 1
+    fi
+else
+    [[ "$(lipo -archs "$dots")" == "$machine" ]]
+fi
+
+actual=$(cd "$stage" && env -i PATH=/usr/bin:/bin     HOME="$stage/home" TMPDIR="$stage/tmp" XDG_CONFIG_HOME="$stage/config"     XDG_CACHE_HOME="$stage/cache" XDG_DATA_HOME="$stage/data" XDG_STATE_HOME="$stage/state"     CODEX_HOME="$stage/home/.codex" CLAUDE_CONFIG_DIR="$stage/home/.claude"     DOTS_SKILL_LINKS=0 "$dots" --version)
+[[ "$actual" == "dots $version (other)" ]]
+(cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
+printf 'Verified %s: %s\n' "$archive" "$actual"

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+platform=${1:?missing native platform}
+out=$(cd "${2:?missing candidate directory}" && pwd -P)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$root/Cargo.toml")
+archive="dots-$version-$platform.tar.gz"
+mise=$(command -v mise)
+# Homebrew's macOS sandbox must keep its own executable outside writable temp.
+scratch_parent=${RUNNER_TEMP:-"$root/dist"}
+mkdir -p "$scratch_parent"
+scratch=$(mktemp -d "$scratch_parent/dots-install.XXXXXXXX")
+scratch=$(cd "$scratch" && pwd -P)
+server=
+cleanup() {
+    if [[ -n "$server" ]]; then
+        kill "$server" 2>/dev/null || true
+        wait "$server" 2>/dev/null || true
+    fi
+    rm -rf -- "$scratch"
+}
+trap cleanup EXIT
+cd "$scratch"
+
+# Real installers, with release metadata and downloads served locally.
+(cd "$out" && shasum -a 256 -c SHA256SUMS)
+tar -xOzf "$out/$archive" bin/dots > expected-dots
+
+private() {
+    local state=$1
+    shift
+    mkdir -p "$state/home" "$state/tmp"
+    env -i PATH="$PATH" HOME="$state/home" TMPDIR="$state/tmp" \
+        XDG_CONFIG_HOME="$state/config" XDG_CACHE_HOME="$state/cache" \
+        XDG_DATA_HOME="$state/data" XDG_STATE_HOME="$state/state" \
+        CODEX_HOME="$state/home/.codex" CLAUDE_CONFIG_DIR="$state/home/.claude" \
+        GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 DOTS_SKILL_LINKS=0 "$@"
+}
+
+# Exec Ruby directly so the saved PID and cleanup refer to the server itself.
+mkdir -p "$scratch/server-home"
+env -i PATH="$PATH" HOME="$scratch/server-home" ruby "$root/packaging/serve-candidate.rb" \
+    "$out" "$version" "$scratch/url" &
+server=$!
+for ((i=0; i<100; i++)); do
+    [[ ! -s url ]] || break
+    kill -0 "$server"
+    sleep 0.1
+done
+url=$(cat url)
+
+mkdir project
+cat > project/mise.toml <<EOF
+[tools]
+"github:EzraCerpac/dots" = { version = "$version", api_url = "$url" }
+EOF
+candidate_mise() (
+    cd project
+    private "$scratch/mise-state" \
+        MISE_SYSTEM_CONFIG_DIR="$scratch/mise-system/config" \
+        MISE_SYSTEM_DATA_DIR="$scratch/mise-system/data" \
+        MISE_CEILING_PATHS="$scratch" MISE_TRUSTED_CONFIG_PATHS="$scratch/project" \
+        MISE_YES=1 "$mise" "$@"
+)
+candidate_mise install
+[[ "$(candidate_mise exec -- dots --version)" == "dots $version (mise)" ]]
+cmp expected-dots "$(candidate_mise which dots)"
+
+# Keep the tap, keg, and cache within the scratch prefix on every platform.
+brew_prefix="$scratch/brew"
+brew="$brew_prefix/bin/brew"
+tap="$brew_prefix/Library/Taps/dots-ci/homebrew-release"
+private "$scratch/brew-state" git clone -q --depth 1 --branch 7.0.14 \
+    https://github.com/Homebrew/brew.git "$brew_prefix"
+[[ "$(private "$scratch/brew-state" git -C "$brew_prefix" rev-parse HEAD)" == c3286d37c37f71b186a7e6647092bf2b56d1d690 ]]
+mkdir -p "$tap/Formula"
+private "$scratch/brew-state" git -C "$tap" init -q
+sed "s|https://github.com/EzraCerpac/dots/|$url/EzraCerpac/dots/|g" "$out/dots.rb" > "$tap/Formula/dots.rb"
+candidate_brew() {
+    private "$scratch/brew-state" HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 \
+        HOMEBREW_CACHE="$scratch/brew-cache" HOMEBREW_TEMP="$scratch/brew-state/tmp" \
+        HOMEBREW_NO_INSTALL_CLEANUP=1 "$brew" "$@"
+}
+# System Git was checked by the scenario setup. Exercise the formula itself
+# without compiling Homebrew dependencies into this non-default prefix.
+candidate_brew install --formula --ignore-dependencies dots-ci/release/dots
+keg=$(candidate_brew --prefix dots-ci/release/dots)
+cmp expected-dots "$keg/bin/dots"
+brew_dots() {
+    private "$scratch/brew-state" "$keg/bin/dots" "$@"
+}
+[[ "$(brew_dots --version)" == "dots $version (homebrew)" ]]
+for shell in bash zsh fish; do
+    case "$shell" in
+        bash) completion=etc/bash_completion.d/dots ;;
+        zsh) completion=share/zsh/site-functions/_dots ;;
+        fish) completion=share/fish/vendor_completions.d/dots.fish ;;
+    esac
+    brew_dots completions "$shell" > "expected-$shell"
+    cmp "expected-$shell" "$keg/$completion"
+done
+printf 'Verified mise and Homebrew installs of %s from %s\n' "$version" "$archive"

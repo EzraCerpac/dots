@@ -3,15 +3,22 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [rust, main]
+    branches: [main]
+  workflow_call:
 
 concurrency:
-  # A run ID also keeps separate pushes of the same SHA from sharing a pending slot.
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.sha, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MISE_VERSION: v2026.11.9
 
 jobs:
   changes:
@@ -19,12 +26,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     outputs:
-      docs: ${{ steps.classify.outputs.docs }}
-      rust: ${{ steps.classify.outputs.rust }}
-      legacy: ${{ steps.classify.outputs.legacy }}
-      other: ${{ steps.classify.outputs.other }}
-      non_docs: ${{ steps.classify.outputs.non_docs }}
+      code: ${{ steps.classify.outputs.code }}
       full: ${{ steps.classify.outputs.full }}
+      matrix: ${{ steps.classify.outputs.matrix }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -33,15 +37,15 @@ jobs:
       - id: classify
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          BASE_REF: ${{ github.base_ref }}
         run: bash .github/scripts/classify-changes
 
   lint:
     name: Rust lint
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -55,80 +59,266 @@ jobs:
       - run: .mise/rust-cargo fmt --all -- --check
       - run: .mise/rust-cargo clippy --locked --all-targets -- -D warnings
 
-  linux:
-    name: Linux x86_64
+  native:
+    name: Rust tests (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    uses: ./.github/workflows/rust-target.yml
-    with:
-      runner: ubuntu-24.04
-      target: x86_64-unknown-linux-musl
-      suites: >-
-        ${{ needs.changes.outputs.full == 'true'
-            && '["native","Fedora","Arch:1/2","Arch:2/2","Alpine","oracle"]'
-            || '["native","Fedora","Arch:1/2","Arch:2/2","Alpine"]' }}
-      first-run: ${{ needs.changes.outputs.full == 'true' }}
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).linux }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - uses: ./.github/actions/scenario-tools
+      - name: Install zsh on Ubuntu
+        run: |
+          if ! command -v zsh >/dev/null; then
+            sudo dpkg -i "$RUNNER_TEMP/dots-scenario-tools"/ubuntu-packages/*.deb
+          fi
+      - name: Test
+        run: |
+          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
+          for tool in bash zsh fish git jq age age-keygen mise gitleaks; do command -v "$tool"; done
+          bash .github/scripts/run-native-tests "$TARGET"
+      - name: Run dots init and dots up in a fresh container
+        if: matrix.platform == 'linux-amd64'
+        run: bash .github/scripts/run-first-run "target/$TARGET/debug/dots"
+      - name: Bundle the Cargo tests for the oracle
+        if: matrix.platform == 'linux-amd64' && needs.changes.outputs.full == 'true'
+        run: bash .github/scripts/archive-cargo-tests "$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.platform == 'linux-amd64' && needs.changes.outputs.full == 'true'
+        with:
+          name: cargo-tests-${{ matrix.target }}
+          path: ${{ runner.temp }}/dots-cargo-tests
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
 
-  extended:
-    name: ${{ matrix.target }}
+  mac-build:
+    name: Build Cargo tests (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.full == 'true'
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).mac }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - run: bash .github/scripts/archive-cargo-tests "$TARGET"
+      - run: .mise/rust-cargo test --locked --target "$TARGET" --doc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cargo-tests-${{ matrix.target }}
+          path: ${{ runner.temp }}/dots-cargo-tests
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  mac-tests:
+    name: Rust tests (${{ matrix.target }} shard ${{ matrix.shard }}/2)
+    needs: [changes, mac-build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).shards }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/scenario-tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cargo-tests-${{ matrix.target }}
+          path: ${{ runner.temp }}/dots-cargo-tests
+      - env:
+          SHARD: ${{ matrix.shard }}
+        run: bash .github/scripts/run-cargo-test-archive "$SHARD"
+
+  distros:
+    name: Rust tests (${{ matrix.distro }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            suites: '["native"]'
-          - runner: macos-26
-            target: aarch64-apple-darwin
-            suites: '["1/2","2/2","oracle"]'
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            suites: '["1/2","2/2"]'
-    uses: ./.github/workflows/rust-target.yml
-    with:
-      runner: ${{ matrix.runner }}
-      target: ${{ matrix.target }}
-      suites: ${{ matrix.suites }}
+        distro: [Fedora, Arch, Alpine]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: x86_64-unknown-linux-musl
+      - uses: ./.github/actions/scenario-tools
+      - env:
+          DISTRO: ${{ matrix.distro }}
+        run: bash .github/scripts/run-distro "$DISTRO"
 
-  legacy-and-secrets:
-    name: Legacy and secrets
-    needs: changes
-    if: needs.changes.outputs.non_docs == 'true'
-    uses: ./.github/workflows/test.yml
-    with:
-      secrets-only: ${{ needs.changes.outputs.legacy != 'true' }}
+  oracle:
+    name: v0.4.0 oracle (${{ matrix.platform }})
+    needs: [changes, native, mac-build]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).oracle }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/scenario-tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cargo-tests-${{ matrix.target }}
+          path: ${{ runner.temp }}/dots-cargo-tests
+      - env:
+          PLATFORM: ${{ matrix.platform }}
+        run: bash .github/scripts/setup-oracle
+      - name: Set up the packaged oracle's uv runtime
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.9'
+          enable-cache: false
+      - name: Run the unchanged scenarios against the packaged oracle
+        env:
+          DOTS_TEST_ORACLE: v0.4.0
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]] && ! command -v zsh >/dev/null; then
+            sudo dpkg -i "$RUNNER_TEMP/dots-scenario-tools"/ubuntu-packages/*.deb
+          fi
+          for tool in node python3 uv; do command -v "$tool"; done
+          export DOTS_TEST_TOOL_PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
+          bash .github/scripts/run-cargo-test-archive oracle
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/scenario-tools
+      - run: gitleaks git --no-banner --redact --verbose --log-opts='--all --full-history --diff-merges=first-parent' .
+
+  package:
+    name: Package (${{ matrix.platform }})
+    needs: [changes, lint, native, mac-tests, distros, oracle, secrets]
+    if: >-
+      ${{ !cancelled() && needs.lint.result == 'success' && needs.native.result == 'success'
+          && needs.mac-tests.result == 'success' && needs.distros.result == 'success'
+          && needs.secrets.result == 'success'
+          && (needs.changes.outputs.full == 'false' || needs.oracle.result == 'success') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).packages }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - run: packaging/build-release "$TARGET" "$RUNNER_TEMP/dots-archive"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.platform }}
+          path: ${{ runner.temp }}/dots-archive
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  assets:
+    name: Assemble release assets
+    needs: [changes, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dots-release
+      - env:
+          ASSEMBLE: ${{ needs.changes.outputs.full == 'true' && 'assemble' || 'assemble-pr' }}
+        run: packaging/build-release "$ASSEMBLE" "$RUNNER_TEMP/dots-release"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.changes.outputs.full == 'true' && 'release-archives' || 'pr-archives' }}
+          path: |
+            ${{ runner.temp }}/dots-release/dots-*.tar.gz
+            ${{ runner.temp }}/dots-release/SHA256SUMS
+            ${{ runner.temp }}/dots-release/dots.rb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  install:
+    name: Test installs (${{ matrix.platform }})
+    needs: [changes, assets]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix).packages }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/scenario-tools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.changes.outputs.full == 'true' && 'release-archives' || 'pr-archives' }}
+          path: ${{ runner.temp }}/dots-release
+      - env:
+          PLATFORM: ${{ matrix.platform }}
+        run: packaging/verify-installs "$PLATFORM" "$RUNNER_TEMP/dots-release"
 
   ci:
     name: ci
     if: always()
-    needs: [changes, lint, linux, extended, legacy-and-secrets]
+    needs: [changes, lint, native, mac-build, mac-tests, distros, oracle, secrets, package, assets, install]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
-      DOCS: ${{ needs.changes.outputs.docs }}
-      RUST: ${{ needs.changes.outputs.rust }}
-      LEGACY: ${{ needs.changes.outputs.legacy }}
-      OTHER: ${{ needs.changes.outputs.other }}
-      NON_DOCS: ${{ needs.changes.outputs.non_docs }}
+      CODE: ${{ needs.changes.outputs.code }}
       FULL: ${{ needs.changes.outputs.full }}
       RESULTS: ${{ toJSON(needs) }}
     steps:
       - name: Summarize and check results
         run: |
-          {
-            echo '### CI'
-            printf 'Paths detected: docs=%s, Rust=%s, legacy=%s, other=%s.\n\n' "$DOCS" "$RUST" "$LEGACY" "$OTHER"
-            echo '| Job group | Result | Selection |'
-            echo '| --- | --- | --- |'
-            printf '| Classification | %s | Every run |\n' "$(jq -r '.changes.result' <<< "$RESULTS")"
-            printf '| Rust lint and Linux x86_64 | %s / %s | Rust changes (%s) |\n' \
-              "$(jq -r '.lint.result' <<< "$RESULTS")" "$(jq -r '.linux.result' <<< "$RESULTS")" "$RUST"
-            printf '| Linux ARM and macOS | %s | Rust changes (%s) on full-matrix events (%s) |\n' \
-              "$(jq -r '.extended.result' <<< "$RESULTS")" "$RUST" "$FULL"
-            printf '| Legacy and secrets | %s | Legacy suites for legacy changes (%s). Secret scan for non-docs changes (%s). |\n' \
-              "$(jq -r '."legacy-and-secrets".result' <<< "$RESULTS")" "$LEGACY" "$NON_DOCS"
-            printf '\nFirst-run smoke and both v0.4.0 oracles are selected on full-matrix Rust runs.\n'
-          } >> "$GITHUB_STEP_SUMMARY"
-          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
+          jq -r 'to_entries[] | "- \(.key): \(.value.result)"' <<< "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
+          jq -e --arg code "$CODE" --arg full "$FULL" '
+            .changes.result == "success" and .secrets.result == "success" and
+            .oracle.result == (if $code == "true" and $full == "true" then "success" else "skipped" end) and
+            (del(.changes, .secrets, .oracle) | all(.[]; .result == (if $code == "true" then "success" else "skipped" end)))
+          ' <<< "$RESULTS"

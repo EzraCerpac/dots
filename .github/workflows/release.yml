@@ -9,32 +9,36 @@ permissions:
 
 jobs:
   test:
-    uses: ./.github/workflows/test.yml
+    uses: ./.github/workflows/rust.yml
 
   release:
     needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # v5.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          go-version-file: dots-up/go.mod
-          cache-dependency-path: dots-up/go.sum
+          name: release-archives
+          path: dist
 
-      - name: Build release assets
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          packaging/build-release "${TAG#v}" dist
-          # The formula for EzraCerpac/homebrew-tap, with this release's checksums;
-          # it is copied to the tap by hand.
-          { printf '```ruby\n'; cat dist/dots.rb; printf '```\n'; } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish release
+      - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/dots-*.tar.gz dist/SHA256SUMS dist/dots.rb --verify-tag --title "$TAG" --generate-notes
+        working-directory: dist
+        shell: bash
+        run: |
+          version=${TAG#v}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]
+          assets=()
+          for platform in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+            archive="dots-$version-$platform.tar.gz"
+            [[ -f "$archive" ]]
+            assets+=("$archive")
+          done
+          shasum -a 256 -c SHA256SUMS
+          grep -Fx "  version \"$version\"" dots.rb
+          gh release create "$TAG" "${assets[@]}" SHA256SUMS dots.rb --verify-tag --title "$TAG" --generate-notes

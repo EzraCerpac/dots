@@ -30,7 +30,7 @@ release="mise-$MISE_VERSION-$mise_platform.tar.gz"
 curl -fsSL --retry 3 "https://github.com/jdx/mise/releases/download/$MISE_VERSION/$release" -o "$release"
 tar -xzf "$release" mise/bin/mise
 install -m 0755 mise/bin/mise "$mise"
-# Use the oracle's mise backends, then expose executables independent of mise's state.
+# Expose real executables independent of mise's installation state.
 provision_mise() {
   env -i PATH="$PATH" HOME="$scratch/install-home" \
     XDG_CONFIG_HOME="$scratch/install-config" XDG_DATA_HOME="$scratch/install-data" \
@@ -93,7 +93,6 @@ done
 test "$(command -v git)" = "$2"
 git --version
 test -x "$(git --exec-path)/git-remote-http"
-python3 --version
 jq --version
 git init -q --bare --initial-branch=main "$TMPDIR/remote.git"
 git ls-remote "$TMPDIR/remote.git"

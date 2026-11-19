@@ -266,6 +266,7 @@ fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     enable_fake_gh(&world, &mut command);
     let output = success(command.arg("init").arg(&root).output().unwrap());
     let id = git(&world, &root, &["rev-parse", "HEAD"]);
+    // 0.5.0 declares gitleaks and age in a fresh scaffold.
     let config = git(&world, &root, &["show", "HEAD:config.toml"]);
     let config = toml_edit::Document::parse(config).unwrap();
     for tool in ["gitleaks", "age"] {

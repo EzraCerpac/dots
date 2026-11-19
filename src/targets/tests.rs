@@ -366,28 +366,49 @@ fn unsafe_markers_cannot_offer_apps_or_make_an_ambiguous_alias_unique() {
 
 #[test]
 fn mismatched_installation_is_omitted_but_a_missing_app_can_be_cleaned_up() {
+    use std::{io, os::unix::fs::MetadataExt, time::UNIX_EPOCH};
+
     let dir = tempfile::tempdir().unwrap();
     let apps = dir.path().join("Applications");
     let markers = dir.path().join("github-apps");
     let path = apps.join("Owned.app");
     fs::create_dir_all(&path).unwrap();
     let marker = marker(&markers, &path, "acme/widget", None);
-    let installation =
-        ownership::AppInstallation::from_metadata(&fs::metadata(&path).unwrap()).unwrap();
+    let metadata = fs::metadata(&path).unwrap();
+    let created = match metadata.created() {
+        Ok(created) => Some(created),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => None,
+        Err(error) => panic!("could not read the app creation time: {error}"),
+    };
+    let installation = json!({
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "created": created.unwrap_or(UNIX_EPOCH),
+    });
     fs::write(&marker, json!({"repo": "acme/widget", "path": path, "bundle_id": "test.example", "installation": installation}).to_string()).unwrap();
+    let discover = || {
+        let mut targets = Targets::default();
+        targets.add_ownership(&markers, &apps, false);
+        targets.finish(|_| None);
+        targets
+    };
+    let targets = discover();
+    if created.is_some() {
+        assert_eq!(values(&targets, "owned", &[], false), ["owned"]);
+    } else {
+        // An existing app without a readable birth time cannot match this proof.
+        assert!(values(&targets, "owned", &[], false).is_empty());
+        assert!(one(&targets, "owned", false).ownership_error.is_some());
+    }
+
     fs::rename(&path, apps.join("Original.app")).unwrap();
     fs::create_dir(&path).unwrap();
-
-    let mut targets = Targets::default();
-    targets.add_ownership(&markers, &apps, false);
-    targets.finish(|_| None);
+    let targets = discover();
     assert!(values(&targets, "owned", &[], false).is_empty());
     assert!(one(&targets, "owned", false).ownership_error.is_some());
 
     fs::remove_dir(&path).unwrap();
-    let mut targets = Targets::default();
-    targets.add_ownership(&markers, &apps, false);
-    targets.finish(|_| None);
+    let targets = discover();
     assert_eq!(values(&targets, "owned", &[], false), ["owned"]);
 }
 

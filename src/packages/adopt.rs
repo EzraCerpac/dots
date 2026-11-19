@@ -946,6 +946,54 @@ fn retained(work: TempDir, path: &Path, error: io::Error) -> Fail {
     )
 }
 
+// Trade two directory entries atomically so we can inspect the displaced file,
+// even when a writer changes the target just before the system call.
+pub(super) fn exchange(a: &Path, b: &Path) -> io::Result<()> {
+    rename(a, b, true)
+}
+
+pub(super) fn rename_noclobber(a: &Path, b: &Path) -> io::Result<()> {
+    rename(a, b, false)
+}
+
+fn rename(a: &Path, b: &Path, exchange: bool) -> io::Result<()> {
+    let a = CString::new(a.as_os_str().as_bytes())?;
+    let b = CString::new(b.as_os_str().as_bytes())?;
+    // The C strings stay live for the atomic exchange and are never retained.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renamex_np(
+            a.as_ptr(),
+            b.as_ptr(),
+            if exchange {
+                libc::RENAME_SWAP
+            } else {
+                libc::RENAME_EXCL
+            },
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            if exchange {
+                libc::RENAME_EXCHANGE
+            } else {
+                libc::RENAME_NOREPLACE
+            },
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1014,53 +1062,5 @@ mod tests {
             "{text}"
         );
         assert_eq!(fs::read_to_string(source).unwrap(), "original");
-    }
-}
-
-// Trade two directory entries atomically so we can inspect the displaced file,
-// even when a writer changes the target just before the system call.
-pub(super) fn exchange(a: &Path, b: &Path) -> io::Result<()> {
-    rename(a, b, true)
-}
-
-pub(super) fn rename_noclobber(a: &Path, b: &Path) -> io::Result<()> {
-    rename(a, b, false)
-}
-
-fn rename(a: &Path, b: &Path, exchange: bool) -> io::Result<()> {
-    let a = CString::new(a.as_os_str().as_bytes())?;
-    let b = CString::new(b.as_os_str().as_bytes())?;
-    // The C strings stay live for the atomic exchange and are never retained.
-    #[cfg(target_os = "macos")]
-    let result = unsafe {
-        libc::renamex_np(
-            a.as_ptr(),
-            b.as_ptr(),
-            if exchange {
-                libc::RENAME_SWAP
-            } else {
-                libc::RENAME_EXCL
-            },
-        )
-    };
-    #[cfg(target_os = "linux")]
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            a.as_ptr(),
-            libc::AT_FDCWD,
-            b.as_ptr(),
-            if exchange {
-                libc::RENAME_EXCHANGE
-            } else {
-                libc::RENAME_NOREPLACE
-            },
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
     }
 }

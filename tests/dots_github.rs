@@ -92,7 +92,8 @@ fn new_nested_command_keeps_the_original_mise_installation_with_a_different_data
     let world = World::new();
     let baseline = dots(&world);
     let original_data = world.home().join("original-data");
-    let installed = original_data.join("installs/fixture/1/bin/dots");
+    let original_installs = original_data.join("installs");
+    let installed = original_installs.join("fixture/1/bin/dots");
     fs::create_dir_all(installed.parent().unwrap()).unwrap();
     support::stage_executable(baseline.get_program(), &installed).unwrap();
 
@@ -108,6 +109,7 @@ case "$(command -v dots)" in
     *) exit 97 ;;
 esac
 export MISE_DATA_DIR="$HOME/changed-data"
+export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs"
 exec dots --version
 "#,
     )
@@ -123,6 +125,7 @@ exec dots --version
                     .filter_map(|(key, value)| value.map(|value| (key, value))),
             )
             .env("MISE_DATA_DIR", &original_data)
+            .env("MISE_INSTALLS_DIR", &original_installs)
             .arg(arg)
             .output()
             .unwrap();

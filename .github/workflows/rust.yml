@@ -14,6 +14,9 @@ permissions:
 
 env:
   RUST_VERSION: "1.100.0"
+  CARGO_TEST_FLAGS: >-
+    ${{ (github.ref == 'refs/heads/rust' ||
+         (github.base_ref == 'main' && github.head_ref == 'rust')) && '--no-fail-fast' || '' }}
 
 jobs:
   rust:
@@ -93,7 +96,7 @@ jobs:
         run: |
           age --version
           age-keygen --version
-          mise run test
+          mise run test -- ${{ env.CARGO_TEST_FLAGS }}
 
   legacy-oracle:
     name: v0.4.0 oracle (${{ matrix.os }})
@@ -241,7 +244,7 @@ jobs:
           mise --version
           age --version
           age-keygen --version
-          mise run test
+          mise run test -- ${{ env.CARGO_TEST_FLAGS }}
           SH
 
   rust-first-run:

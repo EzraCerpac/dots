@@ -105,18 +105,11 @@ pub(super) fn with_published(
             git.id(["write-tree"])?
         };
     }
-    scratch.git.id([
-        "-c",
-        "commit.gpgSign=false",
-        "commit-tree",
+    scratch.git.commit(
         &tree,
-        "-p",
-        local,
-        "-p",
-        published,
-        "-m",
+        &[local, published],
         &format!("Merge published {label}"),
-    ])
+    )
 }
 
 fn merge_output(

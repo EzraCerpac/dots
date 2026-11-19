@@ -122,16 +122,8 @@ impl<'a> Scratch<'a> {
         if tree == before {
             Ok(base.into())
         } else {
-            self.git.id([
-                "-c",
-                "commit.gpgSign=false",
-                "commit-tree",
-                &tree,
-                "-p",
-                base,
-                "-m",
-                "Save local configuration edits",
-            ])
+            self.git
+                .commit(&tree, &[base], "Save local configuration edits")
         }
     }
 
@@ -157,16 +149,8 @@ impl<'a> Scratch<'a> {
         if tree == self.git.id(["rev-parse", &format!("{base}^{{tree}}")])? {
             Ok(base.into())
         } else {
-            self.git.id([
-                "-c",
-                "commit.gpgSign=false",
-                "commit-tree",
-                &tree,
-                "-p",
-                base,
-                "-m",
-                "Save local configuration edits",
-            ])
+            self.git
+                .commit(&tree, &[base], "Save local configuration edits")
         }
     }
 

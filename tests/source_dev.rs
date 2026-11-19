@@ -2290,6 +2290,33 @@ fn new_sync_keeps_main_when_dev_removes_the_saved_profile() {
 }
 
 #[test]
+fn new_sync_keeps_main_when_dev_names_another_origin() {
+    let f = Repo::new();
+    let other = f.world.bare_remote("other-source.git");
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    let main = f.dev_or_head(&f.a);
+    let dev = f.publish(
+        "config.toml",
+        f.config.replace(
+            &format!("file://{}", f.origin.display()),
+            &format!("file://{}", other.display()),
+        ),
+    );
+    f.git(&f.a, &["fetch", "origin"]);
+    let transport = deny_transport(&f);
+    let receipt = f.sync(&f.a);
+    has(&receipt, "origin is missing, unsafe, or differs");
+    absent(&receipt, "Switched this checkout from main to dev");
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "main");
+    assert_eq!(f.dev_or_head(&f.a), main);
+    assert_eq!(read(&f.a.join("config.toml")), f.config);
+    assert!(!transport.exists());
+    assert_eq!(f.remote(), dev);
+    assert!(f.git(&other, &["for-each-ref"]).is_empty());
+}
+
+#[test]
 fn new_sync_creates_dev_when_origin_only_has_main() {
     let f = Repo::new();
     f.git(&f.origin, &["update-ref", "-d", "refs/heads/dev"]);
@@ -2386,11 +2413,90 @@ sync_case!(
                 .env_remove("GIT_COMMITTER_EMAIL"),
         );
         has(&receipt, "identity");
+        if !f.oracle {
+            has(&receipt, "Could not snapshot local edits: Author identity unknown");
+            has(&receipt, "git config --global user.name");
+            has(&receipt, "git config --global user.email");
+        }
         assert_eq!(f.tip(&f.a), before);
         assert_eq!(f.remote(), before);
         assert_eq!(read(&f.a.join("text")), "needs a commit\n");
     }
 );
+
+#[test]
+fn new_sync_supplies_missing_commit_identity_without_writing_config() {
+    let f = Repo::new();
+    let global = f.world.home().join(".gitconfig");
+    fs::remove_file(&global).unwrap();
+    f.git(&f.a, &["config", "--unset", "user.name"]);
+    f.git(&f.a, &["config", "--unset", "user.email"]);
+    let shim = f.tools.join("git");
+    let real = fs::read_link(&shim).unwrap();
+    fs::remove_file(&shim).unwrap();
+    script(
+        &shim,
+        &format!(
+            r#"
+case " $* " in
+  *" write-tree "*)
+    if [ "${{FIXTURE_SNAPSHOT_ERROR:-}}" = 1 ]; then
+      case "${{GIT_INDEX_FILE:-}}" in
+        */snapshot.index) printf 'fixture index error\nsecond diagnostic line\n' >&2; exit 1 ;;
+      esac
+    fi ;;
+  *" var GIT_AUTHOR_IDENT "*|*" var GIT_COMMITTER_IDENT "*|*" commit-tree "*)
+    if [ -z "${{GIT_AUTHOR_EMAIL:-}}" ] || [ -z "${{GIT_COMMITTER_EMAIL:-}}" ]; then
+        printf 'Author identity unknown\nfatal: unable to auto-detect email address\n' >&2
+        exit 128
+    fi ;;
+esac
+exec {} "$@"
+"#,
+            sh(&real)
+        ),
+    );
+    let sync = |fail| {
+        dots_zero(
+            f.dots(&f.a, &["--plain", "sync"])
+                .env("FIXTURE_SNAPSHOT_ERROR", fail)
+                .env_remove("EMAIL")
+                .env_remove("GIT_AUTHOR_NAME")
+                .env_remove("GIT_AUTHOR_EMAIL")
+                .env_remove("GIT_COMMITTER_NAME")
+                .env_remove("GIT_COMMITTER_EMAIL"),
+        )
+    };
+    let before = f.remote();
+    f.write(&f.a, "text", "new public bytes\n");
+    let failed = sync("1");
+    has(
+        &failed,
+        "Could not snapshot local edits: fixture index error",
+    );
+    absent(&failed, "second diagnostic line");
+    assert_eq!(f.remote(), before);
+    assert_eq!(f.tip(&f.a), before);
+
+    for name in ["dots", "Fixture Configured Name"] {
+        if name != "dots" {
+            f.git(&f.a, &["config", "user.name", name]);
+            f.write(&f.a, "text", "a second edit\n");
+        }
+        let config = fs::read(f.a.join(".git/config")).unwrap();
+        has(&sync("0"), "pushed dev");
+        assert_eq!(fs::read(f.a.join(".git/config")).unwrap(), config);
+        assert!(!global.exists());
+        assert_eq!(
+            f.git(
+                &f.origin,
+                &["log", "-1", "--format=%an <%ae>%n%cn <%ce>", "dev"]
+            ),
+            format!("{name} <dots@localhost>\n{name} <dots@localhost>")
+        );
+        assert_eq!(f.blob("dev", "text"), read(&f.a.join("text")).trim());
+    }
+}
 
 struct RunningSync {
     child: Option<std::process::Child>,

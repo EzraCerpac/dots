@@ -162,33 +162,11 @@ impl Git<'_> {
 
         let mut cmd = self.command(self.root)?;
         cmd.args(["-c", "user.useConfigOnly=true"]);
-        for (kind, key, email_env, name_env) in [
-            ("AUTHOR", "author", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME"),
-            (
-                "COMMITTER",
-                "committer",
-                "GIT_COMMITTER_EMAIL",
-                "GIT_COMMITTER_NAME",
-            ),
-        ] {
-            if !self
-                .output(&[
-                    "-c",
-                    "user.useConfigOnly=true",
-                    "var",
-                    &format!("GIT_{kind}_IDENT"),
-                ])?
-                .status
-                .success()
-            {
-                cmd.env_remove(name_env).env_remove(email_env).args([
-                    "-c",
-                    &format!("{key}.name=dots"),
-                    "-c",
-                    &format!("{key}.email=dots@localhost"),
-                ]);
-            }
-        }
+        crate::process::fill_commit_identity(&mut cmd, |args| {
+            let mut probe = vec!["-c", "user.useConfigOnly=true"];
+            probe.extend_from_slice(args);
+            self.output(&probe)
+        })?;
         let oid = line(input(
             cmd.args(["commit-tree", "--no-gpg-sign", &tree, "-F", "-"]),
             SEED_MESSAGE,

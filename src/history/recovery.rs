@@ -68,7 +68,15 @@ struct FileVersion {
     mode: u32,
 }
 
-type LiveVersions = BTreeMap<PathBuf, Option<FileVersion>>;
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+struct ObservedFile {
+    #[serde(flatten)]
+    stamp: FileVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+}
+
+type LiveVersions = BTreeMap<PathBuf, Option<ObservedFile>>;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct StoreDirectory {
@@ -325,9 +333,9 @@ impl Recovery<'_, '_, '_> {
         self.paths.recheck(self.native)?;
         self.native.require_no_pending_operations()?;
         let cmd = self.command(&["bootstrap", "dotfiles", "sync", "--fetch-only"], false)?;
-        require_unchanged(live, &BTreeSet::new())?;
+        require_unchanged(live, &BTreeSet::new(), None)?;
         apply(self.native, cmd, "mise could not fetch encrypted history")?;
-        require_unchanged(live, &BTreeSet::new())?;
+        require_unchanged(live, &BTreeSet::new(), None)?;
         revision(self.native, self.store, TRACKING_REF)
     }
 
@@ -336,7 +344,7 @@ impl Recovery<'_, '_, '_> {
         verify_capture_policy(self.native)?;
         self.native.require_no_pending_operations()?;
         self.paths.secure(self.native)?;
-        live_versions(&self.paths)
+        live_versions(&self.paths, Some(&self.paths))
     }
 
     fn verify(&self, commit: &str) -> Result<VerifiedTree, Fail> {
@@ -448,7 +456,7 @@ impl Recovery<'_, '_, '_> {
     fn launch_attempt(&self, attempt: &Attempt, rollback: bool) -> Result<(), Fail> {
         self.before_apply()?;
         let command = self.attempt_command(attempt, rollback)?;
-        require_unchanged(&attempt.live, &BTreeSet::new())?;
+        require_unchanged(&attempt.live, &BTreeSet::new(), Some(&self.paths))?;
         apply(
             self.native,
             command,
@@ -466,9 +474,9 @@ impl Recovery<'_, '_, '_> {
 
     fn resume(&mut self, mut journal: Journal) -> Result<(), Fail> {
         if matches!(journal.progress, Progress::Prepared | Progress::Fetching(_)) {
-            // A fetch never starts applying the incoming files. Observe again
-            // for this invocation, while keeping later apply phases pinned.
-            if !journal.initial && matches!(journal.progress, Progress::Fetching(_)) {
+            // Fetching has not applied incoming files, so a retry can bind
+            // the current inventory. Prepared still validates the clone binding.
+            if matches!(journal.progress, Progress::Fetching(_)) {
                 journal.paths = self.paths.binding().clone();
             } else {
                 self.paths.check_binding(&journal.paths, false)?;
@@ -521,7 +529,7 @@ impl Recovery<'_, '_, '_> {
                     let completed = self.completion(attempt, false)?;
                     if completed.is_none() {
                         self.paths.check_binding(&journal.paths, false)?;
-                        require_unchanged(&attempt.live, &BTreeSet::new())?;
+                        require_unchanged(&attempt.live, &BTreeSet::new(), Some(&self.paths))?;
                         let created = self
                             .verify_plan(&attempt.target)?
                             .ok_or_else(history_conflict)?;
@@ -537,7 +545,7 @@ impl Recovery<'_, '_, '_> {
                         self.paths.check_binding(&journal.paths, false)?;
                     }
                     let written = completed.unwrap_or_default();
-                    require_unchanged(&attempt.live, &written)?;
+                    require_unchanged(&attempt.live, &written, Some(&self.paths))?;
                     let allowed = self.verify(&attempt.target)?;
                     let remaining: LiveVersions = attempt
                         .live
@@ -561,7 +569,7 @@ impl Recovery<'_, '_, '_> {
                 Progress::RollingBack(attempt) => {
                     if self.completion(attempt, true)?.is_none() {
                         self.paths.check_binding(&journal.paths, false)?;
-                        require_unchanged(&attempt.live, &BTreeSet::new())?;
+                        require_unchanged(&attempt.live, &BTreeSet::new(), Some(&self.paths))?;
                         if self.verify_rollback(&attempt.target, attempt.live.keys())?
                             != attempt.created
                         {
@@ -591,7 +599,7 @@ impl Recovery<'_, '_, '_> {
                         self.launch_attempt(attempt, true)?;
                         if self.completion(attempt, true)?.is_none() {
                             self.native.require_no_pending_operations()?;
-                            require_unchanged(&attempt.live, &BTreeSet::new())?;
+                            require_unchanged(&attempt.live, &BTreeSet::new(), Some(&self.paths))?;
                             self.paths.check_binding(&journal.paths, false)?;
                         }
                     }
@@ -839,7 +847,7 @@ impl Recovery<'_, '_, '_> {
                 || !native.affected.is_empty()
                 || revision(self.native, self.store, MAIN_REF)? != attempt.head
                 || revision(self.native, self.store, TRACKING_REF)? != attempt.target
-                || require_unchanged(&attempt.live, &BTreeSet::new()).is_err()
+                || require_unchanged(&attempt.live, &BTreeSet::new(), Some(&self.paths)).is_err()
             {
                 return Err(unresolved_restore());
             }
@@ -858,7 +866,7 @@ impl Recovery<'_, '_, '_> {
         }
         let completed = self.completion(attempt, rollback)?.is_some();
         if !completed {
-            require_unchanged(&attempt.live, &affected)?;
+            require_unchanged(&attempt.live, &affected, Some(&self.paths))?;
             if record.recovery != NativeRecovery::Pending {
                 native.verify_completed_writes()?;
             }
@@ -876,10 +884,10 @@ impl Recovery<'_, '_, '_> {
         if !completed && self.completion(attempt, rollback)?.is_none() {
             let current = tracked::restore_paths(self.native, Some(self.branch))?;
             current.check_binding(binding, false)?;
-            require_unchanged(&attempt.live, &affected)?;
+            require_unchanged(&attempt.live, &affected, Some(&current))?;
             for (path, previous) in &mut attempt.live {
                 if affected.contains(path) {
-                    *previous = file_version(path)?;
+                    *previous = observe_file(path, Some(&current))?;
                 }
             }
             attempt.head = revision(self.native, self.store, MAIN_REF)?;
@@ -1047,7 +1055,7 @@ impl NativeOperation {
                     let safe = match (attempt.live.get(path), prior) {
                         (Some(None), NativePreimage::Missing) => true,
                         (Some(Some(previous)), NativePreimage::File { mode }) => {
-                            previous.mode & 0o7777 == 0o600 && *mode == 0o600
+                            previous.stamp.mode & 0o7777 == 0o600 && *mode == 0o600
                         }
                         (None, NativePreimage::Missing) => attempt.created.contains(path),
                         _ => false,
@@ -1104,17 +1112,8 @@ impl NativeAfter {
                 if *mode != 0o600 || version.mode & 0o7777 != *mode {
                     return Ok(false);
                 }
-                let mut digest = Sha256::new();
-                let mut input = read_private(path)?;
-                let mut buffer = [0; 8192];
-                loop {
-                    let count = input.read(&mut buffer).map_err(|_| unresolved_restore())?;
-                    if count == 0 {
-                        break;
-                    }
-                    digest.update(&buffer[..count]);
-                }
-                let hash = digest.finalize();
+                let hash =
+                    read_digest(&mut read_private(path)?).map_err(|_| unresolved_restore())?;
                 let matching = sha256.len() == 2 * hash.len()
                     && hash.iter().enumerate().all(|(offset, byte)| {
                         sha256
@@ -1138,37 +1137,113 @@ fn covered_path(home: &Path, path: &str) -> Option<PathBuf> {
     home_path(home, path.strip_prefix("~/")?)
 }
 
-fn file_version(path: &Path) -> Result<Option<FileVersion>, Fail> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(Some(FileVersion {
+impl FileVersion {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.size(),
             modified: (metadata.mtime(), metadata.mtime_nsec()),
             changed: (metadata.ctime(), metadata.ctime_nsec()),
             mode: metadata.mode(),
-        })),
+        }
+    }
+
+    fn digest(&self, path: &Path, paths: &tracked::TrackedPaths) -> Result<String, Fail> {
+        let mut file = paths.open_file(path)?.ok_or_else(changed_live_file)?;
+        let matches = |metadata: &fs::Metadata| {
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o7777 == 0o600
+                && Self::from_metadata(metadata) == *self
+        };
+        if !file.metadata().is_ok_and(|metadata| matches(&metadata)) {
+            return Err(changed_live_file());
+        }
+        let hash = read_digest(&mut file).map_err(|_| changed_live_file())?;
+        if !file.metadata().is_ok_and(|metadata| matches(&metadata))
+            || file_version(path)?.as_ref() != Some(self)
+        {
+            return Err(changed_live_file());
+        }
+        Ok(hash.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
+fn read_digest(file: &mut File) -> std::io::Result<[u8; 32]> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(digest.finalize().into());
+        }
+        digest.update(&buffer[..count]);
+    }
+}
+
+fn file_version(path: &Path) -> Result<Option<FileVersion>, Fail> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(FileVersion::from_metadata(&metadata))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         _ => Err(unsafe_tree()),
     }
 }
 
-fn live_versions(paths: &[PathBuf]) -> Result<LiveVersions, Fail> {
+fn observe_file(
+    path: &Path,
+    digest_paths: Option<&tracked::TrackedPaths>,
+) -> Result<Option<ObservedFile>, Fail> {
+    let Some(stamp) = file_version(path)? else {
+        return Ok(None);
+    };
+    let sha256 = digest_paths
+        .map(|paths| stamp.digest(path, paths))
+        .transpose()?;
+    Ok(Some(ObservedFile { stamp, sha256 }))
+}
+
+fn live_versions(
+    paths: &[PathBuf],
+    digest_paths: Option<&tracked::TrackedPaths>,
+) -> Result<LiveVersions, Fail> {
     paths
         .iter()
-        .map(|path| Ok((path.clone(), file_version(path)?)))
+        .map(|path| Ok((path.clone(), observe_file(path, digest_paths)?)))
         .collect()
 }
 
-fn require_unchanged(live: &LiveVersions, written: &BTreeSet<PathBuf>) -> Result<(), Fail> {
+fn require_unchanged(
+    live: &LiveVersions,
+    written: &BTreeSet<PathBuf>,
+    digest_paths: Option<&tracked::TrackedPaths>,
+) -> Result<(), Fail> {
     for (path, previous) in live {
-        if !written.contains(path) && file_version(path)? != *previous {
-            return Err(blocked(
-                "a tracked file changed after restore started; inspect the live file and any pending restore before retrying",
-            ));
+        if written.contains(path) {
+            continue;
         }
+        let current = file_version(path)?;
+        if current.as_ref() == previous.as_ref().map(|file| &file.stamp) {
+            continue;
+        }
+        // Stamp-only journals cannot establish that changed stamps still
+        // describe the original bytes. Never retrofit a digest from live data.
+        if let (Some(paths), Some(current), Some(previous)) = (digest_paths, current, previous)
+            && current.mode == previous.stamp.mode
+            && let Some(expected) = &previous.sha256
+            && current.digest(path, paths)? == *expected
+        {
+            continue;
+        }
+        return Err(changed_live_file());
     }
     Ok(())
+}
+
+fn changed_live_file() -> Fail {
+    blocked(
+        "a tracked file changed after restore started; inspect the live file and any pending restore before retrying",
+    )
 }
 
 fn prepare(
@@ -1308,12 +1383,12 @@ fn fetch_seed(
         &refspec,
     ]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
-    let live = live_versions(paths)?;
+    let live = live_versions(paths, None)?;
     native.output(
         cmd,
         "could not stage the selected remote history branch; the existing store was left unchanged",
     )?;
-    require_unchanged(&live, &BTreeSet::new())?;
+    require_unchanged(&live, &BTreeSet::new(), None)?;
     native.bare(staged)?;
     let seed = revision(native, staged, MAIN_REF)?;
     verify_tree(native, staged, &seed, branch, paths)?;
@@ -1553,7 +1628,10 @@ fn journal_round_trips_above_four_mib() {
             };
             (
                 home.join(format!("settings/target-{index}.toml")),
-                Some(version),
+                Some(ObservedFile {
+                    stamp: version,
+                    sha256: None,
+                }),
             )
         })
         .collect();

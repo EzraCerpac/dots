@@ -1512,9 +1512,9 @@ fn new_file_adoption_refuses_credential_paths_before_mutation() {
     let before = fs::read(&config).unwrap();
     let dotfiles = world.root().join("dotfiles");
     let allowed = [
-        ".ssh/id_ed25519.pub",
-        "examples/.netrc",
-        ".ssh/id_dir/settings",
+        ".SsH/ID_ed25519.PUB",
+        "examples/.NETRC",
+        ".SsH/ID_dir/settings",
     ]
     .map(|relative| world.home().join(relative));
     for target in &allowed {
@@ -1524,18 +1524,19 @@ fn new_file_adoption_refuses_credential_paths_before_mutation() {
     }
 
     for relative in [
-        ".netrc",
-        ".git-credentials",
-        ".aws/credentials",
-        ".ssh/id_ed25519",
-        ".ssh/id_rsa.pub.bak",
-        ".config/gh/hosts.yml",
-        ".docker/config.json",
-        ".pgpass",
+        ".NETRC",
+        ".Git-Credentials",
+        ".AWS/Credentials",
+        ".SsH/ID_ed25519",
+        ".SsH/id_rsa.PUB.bak",
+        ".config/GH/Hosts.yml",
+        ".Docker/Config.json",
+        ".PGPASS",
     ] {
         let target = world.home().join(relative);
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, "fixture").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         let error = failed(
             dots(&world)
                 .args(["add", "--base"])
@@ -1546,14 +1547,17 @@ fn new_file_adoption_refuses_credential_paths_before_mutation() {
         );
         assert_eq!(error.lines().count(), 1, "{error}");
         assert!(
-            error.contains(relative) && error.contains("bootstrap bundles"),
+            error.trim_end().ends_with(&format!(
+                "{} holds credentials and was not added because dotfiles are shared through Git.",
+                target.display()
+            )),
             "{error}"
         );
         assert!(fs::symlink_metadata(&target).unwrap().is_file());
         assert_eq!(fs::read(&target).unwrap(), b"fixture");
         assert_eq!(fs::read(&config).unwrap(), before);
         assert!(!dotfiles.join(relative).exists());
-        assert!(!dotfiles.join(".ssh/id_ed25519.pub").exists());
+        assert!(!dotfiles.join(".SsH/ID_ed25519.PUB").exists());
     }
 
     success(

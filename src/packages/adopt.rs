@@ -450,8 +450,9 @@ pub struct Adoption {
 }
 
 fn is_credential_path(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
     matches!(
-        key,
+        key.as_str(),
         "~/.netrc"
             | "~/.git-credentials"
             | "~/.aws/credentials"
@@ -477,8 +478,8 @@ pub fn prepare_add(
     }
     if is_credential_path(&paths.key) {
         return Err(Fail::usage(format!(
-            "Use encrypted bootstrap bundles for {:?} because it is a credential path.",
-            paths.key
+            "{} holds credentials and was not added because dotfiles are shared through Git.",
+            paths.target.display()
         )));
     }
     let original = preflight_add(ctx, run, &paths, config)?;

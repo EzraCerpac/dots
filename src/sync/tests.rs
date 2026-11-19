@@ -1213,6 +1213,69 @@ fn unconfirmed_push_record_retains_both_exact_tips_and_expected_absence() {
 }
 
 #[test]
+fn sync_recovers_a_pending_configuration_before_classifying_origin() {
+    let (fixture, ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let git = Git::new(&ctx, ctx.root.path());
+    let config = git.root().join("config.toml");
+    let before = fixture_commit(&git, "before");
+    git.get(["branch", "main", &before]).unwrap();
+    let replacement = b"[vars]\ndots_profiles = 'default'\n# Recovered configuration\n";
+    fs::write(&config, replacement).unwrap();
+    git.get(["add", "config.toml"]).unwrap();
+    let after = fixture_commit(&git, "incoming configuration");
+    git.get(["reset", "--hard", &before]).unwrap();
+
+    let dir = git.root().join(".git");
+    super::checkout::begin(
+        &git,
+        &dir,
+        &super::checkout::index_snapshot(&dir).unwrap(),
+        &before,
+        &after,
+        true,
+    )
+    .unwrap();
+    let pending = dir.join("dots-sync-pending");
+    fs::rename(&config, pending.join("old-0")).unwrap();
+    assert!(!config.exists());
+    let sync = || {
+        let child = isolated(&world, std::env::current_exe().unwrap())
+            .env(RECEIPT_CHILD, "1")
+            .args([
+                "--exact",
+                "sync::tests::receipt_save_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        String::from_utf8(child.stdout).unwrap()
+    };
+    git.get(["symbolic-ref", "HEAD", "refs/heads/main"])
+        .unwrap();
+    let refused = sync();
+    assert!(refused.contains("HEAD on a dev branch"), "{refused}");
+    assert!(!refused.contains("local-only"));
+    assert!(pending.join("old-0").exists());
+    assert!(!config.exists());
+
+    git.get(["symbolic-ref", "HEAD", "refs/heads/dev"]).unwrap();
+    let recovered = sync();
+    assert!(
+        recovered.contains("Finished pending checkout"),
+        "{recovered}"
+    );
+    assert!(
+        recovered.contains("finished pending writes; add a remote"),
+        "{recovered}"
+    );
+    assert_eq!(fs::read(config).unwrap(), replacement);
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    assert!(!pending.exists());
+}
+
+#[test]
 fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_receipts() {
     use std::os::unix::fs::PermissionsExt;
 

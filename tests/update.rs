@@ -981,6 +981,7 @@ fn saved_sync_receipt(fixture: &Fixture) -> Option<Value> {
 fn new_up_embedded_sync_local_only_does_not_emit_or_save_receipt() {
     let fixture = Fixture::new();
     seed_sync_fixture(&fixture);
+    sync_fixture_git(&fixture, &["branch", "-m", "main"]);
     let report = update_sync_evidence(&fixture, 0);
     assert_eq!(report["stages"][1]["outcome"], "skipped");
     assert_eq!(report["stages"][1]["issues"], serde_json::json!([]));

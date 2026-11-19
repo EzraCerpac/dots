@@ -13,6 +13,7 @@ mod validation;
 mod tests;
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -468,12 +469,29 @@ fn synchronize(
         .or_note("Could not verify the local snapshot", GIT)?;
     let local_paths = changed(&base, &candidate_tree);
     receipt.kept = local_paths.len();
+    verify_dev(&git, &before).or_note("The dev checkout changed during capture", GIT)?;
+    let mut index = snapshot.bytes().to_vec();
+    drop(snapshot);
+
+    let (approved, rejected) =
+        match scan_candidate(run, &scratch, &before, &unscanned, &local_paths, receipt) {
+            Ok(approved) => approved,
+            Err(error) => {
+                if !run.cancelled()
+                    && let Ok(heads) = remote::fetch(&git, run, &origin)
+                {
+                    incoming(receipt, &git, &heads, &before);
+                }
+                return Err(scan_note(error));
+            }
+        };
     if !checkout::preserves_staged(
         &scratch.git,
         &scratch.dir.path().join("user.index"),
-        snapshot.bytes(),
+        &index,
         &before,
-        &unscanned,
+        &approved,
+        &rejected,
     )
     .or_note("Could not verify the staged local edits", GIT)?
     {
@@ -482,21 +500,6 @@ fn synchronize(
             "Save or reconcile the two versions with Git, then rerun dots sync.",
         ));
     }
-    verify_dev(&git, &before).or_note("The dev checkout changed during capture", GIT)?;
-    let mut index = snapshot.bytes().to_vec();
-    drop(snapshot);
-
-    let approved = match scan_candidate(run, &scratch, &before, &unscanned, &local_paths, receipt) {
-        Ok(approved) => approved,
-        Err(error) => {
-            if !run.cancelled()
-                && let Ok(heads) = remote::fetch(&git, run, &origin)
-            {
-                incoming(receipt, &git, &heads, &before);
-            }
-            return Err(scan_note(error));
-        }
-    };
     let local_tree = scratch
         .git
         .tree(&approved)
@@ -788,13 +791,13 @@ fn scan_candidate(
     first: &str,
     paths: &[PathBuf],
     receipt: &mut Receipt,
-) -> Result<String, ScanError> {
+) -> Result<(String, BTreeSet<PathBuf>), ScanError> {
     let mut candidate = first.to_owned();
-    let mut rejected = std::collections::BTreeSet::new();
+    let mut rejected = BTreeSet::new();
     loop {
         let found = scratch.scan(run, &candidate, &[before])?;
         if found.is_empty() {
-            return Ok(candidate);
+            return Ok((candidate, rejected));
         }
         if found.keys().any(|path| !paths.contains(path)) {
             return Err(ScanError::Failed);

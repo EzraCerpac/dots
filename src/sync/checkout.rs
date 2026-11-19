@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::git::{Git, Tree, invalid, oid};
 use super::guard::{CStrName, Dir, Image, private_dir, replace_exact, write_private};
-use super::snapshot::changed;
+use super::snapshot::{changed, overlaps};
 
 const PENDING: &str = "dots-sync-pending";
 const SNAPSHOT_LOCK: &str = "dots-sync-snapshot.lock";
@@ -191,23 +191,25 @@ pub(super) fn previous_index_base(
     Ok(None)
 }
 
-/// A single checkout cannot retain two independent staged and unstaged
-/// versions of a path in one commit without choosing one of them.
+/// A path being committed must still include its staged version. A rejected
+/// path is not committed, so its index and worktree can remain distinct.
 pub(super) fn preserves_staged(
     git: &Git<'_>,
     temporary: &Path,
     index: &[u8],
     base: &str,
     candidate: &str,
+    rejected: &BTreeSet<PathBuf>,
 ) -> io::Result<bool> {
     fs::write(temporary, index)?;
     let staged = git.indexed(temporary).id(["write-tree"])?;
     let before = git.tree(base)?;
     let staged = git.tree(&staged)?;
     let candidate = git.tree(candidate)?;
-    Ok(changed(&before, &staged)
-        .iter()
-        .all(|path| staged.get(path) == candidate.get(path)))
+    Ok(changed(&before, &staged).iter().all(|path| {
+        staged.get(path) == candidate.get(path)
+            || (overlaps(rejected, path) && before.get(path) == candidate.get(path))
+    }))
 }
 
 fn directory_in(tree: &Tree, path: &Path) -> bool {
@@ -311,10 +313,16 @@ pub(super) fn begin(
         modes: BTreeMap::new(),
     };
     write_synced(path.join("index.before"), original_index)?;
+    write_synced(path.join("index.after"), original_index)?;
+    // Git's two-tree merge retains independently staged entries in paths
+    // untouched by this revision change and refuses an overlapping update.
     git.indexed(&path.join("index.after")).get([
         "-c",
         "core.splitIndex=false",
         "read-tree",
+        "-i",
+        "-m",
+        before,
         after,
     ])?;
     let permissions = fs::Permissions::from_mode(

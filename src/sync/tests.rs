@@ -845,6 +845,65 @@ fn a_flagged_live_source_is_never_deployed() {
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn flagged_staged_entries_survive_sharing_the_clean_remainder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for distinct in [false, true] {
+        let (fixture, ctx) = shared_mise_fixture("");
+        let git = Git::new(&ctx, ctx.root.path());
+        let path = git.root().join("kept");
+        fs::write(&path, "public baseline\n").unwrap();
+        git.get(["add", "."]).unwrap();
+        fixture_commit(&git, "staged secret preservation fixture");
+        let token = ["ghp_", "Ab3De6Gh9Jk2Mn5Pq8St1Uv4Wx7Yz0Bc3Ef6"].concat();
+        let staged = format!("token = {token}\n");
+        fs::write(&path, &staged).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        git.get(["add", "kept"]).unwrap();
+        let index_entry = git
+            .get(["ls-files", "--stage", "-z", "--", "kept"])
+            .unwrap();
+        assert!(index_entry.starts_with(b"100755 "));
+        let live = if distinct {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            format!("different working bytes\n{staged}")
+        } else {
+            staged.clone()
+        };
+        fs::write(&path, &live).unwrap();
+        fs::write(git.root().join("clean"), "share this change\n").unwrap();
+
+        let receipt = shared_mise_sync(&ctx);
+        assert_eq!(receipt.outcome, "pushed dev", "{:?}", receipt.issues);
+        assert_eq!(receipt.kept, 1);
+        assert!(receipt.issues.iter().any(|issue| {
+            issue.diagnostic.contains("gitleaks flagged") && issue.diagnostic.contains("kept")
+        }));
+        assert_eq!(
+            git.get(["ls-files", "--stage", "-z", "--", "kept"])
+                .unwrap(),
+            index_entry
+        );
+        assert_eq!(git.get(["show", ":kept"]).unwrap(), staged.as_bytes());
+        assert_eq!(fs::read(&path).unwrap(), live.as_bytes());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            if distinct { 0o644 } else { 0o755 }
+        );
+        let remote = git.at(&fixture.path().join("bare-origin"));
+        assert_eq!(
+            remote.get(["show", "refs/heads/dev:clean"]).unwrap(),
+            b"share this change\n"
+        );
+        assert_eq!(
+            remote.get(["show", "refs/heads/dev:kept"]).unwrap(),
+            b"public baseline\n"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn generated_copy_contents_are_published_on_the_next_sync() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]

@@ -116,16 +116,11 @@ impl<'a> Scratch<'a> {
     ) -> io::Result<String> {
         let before = self.git.tree(base)?;
         let after = self.git.tree(candidate)?;
-        let intersects = |path: &Path| {
-            rejected
-                .iter()
-                .any(|rejected| path.starts_with(rejected) || rejected.starts_with(path))
-        };
         let mut index_info = Vec::new();
-        for path in after.keys().filter(|path| intersects(path)) {
+        for path in after.keys().filter(|path| overlaps(rejected, path)) {
             index_row(&mut index_info, path, None, base.len());
         }
-        for (path, entry) in before.iter().filter(|(path, _)| intersects(path)) {
+        for (path, entry) in before.iter().filter(|(path, _)| overlaps(rejected, path)) {
             index_row(&mut index_info, path, Some(entry), base.len());
         }
         self.git.update_index(&index_info)?;
@@ -332,6 +327,12 @@ fn read_findings(
         paths.entry(path).or_insert(FindingLocation { line, rule });
     }
     Ok(paths)
+}
+
+pub(super) fn overlaps(paths: &BTreeSet<PathBuf>, path: &Path) -> bool {
+    paths
+        .iter()
+        .any(|other| path.starts_with(other) || other.starts_with(path))
 }
 
 pub(super) fn changed(before: &Tree, after: &Tree) -> Vec<PathBuf> {

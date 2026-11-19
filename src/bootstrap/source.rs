@@ -430,7 +430,7 @@ pub(super) fn prepare(ctx: &Ctx, run: &Run<'_>, vars: &Vars) -> Result<Outcome, 
             command.args(args);
             probe(run, command)
         },
-        || {
+        |_, _| {
             validate_destination(
                 ctx,
                 run,
@@ -439,5 +439,6 @@ pub(super) fn prepare(ctx: &Ctx, run: &Run<'_>, vars: &Vars) -> Result<Outcome, 
                 true,
             )
         },
+        |diagnostic| Fail::new(1, diagnostic),
     )
 }

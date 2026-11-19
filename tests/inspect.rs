@@ -1,6 +1,7 @@
 mod support;
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -19,12 +20,18 @@ fn minimal(world: &World, declarations: &str) {
 }
 
 fn real_mise() -> PathBuf {
-    env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+    mise_on_path(&env::var_os("PATH").unwrap_or_default()).expect("standalone mise on PATH")
+}
+
+fn mise_on_path(search: &OsStr) -> Option<PathBuf> {
+    env::split_paths(search)
         .map(|directory| directory.join("mise"))
-        .find(|path| path.is_absolute() && path.is_file())
-        .expect("standalone mise on PATH")
+        .find(|path| {
+            path.is_absolute()
+                && fs::metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+        })
 }
 
 fn with_mise(world: &World) -> FixtureCommand<'_> {
@@ -62,6 +69,22 @@ fn read_report(world: &World) -> serde_json::Value {
         0o600
     );
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn mise_lookup_skips_a_non_executable_path_entry() {
+    let world = World::new();
+    let blocked = world.home().join("blocked");
+    let bin = world.home().join("bin");
+    fs::create_dir(&blocked).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let non_executable = blocked.join("mise");
+    fs::write(&non_executable, "").unwrap();
+    fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    let mise = bin.join("mise");
+    script(&mise, "exit 0");
+    let search = env::join_paths([blocked, bin]).unwrap();
+    assert_eq!(mise_on_path(&search), Some(mise));
 }
 
 #[test]
@@ -411,5 +434,64 @@ fn new_status_reads_origin_from_a_local_git_include() {
     assert!(
         stdout.contains("shared through https://example.invalid/owner/repo.git"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn new_status_marks_unreadable_git_config_as_attention() {
+    let world = World::new();
+    minimal(&world, "");
+    output(world.git().args(["init", "--initial-branch=dev"]), 0);
+    fs::write(world.root().join(".git/config"), "[broken\n").unwrap();
+    let status = output(with_mise(&world).arg("status"), 0);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("repository — attention"), "{stdout}");
+    assert!(!stdout.contains("local-only"), "{stdout}");
+    assert_eq!(read_report(&world)["status"], 0);
+}
+
+#[test]
+fn new_status_records_an_invalid_recipe_as_a_failed_section() {
+    let world = World::new();
+    minimal(&world, "");
+    fs::write(world.root().join("dots/exceptions.tsv"), "invalid\n").unwrap();
+    output(with_mise(&world).arg("status"), 1);
+    let report = read_report(&world);
+    assert_eq!(report["status"], 1);
+    assert!(
+        report["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stage| stage["label"] == "Installer exceptions" && stage["outcome"] == "failed")
+    );
+}
+
+#[test]
+fn new_status_records_loss_of_its_executable_during_program_probes() {
+    let world = World::new();
+    minimal(&world, "");
+    let binary = world.home().join("private-dots");
+    fs::copy(world.dots().get_program(), &binary).unwrap();
+    let mise = world.home().join("mise");
+    script(&mise, r#"/bin/rm "$HOME/private-dots" && echo 2026.11.9"#);
+    let status = output(
+        world
+            .command(&binary)
+            .env("DOTS_MISE_BIN", mise)
+            .arg("status"),
+        1,
+    );
+    assert!(!binary.exists());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("locate the running dots"));
+    let report = read_report(&world);
+    assert_eq!(report["status"], 1);
+    let startup = report["stages"].as_array().unwrap().last().unwrap();
+    assert_eq!(startup["label"], "Startup");
+    assert!(
+        startup["issues"][0]["next"]
+            .as_str()
+            .unwrap()
+            .contains("dots status")
     );
 }

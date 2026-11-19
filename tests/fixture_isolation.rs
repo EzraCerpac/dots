@@ -55,6 +55,7 @@ fn fixture_checks_effective_state_paths_and_keeps_agent_roots_absent() {
     for (key, location) in [
         ("XDG_CACHE_HOME", outside.path().to_owned()),
         ("XDG_STATE_HOME", alias.join("not-yet-created")),
+        ("DOTS_UP_STATE_DIR", alias.join("old-reports")),
         ("CLAUDE_CONFIG_DIR", alias.clone()),
         ("CODEX_HOME", alias.clone()),
         ("MISE_CONFIG_DIR", alias.clone()),
@@ -76,6 +77,13 @@ fn fixture_checks_effective_state_paths_and_keeps_agent_roots_absent() {
             .output()
             .unwrap_err(),
         "HOME",
+    );
+    refused(
+        marker(&world, &path)
+            .env("DOTS_UP_STATE_DIR", "old-reports")
+            .status()
+            .unwrap_err(),
+        "DOTS_UP_STATE_DIR",
     );
     refused(
         marker(&world, &path).env_clear().output().unwrap_err(),
@@ -116,4 +124,36 @@ fn fixture_checks_effective_state_paths_and_keeps_agent_roots_absent() {
     for dir in [".agents", ".claude", ".codex"] {
         assert!(!world.home().join(dir).exists());
     }
+}
+
+#[test]
+fn fixture_git_keeps_base_probes_below_the_ceiling() {
+    let world = World::new();
+    let mut git = world.git();
+    git.current_dir(world.base());
+    let ceiling = git
+        .get_envs()
+        .find_map(|(key, value)| {
+            (key == "GIT_CEILING_DIRECTORIES")
+                .then_some(value)
+                .flatten()
+        })
+        .unwrap();
+    let parent = world.base().parent().unwrap();
+    assert!(
+        std::env::split_paths(ceiling).any(|path| path == parent),
+        "Git needs a fixture-owned ceiling above its starting directory"
+    );
+    let init = world
+        .git()
+        .current_dir(parent)
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let probe = git
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .unwrap();
+    assert_eq!(probe.status.code(), Some(128), "{probe:?}");
 }

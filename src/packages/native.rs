@@ -346,9 +346,17 @@ fn apt_plan(ctx: &Ctx, run: &Run<'_>, name: &str) -> Result<Option<Command>, Fai
     if !installed.contains(&chosen) || (!apt_selector(name) && chosen != name) {
         return Err(unsafe_removal(name));
     }
+    // APT's solver may choose different removals after the preview. dpkg
+    // checks dependencies while processing only the named package.
     let command = command(
         ctx,
-        &["apt-get", "--yes", "--no-auto-remove", "remove", &chosen],
+        &[
+            "dpkg",
+            "--no-force-depends",
+            "--no-force-depends-version",
+            "--remove",
+            &chosen,
+        ],
         true,
     )?;
     Ok(Some(command))

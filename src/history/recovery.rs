@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use crate::Fail;
 use crate::config::{RepoSetting, Vars, selection};
 
-use super::checkpoint::{MARKER, STAGING, legacy_marker};
+use super::checkpoint::{LEGACY_RESTORE, MARKER, STAGING, legacy_marker};
 use super::keys::{self, LocalSettings};
 use super::native::{Native, exists, private_dir, read_native_file};
 use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origin};
@@ -182,9 +182,7 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     let journal = if let Some(record) = journal {
         Some(record)
     } else if exists(&legacy_marker(&store))? {
-        return Err(blocked(
-            "an older pending restore cannot be safely resumed by this build; finish it with the dots version that started it",
-        ));
+        return Err(blocked(LEGACY_RESTORE));
     } else {
         native.require_no_pending_operations()?;
         let prior_origin = native.effective_origin().ok();
@@ -436,18 +434,15 @@ impl Recovery<'_, '_, '_> {
 
     fn restore_established(&mut self) -> Result<(), Fail> {
         let live = self.pin_fetch_paths()?;
-        let target = self.fetch(&live)?;
-        let created = self.verify_plan(&target)?;
-        let attempt = self.attempt(target, live, created)?;
         let record = new_journal(
             self.native,
             self.store,
             self.origin,
             self.branch,
             &self.paths,
-            attempt.head.clone(),
+            revision(self.native, self.store, MAIN_REF)?,
             false,
-            Progress::Pulling(attempt),
+            Progress::Fetching(live),
             None,
         )?;
         write_journal(self.store, &record)?;

@@ -14,7 +14,6 @@ const TAIL_LINES: usize = 8;
 #[derive(Default)]
 pub(super) struct Logs {
     directory: Option<TempDir>,
-    unavailable: bool,
     diagnostics: Vec<(StageId, Diagnostic)>,
     terminal_failures: Vec<(StageId, u8)>,
     warnings: Vec<String>,
@@ -34,9 +33,6 @@ impl Logs {
                 }
             }
             return diagnostic;
-        }
-        if self.unavailable {
-            return Diagnostic::default();
         }
         let result = (|| {
             if self.directory.is_none() {
@@ -73,7 +69,6 @@ impl Logs {
             },
             Err(error) => {
                 self.warnings.push(warning(&error));
-                self.unavailable = true;
                 Diagnostic::default()
             }
         }
@@ -210,5 +205,40 @@ pub(crate) fn remove_run_logs(env: &Env, id: &str) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_stages_log_after_a_create_error() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = Ok(fixture.path().join("dots"));
+        let mut logs = Logs::default();
+        logs.stage(&base, StageId(0));
+        let run = logs.directory.as_ref().unwrap().path();
+        let occupied = run.join("1.log");
+        fs::write(&occupied, b"existing file").unwrap();
+
+        let mut failed = logs.stage(&base, StageId(1));
+        failed.record(b"first failure\n");
+        logs.store(StageId(1), failed);
+        let mut issue = Issue::new("Failed.", "Retry.");
+        logs.enrich(StageId(1), &mut issue);
+        assert_eq!(logs.take_warnings().len(), 1);
+        assert_eq!(issue.tail.as_deref(), Some("first failure"));
+        assert_eq!(issue.log, None);
+        assert_eq!(fs::read(&occupied).unwrap(), b"existing file");
+        fs::remove_file(occupied).unwrap();
+
+        let mut next = logs.stage(&base, StageId(2));
+        next.record(b"later failure\n");
+        logs.store(StageId(2), next);
+        logs.enrich(StageId(2), &mut issue);
+        let path = issue.log.expect("later stage must have a full log");
+        assert_eq!(fs::read(path).unwrap(), b"later failure\n");
+        assert!(logs.take_warnings().is_empty());
     }
 }

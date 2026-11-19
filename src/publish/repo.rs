@@ -37,7 +37,7 @@ pub(super) struct PreparedMerge<'a, 'ctx> {
     seed: String,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct StackState {
     operation: String,
     branches: Vec<u8>,
@@ -897,7 +897,6 @@ pub(super) fn stdout(output: &Output) -> Result<&str, Fail> {
 }
 
 fn stdout_path(output: &Output) -> Result<&Path, Fail> {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
     let bytes = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);

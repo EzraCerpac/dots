@@ -82,8 +82,7 @@ fn github_account(git: &Git<'_>) -> Option<String> {
         &["api", "--hostname", "github.com", "user", "--jq", ".login"],
     )?;
     let login = std::str::from_utf8(trim_line(&result.stdout)).ok()?;
-    (!login.is_empty()
-        && login.as_bytes().first()?.is_ascii_alphanumeric()
+    (login.as_bytes().first()?.is_ascii_alphanumeric()
         && login
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-'))

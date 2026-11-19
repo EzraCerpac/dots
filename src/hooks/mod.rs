@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -7,6 +6,7 @@ use tempfile::NamedTempFile;
 
 use crate::Fail;
 use crate::config::{Root, Vars};
+use crate::config_commands::valid_name;
 use crate::process::{BundlePipe, Mise, is_executable};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId, exit_code};
 
@@ -92,11 +92,7 @@ fn hook_name(name: &str) -> Option<(&str, Option<&str>)> {
     let (stem, profile) = name
         .split_once('@')
         .map_or((name, None), |(stem, profile)| (stem, Some(profile)));
-    if !stem
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_alphanumeric)
-        || !stem.bytes().all(name_byte)
+    if !valid_name(stem)
         || profile.is_some_and(|profile| profile.is_empty() || !profile.bytes().all(name_byte))
     {
         return None;
@@ -110,7 +106,7 @@ fn name_byte(byte: u8) -> bool {
 
 fn hook_label(stem: &str) -> String {
     let after_number = stem.trim_start_matches(|c: char| c.is_ascii_digit());
-    let label = if after_number.len() < stem.len() && after_number.len() > 1 {
+    let label = if after_number.len() > 1 {
         after_number.strip_prefix(['-', '_']).unwrap_or(stem)
     } else {
         stem
@@ -243,7 +239,7 @@ fn run_child(
         None
     };
 
-    let child = mise.exec_with_env(path, args.iter().map(OsStr::new), |child| {
+    let child = mise.exec_with_env(path, args.iter().copied(), |child| {
         if let Some(file) = &changes {
             child
                 .env("DOTS_CHANGES", file.path())

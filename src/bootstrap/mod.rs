@@ -30,7 +30,6 @@ const PARENT_HISTORY_ENABLED: &str = "DOTS_BOOTSTRAP_PARENT_HISTORY_ENABLED";
 const FRAGMENT: &str = "stages.json";
 const RETRY: &str = "Resolve the issue and rerun dots bootstrap.";
 
-#[derive(Default)]
 struct Request {
     bundle: Option<PathBuf>,
     identity: Option<PathBuf>,

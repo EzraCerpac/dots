@@ -219,10 +219,6 @@ fn pager(env: &crate::Env) -> Command {
         .args(["-FX"])
         .env("LESSSECURE", "1")
         .env("LESSHISTFILE", "-")
-        .env_remove("LESS")
-        .env_remove("LESSOPEN")
-        .env_remove("LESSCLOSE")
-        .env_remove("LESSSECURE_ALLOW")
         .stdin(Stdio::piped());
     command
 }

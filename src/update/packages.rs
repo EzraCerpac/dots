@@ -33,8 +33,10 @@ fn scoped_status(
     mise: &Mise<'_>,
     scope: &Scope,
     manager: &str,
+    mas: Option<&Tool>,
 ) -> Result<Option<Manager>, Issue> {
-    let mut status: Status = json(run, scoped_status_command(run, mise, scope, manager))?;
+    let command = scoped_status_command(run, mise, scope, manager);
+    let mut status: Status = json(run, command.and_then(|command| expose_mas(command, mas)))?;
     Ok(status.remove(manager))
 }
 
@@ -185,14 +187,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         if unresolved && self.scope.declared_names(name).next().is_none() {
             return Ok(None);
         }
-        let mut status = if let Some(mas) = mas {
-            let command = scoped_status_command(self.run, self.mise, &self.scope, name)
-                .and_then(|command| mas.expose(command));
-            let mut status: Status = json(self.run, command)?;
-            status.remove(name)
-        } else {
-            scoped_status(self.run, self.mise, &self.scope, name)?
-        };
+        let mut status = scoped_status(self.run, self.mise, &self.scope, name, mas)?;
         if let Some(resolved) = resolved {
             let Some(known) = resolved.get(name) else {
                 return Ok(None);
@@ -234,7 +229,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         packages: &[&Package],
         filtered: bool,
         resolved: bool,
-    ) -> Result<Option<Specs>, Issue> {
+    ) -> Result<Option<Vec<String>>, Issue> {
         let Some(specs) = select_rows(
             packages,
             &self.config.exceptions,
@@ -245,7 +240,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         else {
             return Ok(None);
         };
-        if specs.0.is_empty() {
+        if specs.is_empty() {
             return Ok(Some(specs));
         }
         if self.scope.has_bare()
@@ -262,7 +257,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             ));
         }
         if manager == "brew-cask" {
-            if let Some(spec) = specs.0.iter().find(|spec| {
+            if let Some(spec) = specs.iter().find(|spec| {
                 spec.strip_prefix("brew-cask:")
                     .is_some_and(|name| !self.scope.declares(manager, name))
             }) {
@@ -309,8 +304,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         if !eligible_declarations && !self.scope.has_bare() {
             return None;
         }
-        let mut tool = app_store::locate(self.ctx, self.run, self.mise);
-        if let Some(tool) = tool {
+        if let Some(tool) = app_store::locate(self.ctx, self.run, self.mise) {
             return Some((tool, false));
         }
         // A missing manager cannot receive bare declarations through mise's
@@ -318,36 +312,32 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         if !eligible_declarations {
             return None;
         }
-        if tool.is_none() {
-            let can_prepare = self.brew_can_prepare_store_tool();
-            match can_prepare {
-                Ok(true) => (),
-                Ok(false) => {
-                    step(self.run, "Mac App Store tool", |id| {
-                        Ok(self.defer_store_tool(id))
-                    });
-                    return None;
-                }
-                Err(error) => {
-                    step(self.run, "Mac App Store tool", |_| Err(error));
-                    return None;
-                }
+        match self.brew_can_prepare_store_tool() {
+            Ok(true) => (),
+            Ok(false) => {
+                step(self.run, "Mac App Store tool", |id| {
+                    Ok(self.defer_store_tool(id))
+                });
+                return None;
+            }
+            Err(error) => {
+                step(self.run, "Mac App Store tool", |_| Err(error));
+                return None;
             }
         }
         if !self.authorize_store() {
             return None;
         }
-        if tool.is_none() {
-            step(self.run, "Mac App Store tool", |id| {
-                app_store::prepare(self.run, id, self.mise)?;
-                tool = app_store::locate(self.ctx, self.run, self.mise);
-                Ok(if tool.is_some() {
-                    Outcome::Completed
-                } else {
-                    self.defer_store_tool(id)
-                })
-            });
-        }
+        let mut tool = None;
+        step(self.run, "Mac App Store tool", |id| {
+            app_store::prepare(self.run, id, self.mise)?;
+            tool = app_store::locate(self.ctx, self.run, self.mise);
+            Ok(if tool.is_some() {
+                Outcome::Completed
+            } else {
+                self.defer_store_tool(id)
+            })
+        });
         tool.map(|tool| (tool, true))
     }
 
@@ -362,7 +352,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             return Ok(false);
         }
         if self.scope.includes("brew")
-            && let Some(manager) = scoped_status(self.run, self.mise, &self.scope, "brew")?
+            && let Some(manager) = scoped_status(self.run, self.mise, &self.scope, "brew", None)?
             && manager.packages.iter().any(|pkg| {
                 pkg.package.rsplit('/').next() == Some("mas")
                     && (pkg.desired_state != "present" || pkg.requested_version != "latest")
@@ -494,12 +484,12 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         &self,
         name: &str,
         action: &str,
-        specs: &Specs,
+        specs: &[String],
         mas: Option<&Tool>,
     ) -> Result<Command, crate::Fail> {
         let args = [action, "--manager", name, "--yes"]
             .into_iter()
-            .chain(specs.0.iter().map(String::as_str));
+            .chain(specs.iter().map(String::as_str));
         let cmd = mise_command(
             self.run,
             self.mise,
@@ -585,7 +575,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
 
     fn record(&self, id: StageId, name: &str, before: Versions, tracked: Option<&PackageNames>) {
         if !self.run.cancelled()
-            && let Ok(Some(manager)) = scoped_status(self.run, self.mise, &self.scope, name)
+            && let Ok(Some(manager)) = scoped_status(self.run, self.mise, &self.scope, name, None)
             && manager.available
         {
             record_changes(self.run, id, before, versions(name, &manager, tracked));
@@ -600,33 +590,13 @@ fn expose_mas(command: Command, mas: Option<&Tool>) -> Result<Command, crate::Fa
     }
 }
 
-#[derive(Debug)]
-struct Specs(Vec<String>);
-
-#[cfg(test)]
-fn select(
-    packages: &[Package],
-    exceptions: &Exceptions,
-    profile: &str,
-    manager: &str,
-    filtered: bool,
-) -> Result<Option<Specs>, Issue> {
-    select_rows(
-        &packages.iter().collect::<Vec<_>>(),
-        exceptions,
-        profile,
-        manager,
-        filtered,
-    )
-}
-
 fn select_rows(
     packages: &[&Package],
     exceptions: &Exceptions,
     profile: &str,
     manager: &str,
     filtered: bool,
-) -> Result<Option<Specs>, Issue> {
+) -> Result<Option<Vec<String>>, Issue> {
     let mut excluded = filtered;
     let mut requested = Vec::new();
     for pkg in packages {
@@ -641,7 +611,7 @@ fn select_rows(
         return Ok(None);
     }
     if !excluded {
-        return Ok(Some(Specs(Vec::new())));
+        return Ok(Some(Vec::new()));
     }
     // Positional specs are new, desired-present requests. Mise retains pinned
     // versions for macos-app only.
@@ -656,9 +626,7 @@ fn select_rows(
             "Review the manager's declarations and installer exception holds, then rerun dots up.",
         ));
     }
-    Ok(Some(Specs(
-        requested.into_iter().map(|(_, spec)| spec).collect(),
-    )))
+    Ok(Some(requested.into_iter().map(|(_, spec)| spec).collect()))
 }
 
 fn versions(name: &str, manager: &Manager, tracked: Option<&PackageNames>) -> Versions {
@@ -683,7 +651,7 @@ pub(super) fn declared_dots_formula(run: &Run<'_>, mise: &Mise<'_>) -> Option<St
     if !scope.includes("brew") {
         return None;
     }
-    let manager = scoped_status(run, mise, &scope, "brew")
+    let manager = scoped_status(run, mise, &scope, "brew", None)
         .ok()
         .flatten()
         .filter(|manager| manager.available)?;
@@ -735,12 +703,11 @@ mod tests {
         let absent = package("retired", "latest", "absent");
         let pinned = package("pinned", "2", "present");
         let exceptions = exceptions("");
-        for packages in [vec![absent], vec![pinned]] {
+        for packages in [[&absent], [&pinned]] {
             assert!(
-                select(&packages, &exceptions, "test", "pacman", false)
+                select_rows(&packages, &exceptions, "test", "pacman", false)
                     .unwrap()
                     .unwrap()
-                    .0
                     .is_empty()
             );
         }
@@ -754,8 +721,7 @@ mod tests {
         assert_eq!(
             select_rows(&[&held, &ordinary], &exceptions, "test", "pacman", false)
                 .unwrap()
-                .unwrap()
-                .0,
+                .unwrap(),
             ["pacman:ordinary"]
         );
         for unsafe_explicit in [
@@ -785,7 +751,7 @@ mod tests {
         let specs = select_rows(&[&held, &pinned], &exceptions, "test", "pacman", false)
             .unwrap()
             .unwrap();
-        assert!(specs.0.is_empty());
+        assert!(specs.is_empty());
         assert!(select_rows(&[&held, &pinned], &exceptions, "other", "pacman", false).is_err());
     }
 }

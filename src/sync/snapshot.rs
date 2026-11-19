@@ -13,7 +13,7 @@ use crate::{process::Cwd, run::Run};
 
 use super::guard::private_dir;
 
-use super::git::{Git, Tree, bounded, checked, index_row, invalid, local, oid, records, relative};
+use super::git::{Git, Tree, checked, index_row, invalid, local, oid, records, relative};
 
 #[derive(Debug)]
 pub(super) enum ScanError {
@@ -215,13 +215,15 @@ impl<'a> Scratch<'a> {
             cmd.arg("--gitleaks-ignore-path").arg(ignore);
         }
         cmd.arg(self.live.root()).stdin(Stdio::null());
-        let output = bounded(cmd, run, Duration::from_secs(60)).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                ScanError::Missing
-            } else {
-                ScanError::Failed
-            }
-        })?;
+        let output = run
+            .probe_detached(cmd, Duration::from_secs(60))
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    ScanError::Missing
+                } else {
+                    ScanError::Failed
+                }
+            })?;
         if !matches!(output.status.code(), Some(0 | 97)) || !output.stderr.is_empty() {
             return Err(ScanError::Failed);
         }

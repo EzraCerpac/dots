@@ -178,9 +178,6 @@ pub(super) fn update_mise(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) {
     });
 }
 
-#[derive(Eq, PartialEq)]
-pub(super) struct ManagerVersion(String);
-
 pub(super) enum ManagerSource {
     Tool,
     Formula(String),
@@ -247,7 +244,7 @@ pub(super) fn manager_version(
     run: &Run<'_>,
     mise: &Mise<'_>,
     source: &ManagerSource,
-) -> Option<ManagerVersion> {
+) -> Option<String> {
     let executable = match source {
         ManagerSource::Tool => probe_path(run, mise, &["which", "dots"]),
         ManagerSource::Formula(name) => {
@@ -262,7 +259,7 @@ pub(super) fn manager_version(
     let output = text(run, cmd)?;
     let mut words = output.split_whitespace();
     (words.next()? == "dots").then_some(())?;
-    Some(ManagerVersion(words.next()?.to_owned()))
+    Some(words.next()?.to_owned())
 }
 
 pub(super) fn report_manager(
@@ -270,16 +267,16 @@ pub(super) fn report_manager(
     run: &Run<'_>,
     mise: &Mise<'_>,
     source: Option<ManagerSource>,
-    before: Option<ManagerVersion>,
+    before: Option<String>,
 ) {
     step(run, "dots manager", |id| {
-        let Some(ManagerVersion(after)) = source
+        let Some(after) = source
             .as_ref()
             .and_then(|source| manager_version(ctx, run, mise, source))
         else {
             return Ok(Outcome::Skipped);
         };
-        if before.as_ref().is_some_and(|version| version.0 == after) {
+        if before.as_ref() == Some(&after) {
             return Ok(Outcome::Skipped);
         }
         let Some(running) = crate::config_commands::version(&ctx.env)

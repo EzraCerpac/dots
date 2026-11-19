@@ -4,7 +4,6 @@ use std::io::{self, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::Duration;
 
 use crate::{Ctx, process::Cwd, run::Run};
 
@@ -295,10 +294,6 @@ pub(super) fn index_row(buf: &mut Vec<u8>, path: &Path, entry: Option<&Entry>, o
     buf.push(0);
 }
 
-pub(super) fn bounded(cmd: Command, run: &Run<'_>, budget: Duration) -> io::Result<Output> {
-    run.probe_detached(cmd, budget)
-}
-
 pub(super) fn repository_dirs(git: &Git<'_>) -> io::Result<(PathBuf, PathBuf)> {
     let root = git
         .file_path(["rev-parse", "--show-toplevel"])?
@@ -326,7 +321,7 @@ mod tests {
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     const MODE: &str = "DOTS_TEST_SYNC_NETWORK_MODE";
     const FIFO: &str = "DOTS_TEST_SYNC_HOOK_FIFO";
@@ -446,7 +441,7 @@ mod tests {
                 .command(["push", "origin", "HEAD:refs/heads/dev"])
                 .unwrap();
             assert_eq!(
-                bounded(command, &run, budget).unwrap_err().kind(),
+                run.probe_detached(command, budget).unwrap_err().kind(),
                 io::ErrorKind::TimedOut
             );
             assert!(start.elapsed() >= budget);

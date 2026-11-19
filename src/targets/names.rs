@@ -111,7 +111,6 @@ pub(crate) fn safe_text(text: &str) -> bool {
                     | ParagraphSeparator
                     | PrivateUse
                     | SpaceSeparator
-                    | Surrogate
                     | Unassigned
             )
     })

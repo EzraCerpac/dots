@@ -276,11 +276,8 @@ impl Targets {
                 .targets
                 .entry(record.id.clone())
                 .or_insert_with(|| Target::new(&record.id, Kind::ReleaseApp));
-            let aliases = names::aliases(&record.id).chain(
-                [record.alias]
-                    .into_iter()
-                    .filter(|alias| names::valid(alias)),
-            );
+            let aliases = names::aliases(&record.id)
+                .chain(Some(record.alias).filter(|alias| names::valid(alias)));
             match record.app {
                 Ok(app) => {
                     target.kind = Kind::ReleaseApp;
@@ -308,13 +305,14 @@ impl Targets {
             if target.id.starts_with("github:") && target.ownership_error.is_none() {
                 target.ownership_error.clone_from(&self.ownership_error);
             }
-            self.aliases
-                .entry(names::fold(&target.id))
-                .or_default()
-                .insert(target.id.clone());
-            for alias in &target.aliases {
+            for alias in target
+                .aliases
+                .iter()
+                .cloned()
+                .chain([names::fold(&target.id)])
+            {
                 self.aliases
-                    .entry(alias.clone())
+                    .entry(alias)
                     .or_default()
                     .insert(target.id.clone());
             }
@@ -380,11 +378,10 @@ impl Targets {
         if !target.offerable(keep_installed) {
             return None;
         }
-        let name = if self.matches_only(&target.id, &target.id) {
-            target.id.clone()
-        } else {
-            target.qualified()
-        };
+        if self.matches_only(&target.id, &target.id) {
+            return Some(target.id.clone());
+        }
+        let name = target.qualified();
         self.matches_only(&name, &target.id).then_some(name)
     }
 

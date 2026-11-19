@@ -6,6 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+pub(super) use crate::config::unline as trim_line;
 use crate::process::Cwd;
 use crate::{Ctx, Fail};
 
@@ -50,7 +51,7 @@ impl Git<'_> {
         ] {
             cmd.env_remove(var);
         }
-        cmd.env("DOTS_ROOT", self.root).env("LC_ALL", "C");
+        cmd.env("LC_ALL", "C");
         Ok(cmd)
     }
 
@@ -369,10 +370,7 @@ impl Git<'_> {
             .split(|byte| *byte == 0)
             .filter(|entry| !entry.is_empty())
         {
-            if let Some(path) = tree_directory(entry) {
-                if path != b"dots" {
-                    return Ok(None);
-                }
+            if tree_directory(entry) == Some(b"dots") {
                 template_directory = true;
             } else if let Some(template) = possible
                 .iter()
@@ -429,10 +427,6 @@ fn tree_directory(entry: &[u8]) -> Option<&[u8]> {
     let head = entry.strip_prefix(b"040000 tree ")?;
     let tab = head.iter().position(|byte| *byte == b'\t')?;
     Some(&head[tab + 1..])
-}
-
-pub(super) fn trim_line(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 
 fn optional_line(out: Output) -> Result<Option<String>, Fail> {

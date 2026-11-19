@@ -347,7 +347,7 @@ fn prepare_enrollment(
             ),
         ));
     }
-    tracked::secure(&native, &paths)?;
+    paths.secure(&native)?;
     if persist_selection {
         selection::persist(
             &ctx.root,

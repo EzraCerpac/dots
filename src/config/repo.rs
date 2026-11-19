@@ -194,7 +194,7 @@ pub fn checkout_shape(
     })
 }
 
-fn unline(bytes: &[u8]) -> &[u8] {
+pub(crate) fn unline(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 

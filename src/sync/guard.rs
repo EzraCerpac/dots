@@ -290,11 +290,7 @@ fn c_name(name: &OsStr) -> io::Result<CString> {
     if bytes.is_empty() || matches!(bytes, b"." | b"..") || bytes.contains(&b'/') {
         return Err(invalid("unsafe file name"));
     }
-    c_string(name)
-}
-
-fn c_string(name: &OsStr) -> io::Result<CString> {
-    CString::new(name.as_bytes()).map_err(io::Error::other)
+    CString::new(bytes).map_err(io::Error::other)
 }
 
 pub(super) fn private_dir(parent: &Path, prefix: &str) -> io::Result<tempfile::TempDir> {

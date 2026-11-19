@@ -574,11 +574,6 @@ fn parse_at(path: &Path, bytes: &[u8]) -> io::Result<DocumentMut> {
     })
 }
 
-fn parse(bytes: &[u8]) -> io::Result<DocumentMut> {
-    let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
-    text.parse().map_err(io::Error::other)
-}
-
 fn retire(
     root: &Path,
     docs: &BTreeMap<PathBuf, DocumentMut>,
@@ -656,7 +651,7 @@ fn retire(
             for range in combined.into_iter().rev() {
                 after.replace_range(range, "");
             }
-            parse(after.as_bytes())?;
+            after.parse::<DocumentMut>().map_err(io::Error::other)?;
             Ok(Retirement {
                 path: path.to_owned(),
                 before: Image::Regular {
@@ -872,7 +867,7 @@ source = "dotfiles/duplicate"
         fs::create_dir(fixture.path().join("dots"))?;
         fs::write(fixture.path().join("dots/retired-declarations"), rows)?;
         let file = PathBuf::from("config.local.toml");
-        let parsed = parse(config.as_bytes())?;
+        let parsed = config.parse::<DocumentMut>().map_err(io::Error::other)?;
         let docs = BTreeMap::from([(file.clone(), parsed)]);
         let machine = BTreeMap::from([(
             file,

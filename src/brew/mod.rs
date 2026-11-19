@@ -73,10 +73,10 @@ pub fn brew(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
                 Some("updated") => Change::Updated(text_arg(args, "BEFORE")?),
                 _ => unreachable!("selected by the Brew CLI"),
             };
-            if changes_path(ctx).is_some()
+            if let Some(path) = changes_path(ctx)
                 && let Some(brew) = Brew::find(ctx)?
             {
-                brew.record(Kind::from_args(args), token, change)?;
+                brew.record(path, Kind::from_args(args), token, change)?;
             }
             Ok(0)
         }
@@ -341,10 +341,7 @@ impl<'a> Brew<'a> {
         }
     }
 
-    fn record(&self, kind: Kind, token: &str, change: Change<'_>) -> Result<(), Fail> {
-        let Some(path) = changes_path(self.ctx) else {
-            return Ok(());
-        };
+    fn record(&self, path: &Path, kind: Kind, token: &str, change: Change<'_>) -> Result<(), Fail> {
         let Installation::Present(after) = self.inspect(kind, token)? else {
             return Ok(());
         };
@@ -521,7 +518,9 @@ fn update(
     } else {
         Change::Installed
     };
-    brew.record(kind, token, change)?;
+    if let Some(path) = changes_path(ctx) {
+        brew.record(path, kind, token, change)?;
+    }
     Ok(0)
 }
 

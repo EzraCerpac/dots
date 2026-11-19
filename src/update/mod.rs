@@ -104,7 +104,8 @@ fn update(run: &Run<'_>, mas: bool) {
     if local_only {
         step(run, "Apply dotfiles", |id| {
             let command = mise_command(run, &mise, ["bootstrap", "dotfiles", "apply", "--yes"]);
-            match child(run, id, command, Policy::Ordinary) {
+            // Native apply may run pre- and post-dotfiles hooks.
+            match child(run, id, command, Policy::Interactive) {
                 Ok(()) => Ok(Outcome::Completed),
                 Err(error) => {
                     run.issue(id, error);

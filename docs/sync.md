@@ -72,12 +72,9 @@ Sync works on one shape only: a plain Git checkout at the repository root, with 
 - It stops with one line on a detached `HEAD`, another branch, a `.jj` directory, or state from a pre-1.0 sync layout.
 - `dots bootstrap` moves a fresh clone that is still on `main`, with no edits, to `dev`.
   Anything else is converted once, by hand, so local edits and unpushed work are kept.
-- It skips with one line while a merge, rebase, cherry-pick, revert or bisect is in progress, or while another source operation on the same repository runs.
+- It skips with one line while a merge, rebase, cherry-pick, revert or bisect is in progress, or while another sync on the same repository runs.
   A lock left by a dead process on this host is reclaimed.
 - It skips with one line when Git is older than 2.43.
-
-The live checkout does not support JJ.
-When Git `HEAD` follows `dev` and another worktree moves `dev`, JJ re-parents its working copy onto the new commit without changing files and records the difference as a revert, which sync could not tell apart from a real local edit.
 
 ## One shared run
 
@@ -196,7 +193,7 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | Copy kept | A deployed copy differs from what sync expected, or another writer claimed it, so sync left it in place and may print where a displaced file is. Compare the copy with its source, put the version you want in the source, then sync again. |
 | Apply or reload failed | The configuration advanced but dotfiles were not applied, or a reload command failed. Fix the reported error and run the command sync prints. |
 | Retired declaration removed | Sync kept the original machine-local file at the printed recovery path before removing its matching retired tables. Nothing to do unless you had customized that table. |
-| Stopped or skipped | The checkout has the wrong shape or a foreign `origin`, a Git operation is in progress, another source operation is running, or Git is too old. Fix what the line names and sync again. |
+| Stopped or skipped | The checkout has the wrong shape or a foreign `origin`, a Git operation is in progress, another sync is running, or Git is too old. Fix what the line names and sync again. |
 
 ## Exit status
 

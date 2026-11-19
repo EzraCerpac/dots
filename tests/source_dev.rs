@@ -2177,6 +2177,8 @@ fn wrong_checkout(shape: &str, oracle_diagnostic: &str, diagnostic: &str) {
         }
         "main" => {
             f.git(&f.a, &["switch", "-q", "main"]);
+            f.write(&f.a, "unpublished-main", "do not move local main\n");
+            f.commit(&f.a, "Unpublished main change");
         }
         "jj" => fs::create_dir(f.a.join(".jj")).unwrap(),
         "legacy" => f.write(&f.a, ".git/dots-dev.json", "{}"),
@@ -2204,6 +2206,61 @@ sync_case!(active unchanged_detached_head_stops_cleanly, || {
 sync_case!(active unchanged_main_checkout_stops_cleanly, || {
     wrong_checkout("main", "main", "Git HEAD on a dev branch");
 });
+
+#[test]
+fn new_sync_selects_dev_from_a_clean_main_clone() {
+    let f = Repo::new();
+    let dev = f.publish("from-dev", "published on dev\n");
+    let clone = f.scratch.join("fresh");
+    f.git(
+        &f.scratch,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "main",
+            &format!("file://{}", f.origin.display()),
+            clone.to_str().unwrap(),
+        ],
+    );
+    f.seed_identity(&clone);
+    let main = f.dev_or_head(&clone);
+    assert_ne!(main, dev);
+    f.write(&clone, "untracked", "keep local work\n");
+    let refusal = f.sync(&clone);
+    has(&refusal, "Git HEAD on a dev branch");
+    assert_eq!(f.dev_or_head(&clone), main);
+    assert_eq!(read(&clone.join("untracked")), "keep local work\n");
+    assert_eq!(f.remote(), dev);
+    fs::remove_file(clone.join("untracked")).unwrap();
+
+    f.git(&clone, &["branch", "dev", "main"]);
+    has(&f.sync(&clone), "Git HEAD on a dev branch");
+    assert_eq!(f.dev_or_head(&clone), main);
+    assert_eq!(f.tip(&clone), main);
+    f.git(&clone, &["branch", "-d", "dev"]);
+    let receipt = f.sync(&clone);
+    has(&receipt, "dev up to date");
+    assert_eq!(f.git(&clone, &["branch", "--show-current"]), "dev");
+    assert_eq!(f.tip(&clone), dev);
+    assert_eq!(f.git(&clone, &["rev-parse", "main"]), main);
+    assert_eq!(read(&clone.join("from-dev")), "published on dev\n");
+    f.clean(&clone);
+}
+
+#[test]
+fn new_sync_creates_dev_when_origin_only_has_main() {
+    let f = Repo::new();
+    f.git(&f.origin, &["update-ref", "-d", "refs/heads/dev"]);
+    f.git(&f.a, &["switch", "main"]);
+    f.git(&f.a, &["branch", "-d", "dev"]);
+    f.git(&f.a, &["update-ref", "-d", "refs/remotes/origin/dev"]);
+    let receipt = f.sync(&f.a);
+    has(&receipt, "pushed dev");
+    assert_eq!(f.git(&f.a, &["branch", "--show-current"]), "dev");
+    assert_eq!(f.tip(&f.a), f.git(&f.origin, &["rev-parse", "main"]));
+    assert_eq!(f.remote(), f.tip(&f.a));
+}
 sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
     wrong_checkout("jj", ".jj", "JJ workspace");
 });
@@ -4309,6 +4366,45 @@ sync_case!(
     }
 );
 
+#[test]
+fn new_missing_configured_scanner_suggests_up_but_broken_scanner_does_not() {
+    let f = Repo::new();
+    let before = f.remote();
+    // Model mise's passive tool metadata, including the missing installation.
+    script(
+        &f.mise,
+        &format!(
+            "if [ \"$*\" = 'tool --json gitleaks' ]; then\n  printf '%s\\n' '{{\"config_source\":{{}}}}'\n  exit 0\nfi\n{MISE_FIXTURE}"
+        ),
+    );
+    f.write(
+        &f.a,
+        "config.toml",
+        format!("{}\n[tools]\ngitleaks = 'latest'\n", f.config),
+    );
+    f.write(&f.a, "text", "still local\n");
+    let scanner = f.tools.join("gitleaks");
+    fs::remove_file(&scanner).unwrap();
+    let mut sync = f.dots(&f.a, &["--plain", "sync"]);
+    sync.env("PATH", f.scanner_fixture_path());
+    for with_shim in [false, true] {
+        if with_shim {
+            symlink(&f.mise, &scanner).unwrap();
+        }
+        let receipt = dots_zero(&mut sync);
+        has(&receipt, "gitleaks not found");
+        has(&receipt, "Run dots up");
+        assert_eq!(f.remote(), before);
+        assert_eq!(f.tip(&f.a), before);
+    }
+    fs::remove_file(&scanner).unwrap();
+    script(&scanner, "exit 127");
+    let broken = dots_zero(&mut sync);
+    has(&broken, "the gitleaks scan failed");
+    absent(&broken, "dots up");
+    assert_eq!(f.remote(), before);
+}
+
 sync_case!(
     active unchanged_partial_checkout_filter_failure_retries_without_republishing,
     || {
@@ -4652,4 +4748,55 @@ fn new_file_adoption_below_home_shares_and_preserves_source_guard() {
         approved.trim()
     );
     assert_eq!(fs::read_link(&target).unwrap(), source);
+}
+
+#[test]
+fn new_flagged_adopted_file_stays_local_with_its_declaration() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let held = f.world.home().join("withheld.txt");
+    let allowed = f.world.home().join("allowed.txt");
+    put(&held, "FIXTURE_SCAN_MATCH\n");
+    put(&allowed, "allowed content\n");
+    dots_zero(f.dots(&f.a, &["add"]).arg(&held).arg(&allowed));
+    let declaring = ["config.laptop.toml", "config.toml"]
+        .into_iter()
+        .find(|name| {
+            fs::read_to_string(f.a.join(name))
+                .is_ok_and(|text| text.contains("dotfiles/withheld.txt"))
+        })
+        .expect("dots add wrote a declaration for the flagged file");
+    let config = f.a.join(declaring);
+    let local = format!("{}\n# unrelated config edit\n", read(&config));
+    put(&config, &local);
+    f.write(&f.a, "text", "unrelated edit\n");
+
+    let receipt = f.sync(&f.a);
+    has(&receipt, "pushed dev");
+    has(&receipt, "gitleaks flagged");
+    has(&receipt, "dotfiles/withheld.txt:1");
+    absent(&receipt, "FIXTURE_SCAN_MATCH");
+    let replay = f.replay(&f.a);
+    has(&replay, "dotfiles/withheld.txt:1");
+    absent(&replay, "FIXTURE_SCAN_MATCH");
+    let shared = f.blob("dev", declaring);
+    has(&shared, "dotfiles/allowed.txt");
+    has(&shared, "# unrelated config edit");
+    absent(&shared, "withheld.txt");
+    absent(&f.tree(), "withheld.txt");
+    assert_eq!(f.blob("dev", "dotfiles/allowed.txt"), "allowed content");
+    assert_eq!(f.blob("dev", "text"), "unrelated edit");
+    assert_eq!(read(&config), local);
+    assert_eq!(
+        fs::read_link(&held).unwrap(),
+        f.a.join("dotfiles/withheld.txt")
+    );
+    assert_eq!(read(&held), "FIXTURE_SCAN_MATCH\n");
+
+    put(&f.a.join("dotfiles/withheld.txt"), "safe replacement\n");
+    has(&f.sync(&f.a), "pushed dev");
+    has(&f.blob("dev", declaring), "dotfiles/withheld.txt");
+    assert_eq!(f.blob("dev", "dotfiles/withheld.txt"), "safe replacement");
+    f.clean(&f.a);
 }

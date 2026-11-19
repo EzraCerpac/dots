@@ -61,7 +61,7 @@ pub(super) fn screen(
 fn diagnostics_pipe(command: &mut Command) -> io::Result<UnixStream> {
     let (reader, writer) = UnixStream::pair()?;
     let stderr = duplicate(&writer)?;
-    let stdout = duplicate(&File::open("/dev/null")?)?;
+    let stdout = scanner_stdout()?;
     // Override the probe's capture pipes after the supervisor sets them up.
     // The probe still owns child lifecycle and cancellation.
     unsafe {
@@ -75,6 +75,10 @@ fn diagnostics_pipe(command: &mut Command) -> io::Result<UnixStream> {
         });
     }
     Ok(reader)
+}
+
+fn scanner_stdout() -> io::Result<OwnedFd> {
+    duplicate(&File::options().write(true).open("/dev/null")?)
 }
 
 fn duplicate(file: &impl AsRawFd) -> io::Result<OwnedFd> {
@@ -191,6 +195,14 @@ fn coverage_skip(level: &str, message: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_publish_cr120_scanner_stdout_accepts_writes() {
+        use std::io::Write as _;
+
+        let mut stdout = File::from(scanner_stdout().unwrap());
+        stdout.write_all(b"fixture scanner status").unwrap();
+    }
 
     fn check_stderr(code: Option<i32>, stderr: &[u8]) -> Result<(), Fail> {
         check(code, read_diagnostics(stderr).unwrap(), OUTGOING)

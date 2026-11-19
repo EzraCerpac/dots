@@ -230,7 +230,19 @@ fn publish_source(
     let origin = workspace.validate_origin()?;
     if let Some(state) = &merged_state {
         workspace.require_stack_unchanged(state, &base, &revision)?;
-    } else if let Some(stack) = &stack {
+    }
+    if let Some(request) = &existing
+        && !find_request(&workspace, &name)?
+            .is_some_and(|current| current.number == request.number && current.is_open())
+    {
+        return Err(failure(format!(
+            "pull request #{} is no longer open for this bookmark; reopen it or choose another bookmark",
+            request.number
+        )));
+    }
+    if merged_state.is_none()
+        && let Some(stack) = &stack
+    {
         workspace.apply_stack(stack, &base, None)?;
     }
     if !matches!(selection, Selection::Bookmark(_)) {
@@ -249,10 +261,15 @@ fn publish_source(
         if run.cancelled() {
             error
         } else {
-            failure(format!(
-                "{}; pushed {name}; rerun the same dots publish command to retry the pull request",
-                error.diagnostic
-            ))
+            let recovery = match &existing {
+                Some(request) => {
+                    format!("retry editing pull request #{} on GitHub", request.number)
+                }
+                None => {
+                    "use the pushed branch to open a pull request against main on GitHub".to_owned()
+                }
+            };
+            failure(format!("{}; pushed {name}; {recovery}", error.diagnostic))
         }
     })?;
     terminal.message(&format!("Published {name}: {url}\n"))?;
@@ -308,8 +325,7 @@ fn prepare_preview(
         (title_for(&description), format!("{note}{description}"))
     };
 
-    // Build the terminal text once. The scanner and terminal both consume
-    // this buffer, including the original bytes of the diffs.
+    // The scanner and terminal both consume this rendered preview.
     let mut bytes = Vec::new();
     if terminal.input.is_some() {
         writeln!(
@@ -334,7 +350,24 @@ fn prepare_preview(
         "Proposed pull request title: {title}\nProposed pull request description:\n{body}"
     )
     .map_err(output_error)?;
-    Ok(Some(PublicationPreview { bytes, title, body }))
+    Ok(Some(PublicationPreview {
+        bytes: escape_preview(bytes),
+        title,
+        body,
+    }))
+}
+
+fn escape_preview(bytes: Vec<u8>) -> Vec<u8> {
+    let text = String::from_utf8_lossy(&bytes);
+    let mut visible = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            visible.extend(character.escape_default());
+        } else {
+            visible.push(character);
+        }
+    }
+    visible.into_bytes()
 }
 
 fn outgoing_commits(
@@ -384,32 +417,44 @@ fn stack_pull_request(
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct PullRequest {
     number: u64,
     state: String,
+    #[serde(rename = "html_url")]
     url: String,
-    is_cross_repository: bool,
+    head: PullRequestHead,
+}
+
+#[derive(Deserialize)]
+struct PullRequestHead {
+    #[serde(rename = "ref")]
+    branch: String,
+    repo: Option<PullRequestRepository>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestRepository {
+    full_name: String,
+}
+
+impl PullRequest {
+    fn is_open(&self) -> bool {
+        self.state.eq_ignore_ascii_case("open")
+    }
 }
 
 fn find_request(workspace: &Workspace<'_, '_>, name: &str) -> Result<Option<PullRequest>, Fail> {
-    let result = workspace.gh(
-        "list",
-        &[
-            "--head",
-            name,
-            "--state",
-            "all",
-            "--json",
-            "number,url,state,isCrossRepository",
-        ],
-        "look up the pull request",
-    )?;
-    let requests: Vec<PullRequest> = serde_json::from_slice(&result.stdout)
+    let result = workspace.gh_pull_requests(name)?;
+    let pages: Vec<Vec<PullRequest>> = serde_json::from_slice(&result.stdout)
         .map_err(|_| failure("gh returned an invalid pull request lookup"))?;
-    let mut own = requests
-        .into_iter()
-        .filter(|request| !request.is_cross_repository);
+    let mut own = pages.into_iter().flatten().filter(|request| {
+        request.head.branch == name
+            && request
+                .head
+                .repo
+                .as_ref()
+                .is_some_and(|repo| repo.full_name.eq_ignore_ascii_case(&workspace.slug))
+    });
     let first = own.next();
     if own.next().is_some() {
         return Err(failure(
@@ -427,7 +472,7 @@ fn find_request(workspace: &Workspace<'_, '_>, name: &str) -> Result<Option<Pull
 fn open_request(workspace: &Workspace<'_, '_>, name: &str) -> Result<Option<PullRequest>, Fail> {
     let request = find_request(workspace, name)?;
     if let Some(pr) = &request
-        && pr.state != "OPEN"
+        && !pr.is_open()
     {
         return Err(failure(
             "the bookmark's pull request is closed; choose another bookmark",
@@ -443,7 +488,7 @@ fn aggregate_request(
     let mut prior = None;
     for name in workspace.aggregate_bookmarks(head)? {
         if let Some(request) = find_request(workspace, &name)?
-            && request.state == "OPEN"
+            && request.is_open()
             && prior.replace((name, Some(request))).is_some()
         {
             return Err(failure(
@@ -685,6 +730,16 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::path::PathBuf;
+
+    #[test]
+    fn new_publish_cr120_preview_renders_control_characters_as_text() {
+        let input = "first\tline\nnext\r\u{000b}\u{007f}\u{0085} café";
+        assert_eq!(
+            escape_preview(input.as_bytes().to_vec()),
+            b"first\tline\nnext\\r\\u{b}\\u{7f}\\u{85} caf\xc3\xa9"
+        );
+        assert_eq!(escape_preview(b"a\xffb".to_vec()), "a\u{fffd}b".as_bytes());
+    }
 
     fn open_pty() -> (File, File, PathBuf) {
         let (mut master, mut slave) = (-1, -1);

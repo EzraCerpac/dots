@@ -326,14 +326,21 @@ esac
             "gh",
             r#"printf '%s\n' "$*" >> "$PUBLISH_LOG/gh"
 case "${1-} ${2-}" in
-    'pr list')
-        case " $* " in
-            *' --head wip/dotfiles-all-dirty '*)
-                if [ -f "$PUBLISH_LOG/existing-pr.json" ]; then
-                    "$PUBLISH_READ_FILE" "$PUBLISH_LOG/existing-pr.json"; exit 0
+    'pr list') printf '%s\n' '[]' ;;
+    'api --hostname')
+        [ "$#" -eq 12 ] && [ "$3" = github.com ] && [ "$4" = --method ] && [ "$5" = GET ]
+        [ "$6" = --paginate ] && [ "$7" = --slurp ]
+        [ "$8" = --raw-field ] && [ "$9" = state=all ] && [ "${10}" = --raw-field ]
+        [ "${12}" = repos/example/p07-fixture/pulls ]
+        case "${11}" in
+            head=example:wip/cr120-lookup|head=example:wip/dotfiles-all-dirty)
+                if [ -f "$PUBLISH_LOG/existing-pr-pages.json" ]; then
+                    "$PUBLISH_READ_FILE" "$PUBLISH_LOG/existing-pr-pages.json"; exit 0
                 fi ;;
+            head=example:wip/*) ;;
+            *) exit 89 ;;
         esac
-        printf '%s\n' '[]' ;;
+        printf '%s\n' '[[]]' ;;
     'pr create'|'pr edit')
         shift 2
         while [ "$#" -gt 0 ]; do
@@ -364,6 +371,7 @@ esac
             r#"if [ "${1-}" = version ] || [ "${1-}" = --version ]; then
     exec "$PUBLISH_GITLEAKS" "$@"
 fi
+: > "$PUBLISH_LOG/scan-started"
 cwd=$(pwd -P)
 if [ "$1" = stdin ]; then
     case "$cwd" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
@@ -403,21 +411,23 @@ case "$1" in
         if [ -d "$source" ]; then
             source=$(cd "$source" && pwd -P)
             case "$source" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
-            for path in "$source"/public-*.txt "$source"/synthetic-token.txt "$source"/payload.zip "$source"/opaque.bin "$source"/binary.dat "$source"/*.pdf "$source"/collision.txt; do
-                if [ -f "$path" ] && [ ! -L "$path" ]; then
-                    name=${path##*/}
-                    printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-input"
-                    if [ -n "${PUBLISH_SCAN_HEAD:-}" ]; then
-                        "$PUBLISH_GIT" -C "$PUBLISH_WORKSPACE" cat-file blob "$PUBLISH_SCAN_HEAD:$name" > "$PUBLISH_LOG/approved-bytes"
-                        if python3 -I -S -c '
+            paths=$(cd "$source" && /usr/bin/find . -type f -print)
+            printf '%s\n' "$paths" | while IFS= read -r path; do
+                [ -n "$path" ] || continue
+                name=${path#./}
+                path="$source/$name"
+                [ -f "$path" ] && [ ! -L "$path" ]
+                printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-input"
+                if [ -n "${PUBLISH_SCAN_HEAD:-}" ]; then
+                    "$PUBLISH_GIT" -C "$PUBLISH_WORKSPACE" cat-file blob "$PUBLISH_SCAN_HEAD:$name" > "$PUBLISH_LOG/approved-bytes"
+                    if python3 -I -S -c '
 import sys
 from pathlib import Path
 
 scanned, approved = map(Path, sys.argv[1:])
 sys.exit(scanned.read_bytes() != approved.read_bytes())
 ' "$path" "$PUBLISH_LOG/approved-bytes"; then
-                            printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-approved-bytes"
-                        fi
+                        printf '%s\n' "$name" >> "$PUBLISH_LOG/scan-approved-bytes"
                     fi
                 fi
             done
@@ -824,6 +834,101 @@ fn assert_preview_refused(fixture: &Publication, command: FixtureCommand<'_>) {
     assert!(!transcript.contains(PREVIEW_MARKER), "{transcript}");
     assert_no_preview(&transcript);
     fixture.assert_no_publication();
+}
+
+const LOOKUP_BOOKMARK: &str = "wip/cr120-lookup";
+
+fn lookup_fixture() -> Publication {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    fixture.jj(&["bookmark", "create", LOOKUP_BOOKMARK, "-r", "@"]);
+    fixture
+}
+
+fn fake_pull_request(number: u64, repository: &str, state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "number": number,
+        "state": state,
+        "html_url": format!("https://github.com/{REPOSITORY}/pull/{number}"),
+        "head": { "ref": LOOKUP_BOOKMARK, "repo": { "full_name": repository } },
+    })
+}
+
+fn write_fake_pr_lookup(fixture: &Publication, pages: &[Vec<serde_json::Value>]) {
+    fs::write(
+        fixture.log.join("existing-pr-pages.json"),
+        serde_json::to_vec(pages).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn new_publish_cr120_finds_same_repository_pr_beyond_first_page() {
+    let fixture = lookup_fixture();
+    let forks = (100..130)
+        .map(|number| fake_pull_request(number, "elsewhere/p07-fixture", "open"))
+        .collect();
+    write_fake_pr_lookup(
+        &fixture,
+        &[forks, vec![fake_pull_request(17, REPOSITORY, "open")]],
+    );
+
+    let mut terminal = Pty::spawn(fixture.dots(&["publish", "--bookmark", LOOKUP_BOOKMARK]));
+    terminal.expect("[y/N]");
+    terminal.send("y\n");
+    let (status, transcript) = terminal.finish();
+    assert!(status.success(), "{status}\n{transcript}");
+    let calls = fixture.read_log("gh");
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.starts_with("pr edit ") && line.contains(" 17 ")),
+        "{calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line.starts_with("pr create ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn new_publish_cr120_refuses_if_selected_pr_closes_during_approval() {
+    let fixture = lookup_fixture();
+    let bookmarks = fixture.local_bookmarks();
+    write_fake_pr_lookup(&fixture, &[vec![fake_pull_request(17, REPOSITORY, "open")]]);
+
+    let mut terminal = Pty::spawn(fixture.dots(&["publish", "--bookmark", LOOKUP_BOOKMARK]));
+    terminal.expect("[y/N]");
+    write_fake_pr_lookup(
+        &fixture,
+        &[vec![fake_pull_request(17, REPOSITORY, "closed")]],
+    );
+    terminal.send("y\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(1), "{transcript}");
+    assert!(
+        transcript.contains("pull request #17") && transcript.contains("no longer open"),
+        "{transcript}"
+    );
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    fixture.assert_no_publication();
+}
+
+#[test]
+fn new_publish_cr120_records_nested_paths_in_the_scanned_stage() {
+    let fixture = Publication::new(None, false);
+    fs::create_dir(fixture.workspace.join("nested")).unwrap();
+    fs::write(
+        fixture.workspace.join("nested/plain-note.txt"),
+        "plain fixture\n",
+    )
+    .unwrap();
+    fixture.change(0);
+    fixture.approve(
+        fixture.dots(&["publish"]),
+        "@",
+        &["nested/plain-note.txt", "public-0.txt"],
+    );
 }
 
 #[test]
@@ -1356,7 +1461,7 @@ fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
             !diagnostic.contains("Proposed pull request"),
             "{diagnostic}"
         );
-        assert!(!fixture.log.join("scan-complete").exists(), "{diagnostic}");
+        assert!(!fixture.log.join("scan-started").exists(), "{diagnostic}");
         assert_eq!(fixture.working_oid(), working);
         assert_eq!(fixture.local_bookmarks(), bookmarks);
         assert_eq!(
@@ -1968,8 +2073,8 @@ fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
             &branch,
         ])
     };
-    fs::write(fixture.log.join("existing-pr.json"), format!(
-        r#"[{{"number":17,"state":"OPEN","url":"{PR_URL}","isCrossRepository":false,"baseRefName":"release"}}]"#,
+    fs::write(fixture.log.join("existing-pr-pages.json"), format!(
+        r#"[[{{"number":17,"state":"open","html_url":"{PR_URL}","head":{{"ref":"{bookmark}","repo":{{"full_name":"{REPOSITORY}"}}}},"base":{{"ref":"release"}}}}]]"#,
     )).unwrap();
     let reviewed = fixture.change_main("late-main.txt", b"reviewed main\n");
     fs::write(fixture.workspace.join("public-0.txt"), "dirty fixture\n").unwrap();
@@ -1982,9 +2087,15 @@ fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
     assert_eq!(fixture.local_bookmarks(), local);
     assert_eq!(remote().trim(), original);
 
+    for name in ["scan-complete", "scan-status", "scan-stderr"] {
+        fs::remove_file(fixture.log.join(name)).unwrap();
+    }
     let mut second = Pty::spawn(fixture.scan_all());
     second.expect("Merge main@origin");
     second.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    assert!(fixture.log.join("scan-stderr").is_file());
     second.send("y\n");
     second.expect("[y/N]");
     let merged = fixture.working_oid();
@@ -2079,6 +2190,13 @@ fn new_divergent_operation_heads_never_reconcile_during_verification() {
         assert_eq!(heads(), before);
         assert_eq!(refs(), original_refs);
         assert!(fixture.optional_log("git-transport").is_empty());
+        assert!(
+            !fixture
+                .optional_log("jj")
+                .lines()
+                .any(|line| line.contains("git fetch")),
+            "attempted a JJ fetch with divergent operation heads"
+        );
         assert!(!fixture.log.join("scan-complete").exists());
     }
 }

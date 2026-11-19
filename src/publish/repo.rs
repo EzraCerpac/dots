@@ -778,6 +778,29 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(())
     }
 
+    pub(super) fn gh_pull_requests(&self, branch: &str) -> Result<Output, Fail> {
+        let (owner, _) = self
+            .slug
+            .split_once('/')
+            .expect("validated GitHub repository");
+        let mut cmd = self.ctx.command("gh", Cwd::Dir(&self.root))?;
+        cmd.args([
+            "api",
+            "--hostname",
+            "github.com",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            "--raw-field",
+            "state=all",
+            "--raw-field",
+            &format!("head={owner}:{branch}"),
+            &format!("repos/{}/pulls", self.slug),
+        ]);
+        self.checked(cmd, "gh", "look up the pull request")
+    }
+
     pub(super) fn gh(&self, operation: &str, args: &[&str], action: &str) -> Result<Output, Fail> {
         let mut cmd = self.ctx.command("gh", Cwd::Dir(&self.root))?;
         cmd.args([

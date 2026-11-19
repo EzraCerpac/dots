@@ -165,7 +165,7 @@ Before writing anything, `init` looks at the repository around `DIR`:
 
 The steps then run in this order:
 
-1. **Files.** If there is no `config.toml`, `init` writes one containing `[vars] dots_profiles = "default"` and commented hints for the optional settings.
+1. **Files.** If there is no `config.toml`, `init` writes one containing `gitleaks = "latest"` and `age = "latest"` in `[tools]`, `[vars] dots_profiles = "default"` and commented hints for the optional settings.
    If `config.toml` exists without `dots_profiles`, `init` adds `dots_profiles = "default"` and leaves every other byte alone.
    It creates `dots/` with `hooks/update.d/`, `hooks/bootstrap.d/`, `commands/` and `exceptions/`, and writes `dots/README.md`, `dots/exceptions.tsv`, `dots/retired-dotfiles`, `dots/retired-declarations`, `.gitleaks.toml` and `.gitignore`, each one only if it is absent.
 2. **Profile.** A valid persisted profile stays.

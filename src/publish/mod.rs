@@ -1,5 +1,6 @@
 mod repo;
 mod scan;
+mod scanner;
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -17,6 +18,7 @@ use repo::{Workspace, jj_commit};
 
 const MERGE_DESCRIPTION: &str = "Merge main into unpublished setup stack";
 const AGGREGATE_PREFIX: &str = "wip/dotfiles-all-";
+const CLEAN_SCAN: &str = "Secret scan: gitleaks found nothing in the commits to publish.\n";
 
 enum Selection<'a> {
     Working,
@@ -74,7 +76,11 @@ fn publish_source(
     let _locks = workspace.lock()?;
     workspace.validate_origin()?;
     let base = workspace.fetch_main()?;
-    let base_symbol = workspace.revisions("main@origin")?;
+    let stack = (matches!(selection, Selection::All) && workspace.stack_needs_merge(&base)?)
+        .then(|| workspace.stack_snapshot())
+        .transpose()?;
+    let selected = stack.as_ref().map_or(&workspace, |stack| &stack.view);
+    let base_symbol = selected.revisions("main@origin")?;
     if base_symbol.as_slice() != [base.as_str()] {
         return Err(failure(
             "JJ could not resolve the newly fetched main@origin",
@@ -88,14 +94,18 @@ fn publish_source(
             "--bookmark requires an existing private wip/... bookmark",
         ));
     }
-    let mut working = workspace.one_revision("@")?;
+    let working = if let Some(stack) = &stack {
+        stack.working.clone()
+    } else {
+        workspace.one_revision("@")?
+    };
     let mut revision = match selection {
         Selection::Working => working.clone(),
-        Selection::All => workspace.stack_head(&working)?,
+        Selection::All => selected.stack_head(&working)?,
         Selection::Bookmark(name) => workspace.local_bookmark(name)?,
     };
-    workspace.refuse_shared_dev(&base, &revision)?;
-    let mut outgoing = outgoing_commits(&workspace, &base, &revision)?;
+    selected.refuse_shared_dev(&base, &revision)?;
+    let mut outgoing = outgoing_commits(selected, &base, &revision)?;
     if matches!(selection, Selection::Working)
         && (outgoing.len() != 1
             || workspace
@@ -111,8 +121,8 @@ fn publish_source(
         return Err(failure("there are no unpublished changes to publish"));
     }
 
-    if matches!(selection, Selection::All)
-        && !workspace
+    let merge = if matches!(selection, Selection::All)
+        && !selected
             .revisions(&format!(
                 "{} ~ ::{}",
                 jj_commit(&base),
@@ -120,25 +130,46 @@ fn publish_source(
             ))?
             .is_empty()
     {
-        terminal.confirm("Merge main@origin into the current unpublished stack?")?;
-        workspace.require_unchanged(&base, "@", &working)?;
-        workspace.jj(
-            &[
-                "new",
-                "-m",
-                MERGE_DESCRIPTION,
-                &jj_commit(&revision),
-                &jj_commit(&base),
-            ],
-            "merge main into the stack",
-        )?;
-        working = workspace.one_revision("@")?;
-        revision = working.clone();
-        outgoing = outgoing_commits(&workspace, &base, &revision)?;
-    }
+        if stack.is_none() {
+            return Err(repo::stale());
+        }
+        let merge = selected.prepare_merge(&revision, &base)?;
+        revision.clone_from(&merge.commit);
+        outgoing =
+            merge
+                .view
+                .revisions(&format!("{}..{}", jj_commit(&base), jj_commit(&revision)))?;
+        Some(merge)
+    } else {
+        None
+    };
+    let plan = merge.as_ref().map_or(selected, |merge| &merge.view);
+    let conflicts = merge.is_some()
+        && !plan
+            .revisions(&format!("{} & conflicts()", jj_commit(&revision)))?
+            .is_empty();
+    scan::outgoing(plan, &base, &revision, conflicts)?;
 
-    scan::outgoing(&workspace, &base, &revision)?;
-    let diff = workspace.jj(
+    let merged_state = if let (Some(stack), Some(merge)) = (&stack, &merge) {
+        terminal.message(CLEAN_SCAN)?;
+        terminal.confirm("Merge main@origin into the current unpublished stack?")?;
+        workspace.validate_origin()?;
+        if workspace.fetch_main()? != base {
+            return Err(repo::stale());
+        }
+        workspace.apply_stack(stack, &base, Some(merge))?;
+        if conflicts {
+            return Err(Fail::new(
+                3,
+                "the changes to publish have conflicts; resolve them and rerun dots publish",
+            ));
+        }
+        Some(workspace.stack_state()?)
+    } else {
+        None
+    };
+
+    let diff = plan.jj(
         &[
             "diff",
             "--git",
@@ -154,12 +185,14 @@ fn publish_source(
             "there are no file changes to publish against main@origin",
         ));
     }
-    terminal.message("Secret scan: gitleaks found nothing in the commits to publish.\n")?;
+    if merged_state.is_none() {
+        terminal.message(CLEAN_SCAN)?;
+    }
     if terminal.input.is_some() {
         terminal.message("Proposed changes, commit by commit (from main@origin):\n")?;
         for commit in &outgoing {
-            let description = workspace.description(commit)?;
-            let patch = workspace.jj(
+            let description = plan.description(commit)?;
+            let patch = plan.jj(
                 &["diff", "--git", "-r", &jj_commit(commit)],
                 "preview an outgoing commit",
             )?;
@@ -183,7 +216,7 @@ fn publish_source(
             .and_then(|model| model.to_str()),
     );
     let (title, body) = if matches!(selection, Selection::All) {
-        stack_pull_request(&workspace, &outgoing, &note)?
+        stack_pull_request(plan, &outgoing, &note)?
     } else {
         let description = workspace.description(&revision)?;
         let description = if description.is_empty() && matches!(selection, Selection::Working) {
@@ -199,7 +232,7 @@ fn publish_source(
 
     let (name, existing) = match selection {
         Selection::Bookmark(name) => (name.to_owned(), open_request(&workspace, name)?),
-        Selection::All => aggregate_request(&workspace, &revision)?,
+        Selection::All => aggregate_request(plan, &revision)?,
         Selection::Working => {
             let name = format!("wip/dotfiles-{}", workspace.change_id(&revision)?);
             let request = open_request(&workspace, &name)?;
@@ -212,7 +245,9 @@ fn publish_source(
     terminal.confirm(&format!("Publish {name} to {}?", workspace.slug))?;
 
     match selection {
-        Selection::Working | Selection::All => workspace.require_unchanged(&base, "@", &working)?,
+        Selection::Working => workspace.require_unchanged(&base, "@", &working)?,
+        Selection::All if stack.is_none() => workspace.require_unchanged(&base, "@", &working)?,
+        Selection::All => (),
         Selection::Bookmark(name) => {
             workspace.require_unchanged(&base, &Workspace::bookmark_expression(name), &revision)?;
         }
@@ -222,8 +257,13 @@ fn publish_source(
     if workspace.fetch_main()? != base {
         return Err(repo::stale());
     }
-    workspace.refuse_shared_dev(&base, &revision)?;
+    plan.refuse_shared_dev(&base, &revision)?;
     let origin = workspace.validate_origin()?;
+    if let Some(state) = &merged_state {
+        workspace.require_stack_unchanged(state, &base, &revision)?;
+    } else if let Some(stack) = &stack {
+        workspace.apply_stack(stack, &base, None)?;
+    }
     if !matches!(selection, Selection::Bookmark(_)) {
         workspace.save_bookmark(&name, &revision)?;
     }

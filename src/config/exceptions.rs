@@ -81,11 +81,30 @@ impl Exceptions {
     }
 
     pub fn held_by(&self, identity: &str) -> Option<&str> {
+        self.held_by_matching(identity, |_| true)
+    }
+
+    pub(crate) fn held_by_for(&self, identity: &str, profile: &str) -> Option<&str> {
+        self.held_by_matching(identity, |row| {
+            row.profile == "base" || row.profile == profile
+        })
+    }
+
+    fn held_by_matching(
+        &self,
+        identity: &str,
+        eligible: impl Fn(&Exception) -> bool,
+    ) -> Option<&str> {
         let (manager, tail) = identity.split_once(':')?;
         let name = tail.rsplit('/').next()?;
         for key in [name, name.split('@').next()?] {
             let key = format!("{manager}:{key}");
-            if let Some(row) = self.0.iter().rev().find(|row| row.holds.contains(&key)) {
+            if let Some(row) = self
+                .0
+                .iter()
+                .rev()
+                .find(|row| eligible(row) && row.holds.contains(&key))
+            {
                 return Some(&row.name);
             }
         }

@@ -11,9 +11,14 @@ use toml_edit::{DocumentMut, value};
 use crate::Fail;
 
 use super::failure;
-use super::repo::{Workspace, git_commit, object_id, stdout};
+use super::repo::{Workspace, git_commit, jj_commit, object_id, stdout};
 
-pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) -> Result<(), Fail> {
+pub(super) fn outgoing(
+    workspace: &Workspace<'_, '_>,
+    base: &str,
+    head: &str,
+    conflicts: bool,
+) -> Result<(), Fail> {
     let staging = tempfile::Builder::new()
         .permissions(Permissions::from_mode(0o700))
         .tempdir()
@@ -21,7 +26,7 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
     let scratch = fs::canonicalize(staging.path()).map_err(|_| stage_error())?;
     let rules = scratch.join("rules");
     private_dirs(&rules)?;
-    copy_rules(workspace, head, &rules)?;
+    copy_rules(workspace, head, &rules, conflicts)?;
     // Each scanner cwd sits inside the policy sandbox. Its relative paths
     // are for data; approved policy files sit outside the scanned subtree.
     let inputs = rules.join("inputs");
@@ -35,71 +40,19 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
         "list the outgoing commits for screening",
     )?;
     let mut screened = false;
-    for revision in stdout(&history)?.lines() {
-        let mut ids = revision.split_ascii_whitespace();
+    for line in stdout(&history)?.lines() {
+        let mut ids = line.split_ascii_whitespace();
         let commit = object_id(ids.next().ok_or_else(stage_error)?)?;
-        let revision = git_commit(commit);
-        let parent = ids.next().map(object_id).transpose()?.map(git_commit);
-        let mut args = vec![
-            "diff-tree",
-            "--root",
-            "--raw",
-            "--no-abbrev",
-            "--no-commit-id",
-            "--no-renames",
-            "--diff-filter=AMT",
-            "-r",
-            "-z",
-        ];
-        // Against the first parent, a merge includes any blob added by its
-        // resolution. The other outgoing commits are screened independently.
-        if let Some(parent) = &parent {
-            args.push(parent);
-        }
-        args.push(&revision);
-        let changed = workspace.git(&args, "enumerate the outgoing changed blobs")?;
-        if changed.stdout.is_empty() {
-            continue;
-        }
-
-        let root = inputs.join(commit);
-        private_dirs(&root)?;
-        let records = changed.stdout.strip_suffix(b"\0").ok_or_else(stage_error)?;
-        let mut fields = records.split(|byte| *byte == 0);
-        let mut historical_ignores = Vec::new();
-        while let Some(metadata) = fields.next() {
-            let pathname = fields.next().ok_or_else(stage_error)?;
-            let metadata = std::str::from_utf8(metadata).map_err(|_| stage_error())?;
-            let fields: Vec<_> = metadata.split_ascii_whitespace().collect();
-            let [_, mode, _, id, _] = fields.as_slice() else {
-                return Err(stage_error());
-            };
-            // Gitlinks name commits in another repository. Symbolic links
-            // are blobs, so screen their target text without following them.
-            if *mode == "160000" {
-                continue;
+        let parents = ids.map(object_id).collect::<Result<Vec<_>, _>>()?;
+        if conflicts && commit == head {
+            for (index, tree) in conflict_sides(workspace, commit)?.iter().enumerate() {
+                let root = inputs.join(format!("{commit}-{index}"));
+                screened |= screen_tree(workspace, &root, &rules, tree, &parents)?;
             }
-            if !matches!(*mode, "100644" | "100755" | "120000") {
-                return Err(stage_error());
-            }
-            let id = object_id(id)?;
-            if pathname.eq_ignore_ascii_case(b".gitleaksignore") {
-                historical_ignores.push((pathname, id));
-            } else {
-                write_blob(workspace, &root, pathname, id)?;
-            }
+        } else {
+            let root = inputs.join(commit);
+            screened |= screen_tree(workspace, &root, &rules, &git_commit(commit), &parents)?;
         }
-        workspace.gitleaks(&root, OsStr::new("."), &rules)?;
-        // Gitleaks also loads <source>/.gitleaksignore implicitly. Keep the
-        // historical file outside the directory scan, then scan it as data.
-        for (name, id) in historical_ignores {
-            write_blob(workspace, &root, name, id)?;
-            let path = OsStr::from_bytes(name);
-            workspace.gitleaks(&root, path, &rules)?;
-            fs::remove_file(root.join(path)).map_err(|_| stage_error())?;
-        }
-        screened = true;
-        fs::remove_dir_all(&root).map_err(|_| stage_error())?;
     }
     if !screened {
         let empty = inputs.join("empty");
@@ -109,8 +62,144 @@ pub(super) fn outgoing(workspace: &Workspace<'_, '_>, base: &str, head: &str) ->
     Ok(())
 }
 
-fn copy_rules(workspace: &Workspace<'_, '_>, head: &str, rules: &Path) -> Result<(), Fail> {
-    if let Some(ignore) = pinned_policy_blob(workspace, head, ".gitleaksignore")? {
+fn screen_tree(
+    workspace: &Workspace<'_, '_>,
+    root: &Path,
+    rules: &Path,
+    tree: &str,
+    parents: &[&str],
+) -> Result<bool, Fail> {
+    let changed = diff_blobs(workspace, tree, parents.first().copied())?;
+    let mut blobs = blob_changes(&changed)?;
+    for parent in parents.iter().skip(1) {
+        if blobs.is_empty() {
+            break;
+        }
+        // An identical path/blob reaches this tree through that parent.
+        // Following those parents leads to published main or to the outgoing
+        // commit that introduced the pair, which we screen separately.
+        let changed = diff_blobs(workspace, tree, Some(parent))?;
+        let paths: HashSet<_> = blob_changes(&changed)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        blobs.retain(|(path, _)| paths.contains(path));
+    }
+    if blobs.is_empty() {
+        return Ok(false);
+    }
+    private_dirs(root)?;
+    let mut historical_ignores = Vec::new();
+    for (path, id) in blobs {
+        if path.eq_ignore_ascii_case(b".gitleaksignore") {
+            historical_ignores.push((path, id));
+        } else {
+            write_blob(workspace, root, path, id)?;
+        }
+    }
+    workspace.gitleaks(root, OsStr::new("."), rules)?;
+    // Gitleaks also loads <source>/.gitleaksignore implicitly. Keep the
+    // historical file outside the directory scan, then scan it as data.
+    for (name, id) in historical_ignores {
+        write_blob(workspace, root, name, id)?;
+        let path = OsStr::from_bytes(name);
+        workspace.gitleaks(root, path, rules)?;
+        fs::remove_file(root.join(path)).map_err(|_| stage_error())?;
+    }
+    fs::remove_dir_all(root).map_err(|_| stage_error())?;
+    Ok(true)
+}
+
+fn conflict_sides(workspace: &Workspace<'_, '_>, commit: &str) -> Result<Vec<String>, Fail> {
+    let tree = workspace.git(
+        &["ls-tree", "-z", "--full-tree", &git_commit(commit)],
+        "locate the sides of the prepared JJ conflict",
+    )?;
+    // JJ saves full logical trees for each side. Diff the side tree roots
+    // directly so a tracked `.jjconflict-*` path in a side stays ordinary
+    // data and the generated wrappers and obsolete base terms stay out.
+    let mut sides = Vec::new();
+    let entries = tree.stdout.strip_suffix(b"\0").ok_or_else(stage_error)?;
+    for entry in entries.split(|&byte| byte == 0) {
+        let separator = entry
+            .iter()
+            .position(|&byte| byte == b'\t')
+            .ok_or_else(stage_error)?;
+        if let Some(index) = entry[separator + 1..].strip_prefix(b".jjconflict-side-")
+            && !index.is_empty()
+            && index.iter().all(u8::is_ascii_digit)
+        {
+            let meta = std::str::from_utf8(&entry[..separator]).map_err(|_| stage_error())?;
+            let id = meta.strip_prefix("040000 tree ").ok_or_else(stage_error)?;
+            sides.push(format!("{}^{{tree}}", object_id(id)?));
+        }
+    }
+    if sides.len() < 2 {
+        return Err(stage_error());
+    }
+    Ok(sides)
+}
+
+fn diff_blobs(
+    workspace: &Workspace<'_, '_>,
+    tree: &str,
+    parent: Option<&str>,
+) -> Result<Vec<u8>, Fail> {
+    let mut args = vec![
+        "diff-tree",
+        "--root",
+        "--raw",
+        "--no-abbrev",
+        "--no-commit-id",
+        "--no-renames",
+        "--diff-filter=AMT",
+        "-r",
+        "-z",
+    ];
+    let parent = parent.map(git_commit);
+    if let Some(parent) = &parent {
+        args.push(parent);
+    }
+    args.push(tree);
+    Ok(workspace
+        .git(&args, "enumerate the outgoing changed blobs")?
+        .stdout)
+}
+
+fn blob_changes(diff: &[u8]) -> Result<Vec<(&[u8], &str)>, Fail> {
+    if diff.is_empty() {
+        return Ok(Vec::new());
+    }
+    let records = diff.strip_suffix(b"\0").ok_or_else(stage_error)?;
+    let mut fields = records.split(|byte| *byte == 0);
+    let mut blobs = Vec::new();
+    while let Some(metadata) = fields.next() {
+        let path = fields.next().ok_or_else(stage_error)?;
+        let metadata = std::str::from_utf8(metadata).map_err(|_| stage_error())?;
+        let fields: Vec<_> = metadata.split_ascii_whitespace().collect();
+        let [_, mode, old, new, _] = fields.as_slice() else {
+            return Err(stage_error());
+        };
+        // A mode-only change has identical path and bytes. A Gitlink names
+        // a commit elsewhere, while a symlink's target text is a local blob.
+        if old == new || *mode == "160000" {
+            continue;
+        }
+        if !matches!(*mode, "100644" | "100755" | "120000") {
+            return Err(stage_error());
+        }
+        blobs.push((path, object_id(new)?));
+    }
+    Ok(blobs)
+}
+
+fn copy_rules(
+    workspace: &Workspace<'_, '_>,
+    head: &str,
+    rules: &Path,
+    conflicts: bool,
+) -> Result<(), Fail> {
+    if let Some(ignore) = pinned_policy_blob(workspace, head, ".gitleaksignore", conflicts)? {
         private_file(&rules.join(".gitleaksignore"), &ignore)?;
     }
     let mut path = ".gitleaks.toml".to_owned();
@@ -120,7 +209,7 @@ fn copy_rules(workspace: &Workspace<'_, '_>, head: &str, rules: &Path) -> Result
         if !seen.insert(path.clone()) {
             return Err(policy_error());
         }
-        let data = match pinned_policy_blob(workspace, head, &path)? {
+        let data = match pinned_policy_blob(workspace, head, &path, conflicts)? {
             Some(data) => data,
             None if seen.len() == 1 => b"[extend]\nuseDefault = true\n".to_vec(),
             None => return Err(policy_error()),
@@ -185,7 +274,11 @@ fn pinned_policy_blob(
     workspace: &Workspace<'_, '_>,
     head: &str,
     path: &str,
+    conflicts: bool,
 ) -> Result<Option<Vec<u8>>, Fail> {
+    if conflicts {
+        return logical_policy_blob(workspace, head, path);
+    }
     let result = workspace.git(
         &[
             "--literal-pathspecs",
@@ -214,6 +307,66 @@ fn pinned_policy_blob(
     }
     let id = object_id(fields.next().ok_or_else(policy_error)?)?;
     read_blob(workspace, id).map(Some)
+}
+
+fn logical_policy_blob(
+    workspace: &Workspace<'_, '_>,
+    head: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>, Fail> {
+    // The Git conflict wrapper can omit real files. Query JJ's pinned tree
+    // for the path, any children if it is a directory, and non-directory
+    // ancestors such as symlinks or conflicts.
+    let mut fileset = format!("root:{path:?}");
+    for ancestor in Path::new(path).ancestors().skip(1) {
+        if !ancestor.as_os_str().is_empty() {
+            fileset.push_str(&format!(" | root-file:{ancestor:?}"));
+        }
+    }
+    let head = jj_commit(head);
+    let entries = workspace.jj(
+        &[
+            "file",
+            "list",
+            "-r",
+            &head,
+            "-T",
+            r#"json(path) ++ "\t" ++ file_type ++ "\n""#,
+            "--",
+            &fileset,
+        ],
+        "read the logical pinned secret-scan settings",
+    )?;
+    let mut found = false;
+    for record in stdout(&entries)?.lines() {
+        let (name, kind) = record.split_once('\t').ok_or_else(policy_error)?;
+        if kind == "conflict" {
+            return Err(failure(
+                "the gitleaks policy has merge conflicts; resolve the policy locally before publishing",
+            ));
+        }
+        let name: String = serde_json::from_str(name).map_err(|_| policy_error())?;
+        if found || name != path || kind != "file" {
+            return Err(policy_error());
+        }
+        found = true;
+    }
+    if !found {
+        return Ok(None);
+    }
+    let blob = workspace.jj(
+        &[
+            r#"--config=templates.file_show='""'"#,
+            "file",
+            "show",
+            "-r",
+            &head,
+            "--",
+            &format!("root-file:{path:?}"),
+        ],
+        "read the logical pinned policy bytes",
+    )?;
+    Ok(Some(blob.stdout))
 }
 
 fn write_blob(

@@ -543,7 +543,6 @@ fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
 }
 
 #[test]
-#[ignore = "P-04, P-06"]
 fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
     let h = History::new();
     h.tracked_file();
@@ -558,7 +557,6 @@ fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
 }
 
 #[test]
-#[ignore = "P-04, P-06"]
 fn unchanged_up_saves_encrypted_entries_twice() {
     let h = History::new();
     h.tracked_file();

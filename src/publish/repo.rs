@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -9,14 +10,37 @@ use crate::run::Run;
 use crate::sync::lock::RepoLock;
 use crate::{Ctx, Fail};
 
-use super::{AGGREGATE_PREFIX, failure};
+use super::{AGGREGATE_PREFIX, MERGE_DESCRIPTION, failure, scanner};
 
+#[derive(Clone)]
 pub(super) struct Workspace<'a, 'ctx> {
     ctx: &'ctx Ctx,
     run: &'a Run<'ctx>,
     root: PathBuf,
     live: PathBuf,
+    operation: Option<String>,
     pub(super) slug: String,
+}
+
+pub(super) struct StackSnapshot<'a, 'ctx> {
+    pub(super) view: Workspace<'a, 'ctx>,
+    pub(super) working: String,
+    state: StackState,
+    snapshot_options: Vec<String>,
+    needs_recording: bool,
+}
+
+pub(super) struct PreparedMerge<'a, 'ctx> {
+    pub(super) view: Workspace<'a, 'ctx>,
+    pub(super) commit: String,
+    head: String,
+    seed: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct StackState {
+    operation: String,
+    branches: Vec<u8>,
 }
 
 pub(super) struct Origin {
@@ -56,6 +80,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             run,
             root,
             live,
+            operation: None,
             slug,
         };
         workspace.validate_origin()?;
@@ -72,7 +97,7 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             "locate the workspace Git directory",
         )?;
         let jj_root = workspace.jj(
-            &["--ignore-working-copy", "git", "root"],
+            &["--at-op=@", "--ignore-working-copy", "git", "root"],
             "verify the colocated JJ workspace",
         )?;
         let git_dir =
@@ -228,6 +253,262 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         Ok(())
     }
 
+    pub(super) fn stack_needs_merge(&self, base: &str) -> Result<bool, Fail> {
+        let working = self.at_operation("@").one_revision("@")?;
+        let mut command = git_command(self.ctx, &self.root)?;
+        command.args([
+            "merge-base",
+            "--is-ancestor",
+            &git_commit(base),
+            &git_commit(&working),
+        ]);
+        match self.probe(command, "git")?.status.code() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(failure("Git could not check the stack's ancestry")),
+        }
+    }
+
+    pub(super) fn stack_state(&self) -> Result<StackState, Fail> {
+        let operation = self.operation_id(
+            &["--at-op=@", "--ignore-working-copy"],
+            "read the current stack operation",
+        )?;
+        let branches = self
+            .git(
+                &[
+                    "for-each-ref",
+                    "--sort=refname",
+                    "--format=%(refname)%00%(objectname)",
+                    "refs/heads",
+                ],
+                "read the local stack bookmarks",
+            )?
+            .stdout;
+        Ok(StackState {
+            operation,
+            branches,
+        })
+    }
+
+    pub(super) fn stack_snapshot(&self) -> Result<StackSnapshot<'a, 'ctx>, Fail> {
+        let state = self.stack_state()?;
+        let original = self.at_operation(&state.operation);
+        let original_working = original.one_revision("@")?;
+        let immutable_heads_key = "revset-aliases.\"immutable_heads()\"";
+        let aliases = original.jj(
+            &["config", "get", immutable_heads_key],
+            "read the workspace's immutable heads revset",
+        )?;
+        // Snapshot dirty work on top of any bookmarked change so that
+        // accepting the local merge never moves a publication bookmark.
+        let heads = toml_edit::Value::from(format!(
+            "({}) | bookmarks(regex:\"^wip/\")",
+            stdout(&aliases)?.trim()
+        ));
+        let mut snapshot_options = vec![
+            format!("--config={immutable_heads_key}={heads}"),
+            replay_seed(&state.operation),
+        ];
+        let view = self.detached_snapshot(&snapshot_options)?;
+        let working = view.one_revision("@")?;
+        if self.stack_state()? != state {
+            return Err(stale());
+        }
+        let needs_recording = original_working != working;
+        if needs_recording {
+            snapshot_options.push(self.commit_timestamp_arg(&working)?);
+        }
+        Ok(StackSnapshot {
+            view,
+            working,
+            state,
+            snapshot_options,
+            needs_recording,
+        })
+    }
+
+    pub(super) fn prepare_merge(
+        &self,
+        head: &str,
+        base: &str,
+    ) -> Result<PreparedMerge<'a, 'ctx>, Fail> {
+        let seed = replay_seed(head);
+        let view = self.detached_merge(head, base, &[&seed])?;
+        let commit = view.one_revision("@")?;
+        Ok(PreparedMerge {
+            view,
+            commit,
+            head: head.to_owned(),
+            seed,
+        })
+    }
+
+    fn detached_merge(&self, head: &str, base: &str, options: &[&str]) -> Result<Self, Fail> {
+        let head = jj_commit(head);
+        let base = jj_commit(base);
+        let mut args = vec!["--no-integrate-operation", "--config=ui.quiet=false"];
+        args.extend_from_slice(options);
+        args.extend(["new", "-m", MERGE_DESCRIPTION, &head, &base]);
+        let out = self.jj(&args, "prepare the merge with main")?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut ids = stderr.lines().filter_map(|line| {
+            line.strip_prefix(
+                "Operation left uncommitted because --no-integrate-operation was requested: ",
+            )
+        });
+        if let Some(id) = ids.next()
+            && id.len() == 12
+            && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && ids.next().is_none()
+        {
+            Ok(self.at_operation(id))
+        } else {
+            Err(failure("JJ did not identify the prepared merge operation"))
+        }
+    }
+
+    pub(super) fn apply_stack(
+        &self,
+        snapshot: &StackSnapshot<'a, 'ctx>,
+        base: &str,
+        merge: Option<&PreparedMerge<'a, 'ctx>>,
+    ) -> Result<(), Fail> {
+        let current = self.detached_snapshot(&snapshot.snapshot_options)?;
+        self.check_stack(&current, &snapshot.state, base, &snapshot.working)?;
+        let approved = merge.map_or(snapshot.working.as_str(), |merge| merge.commit.as_str());
+        let (plan, active) = if snapshot.needs_recording {
+            // Record the protected dirty snapshot with the real working copy
+            // before integrating the merge. Native stale recovery can then
+            // start from those recorded files after an interruption.
+            let mut args = vec!["--at-op=@"];
+            args.extend(snapshot.snapshot_options.iter().map(String::as_str));
+            let operation = self.operation_id(&args, "record the approved working snapshot")?;
+            let active = self.stack_state()?;
+            let recorded = self.at_operation(&operation);
+            if active.operation != operation
+                || active.branches != snapshot.state.branches
+                || recorded.one_revision("@")? != snapshot.working
+                || self.tracking_main()? != base
+            {
+                return Err(stale());
+            }
+            // Anchor the native merge to the recorded snapshot. Reuse its
+            // identity and timestamp, then require the exact screened OID.
+            let plan = if let Some(merge) = merge {
+                let timestamp = self.commit_timestamp_arg(&merge.commit)?;
+                recorded.detached_merge(&merge.head, base, &[&merge.seed, &timestamp])?
+            } else {
+                recorded
+            };
+            (plan, active)
+        } else {
+            (
+                merge.map_or(&snapshot.view, |merge| &merge.view).clone(),
+                snapshot.state.clone(),
+            )
+        };
+        if plan.one_revision("@")? != approved || self.stack_state()? != active {
+            return Err(stale());
+        }
+        if let Some(operation) = &plan.operation
+            && *operation != active.operation
+        {
+            self.jj(
+                &[
+                    "--at-op=@",
+                    "--ignore-working-copy",
+                    "operation",
+                    "integrate",
+                    operation,
+                ],
+                "integrate the approved stack operation",
+            )?;
+            let mut args: Vec<_> = snapshot
+                .snapshot_options
+                .iter()
+                .map(String::as_str)
+                .collect();
+            args.extend(["workspace", "update-stale"]);
+            self.jj(&args, "update the working copy after approval")?;
+        }
+        if self.at_operation("@").one_revision("@")? != approved {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
+    fn commit_timestamp_arg(&self, commit: &str) -> Result<String, Fail> {
+        let timestamp = self.git(
+            &[
+                "show",
+                "--no-notes",
+                "--no-show-signature",
+                "--no-patch",
+                "--format=%cI",
+                &git_commit(commit),
+            ],
+            "read the approved commit timestamp",
+        )?;
+        Ok(format!(
+            "--config=debug.commit-timestamp={}",
+            stdout(&timestamp)?.trim()
+        ))
+    }
+
+    pub(super) fn require_stack_unchanged(
+        &self,
+        state: &StackState,
+        base: &str,
+        approved_working: &str,
+    ) -> Result<(), Fail> {
+        self.check_stack(&self.detached_snapshot(&[])?, state, base, approved_working)
+    }
+
+    fn check_stack(
+        &self,
+        view: &Self,
+        state: &StackState,
+        base: &str,
+        approved_working: &str,
+    ) -> Result<(), Fail> {
+        if view.one_revision("@")? != approved_working
+            || self.stack_state()? != *state
+            || self.tracking_main()? != base
+        {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
+    fn detached_snapshot(&self, options: &[String]) -> Result<Self, Fail> {
+        let mut args = vec!["--at-op=@", "--no-integrate-operation"];
+        args.extend(options.iter().map(String::as_str));
+        let id = self.operation_id(
+            &args,
+            "prepare a detached stack snapshot (diverged --all requires JJ 0.41 or newer)",
+        )?;
+        Ok(self.at_operation(&id))
+    }
+
+    fn operation_id(&self, flags: &[&str], action: &str) -> Result<String, Fail> {
+        let mut args = flags.to_vec();
+        args.extend(["operation", "log", "--no-graph", "--limit=1", "-T", "id"]);
+        let out = self.jj(&args, action)?;
+        let id = stdout(&out)?.trim();
+        if id.len() != 128 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(failure("JJ returned an invalid stack operation ID"));
+        }
+        Ok(id.to_owned())
+    }
+
+    fn at_operation(&self, operation: &str) -> Self {
+        Self {
+            operation: Some(operation.to_owned()),
+            ..self.clone()
+        }
+    }
+
     pub(super) fn revisions(&self, revset: &str) -> Result<Vec<String>, Fail> {
         let out = self.jj(
             &[
@@ -377,23 +658,15 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         // paths. Active rules and all transitive extensions are absolute
         // snapshots outside its scanned subtree.
         let mut cmd = self.ctx.command("gitleaks", Cwd::Dir(root))?;
-        cmd.args(["dir", "--no-banner", "--redact=100", "--exit-code=20"]);
+        cmd.args(scanner::ARGS);
         cmd.arg("--config")
             .arg(rules.join(".gitleaks.toml"))
             .arg("--gitleaks-ignore-path")
             .arg(rules)
+            .env("TMPDIR", rules)
             .arg("--")
             .arg(target);
-        let output = self.probe(cmd, "gitleaks")?;
-        match output.status.code() {
-            Some(0) => Ok(()),
-            Some(20) => Err(failure(
-                "gitleaks found potential secrets; remove them from every outgoing commit and retry",
-            )),
-            _ => Err(failure(
-                "gitleaks could not scan the outgoing commits; fix the scanner and retry",
-            )),
-        }
+        scanner::screen(cmd, |cmd| self.probe(cmd, "gitleaks"))
     }
 
     pub(super) fn save_bookmark(&self, name: &str, commit: &str) -> Result<(), Fail> {
@@ -513,8 +786,11 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
             "--color=never",
             "--config",
             "git.abandon-unreachable-commits=false",
-        ])
-        .args(args);
+        ]);
+        if let Some(operation) = &self.operation {
+            cmd.args(["--at-op", operation, "--ignore-working-copy"]);
+        }
+        cmd.args(args);
         self.checked(cmd, "jj", action)
     }
 
@@ -528,6 +804,23 @@ impl<'a, 'ctx> Workspace<'a, 'ctx> {
         let out = self.probe(cmd, program)?;
         if out.status.success() {
             Ok(out)
+        } else if program == "jj"
+            && out
+                .stderr
+                .split(|&byte| byte == b'\n')
+                .any(|line| line.starts_with(b"Error: The working copy is stale ("))
+        {
+            Err(failure(
+                "JJ's working copy is stale. Run `jj workspace update-stale` in the workspace, then rerun dots publish",
+            ))
+        } else if program == "jj"
+            && out.stderr.split(|&byte| byte == b'\n').any(|line| {
+                line == b"Error: The \"@\" expression resolved to more than one operation"
+            })
+        {
+            Err(failure(
+                "JJ has multiple operation heads. Reconcile them in the workspace before rerunning dots publish",
+            ))
         } else {
             // Network diagnostics can contain a credential-bearing URL.
             Err(failure(format!("{program} could not {action}")))
@@ -620,6 +913,12 @@ pub(super) fn jj_commit(commit: &str) -> String {
 
 pub(super) fn git_commit(commit: &str) -> String {
     format!("{commit}^{{commit}}")
+}
+
+fn replay_seed(input: &str) -> String {
+    // JJ parses its seed as a signed TOML integer before converting to u64.
+    let seed = RandomState::new().hash_one(input) >> 1;
+    format!("--config=debug.randomness-seed={seed}")
 }
 
 pub(super) fn object_id(value: &str) -> Result<&str, Fail> {

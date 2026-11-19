@@ -17,6 +17,8 @@ case "$#:$*" in
         printf '{"entries":[],"invalid":[]}\n'
         exit 0
         ;;
+    # The v0.4.0 updater saves a checkpoint even with no tracked paths.
+    '3:bootstrap dotfiles save') exit 0 ;;
 esac
 
 case "${1:-} ${2:-} ${3:-}" in
@@ -51,7 +53,12 @@ case "${1:-} ${2:-} ${3:-}" in
         printf '%s\n' "$HOME/new-manager/bin/dots" ;;
     'which '*|'settings get '*) exit 1 ;;
     'settings ls '*) printf '{}\n' ;;
-    'ls '*) printf '{}\n' ;;
+    'ls '*)
+        if [ -x "$HOME/new-manager/bin/dots" ] && [ ! -f "$HOME/manager-installed" ]; then
+            printf '%s\n' '{"github:EzraCerpac/dots":[{"version":"99.0.0","active":true,"installed":false}]}'
+        else
+            printf '{}\n'
+        fi ;;
     'bootstrap packages status') printf '{}\n' ;;
     'bootstrap dotfiles status') printf '{"files":[],"edits":[]}\n' ;;
     'install  ') exit "${FIXTURE_INSTALL_STATUS:-0}" ;;
@@ -64,4 +71,7 @@ case "${1:-} ${2:-} ${3:-}" in
             printf '%s\n' 'mise: self-update is disabled' >&2
             exit 1
         fi ;;
+    *)
+        printf 'unexpected mock mise command: %s\n' "$*" >&2
+        exit 78 ;;
 esac

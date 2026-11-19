@@ -103,15 +103,21 @@ fn update(run: &Run<'_>, mas: bool) {
     let manager = tools::manager_source(ctx, run, &mise, &files);
     let manager_before = manager
         .as_ref()
-        .and_then(|source| tools::manager_version(ctx, run, &mise, source));
+        .and_then(|source| tools::manager_baseline(ctx, run, &mise, source));
     let mut package_update = None;
     step(run, "Inspect declared packages", |_| {
         package_update = Some(packages::Update::inspect(ctx, run, &mise, &config, mas)?);
         Ok(Outcome::Completed)
     });
-    let app_store = package_update
-        .as_ref()
-        .and_then(|packages| packages.update_routine());
+    let mut app_store = None;
+    if let Some(packages) = &package_update
+        && packages.has_managers()
+    {
+        app_store = packages.update_routine();
+        if !validate_configuration(ctx, run) {
+            return;
+        }
+    }
 
     let valid = thread::scope(|scope| {
         if let Some(store) = app_store
@@ -259,7 +265,20 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = mise.command_in_run(run, args)?;
+    mise_command_with(run, mise, args, Ok)
+}
+
+fn mise_command_with<I, S>(
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    args: I,
+    configure: impl FnOnce(Command) -> Result<Command, Fail>,
+) -> Result<Command, Fail>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = mise.command_in_run_with(run, args, configure)?;
     cmd.env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
         .env("MISE_SELF_UPDATE_AUTO", "false");
     Ok(cmd)
@@ -290,6 +309,10 @@ fn probe(run: &Run<'_>, cmd: Result<Command, Fail>) -> Result<Vec<u8>, Issue> {
         return Err(issue("Update cancelled."));
     }
     let output = run.probe(cmd.map_err(issue)?).map_err(issue)?;
+    probe_output(output)
+}
+
+fn probe_output(output: std::process::Output) -> Result<Vec<u8>, Issue> {
     if output.status.success() {
         Ok(output.stdout)
     } else {

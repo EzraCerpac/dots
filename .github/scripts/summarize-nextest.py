@@ -12,16 +12,20 @@ if not report.is_file():
     sys.exit(0)
 
 root = ET.parse(report).getroot()
-print(f"Nextest wall time: {float(root.attrib['time']):.1f}s. Suite times sum test runtimes.\n")
+print(f"Nextest wall time: {float(root.attrib['time']):.1f}s. Suite times sum test attempts.\n")
 print("| Suite | Tests | Time |")
 print("| --- | ---: | ---: |")
 flaky = []
+retry_tags = {"flakyFailure", "flakyError", "rerunFailure", "rerunError"}
 for suite in root.findall("testsuite"):
     name = escape(suite.attrib["name"])
-    print(f"| <code>{name}</code> | {suite.attrib['tests']} | {float(suite.attrib['time']):.1f}s |")
+    seconds = 0.0
     for test in suite.findall("testcase"):
+        seconds += float(test.get("time", "0"))
+        seconds += sum(float(attempt.get("time", "0")) for attempt in test if attempt.tag in retry_tags)
         if test.find("flakyFailure") is not None or test.find("flakyError") is not None:
             flaky.append(f"{name} {escape(test.attrib['name'])}")
+    print(f"| <code>{name}</code> | {suite.attrib['tests']} | {seconds:.1f}s |")
 
 if flaky:
     print()

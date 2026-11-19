@@ -15,6 +15,7 @@ const SOURCE: &str = "templates/herdr.tera";
 const ROW: &str = "dotfiles.herdr\ttemplates/herdr.tera\n";
 const BEFORE: &str = "# this machine\n[env]\nFIXTURE_ROLE = \"laptop\"\n";
 const DEPLOYED: &str = "deployed template bytes\n";
+const NATIVE_VARIANT: &str = r#"variants = [{ target = "~/.retired-fixture" }]"#;
 const IGNORE: &str = "/config.local.toml\n/config.host-*.toml\n/miserc.toml\n/mise.lock\n/mise.*.lock\n/.setup-state/\n/locks/\n";
 const CLEAN_SCAN: &str = r#"#!/bin/sh
 while [ "$#" -gt 0 ]; do
@@ -25,6 +26,20 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 "#;
+
+fn oracle() -> bool {
+    let Some(path) = env::var_os("DOTS_BIN") else {
+        return false;
+    };
+    let path = Path::new(&path);
+    assert!(path.is_absolute(), "DOTS_BIN must be absolute");
+    let mut prefix = [0; 2];
+    fs::File::open(path)
+        .unwrap()
+        .read_exact(&mut prefix)
+        .unwrap();
+    prefix == *b"#!"
+}
 
 struct Retirement {
     world: IsolatedWorld,
@@ -47,16 +62,11 @@ impl Retirement {
         for dir in [&bin, &root, &base.join("tmp"), &base.join("mise-system")] {
             fs::create_dir_all(dir).unwrap();
         }
-        let mut prefix = [0; 2];
-        fs::File::open(world.dots().get_program())
-            .unwrap()
-            .read_exact(&mut prefix)
-            .unwrap();
-        let oracle = prefix == *b"#!";
+        let oracle = oracle();
         let programs: &[&str] = if oracle {
             &["git", "mise", "node", "jq", "python3"]
         } else {
-            &["git", "mise"]
+            &["git", "mise", "gitleaks"]
         };
         for program in programs {
             let executable = executable_on_path(&world.dots(), program).unwrap_or_else(|| {
@@ -69,8 +79,10 @@ impl Retirement {
             };
             symlink(executable, bin.join(program)).unwrap();
         }
-        fs::write(bin.join("gitleaks"), CLEAN_SCAN).unwrap();
-        fs::set_permissions(bin.join("gitleaks"), fs::Permissions::from_mode(0o755)).unwrap();
+        if oracle {
+            fs::write(bin.join("gitleaks"), CLEAN_SCAN).unwrap();
+            fs::set_permissions(bin.join("gitleaks"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let path =
             env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
         let remote = world.bare_remote("retirement.git");
@@ -220,8 +232,12 @@ impl Retirement {
         assert_eq!(fs::read_to_string(deployed).unwrap(), DEPLOYED);
     }
 
-    fn assert_advanced(&self) {
-        assert_eq!(self.git(&self.root, ["rev-parse", "HEAD"]), self.incoming);
+    fn assert_advanced(&self, receipt: &str) {
+        assert_eq!(
+            self.git(&self.root, ["rev-parse", "HEAD"]),
+            self.incoming,
+            "{receipt}"
+        );
     }
 }
 
@@ -238,18 +254,36 @@ fn success(cmd: &mut FixtureCommand<'_>) -> Output {
 }
 
 fn declaration(header: &str, source_assignment: &str) -> String {
-    format!("{header}\n{source_assignment}\nmode = \"template\"\ntarget = \"~/.retired-fixture\"\n")
+    let target = if oracle() {
+        r#"target = "~/.retired-fixture""#
+    } else {
+        // Native mise resolves the target of a named declaration from its variants.
+        NATIVE_VARIANT
+    };
+    format!("{header}\n{source_assignment}\nmode = \"template\"\n{target}\n")
 }
 
 fn table() -> String {
     declaration("[dotfiles.herdr]", &format!("source = \"{SOURCE}\""))
 }
 
+fn inactive(table: String) -> String {
+    if oracle() {
+        table
+    } else {
+        // Keep checkout validation independent of the missing source.
+        table.replace(
+            NATIVE_VARIANT,
+            r#"variants = [{ profile = "not-selected", target = "~/.retired-fixture" }]"#,
+        )
+    }
+}
+
 fn assert_retired(local: &str, expected: &str, rows: &str) {
     let fixture = Retirement::new(rows, false);
     fixture.set_local(local);
     let output = fixture.sync();
-    fixture.assert_advanced();
+    fixture.assert_advanced(&output);
     fixture.assert_local(expected);
     fixture.assert_deployed();
     assert!(!fixture.root.join(SOURCE).exists());
@@ -289,8 +323,8 @@ fn has_exact_file_name(path: &Path) -> bool {
 fn assert_kept_with_source(local: &str, rows: &str, keep_source: bool, extra_source: Option<&str>) {
     let fixture = Retirement::with_source(rows, keep_source, extra_source);
     fixture.set_local(local);
-    fixture.sync();
-    fixture.assert_advanced();
+    let output = fixture.sync();
+    fixture.assert_advanced(&output);
     fixture.assert_local(local);
     assert_eq!(has_exact_file_name(&fixture.root.join(SOURCE)), keep_source);
     if let Some(source) = extra_source {
@@ -302,7 +336,6 @@ fn assert_kept_with_source(local: &str, rows: &str, keep_source: bool, extra_sou
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_exact_retired_table_is_removed_byte_for_byte() {
     let after = "\n# following comment\n[settings]\nexperimental = false\n";
     assert_retired(&format!("{BEFORE}\n{}", table()), BEFORE, ROW);
@@ -318,7 +351,6 @@ fn unchanged_exact_retired_table_is_removed_byte_for_byte() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_quoted_table_and_source_match() {
     for header in [
         "[dotfiles.\"herdr\"]",
@@ -336,7 +368,6 @@ fn unchanged_quoted_table_and_source_match() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_different_source_keeps_declaration() {
     assert_kept(
         &format!("{BEFORE}\n{}", table().replace(SOURCE, "dotfiles/other")),
@@ -346,21 +377,26 @@ fn unchanged_different_source_keeps_declaration() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_source_present_in_the_merge_keeps_declaration() {
     assert_kept(&format!("{BEFORE}\n{}", table()), ROW, true);
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_similar_and_commented_headers_stay() {
-    let similarly_named = table().replace("[dotfiles.herdr]", "[dotfiles.herdr-extra]");
+    let similarly_named = inactive(table().replace("[dotfiles.herdr]", "[dotfiles.herdr-extra]"));
     assert_kept(&format!("{BEFORE}\n{similarly_named}"), ROW, false);
-    let commented = table().replace("[dotfiles.herdr]", "# [dotfiles.herdr]");
+    let commented = if oracle() {
+        table().replace("[dotfiles.herdr]", "# [dotfiles.herdr]")
+    } else {
+        table().lines().map(|line| format!("# {line}\n")).collect()
+    };
     assert_kept(&format!("{BEFORE}\n{commented}"), ROW, false);
-    let neighbour = table()
+    let mut neighbour = table()
         .replace("[dotfiles.herdr]", "[dotfiles.herdr-extra]")
         .replace(SOURCE, "dotfiles/other");
+    if !oracle() {
+        neighbour = neighbour.replace("~/.retired-fixture", "~/.retired-neighbour");
+    }
     assert_retired(
         &format!("{BEFORE}\n{}\n{neighbour}", table()),
         &format!("{BEFORE}\n{neighbour}"),
@@ -369,17 +405,19 @@ fn unchanged_similar_and_commented_headers_stay() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_nested_definition_keeps_local_declaration() {
-    assert_kept(
-        &format!("{BEFORE}\n{}\n[dotfiles.herdr.extra]\nx = 1\n", table()),
-        ROW,
-        false,
-    );
+    let nested = if oracle() {
+        format!("{}\n[dotfiles.herdr.extra]\nx = 1\n", table())
+    } else {
+        table().replace(
+            NATIVE_VARIANT,
+            "[[dotfiles.herdr.variants]]\nprofile = \"not-selected\"\ntarget = \"~/.retired-fixture\"",
+        )
+    };
+    assert_kept(&format!("{BEFORE}\n{nested}"), ROW, false);
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_string_lookalike_stays_and_array_prefix_is_preserved() {
     let quoted = format!("[vars]\nfixture_heredoc = '''\n{}'''\n", table());
     assert_kept(&quoted, ROW, false);
@@ -388,12 +426,11 @@ fn unchanged_string_lookalike_stays_and_array_prefix_is_preserved() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_retirement_is_idempotent() {
     let fixture = Retirement::new(ROW, false);
     fixture.set_local(&format!("{BEFORE}\n{}", table()));
-    fixture.sync();
-    fixture.assert_advanced();
+    let output = fixture.sync();
+    fixture.assert_advanced(&output);
     fixture.assert_local(BEFORE);
     let first = fs::metadata(fixture.root.join("config.local.toml"))
         .unwrap()
@@ -412,7 +449,6 @@ fn unchanged_retirement_is_idempotent() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_list_accepts_only_two_field_dotfile_rows() {
     let quoted_row = format!("# comment\n\n dotfiles . \"her.dr\" \t{SOURCE}\r\n");
     let quoted = table().replace("[dotfiles.herdr]", "[dotfiles.\"her.dr\"]");
@@ -425,13 +461,12 @@ fn unchanged_list_accepts_only_two_field_dotfile_rows() {
     );
     // The same source disappears in both fixtures. Only the valid row
     // may remove the declaration.
-    let exact = format!("{BEFORE}\n{}", table());
+    let exact = format!("{BEFORE}\n{}", inactive(table()));
     assert_kept(&exact, &format!("dotfiles.herdr\t{SOURCE}\textra\n"), false);
     assert_retired(&exact, BEFORE, ROW);
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_list_rejects_noncanonical_paths() {
     for path in [
         "templates/./herdr.tera",
@@ -440,7 +475,10 @@ fn unchanged_list_rejects_noncanonical_paths() {
         "templates/../templates/herdr.tera",
     ] {
         let source = format!("'{}'", path);
-        let matching = declaration("[dotfiles.herdr]", &format!("source = {source}"));
+        let matching = inactive(declaration(
+            "[dotfiles.herdr]",
+            &format!("source = {source}"),
+        ));
         assert_kept(
             &format!("{BEFORE}\n{matching}"),
             &format!("dotfiles.herdr\t{path}\n"),
@@ -457,7 +495,6 @@ fn unchanged_list_rejects_noncanonical_paths() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn unchanged_local_source_is_compared_without_path_normalization() {
     for local in ["templates/HERDR.tera", "templates/herdr.tera.extra"] {
         let matching = declaration("[dotfiles.herdr]", &format!("source = '{local}'"));
@@ -466,7 +503,6 @@ fn unchanged_local_source_is_compared_without_path_normalization() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn new_multiline_toml_source_matches_decoded_value() {
     for quote in ["\"\"\"", "'''"] {
         let table = declaration(

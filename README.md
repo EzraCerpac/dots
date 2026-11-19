@@ -115,8 +115,8 @@ Details and logs · dots up --last
 - It uses mise's configuration directory, normally `~/.config/mise`. For a separate directory, use `dots init "$HOME/dotfiles"`, then `DOTS_ROOT="$HOME/dotfiles" dots up`.
 - It creates missing files and adds `dots_profiles = "default"` under `[vars]` if the existing `config.toml` lacks that setting. It preserves the rest of the file.
 - It keeps a valid saved profile and machine ID. For a fresh setup, it selects `default` if listed (otherwise the first listed profile) and derives the machine ID from the hostname. Both selections stay on this machine.
-- In a new repository it makes one seed commit on branches `main` and `dev`, with `dev` checked out. An existing repository keeps its branches and history; `init` reports anything sync would stop on, with its fix.
-- In the run that creates the seed, while the seed is untouched, a terminal with `gh` signed in gets an offer to create a private GitHub repository. The default is no. For a pristine seed, the printed push uses the verified commit ID. For any other repository without an `origin`, follow the printed remote-add and `dots sync` instructions so outgoing commits are scanned.
+- In a new repository it makes one seed commit on branches `main` and `dev`, with `dev` checked out. An existing repository keeps its branches and history. If its checkout shape would stop sync, `init` reports the problem and its fix.
+- In the run that creates the seed, while the seed is untouched, a terminal with `gh` signed in gets an offer to create a private GitHub repository if `dots_source_repo` is unset or matches the proposed repository. The default is no. For a pristine seed, the printed push uses the verified commit ID. For any other repository without an `origin`, follow the printed remote-add and `dots sync` instructions so outgoing commits are scanned.
 
 `dots up` checks for tracked settings to checkpoint, then syncs and updates eligible software.
 In local-only mode (no `origin` and no `dots_source_repo`), it skips sync. Updating tools or standalone mise can still use the network.
@@ -149,7 +149,7 @@ Run `dots` or `dots help` to list the built-in commands and your configuration's
 
 `dots up` writes ordinary terminal scrollback: a `==>` line when each step starts, one line with its result, and a final line such as `dots up: Complete (exit 0)`.
 Answer a hook’s or installer’s prompt directly in the terminal.
-When something went wrong, “Needs attention” lists each issue with a `Next:` action, and the run still exits 0 unless a step failed.
+When something went wrong, “Needs attention” lists each issue with a `Next:` action, and a completed run with only deferred issues still exits 0.
 For a failed step that owned the terminal, its output is in your scrollback. With `--plain` or without a terminal, hook and recipe failures include a private log path.
 `dots up --last` replays only that final report, not the live step output.
 
@@ -192,7 +192,7 @@ See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order o
 
 ## Why dots
 
-- **Plain mise** already bootstraps a machine and manages tools, packages, dotfiles and their history. If that covers you, keep it. `dots` adds one command that updates all of it, and a fixed, scanned Git policy for sharing the configuration between machines.
+- **Plain mise** already bootstraps a machine and manages tools, packages, dotfiles and their history. If that covers you, keep it. `dots up` checkpoints settings and updates eligible software. Shared sync can apply declared dotfiles. In local-only mode, use `dots apply`.
 - **chezmoi or GNU Stow** suit you if dotfiles are what you manage, and tools and packages are handled elsewhere. `dots` keeps all three in one mise configuration.
 - **Nix** suits you if you want fully reproducible environments and are happy to learn its language. `dots` stays with mise's TOML and your system's own package managers.
 

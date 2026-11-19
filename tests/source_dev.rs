@@ -202,6 +202,7 @@ struct Repo {
     mise: PathBuf,
     mise_real: Option<PathBuf>,
     gitleaks_real: Option<PathBuf>,
+    oracle: bool,
     config: String,
 }
 
@@ -251,6 +252,7 @@ impl Repo {
             mise,
             mise_real,
             gitleaks_real,
+            oracle,
             config,
         };
         for item in fs::read_dir(&fixture.a).unwrap() {
@@ -516,7 +518,10 @@ case "${1:-} ${2:-} ${3:-}" in
         fi
         "$FIXTURE_VALIDATE"
     fi
-    if grep -q 'INVALID' "$config/config.toml"; then printf 'invalid config.toml\n' >&2; exit 1; fi
+    if [ "$config" != "${FIXTURE_LIVE_ROOT:-}" ] && grep -q 'INVALID' "$config/config.toml"; then
+        printf 'invalid config.toml\n' >&2
+        exit 1
+    fi
     jq -n --arg path "$config/config.toml" '[{path: $path}]'
     ;;
   'bootstrap dotfiles paths')
@@ -721,15 +726,82 @@ sync_case!(
     }
 );
 
+fn failing_apply_fixture(f: &Repo) -> (PathBuf, PathBuf) {
+    f.write(
+        &f.a,
+        "config.toml",
+        format!(
+            "{}\n[dotfiles]\n'~/.fixture-apply' = {{ source = 'fixture.tera', mode = 'template' }}\n",
+            f.config
+        ),
+    );
+    f.write(&f.a, "fixture.tera", "{{ 'fixture template' }}\n");
+    f.commit(&f.a, "Seed native apply fixture");
+    f.git(&f.a, &["push", "-q", "origin", "HEAD:dev"]);
+    f.git(&f.b, &["pull", "-q", "--ff-only", "origin", "dev"]);
+
+    let real_mise = f.mise_real.as_ref().expect("real mise on fixture PATH");
+    let wrapper = f.scratch.join("fail-live-apply");
+    let attempted = f.scratch.join("live-apply-attempted");
+    script(
+        &wrapper,
+        &format!(
+            r#"config=$DOTS_ROOT
+if [ "${{1:-}}" = '-C' ]; then config=$2; fi
+case " $* " in
+    *' config ls --json '*)
+        if [ "$config" != {root} ] && [ -n "${{FIXTURE_VALIDATE:-}}" ]; then
+            "$FIXTURE_VALIDATE"
+        fi ;;
+    *' bootstrap dotfiles apply '*)
+        case " $* " in
+            *' --dry-run '*) ;;
+            *)
+                if [ "$config" = {root} ] && [ -n "${{FIXTURE_APPLY_FAILURE:-}}" ]; then
+                    : > {attempted}
+                    printf '%s\n' "$FIXTURE_APPLY_FAILURE" >&2
+                    exit 1
+                fi ;;
+        esac ;;
+esac
+exec {real_mise} "$@""#,
+            root = sh(&f.a),
+            attempted = sh(&attempted),
+            real_mise = sh(real_mise),
+        ),
+    );
+    (wrapper, attempted)
+}
+
+fn applied_failure(f: &Repo, receipt: &str, attempted: &Path, oracle_message: &str) {
+    assert!(
+        attempted.is_file(),
+        "fixture live apply was not reached: {receipt}"
+    );
+    if f.oracle {
+        has(receipt, oracle_message);
+        has(receipt, "dots apply");
+    } else {
+        has(receipt, "mise dotfile apply failed (exit 1)");
+        has(receipt, "rerun dots sync");
+        absent(receipt, oracle_message);
+    }
+}
+
 sync_case!(
-    unchanged_completed_share_checkout_recovery_and_later_apply_failure,
+    active unchanged_completed_share_checkout_recovery_and_later_apply_failure,
     || {
         let f = Repo::new();
+        let (mise, attempted) = failing_apply_fixture(&f);
+        let mise = mise.to_str().unwrap();
         f.publish("incoming", "incoming first\n");
         let lock = f.git_dir(&f.a).join("refs/heads/dev.lock");
         let hook = f.validation_hook(&format!("touch {}", sh(&lock)));
         f.write(&f.a, "local", "local snapshot\n");
-        let receipt = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
+        let receipt = f.sync_env(
+            &f.a,
+            &[("DOTS_MISE_BIN", mise), ("FIXTURE_VALIDATE", hook.to_str().unwrap())],
+        );
         has(&receipt, "pending");
         assert_ne!(f.tip(&f.a), f.remote());
         has(&f.replay(&f.a), "shared on dev");
@@ -738,10 +810,12 @@ sync_case!(
         let latest = f.publish("later", "incoming second\n");
         let receipt = f.sync_env(
             &f.a,
-            &[("FIXTURE_APPLY_FAILURE", "mise ERROR fixture apply failure")],
+            &[
+                ("DOTS_MISE_BIN", mise),
+                ("FIXTURE_APPLY_FAILURE", "mise ERROR fixture apply failure"),
+            ],
         );
-        has(&receipt, "fixture apply failure");
-        has(&receipt, "dots apply");
+        applied_failure(&f, &receipt, &attempted, "fixture apply failure");
         let replay = f.replay(&f.a);
         has(&replay, "pending checkout");
         has(&replay, "updated in this checkout");
@@ -810,7 +884,7 @@ fn tracked_fixture(f: &Repo, encrypted: bool) -> String {
     .to_string()
 }
 
-sync_case!(unchanged_sync_refuses_unencrypted_history, || {
+sync_case!(active unchanged_sync_refuses_unencrypted_history, || {
     let f = Repo::new();
     let before = f.remote();
     let saved = f.scratch.join("saved");
@@ -994,7 +1068,7 @@ sync_case!(unchanged_deleted_dev_during_push_stays_withdrawn, || {
     withdrawn_dev(true);
 });
 
-sync_case!(unchanged_sync_pushes_no_tags_or_main_changes, || {
+sync_case!(active unchanged_sync_pushes_no_tags_or_main_changes, || {
     let f = Repo::new();
     let main = f.git(&f.origin, &["rev-parse", "main"]);
     f.git(&f.a, &["config", "push.followTags", "true"]);
@@ -1176,26 +1250,26 @@ sync_case!(unchanged_hanging_push_times_out, || {
 });
 
 sync_case!(
-    unchanged_failed_native_apply_names_diagnostic_and_recovery,
+    active unchanged_failed_native_apply_names_diagnostic_and_recovery,
     || {
         let f = Repo::new();
+        let (mise, attempted) = failing_apply_fixture(&f);
         let incoming = f.publish("remote", "from peer\n");
         let receipt = f.sync_env(
             &f.a,
-            &[(
-                "FIXTURE_APPLY_FAILURE",
-                "mise ERROR cannot apply fixture file",
-            )],
+            &[
+                ("DOTS_MISE_BIN", mise.to_str().unwrap()),
+                ("FIXTURE_APPLY_FAILURE", "mise ERROR cannot apply fixture file"),
+            ],
         );
-        has(&receipt, "cannot apply fixture file");
-        has(&receipt, "dots apply");
+        applied_failure(&f, &receipt, &attempted, "cannot apply fixture file");
         assert_eq!(f.tip(&f.a), incoming);
         assert_eq!(read(&f.a.join("remote")), "from peer\n");
     }
 );
 
 sync_case!(
-    unchanged_failed_native_save_names_diagnostic_and_recovery,
+    active unchanged_failed_native_save_names_diagnostic_and_recovery,
     || {
         let f = Repo::new();
         failed_history_save(&f, None, "mise ERROR cannot read fixture history");
@@ -1433,14 +1507,23 @@ sync_case!(
     }
 );
 
+fn rejected_validation(f: &Repo, receipt: &str) {
+    if f.oracle {
+        has(receipt, "invalid");
+    } else {
+        has(receipt, "merged configuration failed validation");
+        has(receipt, "nothing pushed or applied");
+    }
+}
+
 sync_case!(
-    unchanged_invalid_merge_is_neither_pushed_nor_applied,
+    active unchanged_invalid_merge_is_neither_pushed_nor_applied,
     || {
         let f = Repo::new();
         let incoming = f.publish("remote", "from peer\n");
         f.write(&f.a, "config.toml", format!("{}\n# INVALID\n", f.config));
         let receipt = f.sync(&f.a);
-        has(&receipt, "invalid");
+        rejected_validation(&f, &receipt);
         assert_eq!(f.remote(), incoming);
         assert!(!f.a.join("remote").exists());
         assert_ne!(f.tip(&f.a), incoming);
@@ -1454,7 +1537,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_toml_diagnostic_has_location_without_source_bytes,
+    active unchanged_toml_diagnostic_has_location_without_source_bytes,
     || {
         let f = Repo::new();
         let mise = f.mise_real.as_ref().expect("real mise on fixture PATH");
@@ -2113,16 +2196,25 @@ fn setup_retirement(f: &Repo, listed: bool, local_file: &str, local: &str) -> St
     incoming
 }
 
-fn retirement_backup(root: &Path, receipt: &str, local_path: &str, expected: &str) {
-    // The filename and storage scheme are internal. Resolve candidates from
-    // the receipt text and accept the existing path with the saved bytes.
-    let saved = receipt
-        .split_whitespace()
-        .filter(|part| part.contains(local_path))
-        .map(|part| {
-            part.trim_matches(['(', ')', ',', ';', '`', '"'])
-                .trim_end_matches('.')
-        })
+fn retirement_backup(f: &Repo, receipt: &str, local_path: &str, expected: &str) {
+    let root = &f.a;
+    let candidates: Vec<_> = if f.oracle {
+        receipt
+            .split_whitespace()
+            .filter(|part| part.contains(local_path))
+            .map(|part| {
+                part.trim_matches(['(', ')', ',', ';', '`', '"'])
+                    .trim_end_matches('.')
+            })
+            .collect()
+    } else {
+        receipt
+            .lines()
+            .filter_map(|line| line.strip_prefix("Recovery copy at "))
+            .collect()
+    };
+    let saved = candidates
+        .into_iter()
         .map(|part| root.join(part))
         .filter(|path| path != &root.join(local_path))
         .filter_map(|path| fixture_file(root.parent().unwrap(), &path))
@@ -2135,7 +2227,7 @@ fn retirement_backup(root: &Path, receipt: &str, local_path: &str, expected: &st
 }
 
 sync_case!(
-    unchanged_matching_local_declaration_is_retired_with_private_backup,
+    active unchanged_matching_local_declaration_is_retired_with_private_backup,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
@@ -2157,13 +2249,16 @@ sync_case!(
         );
         assert_eq!(f.tip(&f.a), incoming);
         assert!(!f.a.join("templates/fixture.tera").exists());
-        retirement_backup(&f.a, &receipt, LOCAL, &local);
-        has(&f.sync(&f.a), "nothing to push");
+        retirement_backup(&f, &receipt, LOCAL, &local);
+        has(
+            &f.sync(&f.a),
+            if f.oracle { "nothing to push" } else { "dev up to date" },
+        );
     }
 );
 
 sync_case!(
-    unchanged_unlisted_stale_declaration_fails_validation,
+    active unchanged_unlisted_stale_declaration_fails_validation,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
@@ -2171,7 +2266,7 @@ sync_case!(
         setup_retirement(&f, false, LOCAL, &local);
         let before = fs::metadata(f.a.join(LOCAL)).unwrap().modified().unwrap();
         let receipt = f.sync(&f.a);
-        has(&receipt, "invalid");
+        rejected_validation(&f, &receipt);
         assert_eq!(read(&f.a.join(LOCAL)), local);
         assert_eq!(
             fs::metadata(f.a.join(LOCAL)).unwrap().modified().unwrap(),
@@ -2182,7 +2277,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_selected_local_source_different_from_retirement_row_is_kept,
+    active unchanged_selected_local_source_different_from_retirement_row_is_kept,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
@@ -2198,7 +2293,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_invalid_incoming_configuration_cannot_retire_local_declaration,
+    active unchanged_invalid_incoming_configuration_cannot_retire_local_declaration,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
@@ -2206,21 +2301,24 @@ sync_case!(
         let incoming = setup_retirement(&f, true, LOCAL, &local);
         f.write(&f.a, "config.toml", format!("{}# INVALID\n", f.config));
         let receipt = f.sync(&f.a);
-        has(&receipt, "invalid");
+        rejected_validation(&f, &receipt);
         assert_eq!(read(&f.a.join(LOCAL)), local);
         assert_eq!(f.remote(), incoming);
         assert!(f.a.join("templates/fixture.tera").exists());
     }
 );
 
-sync_case!(unchanged_retirement_waits_until_files_advance, || {
+sync_case!(active unchanged_retirement_waits_until_files_advance, || {
     let f = Repo::new();
     const LOCAL: &str = "config.host-laptop.toml";
     let local = format!("{KEEP_LOCAL}{RETIRED_DECLARATION}");
     let incoming = setup_retirement(&f, true, LOCAL, &local);
     let lock = f.git_dir(&f.a).join("index.lock");
     put(&lock, "");
-    has(&f.sync(&f.a), "locked");
+    has(
+        &f.sync(&f.a),
+        if f.oracle { "locked" } else { "could not reserve the full Git index" },
+    );
     assert_eq!(read(&f.a.join(LOCAL)), local);
     assert!(f.a.join("templates/fixture.tera").exists());
     fs::remove_file(lock).unwrap();
@@ -2255,7 +2353,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_retirement_reports_local_file_edited_as_dev_advances,
+    active unchanged_retirement_reports_local_file_edited_as_dev_advances,
     || {
         let f = Repo::new();
         const LOCAL: &str = "config.local.toml";
@@ -2266,8 +2364,13 @@ sync_case!(
         sh(&f.a.join(LOCAL)),
     ));
         let receipt = f.sync(&f.a);
-        has(&receipt, "config.local.toml");
-        has(&receipt, "changed");
+        if f.oracle {
+            has(&receipt, "config.local.toml");
+            has(&receipt, "changed");
+        } else {
+            has(&receipt, "machine-local files changed after validation");
+            has(&receipt, "dotfiles were kept");
+        }
         assert_eq!(read(&f.a.join(LOCAL)), format!("{local}{RETIRE_LATE_EDIT}"));
         assert_eq!(f.tip(&f.a), incoming);
         assert!(!f.a.join("templates/fixture.tera").exists());
@@ -2520,7 +2623,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_copy_edited_in_pre_apply_stays_while_unrelated_target_updates,
+    active unchanged_copy_edited_in_pre_apply_stays_while_unrelated_target_updates,
     true,
     |f, a, b, config| {
         let pre = "printf 'late edit\\n' > \"$HOME/.copied\"";
@@ -2564,7 +2667,7 @@ fn assert_recovery_copy(base: &Path, receipt: &str, expected: &str) {
 }
 
 copies_case!(
-    unchanged_prior_copy_stays_writable_through_open_descriptor,
+    active unchanged_prior_copy_stays_writable_through_open_descriptor,
     false,
     |f, a, b, _config| {
         use std::io::{Seek as _, SeekFrom, Write as _};
@@ -2685,13 +2788,13 @@ fn guarded_hooks(only_copy: bool) {
 }
 
 sync_case!(
-    unchanged_guarded_copy_only_runs_between_real_mise_hooks,
+    active unchanged_guarded_copy_only_runs_between_real_mise_hooks,
     || {
         guarded_hooks(true);
     }
 );
 sync_case!(
-    unchanged_mixed_guarded_copies_run_between_real_mise_hooks,
+    active unchanged_mixed_guarded_copies_run_between_real_mise_hooks,
     || {
         guarded_hooks(false);
     }
@@ -2732,7 +2835,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_generated_sources_permissions_and_create_if_missing_apply_the_same_run,
+    active unchanged_generated_sources_permissions_and_create_if_missing_apply_the_same_run,
     true,
     |f, a, _b, config| {
         let config = config.replace(
@@ -2836,7 +2939,7 @@ if cmp -s {expected} {observed}; then cp {observed} {scanned}; fi
 );
 
 copies_case!(
-    unchanged_template_copy_template_dependency_order_and_edited_target_guard,
+    active unchanged_template_copy_template_dependency_order_and_edited_target_guard,
     true,
     |_f, a, _b, config| {
         let config = format!(
@@ -2945,7 +3048,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_dependent_stays_unchanged_when_all_guarded_copies_block,
+    active unchanged_dependent_stays_unchanged_when_all_guarded_copies_block,
     false,
     |_f, a, _b, config| {
         a.source(
@@ -2997,7 +3100,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_former_directory_leaf_is_protected_until_safe_takeover,
+    active unchanged_former_directory_leaf_is_protected_until_safe_takeover,
     true,
     |_f, a, _b, config| {
         let directory = "\"~/.tree\" = { source = \"dir\", mode = \"copy\" }\n";
@@ -3042,7 +3145,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_selected_rendered_directory_target_is_used,
+    active unchanged_selected_rendered_directory_target_is_used,
     false,
     |f, a, _b, config| {
         a.source("miserc.toml", "env = [\"selected\", \"host-fixture\"]\n");
@@ -3190,7 +3293,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_copy_edits_converge_across_two_machines,
+    active unchanged_copy_edits_converge_across_two_machines,
     false,
     |f, a, b, _config| {
         for content in ["first edit\n", "second edit\n"] {
@@ -3356,17 +3459,17 @@ const ABSENT_COPY: &str = r#""~/.copied" = { mode = "absent" }"#;
 const TEMPLATE_COPY: &str = r#""~/.copied" = { mode = "template", source = "template.tera" }"#;
 const REPLACEMENT_COPY: &str = r#""~/.copied" = { mode = "copy", source = "new.txt" }"#;
 
-sync_case!(unchanged_incoming_absent_does_not_remove_dirty_copy, || {
+sync_case!(active unchanged_incoming_absent_does_not_remove_dirty_copy, || {
     incoming_copy_replacement(ABSENT_COPY, None);
 });
 sync_case!(
-    unchanged_incoming_template_does_not_replace_dirty_copy,
+    active unchanged_incoming_template_does_not_replace_dirty_copy,
     || {
         incoming_copy_replacement(TEMPLATE_COPY, Some("updated template\n"));
     }
 );
 sync_case!(
-    unchanged_incoming_different_source_does_not_capture_dirty_copy,
+    active unchanged_incoming_different_source_does_not_capture_dirty_copy,
     || {
         incoming_copy_replacement(REPLACEMENT_COPY, Some("initial\n"));
     }
@@ -3398,13 +3501,13 @@ fn former_copy_edit(interrupted: bool) {
 }
 
 sync_case!(
-    unchanged_locally_changed_replacement_checks_former_copy,
+    active unchanged_locally_changed_replacement_checks_former_copy,
     || {
         former_copy_edit(false);
     }
 );
 sync_case!(
-    unchanged_interrupted_incoming_replacement_checks_former_copy,
+    active unchanged_interrupted_incoming_replacement_checks_former_copy,
     || {
         former_copy_edit(true);
     }
@@ -3439,13 +3542,13 @@ fn former_copy_after_declaration_removal(remembered: bool) {
 }
 
 sync_case!(
-    unchanged_removed_declaration_protects_dirty_copy_from_later_absent,
+    active unchanged_removed_declaration_protects_dirty_copy_from_later_absent,
     || {
         former_copy_after_declaration_removal(true);
     }
 );
 sync_case!(
-    unchanged_native_mise_only_state_protects_dirty_copy_from_later_absent,
+    active unchanged_native_mise_only_state_protects_dirty_copy_from_later_absent,
     || {
         former_copy_after_declaration_removal(false);
     }
@@ -3472,7 +3575,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_clean_copy_to_template_restores_ordinary_template_updates,
+    active unchanged_clean_copy_to_template_restores_ordinary_template_updates,
     false,
     |_f, a, _b, config| {
         a.source(
@@ -3515,8 +3618,10 @@ fn retire_native_mise(listed: bool) {
         assert_eq!(read(&f.a.join(LOCAL)), KEEP_LOCAL);
         assert_eq!(f.tip(&f.a), tip);
     } else {
-        has(&receipt, "invalid");
-        has(&receipt, source);
+        rejected_validation(&f, &receipt);
+        if f.oracle {
+            has(&receipt, source);
+        }
         assert_eq!(read(&f.a.join(LOCAL)), local);
         assert!(f.a.join(source).exists());
     }
@@ -3524,13 +3629,13 @@ fn retire_native_mise(listed: bool) {
 }
 
 sync_case!(
-    unchanged_real_mise_retires_matching_declaration_and_keeps_rendered_file,
+    active unchanged_real_mise_retires_matching_declaration_and_keeps_rendered_file,
     || {
         retire_native_mise(true);
     }
 );
 sync_case!(
-    unchanged_real_mise_rejects_unlisted_retirement_and_keeps_rendered_file,
+    active unchanged_real_mise_rejects_unlisted_retirement_and_keeps_rendered_file,
     || {
         retire_native_mise(false);
     }
@@ -3743,7 +3848,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_up_receives_changed_path_once_and_finishes_source_sync,
+    active unchanged_up_receives_changed_path_once_and_finishes_source_sync,
     || {
         let f = Repo::new();
         let tip = f.publish("fixture-incoming", "from peer\n");
@@ -3830,7 +3935,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_first_takeover_child_preserves_competing_file_and_blocks_dependents,
+    active unchanged_first_takeover_child_preserves_competing_file_and_blocks_dependents,
     false,
     |f, a, _b, config| {
         let original = format!(
@@ -3909,7 +4014,7 @@ exec {mise} "$@""#,
 );
 
 sync_case!(
-    unchanged_two_contenders_reclaim_a_stale_lock_only_once,
+    active unchanged_two_contenders_reclaim_a_stale_lock_only_once,
     || {
         use std::time::{Duration, Instant};
         let f = Repo::new();
@@ -3975,7 +4080,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_copy_capture_keeps_source_edit_observed_during_native_inventory,
+    active unchanged_copy_capture_keeps_source_edit_observed_during_native_inventory,
     false,
     |f, a, _b, _config| {
         a.target(".copied", "deployed edit\n");
@@ -4005,7 +4110,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_symlink_copy_source_keeps_a_target_created_in_pre_hook,
+    active unchanged_symlink_copy_source_keeps_a_target_created_in_pre_hook,
     true,
     |f, a, b, config| {
         fs::remove_file(a.home.join(".copied")).unwrap();

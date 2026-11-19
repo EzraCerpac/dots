@@ -1,4 +1,5 @@
 pub mod lock;
+mod source;
 
 use crate::{Args, Ctx, Fail};
 
@@ -25,11 +26,15 @@ pub enum Display {
     Stage,
 }
 
-pub fn load(_ctx: &Ctx) -> Loaded {
-    Loaded::Problem(Issue::new(
-        Fail::unported("P-08", "loading the source configuration").diagnostic,
-        "rerun with a build that includes P-08",
-    ))
+pub fn load(ctx: &Ctx) -> Loaded {
+    if source::local_only(ctx).unwrap_or(false) {
+        Loaded::LocalOnly
+    } else {
+        Loaded::Problem(Issue::new(
+            Fail::unported("P-08", "loading the source configuration").diagnostic,
+            "rerun with a build that includes P-08",
+        ))
+    }
 }
 
 pub fn run(_run: &Run<'_>, _stage: StageId, _loaded: Loaded, _display: Display) -> Receipt {

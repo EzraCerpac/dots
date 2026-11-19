@@ -1,6 +1,7 @@
 mod checkpoint;
 mod keys;
 mod native;
+mod probe_state;
 mod publication;
 mod recovery;
 mod tracked;

@@ -46,7 +46,7 @@ pub fn checkpoint_classified(
     _stage: StageId,
     ctx: &Ctx,
 ) -> Result<Checkpoint, CheckpointFailure> {
-    let native = Native::new(run, ctx);
+    let native = Native::for_checkpoint(run, ctx);
     let preflight = CheckpointFailure::preflight;
     let paths = tracked::capture_paths(&native, None).map_err(preflight)?;
     if paths.is_empty() {

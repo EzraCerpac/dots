@@ -8,25 +8,34 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use nix::libc;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use toml_edit::DocumentMut;
 
 use crate::Fail;
 
 use super::native::{Native, exists, expand};
+use super::probe_state::ProbeState;
 use super::{blocked, invalid};
 
 #[derive(Deserialize)]
 struct Inventory {
     entries: Vec<Entry>,
     invalid: Vec<InvalidEntry>,
+    // Flattening forces object input. A derived struct also accepts an array
+    // of positional fields by default, including [[], []] here.
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 struct InvalidEntry {
     path: PathBuf,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -35,25 +44,59 @@ struct Entry {
     path: PathBuf,
     variant: Option<String>,
     declared_in: Option<PathBuf>,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
-fn inventory(native: &Native<'_, '_>, local: bool) -> Result<Inventory, Fail> {
+fn inventory_command(
+    native: &Native<'_, '_>,
+    args: &[&str],
+    state: Option<&ProbeState>,
+) -> Result<Command, Fail> {
+    let mut cmd = native.mise(args)?;
+    if let Some(state) = state {
+        // Even the native read commands drain notice queues on dispatch.
+        cmd.env("MISE_STATE_DIR", state.path());
+    }
+    cmd.env_remove("__MISE_HISTORY_LOCAL")
+        .env("MISE_HISTORY_SYNC", "manual")
+        .env("GIT_ALLOW_PROTOCOL", "");
+    if native.checkpoint {
+        cmd.env("MISE_OFFLINE", "1")
+            .env("MISE_NO_HOOKS", "1")
+            .env("MISE_AUTO_UPDATE", "0")
+            .env("GIT_NO_LAZY_FETCH", "1");
+    }
+    Ok(cmd)
+}
+
+fn inventory(
+    native: &Native<'_, '_>,
+    local: bool,
+    state: Option<&ProbeState>,
+) -> Result<Inventory, Fail> {
     let mut args = vec!["bootstrap", "dotfiles"];
     if local {
         args.push("--local");
     }
     args.extend(["paths", "--json"]);
-    let mut cmd = native.mise(&args)?;
-    cmd.env_remove("__MISE_HISTORY_LOCAL")
-        .env("MISE_HISTORY_SYNC", "manual")
-        .env("GIT_ALLOW_PROTOCOL", "");
-    let inventory: Inventory =
-        serde_json::from_slice(&native.output(cmd, "could not read native tracked history paths")?)
-            .map_err(|_| invalid("mise returned an invalid tracked history inventory"))?;
+    let cmd = inventory_command(native, &args, state)?;
+    let diagnostic = "could not read native tracked history paths";
+    let output = native.probe(cmd, diagnostic)?;
+    if !output.status.success() {
+        return Err(blocked(diagnostic));
+    }
+    let inventory: Inventory = serde_json::from_slice(&output.stdout)
+        .map_err(|_| invalid("mise returned an invalid tracked history inventory"))?;
+    // Only a fresh probe with isolated state can treat stderr as uncertainty.
+    // Established stores may print a queued notice alongside valid inventory.
+    if state.is_some() && inventory.entries.is_empty() && !output.stderr.is_empty() {
+        return Err(blocked(diagnostic));
+    }
     let unproved = if local || inventory.invalid.is_empty() {
         inventory.invalid.first()
     } else {
-        let inactive = inactive_invalid_paths(native, &inventory.invalid)?;
+        let inactive = inactive_invalid_paths(native, &inventory.invalid, state)?;
         inventory
             .invalid
             .iter()
@@ -71,53 +114,66 @@ fn inventory(native: &Native<'_, '_>, local: bool) -> Result<Inventory, Fail> {
 #[derive(Deserialize)]
 struct Status {
     files: Vec<StatusEntry>,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
 #[derive(Deserialize)]
 struct StatusEntry {
     target: PathBuf,
     mode: String,
+    state: String,
     reason: Option<String>,
+    #[serde(flatten)]
+    _other: HashMap<String, IgnoredAny>,
 }
 
 fn inactive_invalid_paths(
     native: &Native<'_, '_>,
     invalid_rows: &[InvalidEntry],
+    state: Option<&ProbeState>,
 ) -> Result<BTreeSet<PathBuf>, Fail> {
     // Native paths can report a fault before testing variants. Ask status
     // to select those targets without opening or initializing the store.
     let diagnostic = "could not verify variants of invalid tracked history entries";
-    let mut cmd = native.mise(&["bootstrap", "dotfiles", "status", "--json", "--"])?;
+    let mut cmd = inventory_command(
+        native,
+        &["bootstrap", "dotfiles", "status", "--json", "--"],
+        state,
+    )?;
     cmd.args(invalid_rows.iter().map(|entry| &entry.path))
-        .env_remove("__MISE_HISTORY_LOCAL")
-        .env("MISE_HISTORY_ENABLED", "false")
-        .env("MISE_HISTORY_SYNC", "manual")
-        .env("GIT_ALLOW_PROTOCOL", "");
+        .env("MISE_HISTORY_ENABLED", "false");
     let output = native.probe(cmd, diagnostic)?;
-    if !output.status.success() {
+    if !output.status.success() || state.is_some() && !output.stderr.is_empty() {
         // A malformed declaration can be absent from status completely.
         // Keep the paths command's configuration error in that case.
         return Ok(BTreeSet::new());
     }
     let status: Status = serde_json::from_slice(&output.stdout).map_err(|_| invalid(diagnostic))?;
-    Ok(status
-        .files
-        .into_iter()
-        .filter(|entry| {
-            entry.mode == "track"
-                && entry
-                    .reason
-                    .as_deref()
-                    .and_then(|reason| reason.strip_prefix("no variant matches this machine: "))
-                    .is_some_and(|variants| {
-                        variants.split(", ").all(|variant| {
-                            variant
-                                .strip_prefix("host-")
-                                .is_some_and(|id| super::host(id).is_ok())
+    Ok(invalid_rows
+        .iter()
+        .filter(|row| {
+            if row.path.as_os_str().is_empty() {
+                return false;
+            }
+            let mut matching = status.files.iter().filter(|entry| entry.target == row.path);
+            matching.next().is_some_and(|entry| {
+                entry.mode == "track"
+                    && entry.state == "tracked"
+                    && entry
+                        .reason
+                        .as_deref()
+                        .and_then(|reason| reason.strip_prefix("no variant matches this machine: "))
+                        .is_some_and(|variants| {
+                            variants.split(", ").all(|variant| {
+                                variant
+                                    .strip_prefix("host-")
+                                    .is_some_and(|id| super::host(id).is_ok())
+                            })
                         })
-                    })
+            }) && matching.next().is_none()
         })
-        .map(|entry| entry.target)
+        .map(|row| row.path.clone())
         .collect())
 }
 
@@ -125,8 +181,9 @@ pub(super) fn capture_paths(
     native: &Native<'_, '_>,
     host: Option<&str>,
 ) -> Result<TrackedPaths, Fail> {
-    let paths = paths(native, host)?;
-    if let Some(entry) = inventory(native, true)?.entries.first() {
+    let state = ProbeState::for_capture(native)?;
+    let paths = discover(native, host, None, state.as_ref())?;
+    if let Some(entry) = inventory(native, true, state.as_ref())?.entries.first() {
         // mise 2026.11.9's unqualified save dispatches to both scopes.
         // Native track-local has no encrypted mode.
         return Err(invalid(format!(
@@ -137,26 +194,30 @@ pub(super) fn capture_paths(
     if !paths.is_empty() {
         validate_retained_policy(native, &paths)?;
     }
+    if let Some(state) = state {
+        state.recheck()?;
+    }
     Ok(paths)
 }
 
 pub(super) fn paths(native: &Native<'_, '_>, host: Option<&str>) -> Result<TrackedPaths, Fail> {
-    discover(native, host, None)
+    discover(native, host, None, None)
 }
 
 pub(super) fn restore_paths(
     native: &Native<'_, '_>,
     host: Option<&str>,
 ) -> Result<TrackedPaths, Fail> {
-    discover(native, host, Some(native.ctx.root.path()))
+    discover(native, host, Some(native.ctx.root.path()), None)
 }
 
 fn discover(
     native: &Native<'_, '_>,
     host: Option<&str>,
     source: Option<&Path>,
+    state: Option<&ProbeState>,
 ) -> Result<TrackedPaths, Fail> {
-    let inventory = inventory(native, false)?;
+    let inventory = inventory(native, false, state)?;
     let home = native.home()?;
     let physical_home = physical_home(home)?;
     let mut sources = HashMap::new();

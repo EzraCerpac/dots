@@ -113,6 +113,7 @@ Convert the checkout before you run sync again:
    When both sides changed, sync keeps each as it is and reports the clash.
 3. **Candidate.** Builds a candidate commit from every tracked or unignored public edit, leaving machine-local files out, without moving `dev` or the real index.
    Your staging stays as you left it.
+   When Git cannot tell who you are and `user.useConfigOnly` is unset, sync fills in only the missing name or email for that commit, as `dots` and `dots@localhost`, and leaves your configured values and Git configuration untouched; with `user.useConfigOnly=true` and no identity, nothing is published, and the receipt shows Git's first error with the `git config --global user.name` and `git config --global user.email` commands to run.
    When a path bound for the clean candidate has a staged version that differs from its unstaged one, settle the two before that path can be shared.
 4. **Scan.** Scans the candidate with gitleaks before `dev` or the index advances.
    A flagged file stays on disk and out of the candidate, and the rest is scanned again; only a clean candidate becomes `dev`.

@@ -1,3 +1,7 @@
+[tools]
+gitleaks = "latest"
+age = "latest"
+
 [vars]
 # List profile names separated by spaces. Put profile-specific settings in config.PROFILE.toml.
 dots_profiles = "default"

@@ -65,6 +65,11 @@ impl Doc {
         self.private = true;
     }
 
+    pub(super) fn unchanged(&self) -> bool {
+        self.original.as_deref() == Some(self.document.to_string().as_str())
+            && self.original_mode == Some(self.mode)
+    }
+
     pub(super) fn stage(self) -> Result<Staged, Fail> {
         let source = self.document.to_string();
         let changed =

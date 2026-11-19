@@ -45,7 +45,7 @@ fn new_first_run_needs_only_mise_and_git_on_path() {
     // A self-update regression must only be able to replace the fixture's copy.
     fs::copy(tool_on_path("mise"), bin.join("mise")).unwrap();
 
-    for tool in ["bash", "node", "python3", "uv", "jq"] {
+    for tool in ["age", "bash", "gitleaks", "jq", "node", "python3", "uv"] {
         let result = world.command(tool).env("PATH", &bin).output();
         assert!(
             matches!(&result, Err(error) if error.kind() == ErrorKind::NotFound),
@@ -65,7 +65,8 @@ fn new_first_run_needs_only_mise_and_git_on_path() {
                 .env("GIT_ALLOW_PROTOCOL", "file")
                 .env("MISE_TRUSTED_CONFIG_PATHS", world.base())
                 .env("MISE_OFFLINE", "1")
-                // The container first-run job exercises the networked self-update.
+                // The networked first-run job covers tool downloads and mise self-update.
+                .env("MISE_DISABLE_TOOLS", "age,gitleaks")
                 .env("MISE_SELF_UPDATE_AVAILABLE", "false")
                 .args(args)
                 .output()

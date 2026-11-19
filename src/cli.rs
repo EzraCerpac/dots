@@ -568,6 +568,14 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         return crate::process::exec_pinned(&argv[2..]);
     }
 
+    if let [_, action, profile] = argv.as_slice()
+        && action == "__check-bootstrap-profile"
+    {
+        let env = Env::current().map_err(|error| Fail::new(1, error.to_string()))?;
+        let root = Root::resolve(&env)?;
+        return bootstrap::check_profile(&root, profile);
+    }
+
     let grammar = tree();
     let index = command_index(&argv);
     let word = index.map(|index| &argv[index]);

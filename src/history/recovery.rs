@@ -22,6 +22,7 @@ const CLONE: &str = "clone-";
 const RETIRING: &str = ".dots-restore-retiring";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
+pub(super) const INTERRUPTED_RESTORE: &str = "An earlier restore was interrupted and a tracked settings file changed afterwards. Run mise dot history --pending to see a pending native operation, then mise dot recover UUID for that operation. Otherwise, reconcile the file and run dots restore.";
 
 #[derive(Deserialize, Serialize)]
 struct Journal {
@@ -243,7 +244,13 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
         paths,
     };
     if let Some(record) = journal {
-        recovery.resume(record)?;
+        let established_retry = !record.initial && matches!(record.progress, Progress::Pulling(_));
+        recovery.resume(record).map_err(|mut error| {
+            if established_retry && error.diagnostic == changed_live_file().diagnostic {
+                error.diagnostic = INTERRUPTED_RESTORE.into();
+            }
+            error
+        })?;
     } else {
         recovery.restore_established()?;
     }
@@ -1660,16 +1667,18 @@ fn journal_round_trips_above_four_mib() {
     assert!(fs::metadata(store.join(MARKER)).unwrap().len() > 4 * 1024 * 1024);
     let read = read_journal(store).unwrap();
     assert!(matches!(read.progress, Progress::Fetching(observed) if observed == live));
-    assert!(is_fetching(store));
+    assert!(is_established_restore(store, true));
 }
 
-pub(super) fn is_fetching(store: &Path) -> bool {
+pub(super) fn is_established_restore(store: &Path, fetching: bool) -> bool {
     let Ok(Some(metadata)) = existing_directory(store) else {
         return false;
     };
     read_journal(store).is_ok_and(|record| {
         !record.initial
-            && matches!(record.progress, Progress::Fetching(_))
+            && matches!(record.progress, Progress::Fetching(_)) == fetching
+            && (fetching || matches!(record.progress, Progress::Pulling(_)))
+            && (fetching || matches!(exists(&parent(store).join(STAGING)), Ok(false)))
             && record.obsolete_scope.is_none()
             && match_journal_directory(&record, &metadata).is_ok()
     })

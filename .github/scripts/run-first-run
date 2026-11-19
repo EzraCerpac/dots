@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-trap 'printf "### First-run smoke test\n\nElapsed time: %ss.\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
-binary=$1
-seed="$RUNNER_TEMP/dots-first-run"
-mkdir -p "$seed"
-cp "$(command -v mise)" "$seed/mise"
-install -m 0755 "$binary" "$seed/dots"
+seed=$(mktemp -d "$RUNNER_TEMP/dots-first-run.XXXXXXXX")
+trap 'rm -rf -- "$seed"
+      printf "### First-run smoke test\n\nElapsed time: %ss.\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
+chmod 755 "$seed"
+if [[ ${1:?missing binary or --installer} == --installer ]]; then
+    repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+    version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml")
+    release=${2:?missing candidate directory}
+    install -m 0644 "$repo/install.sh" "$seed/install.sh"
+    install -m 0644 "$release/dots-$version-linux-amd64.tar.gz" "$seed/dots.tar.gz"
+    printf '%s\n' "$version" > "$seed/dots-version"
+    printf '%s\n' "${MISE_VERSION:?missing pinned mise version}" > "$seed/mise-version"
+else
+    cp "$(command -v mise)" "$seed/mise"
+    install -m 0755 "$1" "$seed/dots"
+fi
 
 docker run --rm -i --mount "type=bind,src=$seed,dst=/seed,readonly" \
   alpine:3.23 sh -eu <<'SH'
-apk add --no-cache git ca-certificates
+set -- git ca-certificates
+if [ -f /seed/install.sh ]; then set -- "$@" curl; fi
+apk add --no-cache "$@"
 adduser -D smoke
 su -l smoke <<'SMOKE'
 set -eu
@@ -29,14 +41,52 @@ export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
 export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
 export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
 mkdir -p "$HOME/.local/bin" "$TMPDIR"
-cp /seed/mise /seed/dots "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:/usr/bin:/bin"
 if command -v python3 || command -v node; then
     echo 'Fresh-container fixture unexpectedly contains Python or Node' >&2
     exit 1
 fi
 cd "$HOME"
-dots init </dev/null
-dots up </dev/null
+if [ -f /seed/install.sh ]; then
+    set -o pipefail
+    test ! -e "$MISE_CONFIG_DIR"
+    if command -v mise || command -v dots; then
+        echo 'Fresh-container fixture unexpectedly contains mise or dots' >&2
+        exit 1
+    fi
+    MISE_VERSION=$(cat /seed/mise-version)
+    DOTS_VERSION=$(cat /seed/dots-version)
+    export MISE_VERSION DOTS_VERSION
+    curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz > "$fixture/installer.log"
+    cat "$fixture/installer.log"
+    test ! -e "$MISE_CONFIG_DIR"
+    test -x "$HOME/.local/bin/mise"
+    tar -xOzf /seed/dots.tar.gz bin/dots > "$fixture/expected-dots"
+    tool="http:dots[url=file:///seed/dots.tar.gz]@$DOTS_VERSION"
+    cmp "$fixture/expected-dots" "$(mise which --tool "$tool" dots)"
+    if command -v dots; then exit 1; fi
+
+    setup=$(sed -n '/^dots is installed\. In a terminal, run:$/ { n; p; }' "$fixture/installer.log")
+    test -n "$setup"
+    sh -ec "$setup"
+    test "$(readlink "$HOME/.local/bin/dots")" = "$MISE_SHIMS_DIR/dots"
+    cmp "$fixture/expected-dots" "$(mise which dots)"
+    test "$(sh -c 'command -v dots')" = "$HOME/.local/bin/dots"
+    test "$(sh -c 'dots --version')" = "dots $DOTS_VERSION (mise)"
+
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
+    test "$(git -C "$MISE_CONFIG_DIR" rev-parse main)" = "$(git -C "$MISE_CONFIG_DIR" rev-parse dev)"
+    if ! sh -c 'dots up' > "$fixture/up.log"; then cat "$fixture/up.log"; exit 1; fi
+    cat "$fixture/up.log"
+    grep -Fx 'Sync configuration (no remote configured): skipped' "$fixture/up.log"
+    grep -Fx 'Post-update settings checkpoint: skipped' "$fixture/up.log"
+    test -x "$(mise which age)"
+    test -x "$(mise which gitleaks)"
+    test -z "$(git -C "$MISE_CONFIG_DIR" status --porcelain)"
+else
+    cp /seed/mise /seed/dots "$HOME/.local/bin/"
+    dots init </dev/null
+    dots up </dev/null
+fi
 SMOKE
 SH

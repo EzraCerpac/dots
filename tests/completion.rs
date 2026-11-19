@@ -151,7 +151,13 @@ impl CompletionWorld {
             }
             "zsh" => (
                 &["-f", "-i"][..],
-                "autoload -Uz compinit; compinit -D -i && source <(dots completions zsh)",
+                // Split the markers so they can be distinguished from terminal echo.
+                concat!(
+                    r"printf '%s%s\n' ZSH_ SETUP_STARTED; ",
+                    "autoload -Uz compinit; compinit -D -i && ",
+                    r"{ printf '%s%s\n' ZSH_ COMPINIT_DONE; source <(dots completions zsh); } && ",
+                    r"printf '%s%s\n' ZSH_ SOURCE_DONE",
+                ),
             ),
             "fish" => (&["--no-config", "-i"][..], "dots completions fish | source"),
             _ => unreachable!(),
@@ -885,6 +891,11 @@ impl Session {
                 continue;
             }
             break;
+        }
+        if self.shell == "zsh" && marker == b"READY_DOTS" {
+            // Preserve line endings and terminal controls that CI strips from the transcript.
+            let tail = &self.buffered[self.buffered.len().saturating_sub(512)..];
+            eprintln!("zsh setup PTY tail: {:?}", String::from_utf8_lossy(tail));
         }
         panic!(
             "{} did not print {:?}\n{}",

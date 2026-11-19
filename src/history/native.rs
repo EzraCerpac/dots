@@ -87,10 +87,14 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         Ok(cmd)
     }
 
-    pub fn command(&self, program: &str) -> Result<Command, Fail> {
+    pub fn command(&self, program: impl AsRef<std::ffi::OsStr>) -> Result<Command, Fail> {
         let mut cmd = self.ctx.command(program, Cwd::Root)?;
         cmd.env("LC_ALL", "C");
         Ok(cmd)
+    }
+
+    pub fn tool(&self, name: &str) -> PathBuf {
+        self.run.tool_with(name, |args| self.mise(args))
     }
 
     pub fn probe(&self, cmd: Command, diagnostic: &str) -> Result<Output, Fail> {

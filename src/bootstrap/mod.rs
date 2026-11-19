@@ -9,7 +9,7 @@ pub use bundle::bundle;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Permissions};
-use std::io::{self, Read as _};
+use std::io::{self, IsTerminal as _, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,36 @@ pub fn bootstrap(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         None => launch(ctx, args),
         _ => unreachable!("selected by CLI"),
     }
+}
+
+pub(crate) fn check_profile(root: &Root, requested: &OsStr) -> Result<u8, Fail> {
+    let profiles = crate::config::passive::profiles(root)?;
+    let saved = selection::configured_profile(root)?;
+    let choices = profiles.join(", ");
+    let mut selected = requested.to_string_lossy().into_owned();
+    if selected.is_empty() {
+        if let Some(saved) = &saved {
+            selected.clone_from(saved);
+        } else if profiles.len() == 1 {
+            selected.clone_from(&profiles[0]);
+        } else if io::stdin().is_terminal() {
+            eprint!("Choose a bootstrap profile ({choices}): ");
+            let _ = io::stdin().read_line(&mut selected);
+            selected.truncate(selected.trim_end().len());
+        }
+    }
+    let reason = if !profiles.contains(&selected) {
+        "choose a declared bootstrap profile"
+    } else if saved.as_ref().is_some_and(|saved| saved != &selected) {
+        "requested bootstrap profile differs from the saved profile; use dots profile --profile PROFILE --machine-id ID to change it"
+    } else {
+        println!("{selected}");
+        return Ok(0);
+    };
+    println!("{}", saved.as_ref().unwrap_or(&profiles[0]));
+    Err(Fail::usage(format!(
+        "{reason}. Declared profiles: {choices}"
+    )))
 }
 
 fn arg_path(ctx: &Ctx, args: &Args, name: &str) -> Option<PathBuf> {

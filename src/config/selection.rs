@@ -335,6 +335,9 @@ pub fn persist(root: &Root, env: &Env, selection: Persist<'_>) -> Result<(), Fai
 
     early.make_private();
     local.make_private();
+    if early.unchanged() && local.unchanged() {
+        return Ok(());
+    }
     let early = early.stage()?;
     let local = local.stage()?;
     process::validate_selection(

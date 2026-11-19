@@ -1875,6 +1875,83 @@ exec "$FIXTURE_MISE" "$@"
 }
 
 #[test]
+fn new_established_interrupted_restore_explains_recovery_in_each_command() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let source = seed.world.bare_remote("source.git");
+    let (key, public) = seed.key("recovery");
+    let origin = format!("file://{}", remote.display());
+    seed.configure(&origin, &origin, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+
+    let fixture = Fixture::new();
+    fixture.configure(&origin, &origin, &key, &[public]);
+    let source = format!("file://{}", source.display());
+    let config = fixture.world.root().join("config.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        config,
+        text.replace("[vars]", &format!("[vars]\ndots_source_repo = {source:?}")),
+    )
+    .unwrap();
+    ok(fixture.git(None).args(["init", "-b", "dev"]));
+    ok(fixture.git(None).args(["add", "config.toml"]));
+    ok(fixture.git(None).args(["commit", "-m", "Fixture source"]));
+    ok(fixture.git(None).args(["remote", "add", "origin", &source]));
+    ok(fixture.git(None).args(["push", "origin", "dev"]));
+    ok(&mut fixture.dots(&["restore"], &remote));
+    seed.seed(&remote, REMOTE_EDIT);
+
+    let wrapper = fixture.script(
+        "interrupt-established-pull",
+        r#"#!/bin/sh
+case " $* " in
+  *" bootstrap dotfiles pull "*) exit 93 ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+    );
+    let interrupted = fixture
+        .dots(&["restore"], &remote)
+        .env("DOTS_MISE_BIN", wrapper)
+        .env("FIXTURE_MISE", &fixture.mise)
+        .output()
+        .unwrap();
+    assert_eq!(
+        interrupted.status.code(),
+        Some(1),
+        "{}",
+        messages(&interrupted)
+    );
+    let marker = fixture.store().join("dots-restore-pending");
+    let original = fs::read(&marker).unwrap();
+    let journal: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(journal["initial"], false);
+    assert!(journal["progress"]["Pulling"].is_object());
+    fixture.write(LOCAL_EDIT, 0o600);
+
+    for (command, status) in [("restore", 1), ("up", 1), ("backup", 1), ("sync", 0)] {
+        let output = fixture.dots(&[command], &remote).output().unwrap();
+        let diagnostic = messages(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{command}: {diagnostic}"
+        );
+        for text in [
+            "An earlier restore was interrupted and a tracked settings file changed afterwards.",
+            "mise dot history --pending",
+            "mise dot recover UUID",
+            "Otherwise, reconcile the file and run dots restore.",
+        ] {
+            assert!(diagnostic.contains(text), "{command}: {diagnostic}");
+        }
+        assert_eq!(fs::read(&marker).unwrap(), original);
+        assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
+    }
+}
+
+#[test]
 fn new_interrupted_pull_accepts_only_equivalent_rewrites() {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");

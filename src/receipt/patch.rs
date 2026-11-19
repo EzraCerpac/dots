@@ -58,9 +58,12 @@ pub(super) fn render_until(
     let mut screened = Screened::default();
     if receipt.checkout.as_deref() == Some(root) {
         let root = root.to_owned();
-        let tools = Tools::new(env);
+        let env = Env {
+            vars: env.vars.clone(),
+            cwd: env.cwd().to_owned(),
+        };
         screened = collect_until(deadline, move |budget, send| {
-            screen(&tools, &root, &groups, replay, bytes, budget, send);
+            screen(&env, &root, &groups, replay, bytes, budget, send);
         });
     }
     let omitted = candidates - screened.patches;
@@ -115,7 +118,7 @@ fn collect_until(
 }
 
 fn screen(
-    tools: &Tools,
+    env: &Env,
     root: &Path,
     groups: &[ChangeGroup],
     replay: bool,
@@ -126,7 +129,7 @@ fn screen(
     let Ok(dir) = private_directory().tempdir() else {
         return;
     };
-    let tools = tools.with_scratch_home(dir.path());
+    let tools = Tools::new(env).with_scratch_home(dir.path());
     if run(
         git(&tools, root).args(["rev-parse", "--is-inside-work-tree", "--show-prefix"]),
         budget,
@@ -137,7 +140,23 @@ fn screen(
     {
         return;
     }
-    let Some(scanner) = Scanner::new(&tools, root, dir.path(), budget) else {
+    let gitleaks = crate::process::tool_path(env, "gitleaks", false, |args| {
+        let mise = crate::process::mise_binary(env).ok()?;
+        let managed = crate::config::Root::from_dir(env, root).ok()?;
+        let selected = crate::config::selection::read(&managed, env).ok()?;
+        let mut command = crate::process::quiet_probe(&mise, root, dir.path(), env);
+        match env.get("MISE_STATE_DIR") {
+            Some(state) => command.env("MISE_STATE_DIR", state),
+            None => command.env_remove("MISE_STATE_DIR"),
+        };
+        run(
+            command
+                .env("MISE_ENV", selected.active_environments())
+                .args(args),
+            budget,
+        )
+    });
+    let Some(scanner) = Scanner::new(&tools, &gitleaks, root, dir.path(), budget) else {
         return;
     };
     let mut lines = 0;
@@ -356,13 +375,20 @@ fn git(tools: &Tools, root: &Path) -> Command {
 
 struct Scanner<'a> {
     tools: &'a Tools,
+    gitleaks: &'a Path,
     scratch: &'a Path,
     floor: PathBuf,
     project: Option<PathBuf>,
 }
 
 impl<'a> Scanner<'a> {
-    fn new(tools: &'a Tools, root: &Path, scratch: &'a Path, budget: &Budget) -> Option<Self> {
+    fn new(
+        tools: &'a Tools,
+        gitleaks: &'a Path,
+        root: &Path,
+        scratch: &'a Path,
+        budget: &Budget,
+    ) -> Option<Self> {
         let floor = scratch.join("floor.toml");
         private_file(&floor, b"[extend]\nuseDefault = true\n").ok()?;
         let project_file = root.join(".gitleaks.toml");
@@ -373,6 +399,7 @@ impl<'a> Scanner<'a> {
         };
         Some(Self {
             tools,
+            gitleaks,
             scratch,
             floor,
             project,
@@ -414,7 +441,7 @@ impl<'a> Scanner<'a> {
             private_file(&file, body).ok()?;
             for config in std::iter::once(&self.floor).chain(&self.project) {
                 let stdin = displayed && config == &self.floor;
-                let mut command = self.tools.command("gitleaks");
+                let mut command = self.tools.command(self.gitleaks);
                 command
                     .current_dir(input.path())
                     .arg(if stdin { "stdin" } else { "dir" })
@@ -531,8 +558,14 @@ mod tests {
         ] {
             fs::write(&config, format!("[extend]\n{settings}")).unwrap();
             let scratch = private_directory().tempdir().unwrap();
-            let scanner = Scanner::new(&tools, &root, scratch.path(), &budget)
-                .unwrap_or_else(|| panic!("{name} extension path rejected"));
+            let scanner = Scanner::new(
+                &tools,
+                Path::new("gitleaks"),
+                &root,
+                scratch.path(),
+                &budget,
+            )
+            .unwrap_or_else(|| panic!("{name} extension path rejected"));
             assert_eq!(
                 fs::read_to_string(scanner.floor).unwrap(),
                 "[extend]\nuseDefault = true\n"

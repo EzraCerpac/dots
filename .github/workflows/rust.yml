@@ -98,7 +98,7 @@ jobs:
           for tool in bash zsh fish git jq age age-keygen mise gitleaks; do command -v "$tool"; done
           bash .github/scripts/run-native-tests "$TARGET"
       - name: Run dots init and dots up in a fresh container
-        if: matrix.platform == 'linux-amd64'
+        if: matrix.platform == 'linux-amd64' && needs.changes.outputs.full == 'false'
         run: bash .github/scripts/run-first-run "target/$TARGET/debug/dots"
       - name: Bundle the Cargo tests for the oracle
         if: matrix.platform == 'linux-amd64' && needs.changes.outputs.full == 'true'
@@ -346,6 +346,9 @@ jobs:
       - env:
           PLATFORM: ${{ matrix.platform }}
         run: packaging/verify-installs "$PLATFORM" "$RUNNER_TEMP/dots-release"
+      - name: Run install.sh in a fresh container with the release archive
+        if: matrix.platform == 'linux-amd64'
+        run: bash .github/scripts/run-first-run --installer "$RUNNER_TEMP/dots-release"
 
   ci:
     name: ci

@@ -219,6 +219,8 @@ fn show_programs(ctx: &Ctx, run: &Run<'_>) -> bool {
         }
         let path = if program.name == "mise" {
             mise_binary(&ctx.env).ok()
+        } else if matches!(program.name, "gitleaks" | "age" | "age-keygen") {
+            Some(run.tool(program.name)).filter(|path| path.is_absolute())
         } else {
             find_program(&ctx.env, program.name)
         };

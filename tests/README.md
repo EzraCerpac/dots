@@ -16,7 +16,7 @@ and returns its absolute path.
 ```rust
 #[test]
 fn unchanged_help_without_configuration() {
-    let world = World::new();
+    let world = support::World::new();
     let output = world.dots().env_remove("DOTS_ROOT").arg("help").output().unwrap();
     assert!(output.status.success(), "{output:?}");
 }
@@ -43,7 +43,7 @@ The helper makes a fresh private environment for both the CLI and its adjacent
 renderer, including for their informational flags.
 
 ```sh
-tests/support/oracle-probe "$DOTS_BIN"
+tests/support/oracle-probe /absolute/path/to/v0.4.0/bin/dots
 ```
 
 On DriehuisNAS, wrap each test command with `mise run nas:build --`.

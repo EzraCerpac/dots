@@ -64,6 +64,15 @@ impl Fixture {
         self.command(dots_bin())
     }
 
+    fn selected_version(&self) -> String {
+        let output = successful(self.dots().arg("--version").output().unwrap());
+        let output = std::str::from_utf8(&output).unwrap();
+        let (version, _) = output
+            .split_once(" (")
+            .expect("dots version and install method");
+        version.to_owned()
+    }
+
     fn select(&self, args: &[&str]) -> Output {
         self.dots()
             .args([
@@ -324,7 +333,7 @@ printf '[{"path":"%s/config.laptop.toml"},{"path":"%s/config.host-demo-machine.t
 "#,
     );
     successful(
-        f.command(env!("CARGO_BIN_EXE_dots"))
+        f.dots()
             .args([
                 "profile",
                 "--profile",
@@ -568,6 +577,7 @@ exit 43
 #[test]
 fn new_running_dots_survives_an_upgrade_during_a_configuration_command() {
     let f = Fixture::new();
+    let selected_version = f.selected_version();
     let install = f
         .base
         .join("mise/installs/github-ezracerpac-dots/v1/bin/dots");
@@ -597,7 +607,7 @@ dots --version
     );
     let output = std::str::from_utf8(&output).unwrap();
     let (pinned, version) = output.split_once('\n').unwrap();
-    assert!(version.starts_with(&format!("dots {} ", env!("CARGO_PKG_VERSION"))));
+    assert!(version.starts_with(&format!("{selected_version} ")));
     let parent = Path::new(pinned).parent().unwrap();
     assert!(parent.starts_with(&f.base));
     assert!(!parent.exists());
@@ -606,6 +616,7 @@ dots --version
 #[test]
 fn new_install_method_uses_the_running_binary_location() {
     let f = Fixture::new();
+    let selected_version = f.selected_version();
     for (relative, kind) in [
         ("brew/Cellar/dots/1.0/bin/dots", "homebrew"),
         ("mise/installs/github-ezracerpac-dots/1.0/bin/dots", "mise"),
@@ -624,10 +635,7 @@ fn new_install_method_uses_the_running_binary_location() {
                 .output()
                 .unwrap(),
         );
-        assert_eq!(
-            output,
-            format!("dots {} ({kind})\n", env!("CARGO_PKG_VERSION")).as_bytes()
-        );
+        assert_eq!(output, format!("{selected_version} ({kind})\n").as_bytes());
     }
 }
 
@@ -709,12 +717,13 @@ fn unchanged_skill_link_stays_inside_the_agent_directory() {
 fn unchanged_completion_loader_leaves_skill_links_alone() {
     let f = Fixture::new();
     fs::create_dir(f.home.join(".claude")).unwrap();
-    // Check side effects while the Rust completion loader is still a stub.
-    f.dots()
-        .env_remove("DOTS_SKILL_LINKS")
-        .args(["completions", "zsh"])
-        .output()
-        .unwrap();
+    successful(
+        f.dots()
+            .env_remove("DOTS_SKILL_LINKS")
+            .args(["completions", "zsh"])
+            .output()
+            .unwrap(),
+    );
     assert!(!f.home.join(".claude/skills").exists());
     assert!(!f.base.join("xdg-state").exists());
 }

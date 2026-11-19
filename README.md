@@ -48,7 +48,7 @@ With `--from` and `--profile`, the installer clones that repository instead of r
 <details>
 <summary>Other ways to install</summary>
 
-<!-- TODO (D-01, G-2): Verify these routes against the published 0.5.0 artifacts. -->
+<!-- TODO (G-2): Verify these routes against the published 0.5.0 artifacts. -->
 <!-- TODO (C-01): Add a Cargo install route once dots-cli is published. -->
 
 Once 0.5.0 is released, these will also work; until then the Homebrew tap installs 0.4.0.

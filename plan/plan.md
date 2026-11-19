@@ -117,7 +117,7 @@ Every task is one pull request from its own worktree, into `main`. That is safe 
 
 The coordinator launches each lead as its own top-level T3 thread in its own worktree, with this brief as the first message; the thread gets no history, so the brief carries everything.
 
-- **Read first**: this plan, `docs/contract.md` and `docs/rust-port.md`, `REVIEW.md` and `AGENTS.md`.
+- **Read first**: this plan, `docs/contract.md`, `REVIEW.md` and `AGENTS.md`.
 - **You own**: the listed task IDs and the shared things the ownership table gives you.
 - **You may start**: Opus 5.5 at high effort for taste and Sol 6.2 at high effort for implementation (xhigh where the plan says so), each with `delegate_task` in worktree isolation, one task and one pull request per child. Tell each child it may use its own native subagents and must not start Fable.
 - **Each child must**: keep to its task's acceptance criteria, leave the current implementation untouched, run the tests, run a sol loop, open a pull request with the disclosure note, answer the review findings on it, and end with the pull request URL, head SHA, and the state of checks and reviews.

@@ -1,7 +1,7 @@
 # Review guidelines
 
 For anyone reviewing a pull request here, human or automated.
-[The contract](docs/contract.md) is the reference for what `dots` 0.5 does; check behaviour claims against it, and [the port architecture](docs/rust-port.md) for who owns which module.
+[The contract](docs/contract.md) is the reference for what `dots` 0.5 does; check behaviour claims against it.
 
 ## What this project promises
 

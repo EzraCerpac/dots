@@ -29,39 +29,26 @@ fn unchanged_help_without_configuration() {
 
 ## Run and count cases
 
+Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`; `mise run test` does the same with the Rust that `mise.toml` pins.
+`dots test` is something else: it runs a configuration's own `tests/run`, not these suites.
+
+```sh
+cargo test --locked --test contract
+cargo test --locked --test contract -- --list
+```
+
+On DriehuisNAS, run each test command through `mise run nas:build --`.
+
 Name a case `unchanged_` when v0.4.0 passes it too,
 and `new_` when it covers behaviour that v0.4.0 lacks.
 While Rust does not have the feature yet, mark the case `#[ignore = "P-NN"]` with the task that implements it,
 and take the mark off once that implementation lands.
 `DOTS_BIN`, set to an absolute path, chooses a different executable;
 when it is unset, Cargo provides `dots`.
-The v0.4.0 oracle is a release or archive of commit `f5c8a0e`.
-Point `DOTS_BIN` at that archive's `bin/dots` by absolute path, and also set `DOTS_TEST_ORACLE=v0.4.0`,
-which tells the supervisor fixture to expect the archive's `dots-up` renderer next to it.
-
-```sh
-mise run test -- --test contract
-DOTS_TEST_ORACLE=v0.4.0 DOTS_BIN=/absolute/path/to/v0.4.0/bin/dots mise run test -- unchanged_ -- --include-ignored
-mise run test -- --test contract -- --list
-```
-
-To smoke-test a verified, unpacked archive by hand, give `tests/support/oracle-probe`
-the absolute path to that archive's `bin/dots` as its only argument.
-The `dots-up` renderer must sit beside it.
-The probe builds a fresh private environment for both executables, even for their
-informational flags, and never uses the caller's `HOME`.
-
-```sh
-tests/support/oracle-probe /absolute/path/to/v0.4.0/bin/dots
-```
-
-On DriehuisNAS, run each test command through `mise run nas:build --`.
 
 Every suite has an `inventory/<suite>.tsv` file whose header is
 `unchanged<TAB>new<TAB>dropped`, followed by one row of integer counts.
 Take the `unchanged_` and `new_` counts from the Cargo listing, ignored cases included.
-For each legacy case you drop, add its `Class.test_method` identifier and a concrete reason
-to `inventory/<suite>-dropped.tsv`, whose header is `legacy_case<TAB>reason`.
+A case from the retired legacy suites that was dropped in translation is listed in `inventory/<suite>-dropped.tsv`,
+by its `Class.test_method` identifier and a concrete reason, under the header `legacy_case<TAB>reason`.
 The dropped count is the number of entries in that file.
-The first counts covered only the initial translations and the cases dropped explicitly;
-every other legacy case is still pending.

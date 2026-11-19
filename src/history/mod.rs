@@ -1,6 +1,8 @@
 mod checkpoint;
 mod keys;
 mod native;
+mod probe_state;
+mod publication;
 mod recovery;
 mod tracked;
 mod watcher;
@@ -92,10 +94,41 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     native.destinations(Some(&store), &origin, expected, &vars)?;
     tracked::capture_paths(native, Some(&branch))?.check_binding(paths.binding(), false)?;
     native.require_no_pending_operations()?;
+    let policy = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
+    let http = if publication::allows_plaintext(native.probe(
+        policy,
+        "could not read mise's effective history.allow_plaintext_history setting",
+    )?)? {
+        None
+    } else {
+        publication::preflight(
+            |args, access| {
+                let mut git = native.git(Some(&store))?;
+                if let Some(parameters) = publication::git_parameters(access, git.get_envs()) {
+                    git.env("GIT_CONFIG_PARAMETERS", parameters);
+                }
+                git.envs(publication::git_environment(access)).args(args);
+                let diagnostic = "could not verify the history publication range";
+                if access.is_local() {
+                    native.probe(git, diagnostic)
+                } else {
+                    native
+                        .run
+                        .probe_detached(git, std::time::Duration::from_secs(30))
+                        .map_err(|_| blocked(diagnostic))
+                }
+            },
+            &branch,
+            &origin,
+            &saved,
+            publication::has_ssh_launcher(|name| ctx.env.get(name)),
+        )?
+    };
     let mut cmd = native.mise(&["bootstrap", "dotfiles", "sync"])?;
     recovery::unmodified_git_graph(&mut cmd)
         .env_remove("__MISE_HISTORY_LOCAL")
         .env("GIT_TERMINAL_PROMPT", "0");
+    publication::constrain_http(&mut cmd, http.as_ref());
     native.output(
         cmd,
         "native history sync failed; the settings checkpoint was kept locally and publication could not be verified. Check the private history remote and use mise dot status",
@@ -114,7 +147,7 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         .destinations(Some(&store), &origin, expected, &vars)
         .map_err(|_| unconfirmed())?;
     let reference = format!("refs/heads/{branch}");
-    let remote = remote_checkpoint(native, &store, &origin, &reference)
+    let remote = remote_checkpoint(native, &store, &origin, &reference, http.as_ref())
         .map_err(|_| unconfirmed())?
         .ok_or_else(pending)?;
     if !recovery::ancestor(native, &store, &saved, &remote).map_err(|_| unconfirmed())? {
@@ -128,6 +161,7 @@ fn remote_checkpoint(
     store: &Path,
     origin: &str,
     reference: &str,
+    http: Option<&publication::HttpPolicy>,
 ) -> Result<Option<String>, Fail> {
     let diagnostic = "could not independently verify the private history branch";
     let mut cmd = native.git(Some(store))?;
@@ -140,6 +174,7 @@ fn remote_checkpoint(
         reference,
     ]);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    publication::constrain_http(&mut cmd, http);
     let output = native.probe(cmd, diagnostic)?;
     if output.status.code() == Some(2) && output.stdout.is_empty() && output.stderr.is_empty() {
         return Ok(None);

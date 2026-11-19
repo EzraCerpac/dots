@@ -103,6 +103,7 @@ impl<'a> Git<'a> {
         cmd.args(["-c", "protocol.ext.allow=never", "-c", "gc.auto=0"])
             .args(args)
             .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_GRAFT_FILE", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "/usr/bin/false")
@@ -116,7 +117,10 @@ impl<'a> Git<'a> {
     }
 
     pub fn output(&self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io::Result<Output> {
-        let mut command = self.command(args)?;
+        self.output_command(self.command(args)?)
+    }
+
+    pub fn output_command(&self, mut command: Command) -> io::Result<Output> {
         match self.run {
             Some(run) => run.probe(command),
             None => command.output(),

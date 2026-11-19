@@ -6,6 +6,7 @@ pub mod lock;
 mod merge;
 mod remote;
 mod snapshot;
+mod source;
 mod validation;
 
 #[cfg(test)]
@@ -159,7 +160,7 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
         .and_then(|repo| repo.github())
         .filter(|name| name.len() <= 140)
         .map(str::to_owned);
-    Origin::load(git, vars.source_repo).map_err(|_| {
+    let origin = Origin::load(git, vars.source_repo).map_err(|_| {
         let diagnostic = match github {
             Some(name) => {
                 format!("origin is missing, unsafe, or differs from configured repository {name}")
@@ -168,7 +169,12 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
             None => "origin is missing, unsafe, or differs from the configured repository".into(),
         };
         Note(diagnostic, REMOTE)
-    })
+    })?;
+    if origin.is_none() {
+        crate::config::selection::read(&ctx.root, &ctx.env)
+            .or_note("The profile or machine selection could not be read", CONFIG)?;
+    }
+    Ok(origin)
 }
 
 pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display) -> Receipt {

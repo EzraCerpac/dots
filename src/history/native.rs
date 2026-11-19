@@ -22,6 +22,7 @@ pub(super) struct Native<'a, 'ctx> {
     pub ctx: &'ctx Ctx,
     pub run: &'a Run<'ctx>,
     selection: Option<Selection>,
+    pub(super) checkpoint: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -36,6 +37,14 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
             ctx,
             run,
             selection: None,
+            checkpoint: false,
+        }
+    }
+
+    pub(super) fn for_checkpoint(run: &'a Run<'ctx>, ctx: &'ctx Ctx) -> Self {
+        Self {
+            checkpoint: true,
+            ..Self::new(run, ctx)
         }
     }
 
@@ -55,10 +64,12 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         let environments = selected.active_environments();
         let mise = Mise::with_selection(self.ctx, selected)?;
         let mut cmd = mise.command(args)?;
-        // Use the managed global layers and the same store that dots checks.
-        // A single-file override hides the managed machine-local declaration.
-        cmd.env_remove("MISE_GLOBAL_CONFIG_FILE")
-            .env_remove("MISE_CD")
+        // Backup and restore use the managed layers. Update checkpoints must
+        // see the same effective overrides for inventory and native save.
+        if !self.checkpoint {
+            cmd.env_remove("MISE_GLOBAL_CONFIG_FILE");
+        }
+        cmd.env_remove("MISE_CD")
             .env_remove("MISE_LOG_FILE")
             .env("MISE_ENV", environments)
             .env("MISE_STATE_DIR", self.state_dir()?);
@@ -108,7 +119,7 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
             .ok_or_else(|| invalid("HOME must name an absolute directory"))
     }
 
-    fn state_dir(&self) -> Result<PathBuf, Fail> {
+    pub(super) fn state_dir(&self) -> Result<PathBuf, Fail> {
         let env = &self.ctx.env;
         let home = self.home()?;
         let state = match env.get("MISE_STATE_DIR").filter(|path| !path.is_empty()) {

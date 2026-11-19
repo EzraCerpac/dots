@@ -57,7 +57,12 @@ impl Origin {
             }
         }
         if fetch.is_empty() && push.is_empty() && setting.is_none() {
-            return Ok(None);
+            if super::source::origin_absent(git)? {
+                return Ok(None);
+            }
+            return Err(invalid(
+                "origin exists but has no supported URL configuration",
+            ));
         }
         let raw = fetch.first().ok_or_else(|| invalid("origin has no URL"))?;
         let expected = match setting {

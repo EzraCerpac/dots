@@ -71,7 +71,7 @@ impl Drop for RepoLock {
     }
 }
 
-fn unlock(file: &File) -> io::Result<()> {
+pub(super) fn unlock(file: &File) -> io::Result<()> {
     loop {
         match file.unlock() {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

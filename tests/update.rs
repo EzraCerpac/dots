@@ -991,7 +991,6 @@ fn new_up_embedded_sync_local_only_does_not_emit_or_save_receipt() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn new_up_embedded_sync_records_load_problem_once_and_continues() {
     let fixture = Fixture::new();
     fixture.write(
@@ -1013,7 +1012,6 @@ fn new_up_embedded_sync_records_load_problem_once_and_continues() {
 }
 
 #[test]
-#[ignore = "P-08"]
 fn new_up_embedded_sync_records_the_actual_adopted_revision_once() {
     let fixture = Fixture::new();
     let before = seed_sync_fixture(&fixture);

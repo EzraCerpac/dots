@@ -579,6 +579,12 @@ if [ -n "$report" ]; then printf '[]\n' > "$report"; fi
 "#;
 
 macro_rules! sync_case {
+    (active $name:ident, $body:expr) => {
+        #[test]
+        fn $name() {
+            ($body)();
+        }
+    };
     ($name:ident, $body:expr) => {
         #[test]
         #[ignore = "P-08 sync; run unchanged cases against the v0.4.0 oracle"]
@@ -683,7 +689,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_concurrent_snapshot_is_not_reported_as_local_push,
+    active unchanged_concurrent_snapshot_is_not_reported_as_local_push,
     || {
         let f = Repo::new();
         let hook = publish_during_validation(&f, "dev");
@@ -699,7 +705,7 @@ sync_case!(
 );
 
 sync_case!(
-    unchanged_concurrent_snapshot_and_reviewed_push_distinguished,
+    active unchanged_concurrent_snapshot_and_reviewed_push_distinguished,
     || {
         let f = Repo::new();
         f.reviewed("actual-share", "reviewed change\n");
@@ -2484,8 +2490,8 @@ fn hooks(config: &str, pre: &str, post: &str) -> String {
 }
 
 macro_rules! copies_case {
-    ($name:ident, $hooks:expr, |$f:ident, $a:ident, $b:ident, $config:ident| $body:block) => {
-        sync_case!($name, || {
+    ($($name:ident)+, $hooks:expr, |$f:ident, $a:ident, $b:ident, $config:ident| $body:block) => {
+        sync_case!($($name)+, || {
             let $f = Repo::new();
             let $a = Machine::new(&$f, &$f.a, "machine-a", $hooks);
             let $b = Machine::new(&$f, &$f.b, "machine-b", $hooks);
@@ -2876,9 +2882,16 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
+    active unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
     true,
     |f, a, _b, config| {
+        let umask_probe = f.scratch.join("directory-create-mode");
+        fs::create_dir(&umask_probe).unwrap();
+        assert_eq!(
+            mode(&umask_probe),
+            0o755,
+            "directory-copy fixtures must inherit umask 022"
+        );
         let config = format!(
             "{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\", exclude = [\"skip\"], dot_prefix = true }}\n"
         );
@@ -3065,7 +3078,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_directory_copy_uses_pre_hook_source_and_keeps_late_target_edit,
+    active unchanged_directory_copy_uses_pre_hook_source_and_keeps_late_target_edit,
     true,
     |_f, a, _b, config| {
         let config = format!("{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\" }}\n");
@@ -3095,7 +3108,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_adopted_directory_copy_preserves_deployed_permissions,
+    active unchanged_adopted_directory_copy_preserves_deployed_permissions,
     false,
     |f, a, _b, config| {
         a.source(

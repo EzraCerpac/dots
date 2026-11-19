@@ -12,7 +12,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::{receipt::Receipt, run::Run};
 
 use super::git::{Entry, Git, Tree, invalid, relative};
-use super::guard::{CStrName, Dir, Image, private_dir, write_private};
+use super::guard::{CStrName, Dir, FileId, Image, private_dir, write_private};
 use super::validation::{self, Retirement, Validated};
 use super::{issue, path_issue};
 
@@ -259,6 +259,8 @@ impl KnownCopy {
 pub(super) struct Copies {
     state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
+    observed_directory_inodes: BTreeMap<PathBuf, FileId>,
+    adopted_directory_leaves: BTreeMap<PathBuf, PathBuf>,
     written: BTreeSet<PathBuf>,
     deployments: BTreeMap<PathBuf, NativeDeployment>,
 }
@@ -514,8 +516,9 @@ impl Copies {
                 }
                 continue;
             };
-            let native = if git.root().join(source).is_dir() {
-                Some(stage_tree(run, git_dir, &git.root().join(source), &rules)?)
+            let source_dir = git.root().join(source);
+            let native = if source_dir.is_dir() {
+                Some(stage_tree(run, git_dir, &source_dir, &rules)?)
             } else {
                 None
             };
@@ -551,9 +554,9 @@ impl Copies {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
                 let common = record.source_image(git, revision)?;
-                let deployed = match filesystem.read_path(fs_relative(&path)?) {
-                    Ok(image @ Image::Regular { .. }) => image,
-                    Ok(Image::Absent) => continue,
+                let (deployed, inode) = match filesystem.read_observed(fs_relative(&path)?) {
+                    Ok((image @ Image::Regular { .. }, Some(inode))) => (image, inode),
+                    Ok((Image::Absent, _)) => continue,
                     _ => {
                         path_issue(
                             receipt,
@@ -565,6 +568,9 @@ impl Copies {
                     }
                 };
                 self.observed.insert(path.clone(), deployed.clone());
+                if path != destination {
+                    self.observed_directory_inodes.insert(path.clone(), inode);
+                }
                 let live = root.read_path(leaf)?;
                 let deployment = if path == destination {
                     self.deployments.get(&path)
@@ -677,6 +683,23 @@ impl Copies {
                     }
                 } else {
                     self.state = Self::load(git_dir)?.state;
+                }
+            }
+            if let Some(leaves) = native {
+                for (relative, expected) in leaves {
+                    let path = destination.join(relative);
+                    // A leaf matching what the declared source would deploy
+                    // counts as deployed, even without a prior Git entry.
+                    if !self.state.known.contains_key(&path)
+                        && let Ok((current, Some(inode))) =
+                            filesystem.read_observed(fs_relative(&path)?)
+                        && current == expected
+                    {
+                        self.adopted_directory_leaves
+                            .insert(path.clone(), source_dir.clone());
+                        self.observed_directory_inodes.insert(path.clone(), inode);
+                        self.observed.insert(path, expected);
+                    }
                 }
             }
         }
@@ -1266,8 +1289,22 @@ impl Copies {
         let mut clean = true;
         for (path, replacement) in desired {
             let relative_path = fs_relative(&path)?;
-            let current = filesystem.read_path(relative_path)?;
+            let (current, current_inode) = filesystem.read_observed(relative_path)?;
             if rules.create_only && current != Image::Absent {
+                continue;
+            }
+            let observed_inode = self.observed_directory_inodes.get(&path).copied();
+            if let Some(inode) = observed_inode
+                && (Some(inode) != current_inode
+                    || observed.get(&path).is_some_and(|before| *before != current))
+            {
+                path_issue(
+                    receipt,
+                    "Kept a changed or unmanaged dotfile",
+                    &path,
+                    COPY_ACTION,
+                );
+                clean = false;
                 continue;
             }
             let known = self.state.known.get(&path);
@@ -1346,12 +1383,22 @@ impl Copies {
                         (native.is_none() || known.deployed.is_some() || mode.is_some())
                             && known.matches(&current, base, mode, native)
                     }
-                    (Image::Regular { .. }, None, _) => self
-                        .deployments
-                        .get(&path)
-                        .map_or(target.mode == "template", |native| {
-                            matches_native_copy(&current, &native.digest, None)
-                        }),
+                    (Image::Regular { .. }, None, _) => {
+                        (target.mode == "copy"
+                            && path != destination
+                            && self
+                                .adopted_directory_leaves
+                                .get(&path)
+                                .is_some_and(|source| {
+                                    target.effective_source() == Some(source.as_path())
+                                }))
+                            || self
+                                .deployments
+                                .get(&path)
+                                .map_or(target.mode == "template", |native| {
+                                    matches_native_copy(&current, &native.digest, None)
+                                })
+                    }
                     _ => false,
                 };
                 if !still_observed
@@ -1380,6 +1427,7 @@ impl Copies {
                     Some(WriteEffect::Deploy {
                         target: path.clone(),
                         baseline: next_baseline,
+                        observed_inode,
                     }),
                     receipt,
                 )
@@ -1506,6 +1554,8 @@ enum WriteEffect {
     Deploy {
         target: PathBuf,
         baseline: Option<KnownCopy>,
+        #[serde(default)]
+        observed_inode: Option<FileId>,
     },
 }
 
@@ -1623,7 +1673,26 @@ pub(super) fn recover(git_dir: &Path, receipt: &mut Receipt) -> io::Result<()> {
 }
 
 fn complete_write(git_dir: &Path, plan: &WritePlan, receipt: &mut Receipt) -> io::Result<()> {
-    reconcile_write(git_dir, plan, receipt, super::guard::replace_consuming)
+    let expected_inode = match &plan.effect {
+        Some(WriteEffect::Deploy { observed_inode, .. }) => *observed_inode,
+        _ => None,
+    };
+    reconcile_write(
+        git_dir,
+        plan,
+        receipt,
+        |root, path, stage, old, new, before, after| {
+            super::guard::replace_consuming(
+                root,
+                path,
+                stage,
+                old,
+                new,
+                (before, expected_inode),
+                after,
+            )
+        },
+    )
 }
 
 fn reconcile_write(
@@ -1672,7 +1741,9 @@ fn reconcile_write(
             WriteEffect::Capture { deployed, baseline } => {
                 copies.state.captured.insert(deployed.clone(), *baseline);
             }
-            WriteEffect::Deploy { target, baseline } => {
+            WriteEffect::Deploy {
+                target, baseline, ..
+            } => {
                 copies.state.captured.remove(target);
                 if let Some(baseline) = baseline {
                     copies.state.known.insert(target.clone(), baseline.clone());
@@ -2684,7 +2755,7 @@ mod tests {
             &stage,
             &CStrName::new("previous").unwrap(),
             &CStrName::new("publish").unwrap(),
-            &previous,
+            (&previous, None),
             &replacement,
         )
         .unwrap();

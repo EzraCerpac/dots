@@ -425,6 +425,10 @@ fn new_sync_load_checks_source_and_checkout_before_skipping() {
     f.git(&["switch", "--detach"]);
     f.seam("source", "blocked");
     f.git(&["switch", "dev"]);
+    let jj = root.join(".jj");
+    fs::create_dir(&jj).unwrap();
+    f.seam("source", "blocked");
+    fs::remove_dir(jj).unwrap();
     fs::write(
         &conf,
         format!("{CONFIG}dots_source_repo = 'example/source'\n"),
@@ -462,6 +466,103 @@ fn new_sync_load_checks_source_and_checkout_before_skipping() {
     f.seam("source", "local");
     assert_eq!(f.git(&["show-ref"]), revision);
     assert!(!f.world.home().join("history-calls").exists());
+}
+
+#[test]
+fn new_local_only_sync_skips_the_shared_pipeline_on_main_or_old_git() {
+    for old in [false, true] {
+        let f = Fixture::new();
+        f.seed();
+        if !old {
+            f.git(&["branch", "-m", "main"]);
+        }
+        let root = f.world.root();
+        fs::write(root.join("config.toml"), format!("{CONFIG}# local edit\n")).unwrap();
+        let status = f.git(&["status", "--porcelain"]);
+        let refs = f.git(&["show-ref"]);
+        let index = fs::read(root.join(".git/index")).unwrap();
+
+        let bin = f.world.home().join(".local/bin");
+        let git = bin.join("git");
+        let real = git.canonicalize().unwrap();
+        fs::remove_file(&git).unwrap();
+        executable(
+            &git,
+            r#"#!/bin/sh
+set -eu
+for argument do
+    case "$argument" in
+        --version)
+            if [ "$FIXTURE_OLD_GIT" = 1 ]; then
+                printf 'old\n' > "$HOME/fixture-git-version"
+                printf 'git version 2.42.0\n'
+                exit 0
+            fi ;;
+        fetch|push|ls-remote|clone|pull|commit|write-tree|update-index)
+            printf '%s\n' "$argument" >> "$HOME/pipeline-ran"
+            exit 88 ;;
+    esac
+done
+exec "$FIXTURE_REAL_GIT" "$@"
+"#,
+        );
+        for tool in ["mise", "gitleaks"] {
+            executable(
+                &bin.join(tool),
+                "#!/bin/sh\nprintf 'unexpected child\n' >> \"$HOME/pipeline-ran\"\nexit 88\n",
+            );
+        }
+
+        let sync = |args: &[&str]| {
+            let mut command = f.world.dots();
+            f.isolated(&mut command);
+            success(
+                command
+                    .args(args)
+                    .env("FIXTURE_REAL_GIT", &real)
+                    .env("FIXTURE_OLD_GIT", if old { "1" } else { "0" })
+                    .output()
+                    .unwrap(),
+            )
+        };
+        let live = sync(&["--plain", "sync"]);
+        assert!(live.stderr.is_empty(), "{live:?}");
+        let receipt = String::from_utf8(live.stdout).unwrap();
+        assert_eq!(receipt.lines().count(), 1, "{receipt}");
+        assert!(
+            receipt.contains("local-only") && receipt.contains("git remote add origin URL"),
+            "{receipt}"
+        );
+        if old {
+            assert_eq!(
+                fs::read(f.world.home().join("fixture-git-version")).unwrap(),
+                b"old\n"
+            );
+        }
+        let replay = sync(&["--plain", "sync", "--last"]);
+        assert!(
+            String::from_utf8(replay.stdout)
+                .unwrap()
+                .contains(receipt.trim())
+        );
+        assert!(!f.world.home().join("pipeline-ran").exists());
+        assert_eq!(f.git(&["show-ref"]), refs);
+        assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(f.git(&["status", "--porcelain"]), status);
+
+        let remote = format!("file://{}", f.world.bare_remote("origin").display());
+        f.git(&["remote", "add", "origin", &remote]);
+        let shared = String::from_utf8(sync(&["--plain", "sync"]).stdout).unwrap();
+        let refusal = if old {
+            "Git 2.43"
+        } else {
+            "HEAD on a dev branch"
+        };
+        assert!(shared.contains(refusal), "{shared}");
+        assert!(!shared.contains("local-only"), "{shared}");
+        assert!(!f.world.home().join("pipeline-ran").exists());
+        assert_eq!(f.git(&["show-ref"]), refs);
+    }
 }
 
 #[test]

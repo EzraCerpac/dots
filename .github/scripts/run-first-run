@@ -34,7 +34,8 @@ if [ -f /seed/install.sh ]; then
     cp /home/smoke/.ssh/fixture.pub /home/smoke/.ssh/authorized_keys
     printf '[127.0.0.1]:2222 %s\n' "$(cut -d ' ' -f 1,2 /tmp/dots-ssh-host.pub)" > /home/smoke/.ssh/known_hosts
     git init --bare --initial-branch=main /srv/dotfiles.git
-    chown -R smoke:smoke /home/smoke/.ssh /srv/dotfiles.git
+    git init --bare --initial-branch=main /srv/template.git
+    chown -R smoke:smoke /home/smoke/.ssh /srv/dotfiles.git /srv/template.git
     /usr/sbin/sshd -f /dev/null -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
         -o KbdInteractiveAuthentication=no -p 2222 -h /tmp/dots-ssh-host
 fi
@@ -75,7 +76,7 @@ if [ -f /seed/install.sh ]; then
     fi
     MISE_VERSION=$(cat /seed/mise-version)
     DOTS_VERSION=$(cat /seed/dots-version)
-    export MISE_VERSION DOTS_VERSION MISE_SELF_UPDATE_AVAILABLE=0
+    export MISE_VERSION DOTS_VERSION MISE_SELF_UPDATE_AVAILABLE=0 SHELL=/bin/sh
     curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz > "$fixture/installer.log"
     cat "$fixture/installer.log"
     test "$(cat "$fixture/installer.log")" = 'dots init'
@@ -102,7 +103,11 @@ if [ -f /seed/install.sh ]; then
     export SMOKE_ORIGIN=ssh://smoke@127.0.0.1:2222/srv/dotfiles.git
     git -C "$MISE_CONFIG_DIR" remote add origin "$SMOKE_ORIGIN"
     git -C "$MISE_CONFIG_DIR" push origin main
-    awk -v origin="$SMOKE_ORIGIN" '/^\[vars\]$/ { print; print "dots_source_repo = \"" origin "\""; next } 1' \
+    awk -v origin="$SMOKE_ORIGIN" '
+        /^\[vars\]$/ { print; print "dots_source_repo = \"" origin "\""; next }
+        /^dots_profiles = / { print "dots_profiles = \"default laptop\""; next }
+        1
+    ' \
         "$MISE_CONFIG_DIR/config.toml" > "$fixture/pinned-config"
     cat "$fixture/pinned-config" > "$MISE_CONFIG_DIR/config.toml"
     printf 'first machine bytes\n' > "$fixture/initial"
@@ -113,17 +118,90 @@ if [ -f /seed/install.sh ]; then
     initial=$(git -C /srv/dotfiles.git rev-parse refs/heads/dev)
     git -C /srv/dotfiles.git show "$initial:dotfiles/.dots-smoke" | cmp "$fixture/initial" -
 
+    export SMOKE_MISE="$HOME/.local/bin/mise"
+    mkdir "$fixture/bin"
+    cp "$SMOKE_MISE" "$fixture/bin/mise"
+    cat > "$fixture/bin/curl" <<'CURL'
+#!/bin/sh
+case "$*" in
+    '-fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh')
+        exec /usr/bin/curl -fsSL file:///seed/install.sh ;;
+    '-fsSL https://mise.run')
+        printf '%s\n' '#!/bin/sh' 'cp "$SMOKE_MISE" "$MISE_INSTALL_PATH"' ;;
+    *) exec /usr/bin/curl "$@" ;;
+esac
+CURL
+    chmod +x "$fixture/bin/curl"
     machine b
-    expect <<'EXPECT'
+    export PATH="$fixture/bin:/usr/bin:/bin"
+    printf '%s\n' '#!/bin/sh' 'echo 2026.10.1' > "$HOME/.local/bin/mise"
+    chmod +x "$HOME/.local/bin/mise"
+    test "$(command -v mise)" = "$fixture/bin/mise"
+    test "$(mise --version | cut -d ' ' -f1)" = "${MISE_VERSION#v}"
+    unset MISE_YES
+
+    expect_status() {
+        wanted=$1 logfile=$2
+        shift 2
+        actual=0
+        "$@" > "$logfile" 2>&1 || actual=$?
+        if [ "$actual" -ne "$wanted" ]; then cat "$logfile"; exit 1; fi
+    }
+    adopt() {
+        curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz --from "$SMOKE_ORIGIN" "$@"
+    }
+    expect_status 2 "$fixture/no-profile.log" adopt
+    cmp "$SMOKE_MISE" "$HOME/.local/bin/mise"
+    grep -F 'Declared profiles: default, laptop' "$fixture/no-profile.log"
+    grep -Fx 'Rerun with a declared profile:' "$fixture/no-profile.log"
+    grep '^curl -fsSL ' "$fixture/no-profile.log" > "$fixture/choose-profile"
+    test "$(wc -l < "$fixture/choose-profile" | tr -d ' ')" -eq 1
+    test ! -e "$HOME/.dots-smoke"
+    printf 'same checkout\n' > "$MISE_CONFIG_DIR/.git/retry-marker"
+    printf '# keep this local config\n' > "$MISE_CONFIG_DIR/config.local.toml"
+    printf 'keep this live change\n' > "$HOME/local-note"
+    printf 'keep this checkout change\n' > "$MISE_CONFIG_DIR/local-note"
+
+    git -C "$MISE_CONFIG_DIR" remote set-url origin "${SMOKE_ORIGIN}.other"
+    cp "$MISE_CONFIG_DIR/.git/config" "$fixture/other-config"
+    expect_status 1 "$fixture/other-origin.log" sh "$fixture/choose-profile"
+    grep -Fx "dots installer: Move the Git checkout at $MISE_CONFIG_DIR away or drop --from to keep it." "$fixture/other-origin.log"
+    cmp "$fixture/other-config" "$MISE_CONFIG_DIR/.git/config"
+    git -C "$MISE_CONFIG_DIR" remote set-url origin "$SMOKE_ORIGIN"
+
+    expect_status 2 "$fixture/typo.log" adopt --profile typo
+    grep -F 'Declared profiles: default, laptop' "$fixture/typo.log"
+    grep -Fx 'Rerun with a declared profile:' "$fixture/typo.log"
+    grep '^curl -fsSL ' "$fixture/typo.log" > "$fixture/retry"
+    cmp "$fixture/choose-profile" "$fixture/retry"
+    expect_status 2 "$fixture/no-consent.log" sh "$fixture/retry"
+    grep -Fx 'Adoption needs a terminal or MISE_YES=1.' "$fixture/no-consent.log"
+    test ! -e "$HOME/.dots-smoke"
+
+    export SMOKE_RETRY="$fixture/retry"
+    if ! expect <<'EXPECT' > "$fixture/interrupted.log"
 set timeout 180
-spawn sh -o pipefail -c {curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz --from "$SMOKE_ORIGIN"}
+spawn sh $env(SMOKE_RETRY)
 expect {
-    -re {apply [^\r\n]*\.dots-smoke\?} { send -- y; expect { eof {} timeout { exit 1 } } }
+    -re {apply [^\r\n]*\.dots-smoke\?} { send -- "\003"; expect { eof {} timeout { exit 1 } } }
     timeout { exit 1 }
-    eof {}
+    eof { exit 1 }
 }
-exit [lindex [wait] 3]
+exit [expr {[lindex [wait] 3] != 130}]
 EXPECT
+    then cat "$fixture/interrupted.log"; exit 1; fi
+    grep -F 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh' "$fixture/interrupted.log"
+    test ! -e "$HOME/.dots-smoke"
+    MISE_YES=1 sh "$fixture/retry" > "$fixture/retry.log" 2>&1
+    grep -Fx "Next: '$HOME/.local/bin/dots' up" "$fixture/retry.log"
+    test "$(tail -1 "$fixture/retry.log")" = "export PATH=\"\$HOME/.local/bin:\$PATH\""
+    if grep -q '^Moved ' "$fixture/retry.log"; then exit 1; fi
+    test "$(cat "$MISE_CONFIG_DIR/.git/retry-marker")" = 'same checkout'
+    grep -Fx '# keep this local config' "$MISE_CONFIG_DIR/config.local.toml"
+    test "$(cat "$HOME/local-note")" = 'keep this live change'
+    test "$(cat "$MISE_CONFIG_DIR/local-note")" = 'keep this checkout change'
+    rm "$MISE_CONFIG_DIR/local-note"
+    export PATH="$fixture/bin:$HOME/.local/bin:/usr/bin:/bin"
     test "$(git -C "$MISE_CONFIG_DIR" config --local --get remote.origin.url)" = "$SMOKE_ORIGIN"
     test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
     cmp "$fixture/initial" "$HOME/.dots-smoke"
@@ -147,6 +225,21 @@ EXPECT
     grep -Fx 'Sync configuration: completed' "$fixture/b-second-up.log"
     test "$(git -C "$MISE_CONFIG_DIR" rev-parse HEAD)" = "$updated"
     cmp "$fixture/updated" "$HOME/.dots-smoke"
+
+    template_origin=${SMOKE_ORIGIN%/*}/template.git
+    machine a
+    git -C "$MISE_CONFIG_DIR" push "$template_origin" refs/heads/main
+    test -z "$(git -C /srv/template.git for-each-ref refs/heads/dev)"
+    machine template
+    export PATH="$fixture/bin:$PATH"
+    curl -fsSL file:///seed/install.sh |
+        MISE_YES=1 sh -s -- --archive /seed/dots.tar.gz --from "$template_origin"
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = main
+    sh -c 'dots up' > "$fixture/template-up.log"
+    cat "$fixture/template-up.log"
+    grep -Fx 'Sync configuration: completed' "$fixture/template-up.log"
+    test "$(git -C "$MISE_CONFIG_DIR" branch --show-current)" = dev
+    test "$(git -C /srv/template.git rev-parse refs/heads/dev)" = "$(git -C "$MISE_CONFIG_DIR" rev-parse HEAD)"
 else
     cp /seed/mise /seed/dots "$HOME/.local/bin/"
     dots init </dev/null

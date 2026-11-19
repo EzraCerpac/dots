@@ -29,28 +29,27 @@ supported_mise() {
 }
 
 find_mise() {
-    for candidate in "${DOTS_MISE_BIN:-}" "$(command -v mise || :)" \
-        /opt/homebrew/bin/mise /usr/local/bin/mise "$HOME/.local/bin/mise"; do
-        [ -f "$candidate" ] && [ -x "$candidate" ] || continue
-        case "$candidate" in /*) mise=$candidate ;; *) mise=$PWD/$candidate ;; esac
+    if [ "${DOTS_MISE_BIN+x}" ]; then
+        mise=$DOTS_MISE_BIN
+        [ -f "$mise" ] && [ -x "$mise" ] || fail 'DOTS_MISE_BIN must point to an executable mise.'
+        case "$mise" in /*) ;; *) mise=$PWD/$mise ;; esac
+        supported_mise "$mise" || fail "Update the mise at DOTS_MISE_BIN to $minimum_mise or newer, or unset DOTS_MISE_BIN."
+        return
+    fi
+    mise=$HOME/.local/bin/mise
+    if [ ! -f "$mise" ] || [ ! -x "$mise" ]; then mise=$(command -v mise || :); fi
+    case "$mise" in ''|/*) ;; *) mise=$PWD/$mise ;; esac
+    if [ -f "$mise" ] && [ -x "$mise" ]; then
         supported_mise "$mise" && return
-        if [ -x "$HOME/.local/bin/mise" ] && supported_mise "$HOME/.local/bin/mise"; then
-            mise=$HOME/.local/bin/mise
-            return
-        fi
         printf 'mise %s or newer is required, so installing standalone mise at ~/.local/bin/mise.\n' "$minimum_mise" >&2
-        break
-    done
+    fi
     mise=$HOME/.local/bin/mise
     installer=$(curl -fsSL https://mise.run)
     printf '%s\n' "$installer" | MISE_INSTALL_PATH="$mise" MISE_INSTALL_HELP=0 sh >&2
     supported_mise "$mise" || fail "the installed mise must be $minimum_mise or newer."
 }
 
-adopt() {
-    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG GIT_INDEX_FILE
-    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES MISE_CD
-    case "$source" in *:*) repo=$source ;; *) repo=https://github.com/$source ;; esac
+clone_root() {
     set --
     if git ls-remote --exit-code --heads -- "$repo" refs/heads/dev >/dev/null; then
         set -- --branch dev
@@ -58,7 +57,7 @@ adopt() {
         exit 1
     fi
     if [ -e "$root" ] || [ -L "$root" ]; then
-        [ ! -e "$root/.git" ] && [ ! -L "$root/.git" ] || fail "a Git checkout already exists at $root."
+        [ ! -e "$root/.git" ] && [ ! -L "$root/.git" ] || fail "Move the Git checkout at $root away or drop --from to keep it."
         backup=$root.before-dots-$(date -u +%Y%m%dT%H%M%SZ)
         [ ! -e "$backup" ] && [ ! -L "$backup" ] || fail "backup path already exists at $backup."
         mv -n "$root" "$backup"
@@ -68,14 +67,43 @@ adopt() {
     git clone "$@" -- "$repo" "$root"
     [ "$(git -C "$root" config --local --get-all remote.origin.url)" = "$repo" ] ||
         fail 'the saved origin does not match --from.'
+}
+
+shell_word() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+retry() {
+    printf 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | env '
+    set -- "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --version "$version"
+    if [ -n "$archive" ]; then set -- "$@" --archive "$archive"; fi
+    if [ -n "$profile" ]; then set -- "$@" --profile "$profile"; fi
+    for arg do shell_word "$arg"; printf ' '; done
+    case "$source" in
+        ssh://*@*) rest=${source#ssh://}; printf "%s 'ssh://''%s''@%s'\n" --from "${rest%%@*}" "${rest#*@}" ;;
+        *) printf "%s '%s'\n" --from "$source" ;;
+    esac
+}
+
+adopt() {
+    "$reuse" || clone_root
     cd -P "$root"
     export DOTS_ROOT="$PWD" DOTS_BOOTSTRAP_ADOPT=1 MISE_CONFIG_DIR="$PWD"
     export MISE_GLOBAL_CONFIG_FILE='' MISE_CONFIG_FILE='' MISE_HISTORY_ENABLED=0
-    selected=$("$dots" __check-bootstrap-profile "$profile")
-    export SETUP_PROFILE="$selected"
+    profile=$("$dots" __check-bootstrap-profile "$profile") || {
+        status=$?
+        if [ "$status" -eq 2 ]; then printf '%s\n' 'Rerun with a declared profile:' >&2; fi
+        retry >&2
+        exit "$status"
+    }
+    trap 'test "$?" -eq 0 || retry >&2' 0
+    trap 'exit 130' INT
+    if ! "$terminal" && [ "${MISE_YES:-}" != 1 ]; then
+        printf '%s\n' 'Adoption needs a terminal or MISE_YES=1.' >&2
+        exit 2
+    fi
+    export SETUP_PROFILE="$profile"
     export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:+$MISE_TRUSTED_CONFIG_PATHS:}$PWD"
-    "$mise" bootstrap --skip-dirty --env "$selected"
-    "$dots" __check-bootstrap-profile "$selected" >/dev/null
+    "$mise" bootstrap --skip-dirty --env "$profile"
+    "$dots" __check-bootstrap-profile "$profile" >/dev/null
     "$dots" bootstrap persist-selected
 }
 
@@ -110,10 +138,19 @@ command -v git >/dev/null 2>&1 || fail 'install Git and rerun.'
 global=${MISE_CONFIG_DIR:-"${XDG_CONFIG_HOME:-"$HOME/.config"}/mise"}
 root=${DOTS_ROOT:-"$global"}
 case "$root" in /*) ;; *) root=$PWD/$root ;; esac
+reuse=false
 if [ -n "$source" ]; then
     while [ "${root%/}" != "$root" ]; do root=${root%/}; done
     case "$root" in ''|*/.|*/..|*:*) fail 'choose a configuration directory without a colon.' ;; esac
-    [ ! -e "$root/.git" ] && [ ! -L "$root/.git" ] || fail "a Git checkout already exists at $root."
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG GIT_INDEX_FILE
+    unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES MISE_CD
+    case "$source" in *:*) repo=$source ;; *) repo=https://github.com/$source ;; esac
+    if [ -e "$root/.git" ] || [ -L "$root/.git" ]; then
+        [ "$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" = "$(cd -P "$root" && pwd)" ] &&
+            [ "$(git -C "$root" config --local --get-all remote.origin.url 2>/dev/null)" = "$repo" ] ||
+            fail "Move the Git checkout at $root away or drop --from to keep it."
+        reuse=true
+    fi
 fi
 tool=github:EzraCerpac/dots@$version
 if [ -n "$archive" ]; then
@@ -125,7 +162,7 @@ find_mise
 export DOTS_MISE_BIN="$mise" DOTS_ROOT="$root" PATH="${mise%/*}:$PATH"
 terminal=false
 if ( : </dev/tty ) 2>/dev/null; then exec </dev/tty; terminal=true; fi
-if "$terminal" && [ -n "$source" ]; then
+if [ -n "$source" ]; then
     "$mise" -q -C "$HOME" install "$tool"
     dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
     export PATH="${dots%/*}:$PATH"
@@ -145,26 +182,31 @@ if [ ! -e "$bin/dots" ] && [ ! -L "$bin/dots" ]; then
     mkdir -p "$bin"
     ln -s "$shim" "$bin/dots"
 fi
-if [ "$bin/dots" != "$shim" ] && [ "$(readlink "$bin/dots" 2>/dev/null || :)" != "$shim" ]; then
-    printf 'Use "%s" to run the installed dots alongside your existing entry.\n' "$shim" >&2
-elif [ "$bin/dots" != "$(PATH=$original_path command -v dots || :)" ]; then
-    printf 'Put "%s" first on PATH to use the dots launcher.\n' "$bin" >&2
-fi
-if "$terminal"; then
-    [ -n "$source" ] || exec "$shim" init
-    printf '%s\n' 'Next: dots up'
-elif [ -z "$source" ]; then
-    printf '%s\n' 'dots init'
-else
-    printf 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | env '
-    set -- "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --version "$version"
-    if [ -n "$archive" ]; then set -- "$@" --archive "$archive"; fi
-    if [ -n "$profile" ]; then set -- "$@" --profile "$profile"; fi
-    for arg do printf "'%s' " "$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")"; done
-    case "$source" in
-        ssh://*@*) rest=${source#ssh://}; printf "%s 'ssh://''%s''@%s'\n" --from "${rest%%@*}" "${rest#*@}" ;;
-        *) printf "%s '%s'\n" --from "$source" ;;
+launcher=$bin/dots display=dots
+if [ "$launcher" != "$shim" ] && [ "$(readlink "$launcher" 2>/dev/null || :)" != "$shim" ]; then
+    display=$(shell_word "$shim")
+    trap 'printf "Use \"%s\" to run the installed dots alongside your existing entry.\n" "$shim" >&2' 0
+elif [ "$launcher" != "$(PATH=$original_path command -v dots || :)" ]; then
+    display=$(shell_word "$launcher")
+    case "${SHELL:-}" in
+        */fish|fish) trap 'printf "fish_add_path ~/.local/bin\n" >&2' 0 ;;
+        *) trap 'printf "export PATH=\"\$HOME/.local/bin:\$PATH\"\n" >&2' 0 ;;
     esac
+fi
+[ "$root" = "$global" ] || display="env DOTS_ROOT=$(shell_word "$root") $display"
+
+if [ -n "$source" ]; then
+    printf 'Next: %s up\n' "$display"
+elif "$terminal"; then
+    dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
+    if [ "$display" = dots ]; then "$dots" init; exit 0; fi
+    status=0
+    output=$("$dots" init) || status=$?
+    printf '%s\n' "$output" | sed '/^Next: dots up$/d'
+    [ "$status" -eq 0 ] || exit "$status"
+    printf 'Next: %s up\n' "$display"
+else
+    printf '%s init\n' "$display"
 fi
 exit 0
 }

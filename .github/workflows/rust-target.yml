@@ -96,7 +96,7 @@ jobs:
             Fedora|Arch:*|Alpine) bash .github/scripts/run-distro ;;
             *) bash .github/scripts/run-nextest ;;
           esac
-      - name: Summarize timings and flakes
+      - name: Summarize timings and tests that passed on retry
         if: always()
         run: python3 .github/scripts/summarize-nextest.py target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"
       - name: Upload JUnit

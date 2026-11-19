@@ -16,20 +16,22 @@ print(f"Nextest wall time: {float(root.attrib['time']):.1f}s. Suite times sum te
 print("| Suite | Tests | Time |")
 print("| --- | ---: | ---: |")
 flaky = []
-retry_tags = {"flakyFailure", "flakyError", "rerunFailure", "rerunError"}
+flaky_tags = {"flakyFailure", "flakyError"}
+retry_tags = flaky_tags | {"rerunFailure", "rerunError"}
 for suite in root.findall("testsuite"):
     name = escape(suite.attrib["name"])
     seconds = 0.0
     for test in suite.findall("testcase"):
         seconds += float(test.get("time", "0"))
         seconds += sum(float(attempt.get("time", "0")) for attempt in test if attempt.tag in retry_tags)
-        if test.find("flakyFailure") is not None or test.find("flakyError") is not None:
-            flaky.append(f"{name} {escape(test.attrib['name'])}")
+        failed_attempts = sum(attempt.tag in flaky_tags for attempt in test)
+        if failed_attempts and test.find("failure") is None and test.find("error") is None:
+            flaky.append((f"{name}::{escape(test.attrib['name'])}", failed_attempts + 1))
     print(f"| <code>{name}</code> | {suite.attrib['tests']} | {seconds:.1f}s |")
 
+print("\n#### Tests that passed on retry\n")
 if flaky:
-    print()
-    for name in flaky:
-        print(f"- **FLAKY** <code>{name}</code>")
+    for name, attempt in flaky:
+        print(f"- **FLAKY** <code>{name}</code> (passed on attempt {attempt})")
 else:
-    print("\nNo flaky tests reported.")
+    print("None.")

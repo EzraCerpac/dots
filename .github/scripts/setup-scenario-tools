@@ -4,7 +4,11 @@ set -euo pipefail
 prefix=$1
 github_token=${GITHUB_TOKEN-}
 unset GITHUB_TOKEN GH_TOKEN
-git_version=2.56.1
+packaged_git=$(command -v git)
+git --version | awk -F '[ .]+' 'END {exit !($3+0 > 2 || ($3+0 == 2 && $4+0 >= 43))}' || {
+  echo 'Native scenarios require Git 2.43 or newer' >&2
+  exit 1
+}
 age_version=1.3.2
 jj_version=0.47.1
 gitleaks_version=8.30.1
@@ -48,25 +52,6 @@ for spec in "jj@$jj_version" "gitleaks@$gitleaks_version"; do
   install -m 0755 "$(provision_mise which "$tool" --tool "$spec")" "$prefix/bin/$tool"
 done
 
-# Build the same Git on each OS and libc, including HTTP for the loopback fixture.
-archive="git-$git_version.tar.gz"
-curl -fsSL --retry 3 "https://mirrors.edge.kernel.org/pub/software/scm/git/$archive" -o "$archive"
-printf '%s  %s\n' fd0c0495427dc9ac445fdced8e36bb5eb6f233a14da5db3c6dfd8dcfa7f85761 "$archive" > SHA256SUMS
-if command -v sha256sum >/dev/null; then
-  sha256sum -c SHA256SUMS
-else
-  shasum -a 256 -c SHA256SUMS
-fi
-tar -xzf "$archive"
-# Git 2.56 still supports a C build, independent of the project's Cargo target.
-git_options=(NO_RUST=YesPlease)
-if [[ ${DISTRO:-} == Alpine ]]; then
-  git_options+=(NO_REGEX=NeedsStartEnd)
-fi
-make -s -j4 -C "git-$git_version" prefix="$prefix" CC=cc \
-  NO_EXPAT=YesPlease NO_GETTEXT=YesPlease NO_OPENSSL=YesPlease \
-  NO_PERL=YesPlease NO_TCLTK=YesPlease "${git_options[@]}" install
-
 # Prove fixture PATH still works when HOME and mise state are replaced,
 # including when a library case launches mise and then a child on that PATH.
 mkdir "$scratch/home" "$scratch/tmp"
@@ -79,11 +64,13 @@ env -i PATH="$prefix/bin:$PATH" HOME="$scratch/home" TMPDIR="$scratch/tmp" \
   MISE_OFFLINE=1 MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 \
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ALLOW_PROTOCOL=file \
   JJ_CONFIG="$scratch/jj.toml" \
-  "$mise" exec -- sh -eu -s "$prefix" <<'SH'
-for tool in mise git age age-keygen jj gitleaks; do
+  "$mise" exec -- sh -eu -s "$prefix" "$packaged_git" <<'SH'
+for tool in mise age age-keygen jj gitleaks; do
   test "$(command -v "$tool")" = "$1/bin/$tool"
   "$tool" --version
 done
+test "$(command -v git)" = "$2"
+git --version
 test -x "$(git --exec-path)/git-remote-http"
 python3 --version
 jq --version

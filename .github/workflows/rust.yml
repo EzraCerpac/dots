@@ -47,13 +47,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends musl-tools zlib1g-dev libcurl4-openssl-dev bash zsh fish python3 jq
+          sudo apt-get install -y -qq --no-install-recommends musl-tools git bash zsh fish python3 jq
           printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
             "$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
 
-      - name: Install Fish on macOS
+      - name: Install Fish and Git on macOS
         if: runner.os == 'macOS'
-        run: brew install fish
+        run: brew install fish git
 
       - name: Verify shell executables
         run: |
@@ -210,10 +210,10 @@ jobs:
           unset GITHUB_TOKEN GH_TOKEN
           rust_host=x86_64-unknown-linux-gnu
           case "$DISTRO" in
-            Fedora) dnf install -y bash zsh fish /usr/bin/curl libcurl-devel ca-certificates gcc glibc-devel git tar gzip make zlib-devel python3 jq ;;
-            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git make zlib python jq ;;
+            Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip python3 jq ;;
+            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git python jq ;;
             Alpine)
-              apk add --no-cache bash zsh fish curl curl-dev ca-certificates gcc musl-dev linux-headers git make zlib-dev python3 jq
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git python3 jq
               rust_host=x86_64-unknown-linux-musl
               ;;
             *) exit 2 ;;

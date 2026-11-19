@@ -426,7 +426,22 @@ fn ordinary_crlf_sources_deploy_as_checked_out() {
     fs::remove_file(&source).unwrap();
     git.get(["checkout-index", "--", "source"]).unwrap();
     assert_eq!(fs::read(&source).unwrap(), crlf);
-    assert!(git.get(["status", "--porcelain"]).unwrap().is_empty());
+    let status = git
+        .get(["status", "--porcelain=v1", "-z", "--no-renames"])
+        .unwrap();
+    assert!(
+        status.is_empty(),
+        "dirty fixture (first four entries, paths limited to 160 bytes): {:?}",
+        status
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| entry.split_at_checked(3))
+            .take(4)
+            .map(|(code, path)| (
+                String::from_utf8_lossy(&code[..2]),
+                String::from_utf8_lossy(&path[..path.len().min(160)]),
+            ))
+            .collect::<Vec<_>>()
+    );
 
     let receipt = shared_mise_sync(&ctx);
     assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);

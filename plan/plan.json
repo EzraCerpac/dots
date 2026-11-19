@@ -140,7 +140,7 @@
       "phase": "1 Design",
       "workstream": "Rust core",
       "owner": "Lead B: Astra 6.2 (xhigh); council",
-      "deliverables": ["docs/rust-port.md: module boundaries, the interfaces between them, crates checked against current releases, the supervisor design, embedded templates and skill, the harness design and the release layout", "Every current file mapped to a module task or to the dropped list"],
+      "deliverables": ["docs/rust-port.md (removed in D-01): module boundaries, the interfaces between them, crates checked against current releases, the supervisor design, embedded templates and skill, the harness design and the release layout", "Every current file mapped to a module task or to the dropped list"],
       "depends_on": ["S-01", "T-01"],
       "prerequisites": [],
       "acceptance": ["Both council members are satisfied", "No current file is unmapped", "The note fits on two pages"],

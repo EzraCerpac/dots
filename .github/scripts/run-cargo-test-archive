@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode=${1:?missing test shard or oracle}
+bundle="$RUNNER_TEMP/dots-cargo-tests"
+workspace=$(pwd -P)
+if [[ "$workspace" != "$(cat "$bundle/workspace")" ]]; then
+    echo "Cargo test binaries require the original workspace path" >&2
+    exit 1
+fi
+tar -xzf "$bundle/tests.tar.gz"
+export PATH="$workspace/.github/scripts/scenario-bin:$PATH"
+for tool in bash zsh fish git jq age age-keygen mise gitleaks; do command -v "$tool"; done
+
+selected=0
+failed=0
+next=1
+while IFS=$'\t' read -r kind name executable; do
+    args=(--color never)
+    case "$mode" in
+        oracle)
+            [[ "$kind" == test ]] || continue
+            args+=(unchanged_ --include-ignored) ;;
+        1|2)
+            # Put the long source and history suites in different shards.
+            case "$name" in
+                source_dev) shard=1 ;;
+                native_history) shard=2 ;;
+                *) shard=$next; next=$((3 - next)) ;;
+            esac
+            [[ "$mode" == "$shard" ]] || continue ;;
+        *) echo "Unknown test shard: $mode" >&2; exit 2 ;;
+    esac
+    if [[ "$kind" == lib ]]; then
+        args+=(--test-threads 1)
+    fi
+    printf '\n### %s (%s)\n' "$name" "$kind"
+    if ! "$executable" "${args[@]}" </dev/null; then
+        failed=1
+    fi
+    selected=$((selected + 1))
+done < "$bundle/tests.tsv"
+test "$selected" -gt 0
+exit "$failed"

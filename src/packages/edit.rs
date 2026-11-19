@@ -9,7 +9,10 @@ use crate::config::Doc;
 use crate::targets::{Declaration, Section};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use super::{io_fail, missing};
+use super::{
+    adopt::{Replacement, needed},
+    io_fail, missing,
+};
 
 pub const TOOLS: &[&str] = &["tools"];
 pub const PACKAGES: &[&str] = &["bootstrap", "packages"];
@@ -149,21 +152,20 @@ impl Edit {
         if self.before.as_ref().is_some_and(|old| old.bytes == bytes) {
             return Ok(None);
         }
-        if self.before.is_some() && bytes == rendered {
-            self.doc
-                .install()
-                .map_err(|error| Fail::new(1, error.diagnostic))?;
-        } else {
-            let mode = self.before.as_ref().map_or(0o600, |old| old.mode);
-            let file = stage_bytes(&self.path, &bytes, mode)
+        if let Some(before) = &self.before {
+            let original = needed(&self.path)?;
+            let mut replacement = Replacement::new(&self.path, original)?;
+            let file = stage_bytes(&replacement.parked, &bytes, before.mode)
                 .map_err(|error| io_fail("could not stage", &self.path, error))?;
+            file.persist_noclobber(&replacement.parked)
+                .map_err(|error| io_fail("could not stage", &self.path, error.error))?;
             self.check()?;
-            if self.before.is_none() {
-                file.persist_noclobber(&self.path)
-            } else {
-                file.persist(&self.path)
-            }
-            .map_err(|error| io_fail("could not install", &self.path, error.error))?;
+            replacement.install()?;
+        } else {
+            let file = stage_bytes(&self.path, &bytes, 0o600)
+                .map_err(|error| io_fail("could not stage", &self.path, error))?;
+            file.persist_noclobber(&self.path)
+                .map_err(|error| io_fail("could not install", &self.path, error.error))?;
         }
         Ok(Some(Written {
             path: self.path,
@@ -392,8 +394,35 @@ pub fn rollback(error: Fail, restores: impl IntoIterator<Item = Result<(), Fail>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        static BEFORE_REPLACE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(in crate::packages) fn before_config_replace() {
+        if let Some(before_replace) = BEFORE_REPLACE.take() {
+            before_replace();
+        }
+    }
+
+    #[test]
+    fn edit_rejects_a_later_file_at_the_replacement_boundary() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, b"[tools]\r\nknown = 1\r\n").unwrap();
+        let mut edit = Edit::open(&path).unwrap();
+        put(&mut edit.doc.document, TOOLS, "new", toml_edit::value(2)).unwrap();
+        let destination = path.clone();
+        BEFORE_REPLACE.set(Some(Box::new(move || {
+            fs::write(destination, "# later edit\n").unwrap();
+        })));
+        assert!(edit.install().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "# later edit\n");
+    }
 
     #[test]
     fn preserves_original_line_endings_and_final_newline() {

@@ -8,7 +8,7 @@ use std::time::Duration;
 use toml_edit::DocumentMut;
 
 use super::{Root, file_error, selection, vars};
-use crate::process::{config_paths, mise_binary, quiet_probe};
+use crate::process::{config_paths, mise_binary, quiet_probe, require_mise};
 use crate::{Env, Fail};
 
 const TOML_LIMIT: u64 = 2 << 20;
@@ -77,12 +77,26 @@ pub fn active_files(root: &Root) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
     active_files_in(root, &env)
 }
 
+pub(crate) fn checked_active_files(root: &Root) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
+    let env = Env::current().map_err(|error| Fail::usage(error.to_string()))?;
+    let mise = require_mise(&env)?;
+    discover_active_files(root, &env, &mise)
+}
+
 pub(super) fn active_files_in(root: &Root, env: &Env) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
     let mise = mise_binary(env)?;
+    discover_active_files(root, env, &mise)
+}
+
+fn discover_active_files(
+    root: &Root,
+    env: &Env,
+    mise: &Path,
+) -> Result<Vec<Result<PathBuf, Fail>>, Fail> {
     let selected = selection::read(root, env)?;
     let scratch = tempfile::tempdir()
         .map_err(|error| Fail::usage(format!("could not create mise probe directory: {error}")))?;
-    let mut command = quiet_probe(&mise, root.path(), scratch.path(), env);
+    let mut command = quiet_probe(mise, root.path(), scratch.path(), env);
     command.env("MISE_ENV", selected.active_environments());
     let paths = config_paths(command, Duration::from_millis(1200))?;
     let mut seen = HashSet::new();

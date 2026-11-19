@@ -537,6 +537,89 @@ fn new_configuration_help_lists_real_executables_and_builtins_win() {
 }
 
 #[test]
+fn new_mise_stops_before_the_requested_action_on_an_older_runtime() {
+    let f = Fixture::new();
+    let fake = f.script(
+        "mise",
+        r#"
+if [ "$1" = --version ]; then
+    printf '%s linux-x64 (fixture)\n' "$FIXTURE_VERSION"
+    exit 0
+fi
+printf '%s\n' "$@"
+"#,
+    );
+    for version in ["2026.9.99", "2026.11.7", "2026.11.8-rc.1"] {
+        let output = f
+            .dots()
+            .args(["mise", "config", "ls"])
+            .env("DOTS_MISE_BIN", &fake)
+            .env("FIXTURE_VERSION", version)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = std::str::from_utf8(&output.stderr).unwrap();
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.contains(version) && stderr.contains(env!("DOTS_MINIMUM_MISE")));
+        assert!(stderr.contains("curl -fsSL https://mise.run | MISE_VERSION=v"));
+        assert!(stderr.contains("unset DOTS_MISE_BIN"));
+    }
+
+    for version in [env!("DOTS_MINIMUM_MISE"), "2026.11.10"] {
+        let output = f
+            .dots()
+            .args(["mise", "config", "ls"])
+            .env("DOTS_MISE_BIN", &fake)
+            .env("FIXTURE_VERSION", version)
+            .output()
+            .unwrap();
+        assert_eq!(successful(output), b"config\nls\n");
+    }
+    successful(
+        f.dots()
+            .arg("--version")
+            .env("DOTS_MISE_BIN", "")
+            .output()
+            .unwrap(),
+    );
+
+    for args in [
+        &["profile", "--profile", "laptop", "--machine-id", "example"][..],
+        &["remove", "--keep-installed", "jq"][..],
+    ] {
+        let output = f
+            .dots()
+            .args(args)
+            .env("DOTS_MISE_BIN", &fake)
+            .env("FIXTURE_VERSION", "2026.11.7")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("mise 2026.11.7 is too old"));
+        assert_eq!(
+            fs::read_to_string(f.config.join("config.toml")).unwrap(),
+            BASE
+        );
+        assert!(!f.config.join("miserc.toml").exists());
+        assert!(!f.config.join("config.local.toml").exists());
+    }
+
+    let missing = f.base.join("new-config");
+    let output = f
+        .dots()
+        .arg("init")
+        .arg(&missing)
+        .env("DOTS_MISE_BIN", &fake)
+        .env("FIXTURE_VERSION", "2026.11.7")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(!missing.exists());
+}
+
+#[test]
 fn new_mise_override_and_program_arguments_are_literal() {
     let f = Fixture::new();
     let fake = f.script(

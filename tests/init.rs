@@ -342,6 +342,7 @@ fn new_seed_excludes_ignored_modified_linked_and_executable_files() {
     );
 
     let output = success(init(&world, &root));
+    assert_eq!(output.lines().last(), Some("Next: dots up"));
     assert_eq!(
         git(&world, &root, &["ls-tree", "-r", "--name-only", "HEAD"]),
         ".gitignore\ndots/exceptions.tsv\ndots/retired-declarations"
@@ -357,6 +358,31 @@ fn new_seed_excludes_ignored_modified_linked_and_executable_files() {
     );
     let seed = git(&world, &root, &["rev-parse", "HEAD"]);
     assert!(seed_push(&output, &seed), "{output}");
+}
+
+#[test]
+fn new_adoption_and_init_share_the_hostname_fallback() {
+    let world = World::new();
+    let root = fresh(&world);
+    success(init(&world, &root));
+    let machine_id = |root: &Path| {
+        let config = fs::read_to_string(root.join("config.local.toml")).unwrap();
+        let doc = toml_edit::Document::parse(config).unwrap();
+        doc["env"]["SETUP_MACHINE_ID"].as_str().unwrap().to_owned()
+    };
+    let expected = machine_id(&root);
+    let mut callback = fixture_dots(&world);
+    callback
+        .args(["bootstrap", "persist-selected"])
+        .env("SETUP_PROFILE", "laptop")
+        .env("DOTS_BOOTSTRAP_ADOPT", "1");
+    success(callback.output().unwrap());
+    assert_eq!(machine_id(world.root()), expected);
+
+    callback.env("DOTS_BOOTSTRAP_RESTORE", "replacement");
+    let result = callback.output().unwrap();
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert_eq!(machine_id(world.root()), expected);
 }
 
 #[test]

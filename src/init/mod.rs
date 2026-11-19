@@ -17,6 +17,7 @@ use crate::{Args, Ctx, Env, Fail};
 use git::{Git, Shape};
 
 pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
+    crate::process::require_mise(&ctx.env)?;
     let root = ctx.root.path();
     let ancestor = existing_directory(root)?;
     let probe = Git {
@@ -59,7 +60,7 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let machine = match selected.machine_id.as_deref() {
         Some(machine) => machine,
         None => {
-            fallback = hostname().as_deref().and_then(machine_name);
+            fallback = hostname_machine_id();
             let Some(machine) = fallback.as_deref() else {
                 repair_commands(root)?;
                 return Err(Fail::usage(
@@ -110,6 +111,7 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         checkout::advise(&git)?;
     }
     remote::configure(&git, vars.source_repo.as_ref(), created_seed)?;
+    println!("Next: dots up");
     Ok(0)
 }
 
@@ -132,7 +134,7 @@ fn existing_directory(path: &Path) -> Result<&Path, Fail> {
     ))
 }
 
-fn hostname() -> Option<Vec<u8>> {
+pub(crate) fn hostname_machine_id() -> Option<String> {
     let mut buffer = [0_u8; 256];
     // The pointer is writable for exactly the supplied size.
     let result = unsafe { nix::libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -140,7 +142,7 @@ fn hostname() -> Option<Vec<u8>> {
         return None;
     }
     let end = buffer.iter().position(|b| *b == 0)?;
-    Some(buffer[..end].to_vec())
+    machine_name(&buffer[..end])
 }
 
 fn machine_name(hostname: &[u8]) -> Option<String> {

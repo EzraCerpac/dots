@@ -3,7 +3,6 @@ mod process;
 mod support;
 
 use std::fs::{self, File};
-use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
@@ -79,7 +78,7 @@ fn dots(world: &World) -> FixtureCommand<'_> {
         .env("TMPDIR", world.home().join("tmp"))
         .env("TERM", "xterm")
         .env_remove("CI");
-    if legacy_script(command.get_program().as_ref()) {
+    if oracle_selected() {
         let renderer = Path::new(command.get_program()).with_file_name("dots-up");
         assert!(
             renderer.is_file(),
@@ -91,14 +90,12 @@ fn dots(world: &World) -> FixtureCommand<'_> {
     command
 }
 
-fn legacy_script(path: &Path) -> bool {
-    let mut magic = [0; 2];
-    File::open(path).unwrap().read_exact(&mut magic).unwrap();
-    magic == *b"#!"
+fn oracle_selected() -> bool {
+    std::env::var_os("DOTS_TEST_ORACLE").is_some_and(|value| value == "v0.4.0")
 }
 
 fn assert_legacy_renderer(world: &World, active: bool) {
-    if legacy_script(world.dots().get_program().as_ref()) {
+    if oracle_selected() {
         assert!(
             files(&state(world)).iter().any(|path| {
                 path.file_name().is_some_and(|name| name == "events.jsonl")

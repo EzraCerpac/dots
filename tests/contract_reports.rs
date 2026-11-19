@@ -348,15 +348,21 @@ fn new_plan_prints_the_preview_and_saves_private_stage_metadata() {
     let world = World::new();
     let config = world.root().join("config.toml");
     let before = fs::read(&config).unwrap();
+    let apply_called = world.home().join("apply-called");
     let output = dots(&world)
         .arg("plan")
         .env("EXPECT_PLAN_SELECTOR", "laptop,host-fixture")
+        .env("RECORD_APPLY", &apply_called)
         .output()
         .unwrap();
     assert_code(&output, 0);
     assert_eq!(output.stdout, PLAN_OUTPUT.as_bytes(), "{output:?}");
     assert_eq!(fs::read(&config).unwrap(), before);
     assert!(!world.home().join(".config/example/settings.toml").exists());
+    assert!(
+        !apply_called.exists(),
+        "dots plan invoked mise dotfiles apply"
+    );
 
     let report = saved_report(&world, "plan");
     assert_report_status(&report, 0);

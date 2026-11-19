@@ -310,11 +310,11 @@ impl<'a> Brew<'a> {
         })
     }
 
-    fn outdated(&self, kind: Kind, token: &str, greedy: bool) -> Result<bool, Fail> {
+    fn outdated(&self, kind: Kind, token: &str, auto_updates: bool) -> Result<bool, Fail> {
         let mut command = self.command()?;
         command.args(["outdated", kind.flag(), "--quiet"]);
-        if greedy {
-            command.arg("--greedy");
+        if auto_updates {
+            command.arg("--greedy-auto-updates");
         }
         let output = command
             .arg(token)
@@ -451,7 +451,7 @@ fn update(
     kind: Kind,
     token: &str,
     install_only: bool,
-    greedy: bool,
+    auto_updates: bool,
     admin: bool,
     process: Option<&str>,
 ) -> Result<u8, Fail> {
@@ -476,7 +476,7 @@ fn update(
             println!("Already installed: {token}");
             return Ok(0);
         }
-        if !brew.outdated(kind, token, greedy)? {
+        if !brew.outdated(kind, token, auto_updates)? {
             println!("Unchanged: {token}");
             return Ok(0);
         }
@@ -497,8 +497,8 @@ fn update(
 
     let mut command = brew.command()?;
     command.args([action, kind.flag()]);
-    if installed && greedy {
-        command.arg("--greedy");
+    if installed && auto_updates {
+        command.arg("--greedy-auto-updates");
     }
     let status = command.arg(token).status().map_err(|error| {
         Fail::new(

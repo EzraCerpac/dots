@@ -43,11 +43,13 @@ The archived v0.4.0 oracle jobs also need `node`, `python3` and `uv`; ordinary r
 
 ## Run and count cases
 
-Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`, through `mise exec` as above.
+Run everything with `cargo test --locked -- --test-threads 1`, or one suite with `cargo test --locked --test SUITE`, through `mise exec` as above.
 `dots test` is something else: it runs a configuration's own `tests/run`, not these suites.
-CI runs the library tests with `-- --test-threads 1`, because their terminal and signal fixtures must not overlap.
+The library tests have terminal and signal fixtures that must not overlap, so the full local run is serial.
+CI serializes only the library tests, and runs the binaries, integration suites and doctests separately.
 
 ```sh
+mise exec -- cargo test --locked -- --test-threads 1
 mise exec -- cargo test --locked --test contract
 mise exec -- cargo test --locked --test contract -- --list
 mise exec -- cargo test --locked --lib -- --test-threads 1

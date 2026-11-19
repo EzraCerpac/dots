@@ -127,7 +127,7 @@ This repository is the Rust crate `dots-cli`, which builds the `dots` binary.
 ```sh
 mise install
 mise exec -- cargo build --locked
-mise exec -- cargo test --locked
+mise exec -- cargo test --locked -- --test-threads 1
 ```
 
 The full test suite also needs real scenario tools on your `PATH`; [the test guide](tests/README.md#prerequisites) lists them.

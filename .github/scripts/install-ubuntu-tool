@@ -2,7 +2,8 @@
 set -euo pipefail
 
 tool=$1
-if command -v "$tool" >/dev/null; then
+destination=${2:-}
+if [[ -z "$destination" ]] && command -v "$tool" >/dev/null; then
   exit 0
 fi
 
@@ -10,19 +11,30 @@ fi
 # installs on hosted runners. Fetch the same Noble packages by checksum.
 arch=$(dpkg --print-architecture)
 case "$arch" in
-  amd64) mirror=https://azure.archive.ubuntu.com/ubuntu ;;
-  arm64) mirror=https://ports.ubuntu.com/ubuntu-ports ;;
+  amd64) mirrors=(https://azure.archive.ubuntu.com/ubuntu https://mirrors.edge.kernel.org/ubuntu https://mirrors.mit.edu/ubuntu) ;;
+  arm64) mirrors=(https://ports.ubuntu.com/ubuntu-ports) ;;
   *) echo "Unsupported Ubuntu architecture: $arch" >&2; exit 2 ;;
 esac
 
-scratch=$(mktemp -d "$RUNNER_TEMP/ubuntu-packages.XXXXXX")
-trap 'rm -rf -- "$scratch"' EXIT
-cd "$scratch"
+if [[ -n "$destination" ]]; then
+  mkdir -p "$destination"
+  cd "$destination"
+else
+  scratch=$(mktemp -d "$RUNNER_TEMP/ubuntu-packages.XXXXXX")
+  trap 'rm -rf -- "$scratch"' EXIT
+  cd "$scratch"
+fi
 
 download() {
-  local path=$1 sha=$2 file=${1##*/}
-  curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 "$mirror/pool/$path" -o "$file"
-  printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c
+  local path=$1 sha=$2 file=${1##*/} mirror
+  for mirror in "${mirrors[@]}"; do
+    if curl -fsSL --connect-timeout 5 --max-time 15 "$mirror/pool/$path" -o "$file" &&
+      printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c; then
+      return
+    fi
+  done
+  echo "Could not fetch verified package: $file" >&2
+  return 1
 }
 
 case "$tool-$arch" in
@@ -43,5 +55,7 @@ esac
 if [[ "$tool" == zsh ]]; then
   download main/z/zsh/zsh-common_5.9-6ubuntu2_all.deb 56d160585b417af0cc04d7372f74a3b734609d7cc43ef8ea6e92bfdfc27f77c3
 fi
-sudo dpkg -i ./*.deb
-command -v "$tool"
+if [[ -z "$destination" ]]; then
+  sudo dpkg -i ./*.deb
+  command -v "$tool"
+fi

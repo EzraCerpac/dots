@@ -13,6 +13,9 @@ fi
 tools="$BUNDLE/tools"
 mkdir -p "$tools"
 tar -xzf "$BUNDLE/tools.tar.gz" -C "$tools"
+if [[ "${RUNNER_OS:-}" == Linux ]] && ! command -v zsh >/dev/null; then
+  sudo dpkg -i "$tools"/ubuntu-packages/*.deb
+fi
 export PATH="$workspace/.github/scripts/scenario-bin:$tools/bin:$PATH"
 if ! command -v fish >/dev/null && [[ -x "$tools/fish/bin/fish" ]]; then
   export PATH="$tools/fish/bin:$PATH"

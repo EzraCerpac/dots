@@ -95,11 +95,7 @@ jobs:
         run: bash .github/scripts/run-distro
       - name: Run nextest from the archive
         if: ${{ !contains(fromJSON('["Fedora","Arch","Alpine"]'), matrix.suite) }}
-        run: |
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            bash .github/scripts/install-ubuntu-tool zsh
-          fi
-          bash .github/scripts/run-nextest
+        run: bash .github/scripts/run-nextest
       - name: Summarize timings and flakes
         if: always()
         run: python3 .github/scripts/summarize-nextest.py target/nextest/ci/junit.xml >> "$GITHUB_STEP_SUMMARY"

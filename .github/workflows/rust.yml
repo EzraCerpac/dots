@@ -214,9 +214,9 @@ jobs:
           rust_host=x86_64-unknown-linux-gnu
           case "$DISTRO" in
             Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip age ;;
-            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age ;;
+            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age python ;;
             Alpine)
-              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age python3
               rust_host=x86_64-unknown-linux-musl
               ;;
             *) exit 2 ;;

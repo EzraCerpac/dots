@@ -72,7 +72,7 @@ Sync works on one shape only: a plain Git checkout at the repository root, with 
 - It stops with one line on a detached `HEAD`, another branch, a `.jj` directory, or state from a pre-1.0 sync layout.
 - `dots bootstrap` moves a fresh clone that is still on `main`, with no edits, to `dev`.
   Anything else is converted once, by hand, so local edits and unpushed work are kept.
-- It skips with one line while a merge, rebase, cherry-pick, revert or bisect is in progress, or while another sync or publish on the same repository runs.
+- It skips with one line while a merge, rebase, cherry-pick, revert or bisect is in progress, or while another source operation on the same repository runs.
   A lock left by a dead process on this host is reclaimed.
 - It skips with one line when Git is older than 2.43.
 
@@ -196,7 +196,7 @@ Issue lines carry `dots`' own diagnostics, never raw Git, mise or gitleaks outpu
 | Copy kept | A deployed copy differs from what sync expected, or another writer claimed it, so sync left it in place and may print where a displaced file is. Compare the copy with its source, put the version you want in the source, then sync again. |
 | Apply or reload failed | The configuration advanced but dotfiles were not applied, or a reload command failed. Fix the reported error and run the command sync prints. |
 | Retired declaration removed | Sync kept the original machine-local file at the printed recovery path before removing its matching retired tables. Nothing to do unless you had customized that table. |
-| Stopped or skipped | The checkout has the wrong shape or a foreign `origin`, a Git operation is in progress, another sync or publish is running, or Git is too old. Fix what the line names and sync again. |
+| Stopped or skipped | The checkout has the wrong shape or a foreign `origin`, a Git operation is in progress, another source operation is running, or Git is too old. Fix what the line names and sync again. |
 
 ## Exit status
 
@@ -214,28 +214,6 @@ Cancellation prevents any further stage from starting.
 
 ## Reviewed changes into main
 
-Reviewed changes reach `main` through a pull request from a task branch or a JJ workspace made from `origin/main`, never from the live checkout.
+Reviewed changes reach `main` through a pull request from a task branch made from `origin/main`, never from the live checkout.
 To extract a change made on `dev`, create a task branch from `origin/main`, copy or cherry-pick only that change, and review its diff against `main`.
 Do not move `dev` by hand or merge it wholesale into `main`.
-
-### `dots publish`
-
-`dots publish` is optional: it does that extraction and opens the pull request for you.
-It works only with a configuration on GitHub, because it opens or updates the pull request with `gh`.
-Before it looks for JJ, `gh` or gitleaks, it checks that `origin`, both in the live checkout and where you run it, is the configured GitHub repository.
-
-It uses JJ to assemble a clean change on top of `main` without touching your live checkout.
-Run it in a separate JJ clone of the configuration repository, for example one made with `jj git clone --colocate URL DIR`, never in the live checkout.
-There it builds the pull request on `main@origin`, while the live checkout keeps `dev` and your edits as they are.
-
-- By default it publishes exactly one change, the working change `@`, which must sit directly on `main@origin`.
-- `--bookmark NAME` publishes an existing private `wip/...` bookmark instead of `@`.
-- `--all` publishes the whole current stack as one pull request.
-  When the stack has diverged from `main@origin`, it first offers to merge `main@origin` into it, which needs JJ 0.41 or newer.
-
-It stops before any push when `main` does not exist on GitHub, or when the change builds on `dev` work that `main` lacks; extract a focused change onto a branch based on `main` instead.
-It scans the outgoing commits with gitleaks, shows a preview and asks for confirmation, then pushes a bookmark without force and opens or updates the pull request.
-Gitleaks' built-in allowlists can skip some binary and lock files in that scan without reporting a skip.
-A new pull request targets `main`; an open one for the same bookmark keeps its base, even one other than `main`.
-It needs Git, JJ, `gh` signed in and gitleaks, and exits 3 when conflicts stop it.
-See [the contract](contract.md#dots-publish) for every check.

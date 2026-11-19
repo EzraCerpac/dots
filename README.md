@@ -8,6 +8,8 @@
 - **Add software from many sources** with `dots add`: mise tools, Homebrew, apt, dnf, pacman, apk, the Mac App Store and apps from GitHub releases, as each platform supports them.
 - **Share between machines** with `dots sync`, which scans your changes for secrets before pushing configuration changes.
 - **Set up a new machine from your own configuration** with one command, over SSH from a machine you already have.
+- **Extend it with your own scripts.** Executables in your configuration's `dots/hooks/update.d/` run during `dots up`, those in `dots/hooks/bootstrap.d/` during `dots bootstrap`, and an executable `dots/commands/NAME` becomes `dots NAME`, listed in `dots help`.
+  [The `dots/` directory](docs/contract.md#the-dots-directory) has the naming rules.
 - **Works with your coding agent.** `dots` links its built-in agent skill when it finds Claude Code or Codex.
   Your own skills are ordinary files: adopt them with `dots add` and they sync like any dotfile; `dots` does not install them for you.
 
@@ -27,8 +29,9 @@ dots remote HOST --profile P           # set up another machine from your config
 <!-- The published installer URL is pending; once A-07 publishes install.sh at a project-owned endpoint, show its one-line form here. -->
 
 `dots` 0.5.0 is not released yet.
-**Planned for 0.5.0, not available yet:** the recommended install is the project's `install.sh`, which installs mise first when it is missing, then `dots`.
-Once the script is available, the same script will also set this machine up from your configuration:
+**Planned for 0.5.0, not available yet:** the recommended install is the project's `install.sh`.
+Without flags it installs mise when it is missing, then runs `dots init`, asking at most two questions in a terminal.
+With `--from REPO --profile P` it instead clones that repository and bootstraps this machine from it:
 
 ```sh
 sh install.sh --from OWNER/NAME --profile laptop
@@ -61,7 +64,6 @@ cargo install dots-cli --locked
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
 Once your configuration declares them, for example with `dots add --base gitleaks age`, `dots up` installs and updates them through mise.
 <!-- TODO: A-08 scaffold tools -->
-JJ and `gh` are needed only for `dots publish`; `gh` also enables an optional offer in `dots init`.
 [Platforms and programs](docs/contract.md#platforms-and-programs) lists what each action needs.
 
 ## Start
@@ -77,6 +79,11 @@ When it creates the repository in a terminal with `gh` signed in, and `dots_sour
 Otherwise, without `origin`, it prints how to add a remote.
 Until there is a remote, the configuration stays on this machine; see [adding a remote](docs/sync.md#adding-a-remote).
 [`dots init`](docs/contract.md#dots-init-dir) has the details.
+
+**Public or private?** Sync runs the same gitleaks scan either way, and the repository `dots init` offers is private.
+In a public repository, every synced change is public as soon as it reaches the shared `dev` branch.
+gitleaks catches token and key patterns, but personal host names and addresses can pass.
+Machine-local files stay out of the repository, and encrypted settings history lives in a separate private repository.
 
 ## Day to day
 
@@ -95,7 +102,6 @@ Until there is a remote, the configuration stays on this machine; see [adding a 
 
 ## More
 
-- [`dots publish`](docs/sync.md#dots-publish) opens a pull request to `main` from a separate JJ workspace of a configuration on GitHub.
 - [`dots backup`](docs/contract.md#dots-backup) saves this machine's encrypted app settings and publishes them to a private repository.
 - [`dots restore`](docs/contract.md#dots-restore---initialize-history) fetches those settings back onto this machine.
 - [`dots bundle`](docs/contract.md#dots-bundle) encrypts private values that [`dots bootstrap`](docs/contract.md#dots-bootstrap) needs to set up a machine.

@@ -1216,7 +1216,9 @@ Backup runs native sync once, with no publication retry and no force push.
 - Before a new store is installed, it is staged and validated as a bare clone.
   On a first restore, mise applies the fetched remote state as the initial checkpoint, under its native conflict checks.
 - An interrupted first restore resumes on the next run rather than treating the new store as established.
-- Restore keeps what it observed of the live files before the fetch through fallback and retry.
+- Restore observes the live files before it fetches, and detects changes made during the fetch before anything is applied.
+  A retry of an attempt that never started applying observes the live files afresh, so edits made between attempts count as the user's and are kept.
+  Once an apply has started, its observation is kept through fallback and retry.
   If it cannot prove that recovery is safe, it keeps later edits as well as both the dots and the native recovery journals.
 - A completed restore leaves behind no staging clone and no pending marker.
 - An existing store that is not connected is replaced only with `--initialize-history`.

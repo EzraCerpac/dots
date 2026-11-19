@@ -28,7 +28,7 @@ impl<'a> Mise<'a> {
     }
 
     pub fn with_selection(ctx: &'a Ctx, selected: Selection) -> Result<Self, Fail> {
-        let binary = mise_binary(&ctx.env)?;
+        let binary = require_mise(&ctx.env)?;
         Ok(Self {
             ctx,
             binary,
@@ -309,6 +309,69 @@ pub(crate) fn mise_binary(env: &Env) -> Result<PathBuf, Fail> {
         })
 }
 
+const MINIMUM_MISE: &str = env!("DOTS_MINIMUM_MISE");
+
+fn version_number(version: &str) -> Option<([u32; 3], bool)> {
+    if !version
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b".+-".contains(&byte))
+    {
+        return None;
+    }
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let version = version.split('+').next()?;
+    let (number, stable) = version
+        .split_once('-')
+        .map_or((version, true), |(number, _)| (number, false));
+    let mut fields = number.split('.');
+    let parts = [
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+    ];
+    fields.next().is_none().then_some((parts, stable))
+}
+
+fn reported_version(stdout: &str) -> Option<&str> {
+    let mut words = stdout.split_whitespace();
+    match words.next()? {
+        "mise" => words.next(),
+        version => Some(version),
+    }
+}
+
+pub(crate) fn require_mise(env: &Env) -> Result<PathBuf, Fail> {
+    let binary = mise_binary(env)?;
+    let output = Command::new(&binary)
+        .current_dir(env.cwd())
+        .env_clear()
+        .envs(&env.vars)
+        .env_remove("MISE_LOG_FILE")
+        .env("MISE_OFFLINE", "1")
+        .env("MISE_SELF_UPDATE_AUTO", "0")
+        .stdin(Stdio::null())
+        .arg("--version")
+        .output();
+    if let Ok(output) = output
+        && output.status.success()
+        && let Ok(stdout) = std::str::from_utf8(&output.stdout)
+        && let Some(found) = reported_version(stdout)
+        && let Some(version) = version_number(found)
+        && version < version_number(MINIMUM_MISE).expect("valid minimum_mise in install.sh")
+    {
+        // This also works with an older package-managed mise still on PATH.
+        let select = if env.get("DOTS_MISE_BIN").is_some() {
+            " && unset DOTS_MISE_BIN"
+        } else {
+            ""
+        };
+        return Err(Fail::usage(format!(
+            "mise {found} is too old (requires {MINIMUM_MISE} or newer); update with `curl -fsSL https://mise.run | MISE_VERSION=v{MINIMUM_MISE} MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh{select}`."
+        )));
+    }
+    Ok(binary)
+}
+
 pub(crate) fn quiet_probe(binary: &Path, root: &Path, scratch: &Path, env: &Env) -> Command {
     let mut command = Command::new(binary);
     command
@@ -392,7 +455,7 @@ pub(crate) fn validate_selection(
     profile: &str,
     host: &str,
 ) -> Result<(), Fail> {
-    let mise = mise_binary(env)?;
+    let mise = require_mise(env)?;
     let scratch = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()

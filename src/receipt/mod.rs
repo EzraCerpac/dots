@@ -292,7 +292,7 @@ fn printable(text: &str) -> String {
     printable
 }
 
-fn terminal_control(c: char) -> bool {
+pub(crate) fn terminal_control(c: char) -> bool {
     c.is_control()
         || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }

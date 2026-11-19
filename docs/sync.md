@@ -69,7 +69,10 @@ Commits pushed straight to `origin/dev` from a task worktree are fine: the next 
 
 Sync works on one shape only: a plain Git checkout at the repository root, with `HEAD` on `dev` and at least one commit.
 
-- It stops with one line on a detached `HEAD`, another branch, a `.jj` directory, or state from a pre-1.0 sync layout.
+- It stops with one line on a detached `HEAD`, another branch, a `.jj` directory, or a pre-1.0 `.git/dots-dev.json` file.
+  In a linked worktree, locate that file with `git -C "$(dots root)" rev-parse --git-path dots-dev.json`.
+  Back up local edits and unpushed commits, then finish any interrupted sync with the previous version or reconcile the worktree and index by hand.
+  Once you have verified the plain Git `dev` checkout and recovered your work, move the legacy file to your backup and rerun `dots sync`.
 - `dots bootstrap` moves a fresh clone that is still on `main`, with no edits, to `dev`.
   Anything else is converted once, by hand, so local edits and unpushed work are kept.
 - It skips with one line while a merge, rebase, cherry-pick, revert or bisect is in progress, or while another sync or publish on the same repository runs.

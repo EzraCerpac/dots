@@ -529,8 +529,13 @@ exec "$FIXTURE_REAL_GIT" "$@"
         assert!(live.stderr.is_empty(), "{live:?}");
         let receipt = String::from_utf8(live.stdout).unwrap();
         assert_eq!(receipt.lines().count(), 1, "{receipt}");
+        let root_argument = fs::canonicalize(root).unwrap();
         assert!(
-            receipt.contains("local-only") && receipt.contains("git remote add origin URL"),
+            receipt.contains("local-only")
+                && receipt.contains(&format!(
+                    "git -C '{}' remote add origin URL",
+                    root_argument.display()
+                )),
             "{receipt}"
         );
         if old {

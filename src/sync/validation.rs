@@ -259,12 +259,12 @@ fn materialize(
         if local(path) {
             return Err(invalid("configuration tracks a machine-local file"));
         }
+        let destination = scratch_destination(root, path)?;
         let image = if checkout_config(path) {
             Image::checkout(&scratch.git, revision, path, Some(entry))?
         } else {
             Image::from_git(&scratch.git, Some(entry))?
         };
-        let destination = root.join(path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -277,6 +277,21 @@ fn materialize(
         }
     }
     Ok(documents)
+}
+
+fn scratch_destination(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let path = super::git::relative(path.as_os_str().as_bytes())?;
+    let mut ancestor = root.to_owned();
+    for part in path.iter().take(path.components().count() - 1) {
+        ancestor.push(part);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(invalid("validation path has a non-directory ancestor")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root.join(path))
 }
 
 fn checkout_config(path: &Path) -> bool {
@@ -304,8 +319,8 @@ fn materialize_sources(
         {
             continue;
         }
+        let destination = scratch_destination(root, path)?;
         let image = Image::checkout(&scratch.git, revision, path, Some(entry))?;
-        let destination = root.join(path);
         fs::remove_file(&destination)?;
         write_private(&destination, &image)?;
     }
@@ -768,6 +783,18 @@ mod tests {
             fs::write(&ignore, pattern).unwrap();
             assert!(protect_future_hosts(fixture.path()).is_err(), "{pattern}");
         }
+    }
+
+    #[test]
+    fn cutover_scratch_destination_declines_symlink_ancestors_before_materialization() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        fs::create_dir(root.join("inside")).unwrap();
+        std::os::unix::fs::symlink("inside", root.join("alias")).unwrap();
+
+        assert!(scratch_destination(root, Path::new("inside/file")).is_ok());
+        assert!(scratch_destination(root, Path::new("alias/file")).is_err());
+        assert!(!root.join("inside/file").exists());
     }
 
     #[test]

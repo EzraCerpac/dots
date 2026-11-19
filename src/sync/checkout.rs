@@ -46,8 +46,17 @@ pub(super) struct Installed {
 pub(super) struct Interrupted {
     pub path: Option<PathBuf>,
     pub backups: Vec<PathBuf>,
-    pub moved_dev: Option<(String, String)>,
+    pub moved_dev: bool,
     pub recorded_revisions: Option<Box<(String, String)>>,
+    pub journal: JournalDisposition,
+}
+
+#[derive(Debug, Default)]
+pub(super) enum JournalDisposition {
+    #[default]
+    Active,
+    Parked(PathBuf),
+    RetiredBeforeStart,
 }
 
 fn fingerprints_match(path: &Path, other: &Path) -> io::Result<bool> {
@@ -480,7 +489,7 @@ fn apply(
     }
     let head = git.id(["rev-parse", "--verify", "HEAD^{commit}"])?;
     if head != plan.before && head != plan.after {
-        progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
+        progress.moved_dev = true;
         if !pending.join("started").exists() && !pending.join("finished").exists() {
             release_index(directory, pending)?;
             retire_pending(directory, pending, progress)?;
@@ -499,7 +508,7 @@ fn apply(
     };
     if pending.join("finished").exists() {
         if head != plan.after {
-            progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
+            progress.moved_dev = true;
             return Err(invalid("branch no longer matches the finished checkout"));
         }
         release_index(directory, pending)?;
@@ -512,8 +521,11 @@ fn apply(
         && index_snapshot(directory)? != fs::read(pending.join("index.before"))?
     {
         release_index(directory, pending)?;
-        if !pending.join("started").exists() {
+        if pending.join("started").is_file() {
+            park_pending(directory, pending, progress)?;
+        } else {
             retire_pending(directory, pending, progress)?;
+            progress.journal = JournalDisposition::RetiredBeforeStart;
         }
         return Err(invalid("Git index changed while sync was running"));
     }
@@ -573,6 +585,7 @@ fn apply(
                 &replacement,
             )?;
             write_synced(marker, b"applied\n")?;
+            progress.path = None;
             paths.push(item);
         }
     } else {
@@ -610,14 +623,15 @@ fn apply(
         Ok::<(), io::Error>(())
     })();
     if let Err(error) = update {
+        let dev = git.id(["rev-parse", "--verify", "refs/heads/dev^{commit}"]);
         if !cancelled()
-            && git
-                .id(["rev-parse", "--verify", "refs/heads/dev^{commit}"])
-                .is_ok_and(|dev| dev != plan.before && dev != plan.after)
+            && dev
+                .as_ref()
+                .is_ok_and(|dev| dev != &plan.before && dev != &plan.after)
         {
-            progress.moved_dev = Some((plan.before.clone(), plan.after.clone()));
+            progress.moved_dev = true;
         }
-        if !plan.checkout {
+        if !plan.checkout && dev.is_ok_and(|dev| dev != plan.after) {
             replace_index(&pending.join("index.before"), directory)?;
             File::open(directory)?.sync_all()?;
             release_index(directory, pending)?;
@@ -762,6 +776,7 @@ fn park_pending(
         let _ = fs::remove_dir(&recovery);
         return Err(error);
     }
+    progress.journal = JournalDisposition::Parked(recovery.clone());
     // Completed empty directory transitions do not contain user bytes.
     // rmdir refuses any directory into which an editor has added a file.
     if recovery.join("finished").is_file() {
@@ -784,6 +799,7 @@ fn retire_pending(directory: &Path, pending: &Path, progress: &mut Interrupted) 
     if progress.backups.is_empty() && clean_retired(&recovery).is_err() {
         progress.backups = vec![recovery];
     }
+    progress.journal = JournalDisposition::Active;
     Ok(())
 }
 
@@ -819,9 +835,14 @@ pub(super) fn finish(
             if has_pending(directory) {
                 progress.backups = recovery_paths(&pending);
             }
-            // Omit revisions when the interrupted operation never started
-            // or its journal has since been retired.
-            if !fs::symlink_metadata(pending.join("started")).is_ok_and(|marker| marker.is_file()) {
+            let started = match &progress.journal {
+                JournalDisposition::Parked(path) => path,
+                _ => &pending,
+            }
+            .join("started");
+            if !progress.moved_dev
+                && !fs::symlink_metadata(started).is_ok_and(|marker| marker.is_file())
+            {
                 progress.recorded_revisions = None;
             }
             Err(progress)
@@ -1133,6 +1154,75 @@ mod tests {
     }
 
     #[test]
+    fn cutover_interruption_after_a_synced_marker_names_no_completed_path() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        for path in ["alpha", "zeta"] {
+            fs::write(git.root().join(path), b"original").unwrap();
+        }
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let before = fixture_commit(&git, "before");
+        for path in ["alpha", "zeta"] {
+            fs::write(git.root().join(path), b"incoming").unwrap();
+        }
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let after = fixture_commit(&git, "after");
+        git.get(["reset", "--hard", &before]).unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, true).unwrap();
+        let pending = dir.join(PENDING);
+        let problem = finish(&git, &dir, || pending.join("done-0").is_file())
+            .err()
+            .expect("interrupted between completed paths");
+        assert!(pending.join("done-0").is_file());
+        assert!(!pending.join("done-1").exists());
+        assert_eq!(problem.path, None);
+        assert!(finish(&git, &dir, || false).unwrap().is_some());
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+        assert_eq!(fs::read(git.root().join("zeta")).unwrap(), b"incoming");
+    }
+
+    #[test]
+    fn cutover_failed_ref_update_keeps_installed_index_if_dev_reached_candidate() {
+        use crate::sync::tests::{fixture_commit, git_fixture};
+        let (_fixture, ctx) = git_fixture();
+        let git = Git::new(&ctx, ctx.root.path());
+        let before = fixture_commit(&git, "baseline");
+        fs::write(git.root().join("candidate"), b"approved candidate").unwrap();
+        git.get(["add", "candidate"]).unwrap();
+        let after = fixture_commit(&git, "candidate");
+        git.get(["reset", "--hard", &before]).unwrap();
+        fs::write(git.root().join("candidate"), b"approved candidate").unwrap();
+        let dir = git.root().join(".git");
+        let index = index_snapshot(&dir).unwrap();
+        begin(&git, &dir, &index, &before, &after, false).unwrap();
+        let pending = dir.join(PENDING);
+        let expected = fs::read(pending.join("index.after")).unwrap();
+        let result = apply(
+            &git,
+            &dir,
+            &pending,
+            &mut Interrupted::default(),
+            || false,
+            |staged, directory| {
+                replace_index(staged, directory)?;
+                git.get(["update-ref", "refs/heads/dev", &after, &before])?;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+        assert!(
+            index_snapshot(&dir).unwrap() == expected,
+            "candidate index lost"
+        );
+        assert!(finish(&git, &dir, || false).unwrap().is_some());
+        assert!(!has_pending(&dir));
+    }
+
+    #[test]
     fn prepared_head_transaction_excludes_competing_git_writers() {
         use crate::sync::tests::{fixture_commit, git_fixture};
         let (_fixture, ctx) = git_fixture();
@@ -1182,7 +1272,11 @@ mod tests {
         git.get(["update-ref", "refs/heads/dev", &other, &before])
             .unwrap();
         let problem = finish(&git, &dir, || false).err().expect("dev moved");
-        assert_eq!(problem.moved_dev, Some((before, after)));
+        assert!(problem.moved_dev);
+        assert_eq!(
+            problem.recorded_revisions.as_deref(),
+            Some(&(before, after))
+        );
         assert!(problem.backups.is_empty());
         assert!(!has_pending(&dir));
         assert_eq!(fs::read(live).unwrap(), b"baseline");

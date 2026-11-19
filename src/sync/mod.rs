@@ -108,7 +108,10 @@ fn protected_shape_problem(shape: &CheckoutShape) -> Option<Note> {
     if shape.jj_workspace {
         Some(Note::new("Sync stopped in a JJ workspace", GUIDE))
     } else if shape.legacy_sync {
-        Some(Note::new("Sync found pre-1.0 source state", GUIDE))
+        Some(Note::new(
+            "Sync found pre-1.0 source state in .git/dots-dev.json",
+            GUIDE,
+        ))
     } else if shape.head.is_none() || !shape.has_commit {
         Some(dev_required())
     } else if !shape.operations.is_empty() {
@@ -240,8 +243,24 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
 
 fn local_only(receipt: &mut Receipt) {
     receipt.local_only = true;
-    receipt.outcome = "local-only; add a remote with git remote add origin URL".into();
+    receipt.outcome = format!(
+        "local-only; add a remote with {}",
+        remote_add_command(receipt)
+    );
     receipt.stage_outcome = Outcome::Skipped;
+}
+
+fn remote_add_command(receipt: &Receipt) -> String {
+    let root = receipt
+        .checkout
+        .as_deref()
+        .and_then(Path::to_str)
+        .filter(|root| !root.chars().any(receipt::terminal_control))
+        .map_or_else(
+            || "\"$(dots root)\"".into(),
+            |root| format!("'{}'", root.replace('\'', "'\\''")),
+        );
+    format!("git -C {root} remote add origin URL")
 }
 
 #[derive(Debug)]
@@ -383,8 +402,10 @@ fn synchronize(
         if receipt.recovered.is_empty() && receipt.recovery_files.is_empty() {
             local_only(receipt);
         } else {
-            receipt.outcome =
-                "finished pending writes; add a remote with git remote add origin URL".into();
+            receipt.outcome = format!(
+                "finished pending writes; add a remote with {}",
+                remote_add_command(receipt)
+            );
         }
         receipt.stage_outcome = Outcome::Skipped;
         return Ok(());
@@ -934,13 +955,38 @@ fn finish_pending(
         }
         Ok(None) => Ok(None),
         Err(error) => {
+            use checkout::JournalDisposition::{Active, Parked, RetiredBeforeStart};
+
             receipt.recovery_files.extend(error.backups);
-            if let Some((before, after)) = error.moved_dev {
+            if error.moved_dev
+                && let Some((before, after)) = error.recorded_revisions.as_deref()
+            {
                 return Err(Note(
                     format!("dev moved during guarded checkout (expected {before} or {after})")
                         .into(),
                     "Preserve the competing dev tip, reconcile the checkout with the recorded revisions, then rerun dots sync.",
                 ));
+            }
+            match error.journal {
+                Parked(path) => {
+                    let revisions = error
+                        .recorded_revisions
+                        .as_deref()
+                        .map_or_else(String::new, |(before, after)| {
+                            format!(" (recorded revisions {before} to {after})")
+                        });
+                    return Err(Note(
+                        format!("Guarded checkout parked at {path:?}{revisions}").into(),
+                        "Preserve your edits, reconcile the index and checkout with the recorded revisions and any recovery copies, then rerun dots sync.",
+                    ));
+                }
+                RetiredBeforeStart => {
+                    return Err(Note::new(
+                        "Not saved: the Git index changed before checkout started",
+                        "Review your staged changes and rerun dots sync.",
+                    ));
+                }
+                Active => {}
             }
             if let Some(path) = error.path {
                 path_issue(

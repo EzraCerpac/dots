@@ -128,10 +128,9 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
         .env_remove("__MISE_HISTORY_LOCAL")
         .env("GIT_TERMINAL_PROMPT", "0");
     publication::constrain_http(&mut cmd, http.as_ref());
-    // A native exit status does not prove whether its push reached the host ref.
-    native.probe(
+    native.output(
         cmd,
-        "native history sync failed; the checkpoint was kept locally and publication could not be verified",
+        "native history sync failed; the settings checkpoint was kept locally and publication could not be verified. Check the private history remote and use mise dot status",
     )?;
     let pending = || {
         blocked(

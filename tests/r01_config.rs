@@ -537,12 +537,16 @@ fn new_configuration_help_lists_real_executables_and_builtins_win() {
 }
 
 #[test]
-fn new_mise_stops_before_the_requested_action_on_an_older_runtime() {
+fn new_mise_probe_policy_rejects_known_old_and_allows_unreported_versions() {
     let f = Fixture::new();
     let fake = f.script(
         "mise",
         r#"
 if [ "$1" = --version ]; then
+    case "$FIXTURE_VERSION" in
+        nonzero) exit 43 ;;
+        "") exit 0 ;;
+    esac
     printf '%s linux-x64 (fixture)\n' "$FIXTURE_VERSION"
     exit 0
 fi
@@ -562,11 +566,18 @@ printf '%s\n' "$@"
         let stderr = std::str::from_utf8(&output.stderr).unwrap();
         assert_eq!(stderr.lines().count(), 1, "{stderr}");
         assert!(stderr.contains(version) && stderr.contains(env!("DOTS_MINIMUM_MISE")));
+        assert!(stderr.contains(&format!("{fake:?}")), "{stderr}");
         assert!(stderr.contains("curl -fsSL https://mise.run | MISE_VERSION=v"));
         assert!(stderr.contains("unset DOTS_MISE_BIN"));
     }
 
-    for version in [env!("DOTS_MINIMUM_MISE"), "2026.11.10"] {
+    for version in [
+        env!("DOTS_MINIMUM_MISE"),
+        "2026.11.10",
+        "nonzero",
+        "",
+        "unparseable",
+    ] {
         let output = f
             .dots()
             .args(["mise", "config", "ls"])
@@ -617,6 +628,120 @@ printf '%s\n' "$@"
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(!missing.exists());
+}
+
+#[test]
+fn new_mise_probe_policy_completion_only_runs_passive_discovery() {
+    let f = Fixture::new();
+    f.write("config.toml", &format!("{BASE}\n[tools]\nfixture = '1'\n"));
+    let trace = f.base.join("probe-trace");
+    let mise = f.script(
+        "mise",
+        r#"
+printf '%s\n' "$1" >> "$PROBE_TRACE"
+printf '%s\n' "$PROBE_PATHS"
+"#,
+    );
+    let output = successful(
+        f.dots()
+            .args(["__complete", "bash", "remove", "fi"])
+            .env("DOTS_MISE_BIN", mise)
+            .env("PROBE_TRACE", &trace)
+            .env(
+                "PROBE_PATHS",
+                serde_json::json!([{"path": f.config.join("config.toml")}]).to_string(),
+            )
+            .output()
+            .unwrap(),
+    );
+    assert!(String::from_utf8_lossy(&output).contains("fixture"));
+    assert_eq!(fs::read_to_string(trace).unwrap(), "--quiet\n");
+}
+
+#[test]
+fn new_mise_prefers_the_home_executable_to_path_when_no_override_is_set() {
+    let f = Fixture::new();
+    let on_path = f.script("path-bin/mise", "echo 2026.11.9");
+    let in_home = f.script("home/.local/bin/mise", "echo 2026.11.7");
+    let path = std::env::join_paths([on_path.parent().unwrap(), Path::new("/bin")]).unwrap();
+    let mut command = f.dots();
+    command
+        .args(["mise", "config", "ls"])
+        .env_remove("DOTS_MISE_BIN")
+        .env("PATH", path);
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("{in_home:?}")));
+
+    fs::remove_file(in_home).unwrap();
+    assert_eq!(successful(command.output().unwrap()), b"2026.11.9\n");
+}
+
+#[test]
+fn new_backup_interrupt_during_the_mise_version_probe_reaps_it() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    let trace = f.base.join("probe-trace");
+    let mise = f.script(
+        "blocking mise",
+        r#"
+case "$1" in
+    --version)
+        echo version >> "$PROBE_TRACE"
+        sleep 4
+        echo finished >> "$PROBE_TRACE"
+        echo 2026.11.9
+        ;;
+    *) echo mode-read >> "$PROBE_TRACE" ;;
+esac
+"#,
+    );
+    let mut child = f
+        .dots()
+        .arg("backup")
+        .env("DOTS_MISE_BIN", mise)
+        .env("PROBE_TRACE", &trace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !trace.exists() && Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    if !trace.exists() {
+        let _ = child.kill();
+        panic!(
+            "mise version probe did not start: {:?}",
+            child.wait_with_output()
+        );
+    }
+    // SAFETY: the PID belongs to the unreaped dots child.
+    assert_eq!(
+        unsafe { nix::libc::kill(child.id() as i32, nix::libc::SIGINT) },
+        0
+    );
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let diagnostic = "mise version check was cancelled";
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("dots: {diagnostic}\n")
+    );
+    assert_eq!(fs::read_to_string(trace).unwrap(), "version\n");
+    let report = fs::read_dir(f.skill_state().join("reports"))
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension()? == "json").then(|| fs::read(path).unwrap())
+        })
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&report).unwrap();
+    assert_eq!(report["status"], 130);
+    assert_eq!(report["cancelled"], true);
+    assert_eq!(report["stages"][0]["issues"][0]["diagnostic"], diagnostic);
 }
 
 #[test]

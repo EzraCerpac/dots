@@ -579,6 +579,12 @@ if [ -n "$report" ]; then printf '[]\n' > "$report"; fi
 "#;
 
 macro_rules! sync_case {
+    (active $name:ident, $body:expr) => {
+        #[test]
+        fn $name() {
+            ($body)();
+        }
+    };
     ($name:ident, $body:expr) => {
         #[test]
         #[ignore = "P-08 sync; run unchanged cases against the v0.4.0 oracle"]
@@ -2484,8 +2490,8 @@ fn hooks(config: &str, pre: &str, post: &str) -> String {
 }
 
 macro_rules! copies_case {
-    ($name:ident, $hooks:expr, |$f:ident, $a:ident, $b:ident, $config:ident| $body:block) => {
-        sync_case!($name, || {
+    ($($name:ident)+, $hooks:expr, |$f:ident, $a:ident, $b:ident, $config:ident| $body:block) => {
+        sync_case!($($name)+, || {
             let $f = Repo::new();
             let $a = Machine::new(&$f, &$f.a, "machine-a", $hooks);
             let $b = Machine::new(&$f, &$f.b, "machine-b", $hooks);
@@ -3208,7 +3214,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_dirty_copy_survives_incoming_source_and_retry,
+    active unchanged_dirty_copy_survives_incoming_source_and_retry,
     false,
     |f, a, b, _config| {
         const DIRTY: &str = "my dirty copy\n";
@@ -3446,7 +3452,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
+    active unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
     false,
     |_f, a, _b, config| {
         fs::remove_file(a.home.join(".copied")).unwrap();

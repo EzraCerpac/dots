@@ -1,7 +1,7 @@
 mod support;
 
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::{env, fs};
 
@@ -107,6 +107,18 @@ fn success(output: Output) -> Output {
     output
 }
 
+fn native_mise() -> PathBuf {
+    env::var_os("DOTS_TEST_NATIVE_MISE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::split_paths(&env::var_os("PATH").unwrap())
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join("mise"))
+                .find(|path| path.is_file())
+                .expect("mise executable on PATH")
+        })
+}
+
 #[test]
 #[ignore = "guarded subprocess for the public Rust seams"]
 fn decision_child() {
@@ -125,11 +137,8 @@ fn decision_child() {
             let stage = run.start("Test checkpoint");
             let result = match history::checkpoint(&run, stage, &ctx) {
                 Ok(Checkpoint::NothingTracked) => "empty",
-                Err(issue) => {
-                    assert!(issue.diagnostic.contains("P-06"), "{issue:?}");
-                    "blocked"
-                }
-                Ok(Checkpoint::Saved) => panic!("checkpoint saved history"),
+                Err(_) => "blocked",
+                Ok(Checkpoint::Saved) => "saved",
             };
             let _ = run.end(0);
             result
@@ -209,15 +218,7 @@ fn new_checkpoint_requires_proven_empty_native_inventory() {
 #[test]
 fn new_checkpoint_preserves_mise_notices_and_honors_global_override() {
     let f = Fixture::new();
-    let mise = env::var_os("DOTS_TEST_NATIVE_MISE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            env::split_paths(&env::var_os("PATH").unwrap())
-                .filter(|path| path.is_absolute())
-                .map(|path| path.join("mise"))
-                .find(|path| path.is_file())
-                .expect("mise executable on PATH")
-        });
+    let mise = native_mise();
     let state = f.world.base().join("mise/state");
     let stores = [state.join("history"), state.join("history-local/history")];
     let notice = "fixture pending watcher notice\n";
@@ -283,6 +284,116 @@ fn new_checkpoint_preserves_mise_notices_and_honors_global_override() {
         );
         assert!(!store.join("notices").exists());
     }
+}
+
+#[test]
+fn new_checkpoint_skips_after_native_install_records_trust() {
+    let f = Fixture::new();
+    let mise = native_mise();
+    let home = f.world.home();
+    let root = home.join(".config/mise");
+    let state = f.world.base().join("mise/state");
+    let trust = state.join("trusted-configs");
+    let fresh = |command: &mut FixtureCommand<'_>| {
+        f.isolated(command);
+        command
+            .current_dir(home)
+            .env("DOTS_MISE_BIN", &mise)
+            .env("DOTS_ROOT", &root)
+            .env("MISE_CONFIG_DIR", &root)
+            .env_remove("MISE_TRUSTED_CONFIG_PATHS")
+            .env_remove("SETUP_PROFILE")
+            .env_remove("SETUP_MACHINE_ID");
+    };
+    let mut init = f.world.command(env!("CARGO_BIN_EXE_dots"));
+    fresh(&mut init);
+    success(init.arg("init").output().unwrap());
+    let checkpoint = |expected| {
+        let mut command = f.seam_command("checkpoint", expected);
+        fresh(&mut command);
+        success(command.output().unwrap());
+    };
+    checkpoint("empty");
+    assert!(!trust.exists());
+
+    let mut install = f.world.command(&mise);
+    fresh(&mut install);
+    success(install.current_dir(&root).arg("install").output().unwrap());
+    let records: Vec<_> = fs::read_dir(&trust)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(fs::read_link(&records[0]).unwrap(), home);
+    checkpoint("empty");
+    assert_eq!(fs::read_link(&records[0]).unwrap(), home);
+
+    let config = root.join("config.toml");
+    let original = fs::read_to_string(&config).unwrap();
+    f.write("setting", "fixture payload\n");
+    fs::write(
+        &config,
+        format!("{original}\n[dotfiles]\n'~/setting' = {{ mode = 'track' }}\n"),
+    )
+    .unwrap();
+    checkpoint("blocked");
+    fs::write(config, original).unwrap();
+
+    for uncertain in [
+        trust.join("unsupported.hash"),
+        state.join("vars.toml"),
+        state.join("ignored-configs"),
+    ] {
+        fs::write(&uncertain, "").unwrap();
+        checkpoint("blocked");
+        fs::remove_file(uncertain).unwrap();
+    }
+}
+
+#[test]
+fn new_checkpoint_keeps_the_merged_save_path_for_established_history() {
+    let f = Fixture::new();
+    let state = f.world.base().join("mise/state/history");
+    let store = state.join("repo.git");
+    fs::create_dir_all(&state).unwrap();
+    success(
+        f.world
+            .git()
+            .args(["init", "--bare"])
+            .arg(&store)
+            .output()
+            .unwrap(),
+    );
+    let declaration = f.world.root().join("config.toml");
+    fs::write(
+        &declaration,
+        format!("{CONFIG}\n[dotfiles]\n'~/setting' = {{ mode = 'track', encrypt = true }}\n"),
+    )
+    .unwrap();
+    f.write("setting", "fixture payload\n");
+    f.write(
+        "shared",
+        &serde_json::json!({
+            "entries": [{"mode": "track", "path": "~/setting", "declared_in": declaration}],
+            "invalid": [],
+        })
+        .to_string(),
+    );
+
+    let notice = state.join("notices");
+    fs::write(&notice, "queued note\n").unwrap();
+    f.seam("checkpoint", "blocked");
+    assert_eq!(fs::read_to_string(&notice).unwrap(), "queued note\n");
+    assert!(!f.world.home().join("history-calls").exists());
+    fs::remove_file(notice).unwrap();
+
+    f.seam("checkpoint", "saved");
+    let calls = fs::read_to_string(f.world.home().join("history-calls")).unwrap();
+    assert_eq!(
+        calls.lines().filter(|call| *call == "save").count(),
+        1,
+        "{calls}"
+    );
 }
 
 #[test]

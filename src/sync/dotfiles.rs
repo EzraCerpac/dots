@@ -744,7 +744,14 @@ impl Copies {
                 })
                 .collect::<Vec<_>>()
         };
-        let reload = ReloadQueue::new(run, git.root(), git_dir, selectors, &configs.reload)?;
+        let reload = ReloadQueue::new(
+            run,
+            git.root(),
+            git_dir,
+            selectors,
+            &configs.reload,
+            &active_configs.reload,
+        )?;
         let directory_copies = targets
             .iter()
             .filter(|target| target.mode == "copy")
@@ -1731,6 +1738,13 @@ struct Configs {
     reload: Vec<(String, String)>,
 }
 
+#[derive(Deserialize)]
+struct LoadedConfig {
+    path: PathBuf,
+    #[serde(default, rename = "override")]
+    is_override: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Declaration<'a> {
     name: &'a str,
@@ -1787,13 +1801,11 @@ fn omit_permissions(item: &mut Item) {
 
 impl Configs {
     fn read_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Self> {
-        #[derive(Deserialize)]
-        struct Config {
-            path: PathBuf,
-        }
         let bytes = validation::probe(run, root, validation::MiseProbe::ConfigList, preview)?;
-        let configs: Vec<Config> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let configs: Vec<LoadedConfig> =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         let mut result = Self::default();
+        let mut reload_layers = Vec::new();
         for config in configs {
             if !config.path.starts_with(root) {
                 continue;
@@ -1808,20 +1820,33 @@ impl Configs {
                     result.post.extend(strings(post));
                 }
             }
-            if let Some(reload) = doc
-                .get("history")
-                .and_then(|item| item.get("reload"))
-                .and_then(Item::as_table_like)
+            if !config.is_override
+                && let Some(reload) = doc
+                    .get("history")
+                    .and_then(|item| item.get("reload"))
+                    .and_then(Item::as_table_like)
             {
-                for (path, command) in reload.iter() {
-                    result.reload.extend(
-                        strings(command)
-                            .into_iter()
-                            .map(|command| (path.to_owned(), command)),
-                    );
-                }
+                reload_layers.push(
+                    reload
+                        .iter()
+                        .map(|(glob, command)| (glob.to_owned(), command.clone()))
+                        .collect::<Vec<_>>(),
+                );
             }
             result.docs.push((config.path, doc));
+        }
+        // JSON lists the most local files first. As in native history reload,
+        // merge low to high priority and preserve each glob's original slot.
+        let mut reload = Table::new();
+        for (glob, command) in reload_layers.into_iter().rev().flatten() {
+            reload.insert(&glob, command);
+        }
+        for (glob, command) in reload.iter() {
+            result.reload.extend(
+                strings(command)
+                    .into_iter()
+                    .map(|command| (glob.to_owned(), command)),
+            );
         }
         Ok(result)
     }
@@ -2079,8 +2104,9 @@ impl ReloadQueue {
         git_dir: &Path,
         selectors: &str,
         rules: &[(String, String)],
+        live_rules: &[(String, String)],
     ) -> io::Result<Option<Self>> {
-        if rules.is_empty() {
+        if rules.is_empty() && live_rules.is_empty() {
             return Ok(None);
         }
         let stage = private_dir(git_dir, "copy-reload-")?;
@@ -2102,21 +2128,25 @@ impl ReloadQueue {
         } else {
             format!("{selectors},{profile}")
         };
-        let doc = reload_config(rules, &stage.path().join("matches"), |pattern| {
+        let mut doc = reload_config(rules, &stage.path().join("matches"), |pattern| {
             Ok(pattern.to_owned())
         })?;
+        let reload = doc["history"]["reload"]
+            .as_table_mut()
+            .expect("reload_config creates a reload table");
+        // A validated pre-hook can write a new rule for a future sync.
+        // Keep native apply from executing that unvalidated command now.
+        for (glob, _) in live_rules {
+            if !reload.contains_key(glob) {
+                reload.insert(glob, value(":"));
+            }
+        }
         config.write_all(doc.to_string().as_bytes())?;
         let mut command = validation::command(run, live, ["config", "ls", "--json"], false)?;
         command
             .env("MISE_ENV", &selectors)
             .env("MISE_NO_HOOKS", "1");
         let output = run.probe(command)?;
-        #[derive(Deserialize)]
-        struct LoadedConfig {
-            path: PathBuf,
-            #[serde(default, rename = "override")]
-            is_override: bool,
-        }
         if !output.status.success()
             || !serde_json::from_slice::<Vec<LoadedConfig>>(&output.stdout)
                 .map_err(io::Error::other)?
@@ -2141,6 +2171,9 @@ impl ReloadQueue {
         paths: &BTreeSet<PathBuf>,
         receipt: &mut Receipt,
     ) -> io::Result<()> {
+        if rules.is_empty() {
+            return Ok(());
+        }
         let marker = self.stage.path().join("matches");
         if !paths.is_empty() {
             let root = self.stage.path().join("paths");

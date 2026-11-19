@@ -16,16 +16,45 @@ quote() {
     printf "'%s'" "$word"
 }
 
+set_launcher_target() (
+    if [ -L "$launcher_state" ] || { [ -e "$launcher_state" ] && [ ! -d "$launcher_state" ]; }; then
+        printf 'Kept existing path %s. The installed executable is at %s.\n' "$launcher_state" "$dots"
+    elif [ ! -e "$launcher_target" ] && [ ! -L "$launcher_target" ]; then
+        mkdir -p "$launcher_state"
+        ln -s "$dots" "$launcher_state"
+    elif [ -L "$launcher_target" ] && [ ! -d "$launcher_target" ] &&
+        [ "$(readlink "$launcher_target")" != "$dots" ]; then
+        staged=$(mktemp -d "$launcher_state/.update.XXXXXXXX")
+        trap 'rm -f "$staged/dots"; rmdir "$staged"' 0
+        ln -s "$dots" "$staged"
+        mv -f "$staged/dots" "$launcher_target"
+    fi
+)
+
 install_launcher() {
     user_bin=$HOME/.local/bin
     launcher=$user_bin/dots
+    # The exact relative link marks launchers we own. An ordinary link to
+    # a mise-installed executable could belong to the user.
+    managed=.dots-installer/dots
+    launcher_target=$user_bin/$managed
+    launcher_state=${launcher_target%/*}
     mise_data=${MISE_DATA_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/mise"}
     shim=${MISE_SHIMS_DIR:-"$mise_data/shims"}/dots
     if [ ! -e "$launcher" ] && [ ! -L "$launcher" ]; then
         case "$old_dots" in
-            ''|"$shim") mkdir -p "$user_bin"; ln -s "$dots" "$user_bin" ;;
+            ''|"$shim") ;;
             *) printf 'Kept existing dots command at %s.\n' "$old_dots"; return ;;
         esac
+        if [ -e "$launcher_state" ] || [ -L "$launcher_state" ]; then
+            printf 'Kept existing path %s. The installed executable is at %s.\n' "$launcher_state" "$dots"
+            return
+        fi
+        mkdir -p "$user_bin"
+        ln -s "$managed" "$user_bin"
+    fi
+    if [ -L "$launcher" ] && [ "$(readlink "$launcher")" = "$managed" ]; then
+        set_launcher_target
     fi
     if [ "$launcher" = "$shim" ] || [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
         printf 'Kept existing path %s. The installed executable is at %s.\n' "$launcher" "$dots"

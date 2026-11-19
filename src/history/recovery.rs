@@ -20,6 +20,7 @@ use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origi
 const PREVIOUS: &str = "repo.git.pre-restore.";
 const ATTEMPT: &str = ".dots-restore-attempt.";
 const CLONE: &str = "clone-";
+const RETIRING: &str = ".dots-restore-retiring";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
 
@@ -125,6 +126,7 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
             "pending history install location is not a real directory",
         ));
     }
+    resume_staging_retirement(native, &staging, &raw, &branch, &paths)?;
     let staged = staging.join("repo.git");
     let mut owned_stage = exists(&staging.join(MARKER))?;
     if owned_stage {
@@ -1194,10 +1196,12 @@ fn prepare(
     let base = parent(store);
     let temp = tempfile::Builder::new()
         .prefix(".dots-restore-reservation-")
+        .permissions(Permissions::from_mode(0o700))
         .tempdir_in(base)
         .map_err(|_| blocked("could not stage a private history clone"))?;
     let clone = tempfile::Builder::new()
         .prefix(CLONE)
+        .permissions(Permissions::from_mode(0o700))
         .tempdir_in(temp.path())
         .map_err(|_| blocked("could not stage a private history repository"))?;
     let clone_metadata = existing_directory(clone.path())?
@@ -1433,12 +1437,58 @@ fn discard_clone(staging: &Path, clone: &StoreDirectory) -> Result<(), Fail> {
 }
 
 fn finish_staging(staging: &Path, owned_stage: bool) -> Result<(), Fail> {
-    if owned_stage {
-        fs::remove_file(staging.join(MARKER))
-            .map_err(|_| blocked("could not clear the history clone ownership marker"))?;
+    if !owned_stage {
+        return fs::remove_dir(staging)
+            .map_err(|_| blocked("could not finish the history install staging directory"));
     }
-    fs::remove_dir(staging)
-        .map_err(|_| blocked("could not finish the history install staging directory"))
+    let retirement = parent(staging).join(RETIRING);
+    if exists(&retirement)? {
+        return Err(blocked("a history clone retirement is already pending"));
+    }
+    // Keep the ownership record outside the directory while rmdir needs it
+    // empty. An interruption can then leave either the stage or its receipt.
+    fs::rename(staging.join(MARKER), &retirement)
+        .map_err(|_| blocked("could not retire the history clone ownership marker"))?;
+    finish_retirement(staging, &retirement)
+}
+
+fn resume_staging_retirement(
+    native: &Native<'_, '_>,
+    staging: &Path,
+    origin: &str,
+    branch: &str,
+    paths: &tracked::TrackedPaths,
+) -> Result<(), Fail> {
+    let retirement = parent(staging).join(RETIRING);
+    if !exists(&retirement)? {
+        return Ok(());
+    }
+    let owner = read_journal_at(&retirement)?;
+    if !matches!(owner.progress, Progress::Cloning(_)) {
+        return Err(invalid(
+            "invalid ownership marker for a retired history clone",
+        ));
+    }
+    match_journal_context(native, &owner, origin, branch)?;
+    paths.check_binding(&owner.paths, false)?;
+    if let Some(meta) = existing_directory(staging)? {
+        match_journal_directory(&owner, &meta)?;
+    }
+    finish_retirement(staging, &retirement)
+}
+
+fn finish_retirement(staging: &Path, retirement: &Path) -> Result<(), Fail> {
+    let base = parent(staging);
+    if exists(staging)? {
+        fsync_dir(staging)?;
+        fsync_dir(base)?;
+        fs::remove_dir(staging)
+            .map_err(|_| blocked("could not finish the history install staging directory"))?;
+    }
+    fsync_dir(base)?;
+    fs::remove_file(retirement)
+        .map_err(|_| blocked("could not clear the history clone retirement marker"))?;
+    fsync_dir(base)
 }
 
 fn parent(store: &Path) -> &Path {
@@ -1477,7 +1527,11 @@ fn write_journal(store: &Path, record: &Journal) -> Result<(), Fail> {
 }
 
 fn read_journal(store: &Path) -> Result<Journal, Fail> {
-    serde_json::from_reader(read_private(&store.join(MARKER))?.take(4 * 1024 * 1024))
+    read_journal_at(&store.join(MARKER))
+}
+
+fn read_journal_at(path: &Path) -> Result<Journal, Fail> {
+    serde_json::from_reader(read_private(path)?.take(4 * 1024 * 1024))
         .map_err(|_| invalid("could not validate the pending history recovery marker"))
 }
 
@@ -1519,6 +1573,18 @@ fn match_journal_owner(
     origin: &str,
     branch: &str,
 ) -> Result<(), Fail> {
+    match_journal_context(native, record, origin, branch)?;
+    let metadata =
+        existing_directory(store)?.ok_or_else(|| blocked("pending history store vanished"))?;
+    match_journal_directory(record, &metadata)
+}
+
+fn match_journal_context(
+    native: &Native<'_, '_>,
+    record: &Journal,
+    origin: &str,
+    branch: &str,
+) -> Result<(), Fail> {
     let root = native.ctx.root.path();
     if record.root != root
         || record.home != physical_home(native)?
@@ -1529,8 +1595,10 @@ fn match_journal_owner(
             "pending history restore belongs to another configuration root, origin or branch",
         ));
     }
-    let metadata =
-        existing_directory(store)?.ok_or_else(|| blocked("pending history store vanished"))?;
+    Ok(())
+}
+
+fn match_journal_directory(record: &Journal, metadata: &fs::Metadata) -> Result<(), Fail> {
     if (record.device, record.inode) != (metadata.dev(), metadata.ino()) {
         return Err(invalid(
             "pending history restore belongs to a different store",

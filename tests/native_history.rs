@@ -1923,15 +1923,18 @@ fn new_restore_recovers_a_killed_staging_fetch_and_keeps_native_health_in_place(
     assert_eq!(old_status["origin_url"], previous_url);
     assert_ne!(old_status["upstream_commit"], tip);
 
+    fs::set_permissions(history, fs::Permissions::from_mode(0o755)).unwrap();
     let unknown_stage = history.join(".dots-restore-clone-unrelated");
     fs::create_dir(&unknown_stage).unwrap();
     fs::write(unknown_stage.join("keep"), b"unrelated fixture").unwrap();
     fixture.configure(&url, &url, &key, &[public]);
     let hit = fixture.world.home().join("staging-fetch-hit");
+    let modes = fixture.world.home().join("staging-fetch-modes");
     fixture.script(
         "git",
         r#"#!/bin/sh
 if [ "${FIXTURE_KILL_STAGING_FETCH-}" = 1 ] && [ "${3-}" = fetch ]; then
+    ls -ld "${2%/*}" "$2" > "$FIXTURE_STAGE_MODES" || exit "$?"
     "$FIXTURE_GIT" "$@" || exit "$?"
     printf '%s\n' "$2" > "$FIXTURE_STAGE_HIT"
     kill -KILL "$PPID"
@@ -1940,13 +1943,27 @@ fi
 exec "$FIXTURE_GIT" "$@"
 "#,
     );
-    let killed = fixture
-        .dots(&["restore", "--initialize-history"], &remote)
+    let mut command = fixture.dots(&["restore", "--initialize-history"], &remote);
+    // Use a permissive umask only in this forked fixture process.
+    unsafe {
+        command.pre_exec(|| {
+            nix::libc::umask(0o022);
+            Ok(())
+        });
+    }
+    let killed = command
         .env("FIXTURE_KILL_STAGING_FETCH", "1")
         .env("FIXTURE_STAGE_HIT", &hit)
+        .env("FIXTURE_STAGE_MODES", &modes)
         .output()
         .unwrap();
     assert_eq!(killed.status.signal(), Some(9), "{}", messages(&killed));
+    let modes = fs::read_to_string(modes).expect("staging modes were not observed before fetch");
+    let modes: Vec<_> = modes.lines().collect();
+    assert_eq!(modes.len(), 2);
+    for line in modes {
+        assert!(line.starts_with("drwx------"), "unexpected mode: {line}");
+    }
     let staging = history.join(".dots-restore-install");
     let clone = PathBuf::from(
         fs::read_to_string(hit)
@@ -1958,6 +1975,36 @@ exec "$FIXTURE_GIT" "$@"
     assert_eq!(fixture.tip(&store, "refs/heads/main"), old_tip);
     assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);
     assert!(fs::read(&health).unwrap() == old_health);
+
+    let marker = staging.join("dots-restore-pending");
+    let owner = fs::read(&marker).unwrap();
+    let retirement = history.join(".dots-restore-retiring");
+    let foreign = staging.join("unrelated");
+    // Stop rmdir after the owner record moves, with no installed journal.
+    fs::write(&foreign, b"unrelated fixture").unwrap();
+    let interrupted = fixture
+        .dots(&["restore", "--initialize-history"], &remote)
+        .output()
+        .unwrap();
+    assert_eq!(
+        interrupted.status.code(),
+        Some(1),
+        "{}",
+        messages(&interrupted)
+    );
+    assert!(
+        messages(&interrupted).contains("could not finish the history install staging directory")
+    );
+    assert!(!clone.exists());
+    assert!(!marker.exists());
+    assert_eq!(fs::read(&retirement).unwrap(), owner);
+    assert_eq!(fs::read(&foreign).unwrap(), b"unrelated fixture");
+    assert!(!store.join("dots-restore-pending").exists());
+    assert_eq!(fixture.tip(&store, "refs/heads/main"), old_tip);
+    assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);
+    assert!(fs::read(&health).unwrap() == old_health);
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+    fs::remove_file(foreign).unwrap();
 
     let report_only = fixture.script(
         "skip-native-fetch",
@@ -1978,6 +2025,7 @@ exec "$FIXTURE_MISE" "$@"
     assert!(
         messages(&skipped).contains("could not resolve the fetched private history checkpoint")
     );
+    assert!(!retirement.exists());
     assert!(store.join("dots-restore-pending").is_file());
     assert_eq!(fixture.tip(&store, "refs/heads/main"), tip);
     assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);

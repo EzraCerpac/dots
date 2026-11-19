@@ -27,14 +27,30 @@ fn unchanged_help_without_configuration() {
 }
 ```
 
+## Prerequisites
+
+`mise.toml` pins only Rust.
+Run Cargo as `mise exec -- cargo ...`, so that Cargo and rustc both come from that toolchain without activating mise in your shell.
+
+The suites also run real programs inside their fixtures: `bash`, `zsh`, `fish`, `git` 2.43 or newer, `jq`, `age`, `age-keygen`, `mise` and `gitleaks`.
+The receipt suite, for example, stops when no real `gitleaks` is on `PATH`.
+A fixture replaces `HOME`, the XDG and mise directories and the Git configuration, but starts from the caller's `PATH`, and some suites drop mise shim directories from it.
+So put each tool's real executable in a directory on `PATH` before running Cargo, rather than relying on mise shims or shell activation.
+CI does this with `.github/scripts/setup-scenario-tools`, which installs pinned `mise`, `age`, `age-keygen`, `gitleaks` and `fish` under one prefix and puts its `bin` directories on `PATH`.
+
+These are test needs only: what the `dots` executable needs at run time is listed in [Platforms and programs](../docs/contract.md#platforms-and-programs).
+The archived v0.4.0 oracle jobs also need `node`, `python3` and `uv`; ordinary runs do not.
+
 ## Run and count cases
 
-Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`, using the Rust toolchain that `mise.toml` pins.
+Run every suite with `cargo test --locked`, or one suite with `cargo test --locked --test SUITE`, through `mise exec` as above.
 `dots test` is something else: it runs a configuration's own `tests/run`, not these suites.
+CI runs the library tests with `-- --test-threads 1`, because their terminal and signal fixtures must not overlap.
 
 ```sh
-cargo test --locked --test contract
-cargo test --locked --test contract -- --list
+mise exec -- cargo test --locked --test contract
+mise exec -- cargo test --locked --test contract -- --list
+mise exec -- cargo test --locked --lib -- --test-threads 1
 ```
 
 On DriehuisNAS, run each test command through `mise run nas:build --`.

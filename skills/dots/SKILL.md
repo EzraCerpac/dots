@@ -20,8 +20,6 @@ dots add --help      # usage for the built-in add command
 If it describes sourcing shell libraries from a manager directory, it predates 1.0; use `dots help` for the current command list.
 `dots test` and `dots mise` pass `--help` to the child, as do configuration commands.
 
-> TODO(R-01): Confirm this skill reads correctly once extracted on its own, with nothing else from the dots repository beside it.
-
 ## Safe and unsafe commands
 
 These commands inspect the configuration or preview an action. Some save a private report, and invocation can refresh agent skill links.
@@ -39,7 +37,7 @@ Run them only when the user asks for that action, and otherwise say which comman
 `dots up`, `dots sync`, `dots apply`, `dots add`, `dots remove`, `dots init`, `dots bootstrap`, `dots remote`, `dots backup`, `dots restore`, `dots publish`, `dots profile --profile PROFILE --machine-id ID`, `dots exceptions`, `dots retire-dotfiles`, `dots enroll-history`.
 `dots mise ARGS...` and configuration commands do whatever they run.
 
-In shared mode, `dots sync` and the sync stage of `dots up` can publish eligible edits to `dev` once scanning, validation, checkout and remote checks pass.
+In shared mode, `dots sync` and the sync stage of `dots up` can publish eligible edits to `dev` once scanning, validation and remote checks pass; the checkout and dotfiles update only after the remote confirms `dev`.
 Do not run them while someone else has uncommitted edits there, and do not leave half-finished edits there yourself.
 
 ## Profiles
@@ -151,6 +149,7 @@ Make them executable (`chmod +x`), keep them safe to rerun, and check their synt
 - `dots up --last` prints the saved update report and returns its recorded exit status.
   Captured stages have private logs under `${XDG_STATE_HOME:-~/.local/state}/dots/`. A failed step that had the terminal gives its exit status and next action, with its output in scrollback.
 - `dots sync --last` replays the last sync receipt.
+  When it reports a push as unconfirmed, compare `refs/heads/dev` at `origin` with the candidate and expected commits it prints before running sync again.
   The [sync guide](https://github.com/EzraCerpac/dots/blob/main/docs/sync.md) explains each kind of sync issue.
 - `dots reports [COMMAND]` lists completed reports, newest first, with the command, time, outcome, exit status and location.
 - Run `dots` for help, including the configuration's commands.

@@ -5,7 +5,7 @@ Every part is optional; delete what you do not use.
 `dots init` writes this file and the others here only when they are absent, and never overwrites them.
 `dots help` lists every command, and `dots COMMAND --help` prints a built-in command's usage.
 
-> TODO(P-03): Check every example here against the integrated 1.0 binary and against the copy `dots init` installs, then delete this line.
+> TODO(P-03): Run the font hook and the Homebrew recipe examples on a real macOS machine; they have not been run against the integrated binary.
 
 | Path | Purpose |
 | --- | --- |
@@ -225,8 +225,6 @@ Call it from a mise `post-dotfiles` hook, the same way the [bootstrap hook](#con
 post-dotfiles = '"$(command -v mise || echo "$HOME/.local/bin/mise")" x github:EzraCerpac/dots -- dots retire-dotfiles'
 ```
 
-> TODO(P-02): Confirm this hook form under native bootstrap and `dots apply` with the integrated binary.
-
 `retired-declarations` is for a `[dotfiles.NAME]` table that a setup script once wrote into machines' `config.local.toml` or `config.host-*.toml`, whose source this configuration has since removed.
 Such a table would make every `dots sync` on those machines reject the configuration.
 Rows are `dotfiles.NAME<TAB>SOURCE`, with `SOURCE` a plain relative path without `.`, `..` or empty parts; other rows are ignored.
@@ -261,4 +259,4 @@ raw = true
 The `pre-dotfiles` hook can run before `mise` is on `PATH`, so it locates mise itself and runs the `dots` version that `[tools]` pins.
 `dots bootstrap complete` then reads private inputs, moves a fresh clone to `dev`, restores settings history when asked, installs installer exceptions, runs `hooks/bootstrap.d/`, and prepares encrypted history when a state repository is set.
 
-> TODO(P-05): Replace the pinned version with the first released 1.0 version and confirm both callbacks against it.
+> TODO(P-05): Replace the pinned version with the first released 1.0 version and confirm a cold install fetches it for both callbacks.

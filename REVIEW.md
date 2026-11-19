@@ -8,7 +8,8 @@ For anyone reviewing a pull request here, human or automated.
 - `dots` is a generic dotfiles manager layered on mise.
   Nothing here may assume one person's configuration: owner- and machine-specific behaviour comes only from the configuration (`[vars] dots_*` and the `dots/` directory).
 - An ordinary `dots up` never prunes software, restarts services or updates project dependencies.
-- During guarded writes and rollback, preserve concurrent edits and files that obstruct the operation. Replace owned files atomically where the contract requires it.
+- `dots` guards its own writes and rollbacks: it preserves edits made in the meantime and files that obstruct the operation, and replaces the files it owns atomically where the contract requires it.
+  mise's native template and inline apply is outside that guard and can lose a file created between planning and installation.
   When a step of `dots add` or `dots remove` fails, it puts back only what it changed.
 - A command checks only the programs its requested action uses; a missing one fails that action with one line naming it, without failing an inspection command or a stage with nothing to do.
 - Ctrl-C cancels every active stage's process group, starts no further stage, and waits for cleanup before saving the report or exiting, with the statuses the contract gives.
@@ -24,7 +25,8 @@ For anyone reviewing a pull request here, human or automated.
 - `dots sync` with valid arguments always exits 0 and prints a receipt.
   The receipt records verified sharing, local saves and checkout updates, and each issue carries a diagnostic and recovery action.
   Patch contents appear only on a terminal, after a clean gitleaks screen; piped, `--plain` and saved receipts carry metadata only.
-  Sync never force-pushes, skips validation or discards uncommitted edits.
+  Sync never force-pushes, skips validation or writes conflict markers into live files.
+  A push whose outcome is uncertain stops the run before any retry, checkout or apply, and is reported as unconfirmed, never as shared.
 - Tests build their own configuration or copy `tests/fixtures`; they must pass from a copy of this repository alone.
 
 A change that breaks one of these is worth a comment at any size.

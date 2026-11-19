@@ -1,6 +1,7 @@
 #!/bin/sh
 {
 set -eu
+minimum_mise=2026.11.8
 
 fail() {
     printf 'dots installer: %s\n' "$*" >&2

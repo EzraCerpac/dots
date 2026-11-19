@@ -5,6 +5,10 @@ on:
   push:
     branches: [rust, main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -13,28 +17,22 @@ env:
 
 jobs:
   rust:
-    name: Rust (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    name: Rust (${{ matrix.host[matrix.platform].target }})
+    runs-on: ${{ matrix.host[matrix.platform].runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-15-intel
-            arch: x86_64
-            target: x86_64-apple-darwin
-          - os: macos-15
-            arch: arm64
-            target: aarch64-apple-darwin
-          - os: ubuntu-24.04
-            arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            arch: aarch64
-            target: aarch64-unknown-linux-musl
+        # Module PRs run Linux. Integrated pushes and main-bound PRs also run both Macs.
+        platform: ${{ fromJSON(github.base_ref == 'rust' && '["linux"]' || '["linux","macos"]') }}
+        host:
+          - linux: { runner: ubuntu-24.04, arch: x86_64, target: x86_64-unknown-linux-musl }
+            macos: { runner: macos-15-intel, arch: x86_64, target: x86_64-apple-darwin }
+          - linux: { runner: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-musl }
+            macos: { runner: macos-15, arch: arm64, target: aarch64-apple-darwin }
     env:
-      ARCH: ${{ matrix.arch }}
-      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.host[matrix.platform].arch }}
+      CARGO_BUILD_TARGET: ${{ matrix.host[matrix.platform].target }}
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -93,7 +91,10 @@ jobs:
 
   legacy-oracle:
     name: v0.4.0 oracle (${{ matrix.os }})
-    if: github.event_name == 'pull_request' && github.base_ref == 'rust'
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/rust') ||
+      (github.event_name == 'pull_request' &&
+       (github.base_ref == 'rust' || (github.base_ref == 'main' && github.head_ref == 'rust')))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     defaults:
@@ -102,11 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux-amd64
-          - os: macos-15
-            platform: darwin-arm64
+        os: ${{ fromJSON(github.base_ref == 'rust' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
     env:
       MISE_VERSION: v2026.11.9
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
@@ -142,7 +139,7 @@ jobs:
 
       - name: Verify and unpack the pinned oracle
         env:
-          PLATFORM: ${{ matrix.platform }}
+          PLATFORM: ${{ matrix.os == 'macos-15' && 'darwin-arm64' || 'linux-amd64' }}
         run: |
           repo=https://github.com/EzraCerpac/dots
           tag=v0.4.0

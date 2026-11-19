@@ -255,16 +255,22 @@ fn bootstrap_tree() -> Command {
             "complete",
             "Run the dots stages (final bootstrap task)",
         ))
-        .arg(file(
-            "bundle",
-            "FILE",
-            "Read private inputs from this encrypted bundle",
-        ))
-        .arg(file(
-            "identity",
-            "KEY",
-            "age identity for the bundle and recovery",
-        ))
+        .arg(
+            file(
+                "bundle",
+                "FILE",
+                "Read private inputs from this encrypted bundle",
+            )
+            .allow_hyphen_values(false),
+        )
+        .arg(
+            file(
+                "identity",
+                "KEY",
+                "age identity for the bundle and recovery",
+            )
+            .allow_hyphen_values(false),
+        )
         .arg(
             value(
                 "restore",
@@ -276,7 +282,11 @@ fn bootstrap_tree() -> Command {
         )
         .arg(value("from", "REPO", "Bootstrap from this repository"))
         .arg(value("adopt", "REPO", "Adopt this repository"))
-        .arg(file("from-dir", "DIR", "Use this checkout directory").value_hint(ValueHint::DirPath))
+        .arg(
+            file("from-dir", "DIR", "Use this checkout directory")
+                .allow_hyphen_values(false)
+                .value_hint(ValueHint::DirPath),
+        )
         .arg(value(
             "config-dir",
             "DIR",

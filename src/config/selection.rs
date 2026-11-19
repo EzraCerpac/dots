@@ -309,12 +309,27 @@ pub fn persist(root: &Root, env: &Env, selection: Persist<'_>) -> Result<(), Fai
     if old != next {
         set_selectors(&mut early, next);
     }
+    let machine_changed = local
+        .document
+        .get("env")
+        .and_then(|env| env.get("SETUP_MACHINE_ID"))
+        .and_then(Item::as_str)
+        != Some(machine_id);
+    let has_history_origin = local
+        .document
+        .get("history")
+        .and_then(|history| history.get("origin"))
+        .and_then(|origin| origin.get("url"))
+        .and_then(Item::as_str)
+        .is_some();
     set_string(&mut local, &["env", "SETUP_PROFILE"], profile)?;
     set_string(&mut local, &["env", "SETUP_MACHINE_ID"], machine_id)?;
     set_string(&mut local, &["settings", "history", "sync"], "manual")?;
     if let Some(origin) = origin {
         set_string(&mut local, &["env", "SETUP_HISTORY_ORIGIN"], origin)?;
         set_string(&mut local, &["history", "origin", "url"], origin)?;
+    }
+    if origin.is_some() || (machine_changed && has_history_origin) {
         set_string(&mut local, &["history", "origin", "branch"], &host)?;
     }
 
@@ -332,7 +347,12 @@ pub fn persist(root: &Root, env: &Env, selection: Persist<'_>) -> Result<(), Fai
     local.check_destination()?;
     early.check_destination()?;
     local.install()?;
-    early.install()
+    early.install().map_err(|error| {
+        Fail::new(
+            error.status,
+            format!("{error}; if the two selection files now disagree, repair them with {REPAIR}"),
+        )
+    })
 }
 
 fn set_selectors(early: &mut Doc, next: Vec<String>) {

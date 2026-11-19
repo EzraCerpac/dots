@@ -138,6 +138,7 @@ Sync never force-pushes, skips validation or writes conflict markers into live f
 - `dots` guards its own checkout and file writes against intervening edits: a file edited during the run is left alone and reported with a recovery action.
 - Before a fresh snapshot, sync finishes an interrupted checkout, index installation or `dev` update only while the checkout, index and `dev` still match the recorded recovery state.
   Otherwise it keeps the competing `dev` tip or edits, the private original files and the pending recovery record, and reports the recorded revisions, the recovery paths and how to reconcile before you rerun.
+  If you edit or delete a path the interrupted checkout had already finished, that is later local work, not a competing edit: sync finishes recovery and then handles your change in the same run.
 - When the Git index changed under an interrupted checkout, act on the line the receipt prints, because it says what sync actually did:
   - `Not saved: the Git index changed before checkout started` means nothing had been written, so sync dropped the pending record.
     Review your staging and sync again.

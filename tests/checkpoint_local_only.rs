@@ -81,18 +81,19 @@ impl Fixture {
             .env("GIT_NO_LAZY_FETCH", "1");
     }
 
-    fn seam(&self, name: &str, expected: &str) {
+    fn seam_command(&self, name: &str, expected: &str) -> FixtureCommand<'_> {
         let test = std::env::current_exe().unwrap();
         let mut command = self.world.command(test);
         self.isolated(&mut command);
-        success(
-            command
-                .env("DOTS_TEST_SEAM", name)
-                .env("DOTS_TEST_EXPECTED", expected)
-                .args(["--ignored", "--exact", "decision_child"])
-                .output()
-                .unwrap(),
-        );
+        command
+            .env("DOTS_TEST_SEAM", name)
+            .env("DOTS_TEST_EXPECTED", expected)
+            .args(["--ignored", "--exact", "decision_child"]);
+        command
+    }
+
+    fn seam(&self, name: &str, expected: &str) {
+        success(self.seam_command(name, expected).output().unwrap());
     }
 }
 
@@ -157,12 +158,15 @@ fn new_checkpoint_requires_proven_empty_native_inventory() {
         ("shared", r#"{"entries":[{"mode":"unknown"}],"invalid":[]}"#),
         ("shared", r#"{"entries":[]}"#),
         ("shared", "not JSON"),
+        ("shared", "[[],[]]"),
+        ("shared", r#"{"entries":[],"invalid":[["~/setting"]]}"#),
         (
             "local",
             r#"{"entries":[{"mode":"track-local","path":"~/setting"}],"invalid":[]}"#,
         ),
         ("local", invalid),
         ("local", r#"{"entries":null,"invalid":[]}"#),
+        ("local", "[[],[]]"),
     ] {
         f.write(scope, output);
         f.seam("checkpoint", "blocked");
@@ -172,15 +176,21 @@ fn new_checkpoint_requires_proven_empty_native_inventory() {
     f.seam("checkpoint", "blocked");
     fs::remove_file(f.world.home().join("local-failure")).unwrap();
     f.write("shared", invalid);
-    let inactive = r#"{"target":"~/setting","mode":"track","reason":"no variant matches this machine: host-other"}"#;
-    let active = r#"{"target":"~/setting","mode":"track"}"#;
-    for (rows, expected) in [
-        (inactive.to_owned(), "empty"),
-        (active.to_owned(), "blocked"),
-        (format!("{inactive},{active}"), "blocked"),
-        (String::new(), "blocked"),
+    let inactive = r#"{"target":"~/setting","mode":"track","state":"tracked","reason":"no variant matches this machine: host-other"}"#;
+    let active = r#"{"target":"~/setting","mode":"track","state":"tracked"}"#;
+    for (status, expected) in [
+        (format!(r#"{{"files":[{inactive}]}}"#), "empty"),
+        (format!(r#"{{"files":[{active}]}}"#), "blocked"),
+        (format!(r#"{{"files":[{inactive},{active}]}}"#), "blocked"),
+        (format!("[[{inactive}]]"), "blocked"),
+        (
+            r#"{"files":[["~/setting","track","tracked","no variant matches this machine: host-other"]]}"#.to_owned(),
+            "blocked",
+        ),
+        (format!(r#"{{"files":[{}]}}"#, inactive.replace("tracked", "applied")), "blocked"),
+        (r#"{"files":[]}"#.to_owned(), "blocked"),
     ] {
-        f.write("status", &format!(r#"{{"files":[{rows}]}}"#));
+        f.write("status", &status);
         f.seam("checkpoint", expected);
     }
     f.write("status", &format!(r#"{{"files":[{inactive}]}}"#));
@@ -194,6 +204,85 @@ fn new_checkpoint_requires_proven_empty_native_inventory() {
         "{calls}"
     );
     assert!(!f.world.base().join("mise/state/history").exists());
+}
+
+#[test]
+fn new_checkpoint_preserves_mise_notices_and_honors_global_override() {
+    let f = Fixture::new();
+    let mise = env::var_os("DOTS_TEST_NATIVE_MISE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            env::split_paths(&env::var_os("PATH").unwrap())
+                .filter(|path| path.is_absolute())
+                .map(|path| path.join("mise"))
+                .find(|path| path.is_file())
+                .expect("mise executable on PATH")
+        });
+    let state = f.world.base().join("mise/state");
+    let stores = [state.join("history"), state.join("history-local/history")];
+    let notice = "fixture pending watcher notice\n";
+    for store in &stores {
+        fs::create_dir_all(store).unwrap();
+        fs::write(store.join("notices"), notice).unwrap();
+    }
+    let config = f.world.home().join("alternate.toml");
+    let checkpoint = |expected| {
+        success(
+            f.seam_command("checkpoint", expected)
+                .env("DOTS_TEST_NATIVE_MISE", &mise)
+                .env("MISE_GLOBAL_CONFIG_FILE", &config)
+                .output()
+                .unwrap(),
+        );
+        for store in &stores {
+            assert_eq!(fs::read_to_string(store.join("notices")).unwrap(), notice);
+        }
+    };
+    f.write("setting", "fixture payload\n");
+    fs::write(&config, "[dotfiles]\n'~/setting' = { mode = 'track' }\n").unwrap();
+    checkpoint("blocked");
+
+    // Native paths marks a symlinked ancestor invalid before resolving the
+    // variant. The targeted status proof distinguishes the active host.
+    symlink(f.world.home(), f.world.home().join("linked")).unwrap();
+    for (host, expected) in [("host-other", "empty"), ("host-fixture", "blocked")] {
+        fs::write(
+            &config,
+            format!("[dotfiles]\n'~/linked/setting' = {{ mode = 'track', variants = [{{ profile = '{host}' }}] }}\n"),
+        )
+        .unwrap();
+        checkpoint(expected);
+    }
+    let calls = fs::read_to_string(f.world.home().join("history-calls")).unwrap();
+    assert!(calls.lines().any(|line| line == "status"), "{calls}");
+
+    fs::write(&config, "").unwrap();
+    checkpoint("empty");
+    for store in &stores {
+        let repo = store.join("repo.git");
+        fs::create_dir(&repo).unwrap();
+        checkpoint("blocked");
+        fs::remove_dir(repo).unwrap();
+    }
+
+    // Prove these are consumable watcher notices with each native dispatch.
+    for (store, scope) in stores.iter().zip([None, Some("--local")]) {
+        let mut command = f.world.command(&mise);
+        f.isolated(&mut command);
+        let output = success(
+            command
+                .args(["bootstrap", "dotfiles"])
+                .args(scope)
+                .args(["paths", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(notice.trim()),
+            "{output:?}"
+        );
+        assert!(!store.join("notices").exists());
+    }
 }
 
 #[test]

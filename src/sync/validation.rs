@@ -45,6 +45,10 @@ pub(super) struct Validated {
 }
 
 impl Validated {
+    pub(super) fn revision(&self) -> &str {
+        &self.revision
+    }
+
     pub fn still_current(&self, root: &Path) -> io::Result<bool> {
         Ok(self.local == local_files(root)?)
     }

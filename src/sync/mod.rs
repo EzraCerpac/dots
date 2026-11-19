@@ -523,7 +523,7 @@ fn synchronize(
     }
 
     copies
-        .confirm_capture(&git, &shared.dir, &local_tree)
+        .confirm_capture(&git, &shared.dir, &approved, &local_tree)
         .or_note("Could not record the saved copy baseline", RERUN)?;
 
     let Ok(mut heads) = remote::fetch(&git, run, &origin) else {

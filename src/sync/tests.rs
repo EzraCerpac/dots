@@ -446,12 +446,41 @@ fn ordinary_crlf_sources_deploy_as_checked_out() {
     let receipt = shared_mise_sync(&ctx);
     assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
     let home = fixture.path().join("home");
+    let copied = home.join("copied");
     assert_eq!(fs::read(&source).unwrap(), crlf);
-    assert_eq!(fs::read(home.join("copied")).unwrap(), crlf);
+    assert_eq!(fs::read(&copied).unwrap(), crlf);
     let link = home.join("linked");
     assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
     assert_eq!(link.canonicalize().unwrap(), source);
-    assert_eq!(fs::read(link).unwrap(), crlf);
+    assert_eq!(fs::read(&link).unwrap(), crlf);
+
+    let edited = b"first\r\nchanged copy\r\n";
+    fs::write(&copied, edited).unwrap();
+    let remote = git.at(&fixture.path().join("bare-origin"));
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(fs::read(&source).unwrap(), edited);
+    assert_eq!(fs::read(&copied).unwrap(), edited);
+    assert_eq!(fs::read(&link).unwrap(), edited);
+    assert_eq!(
+        remote.get(["show", "refs/heads/dev:source"]).unwrap(),
+        b"first\nchanged copy\n"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(git.root().join(".git/dots-sync-copies.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["captured"], serde_json::json!({}));
+
+    let published = remote.id(["rev-parse", "refs/heads/dev"]).unwrap();
+    let repeat = shared_mise_sync(&ctx);
+    assert!(repeat.issues.is_empty(), "{:?}", repeat.issues);
+    assert!(repeat.saved.is_empty());
+    assert_eq!(
+        remote.id(["rev-parse", "refs/heads/dev"]).unwrap(),
+        published
+    );
+    assert_eq!(fs::read(source).unwrap(), edited);
+    assert_eq!(fs::read(copied).unwrap(), edited);
 }
 
 #[test]

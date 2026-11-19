@@ -181,12 +181,23 @@ fn source_for_apply(
 struct KnownCopy {
     source: PathBuf,
     entry: Option<Entry>,
+    #[serde(default)]
+    revision: Option<String>,
     mode: Option<u32>,
     #[serde(default)]
     deployed: Option<[u8; 32]>,
 }
 
 impl KnownCopy {
+    fn source_image(&self, git: &Git<'_>, revision: &str) -> io::Result<Image> {
+        Image::checkout(
+            git,
+            self.revision.as_deref().unwrap_or(revision),
+            &self.source,
+            self.entry.as_ref(),
+        )
+    }
+
     fn matches(&self, observed: &Image, base: &Image, mode: Option<u32>) -> bool {
         if let (
             Some(digest),
@@ -374,6 +385,7 @@ impl Copies {
                         self.state.known.entry(destination).or_insert(KnownCopy {
                             source: source.to_owned(),
                             entry: None,
+                            revision: None,
                             mode: Some(*mode),
                             deployed: Some(digest),
                         });
@@ -404,6 +416,7 @@ impl Copies {
                     .or_insert_with(|| KnownCopy {
                         source: leaf.clone(),
                         entry: Some(entry.clone()),
+                        revision: Some(revision.to_owned()),
                         mode: None,
                         deployed: None,
                     })
@@ -415,7 +428,7 @@ impl Copies {
                 if run.cancelled() {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let common = Image::from_git(git, record.entry.as_ref())?;
+                let common = record.source_image(git, revision)?;
                 let deployed = match filesystem.read_path(fs_relative(&path)?) {
                     Ok(image @ Image::Regular { .. }) => image,
                     Ok(Image::Absent) => continue,
@@ -508,6 +521,7 @@ impl Copies {
         &mut self,
         git: &Git<'_>,
         git_dir: &Path,
+        revision: &str,
         tree: &Tree,
     ) -> io::Result<()> {
         if self.state.captured.is_empty() {
@@ -521,11 +535,12 @@ impl Copies {
                 self.state.captured.insert(path, observed);
                 continue;
             };
-            let shared = Image::from_git(git, Some(entry))?;
+            let shared = Image::checkout(git, revision, &known.source, Some(entry))?;
             if let Image::Regular { bytes, .. } = &shared
                 && <[u8; 32]>::from(Sha256::digest(bytes)) == observed.digest
             {
                 known.entry = Some(entry.clone());
+                known.revision = Some(revision.to_owned());
                 known.mode = Some(observed.mode);
                 known.deployed = Some(observed.digest);
             } else {
@@ -845,7 +860,7 @@ impl Copies {
         let previous_copy = self.state.known.get(path);
         let copy_is_edited = match previous_copy {
             Some(copy) if current != Image::Absent => {
-                let common = Image::from_git(git, copy.entry.as_ref())?;
+                let common = copy.source_image(git, validated.revision())?;
                 !copy.matches(&current, &common, copy.mode)
             }
             _ => false,
@@ -1026,7 +1041,7 @@ impl Copies {
             }
             let known = self.state.known.get(&path);
             let baseline = known
-                .map(|known| Image::from_git(git, known.entry.as_ref()))
+                .map(|known| known.source_image(git, validated.revision()))
                 .transpose()?;
             if let (
                 Image::Regular { mode, .. },
@@ -1061,6 +1076,7 @@ impl Copies {
             {
                 Some(KnownCopy {
                     source,
+                    revision: entry.as_ref().map(|_| validated.revision().to_owned()),
                     entry,
                     mode: Some(*mode),
                     deployed: Some(Sha256::digest(bytes).into()),

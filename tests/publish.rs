@@ -20,6 +20,13 @@ const REPOSITORY: &str = "example/p07-fixture";
 const GITHUB_ORIGIN: &str = "https://github.com/example/p07-fixture.git";
 const PR_URL: &str = "https://github.com/example/p07-fixture/pull/17";
 const MODEL: &str = "Fixture Model";
+const PDF: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+const PDF_POLICY: &str = r#"
+[[rules]]
+id = "p07-fixture-marker"
+description = "Synthetic fixture marker"
+regex = 'P07_OUTGOING_MARKER_[0-9]{4}'
+"#;
 
 struct Publication {
     world: IsolatedWorld,
@@ -35,6 +42,14 @@ struct Publication {
 
 impl Publication {
     fn new(on_behalf_of: Option<&str>, baseline_secret: bool) -> Self {
+        Self::with_seed(on_behalf_of, baseline_secret, &[])
+    }
+
+    fn with_seed(
+        on_behalf_of: Option<&str>,
+        baseline_secret: bool,
+        files: &[(&str, &[u8])],
+    ) -> Self {
         let world = IsolatedWorld::new();
         let bare = world.bare_remote("publish");
         assert!(bare.is_absolute() && bare.starts_with(world.root().parent().unwrap()));
@@ -79,6 +94,12 @@ impl Publication {
         if baseline_secret {
             write_token(world.root());
             success(world.git().args(["add", "synthetic-token.txt"]));
+        }
+        for (name, bytes) in files {
+            let path = world.root().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            success(world.git().args(["add", "--", name]));
         }
         success(world.git().args(["commit", "-m", "Initial setup"]));
         success(
@@ -225,11 +246,23 @@ esac
         self.shim(
             "jj",
             r#"printf '%s\n' "$*" >> "$PUBLISH_LOG/jj"
+if [ "${PUBLISH_NO_DETACHED:-}" = 1 ]; then
+    for arg do
+        if [ "$arg" = --no-integrate-operation ]; then
+            printf 'error: unexpected argument %s\n' "$arg" >&2
+            exit 2
+        fi
+    done
+fi
 classify() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --no-pager|--color=never|--ignore-working-copy) shift ;;
-            --config) [ "$2" = git.abandon-unreachable-commits=false ]; shift 2 ;;
+            --no-pager|--color=never|--ignore-working-copy|--no-integrate-operation|--at-op=*) shift ;;
+            --at-op) shift 2 ;;
+            --config=ui.quiet=false|--config=debug.randomness-seed=*|--config=debug.commit-timestamp=*|'--config=revset-aliases."immutable_heads()"='*) shift ;;
+            --config)
+                case "$2" in git.abandon-unreachable-commits=false|debug.commit-timestamp=*) ;; *) return 88 ;; esac
+                shift 2 ;;
             --repository|-R) [ "$2" = "$PUBLISH_WORKSPACE" ]; shift 2 ;;
             *) break ;;
         esac
@@ -237,9 +270,15 @@ classify() {
     case "${1-} ${2-}" in
         'git fetch'|'git push') printf transport; return ;;
         'git root') printf local; return ;;
+        'config get') [ "$#" -eq 3 ] && [ "$3" = 'revset-aliases."immutable_heads()"' ]; printf local; return ;;
+        'workspace update-stale') [ "$#" -eq 2 ]; printf local; return ;;
+        'resolve --list')
+            [ "$#" -eq 6 ] && [ "$3" = -r ] && [ "$5" = -- ]
+            case "$4" in commit_id\(*\)) ;; *) return 88 ;; esac
+            printf local; return ;;
     esac
     case "${1-}" in
-        bookmark|describe|diff|log|new|root|show|status|--version|version) printf local ;;
+        bookmark|describe|diff|edit|file|log|new|op|operation|root|show|status|--version|version) printf local ;;
         *) return 88 ;;
     esac
 }
@@ -264,7 +303,17 @@ case "$mode" in
         git remote set-url origin "$PUBLISH_GITHUB"
         exit "$status"
         ;;
-    local) exec "$PUBLISH_JJ" "$@" ;;
+    local)
+        if [ "${PUBLISH_INTERRUPT_ON_INTEGRATE:-0}" = 1 ]; then
+            case " $* " in
+                *' operation integrate '*)
+                    "$PUBLISH_JJ" "$@"
+                    : > "$PUBLISH_LOG/integrated"
+                    kill -INT "$PPID"
+                    exit 0 ;;
+            esac
+        fi
+        exec "$PUBLISH_JJ" "$@" ;;
     *) exit 88 ;;
 esac
 "#,
@@ -273,7 +322,14 @@ esac
             "gh",
             r#"printf '%s\n' "$*" >> "$PUBLISH_LOG/gh"
 case "${1-} ${2-}" in
-    'pr list') printf '%s\n' '[]' ;;
+    'pr list')
+        case " $* " in
+            *' --head wip/dotfiles-all-dirty '*)
+                if [ -f "$PUBLISH_LOG/existing-pr.json" ]; then
+                    "$PUBLISH_READ_FILE" "$PUBLISH_LOG/existing-pr.json"; exit 0
+                fi ;;
+        esac
+        printf '%s\n' '[]' ;;
     'pr create'|'pr edit')
         shift 2
         while [ "$#" -gt 0 ]; do
@@ -414,6 +470,40 @@ exit "$status"
         )
         .unwrap();
         self.jj(&["describe", "-m", &format!("Publish fixture change {index}")]);
+    }
+
+    fn change_main(&self, path: &str, bytes: &[u8]) -> String {
+        let root = self.world.root();
+        fs::write(root.join(path), bytes).unwrap();
+        self.git_in(root, &["add", "--", path]);
+        self.git_in(root, &["commit", "-m", &format!("Change {path} on main")]);
+        self.git_in(root, &["push", self.bare.to_str().unwrap(), "main"]);
+        self.git_in(root, &["rev-parse", "main"]).trim().to_owned()
+    }
+
+    fn observe_jj(&self, args: &[&str]) -> String {
+        self.jj(&[&["--at-op=@", "--ignore-working-copy"][..], args].concat())
+    }
+
+    fn working_oid(&self) -> String {
+        self.observe_jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .trim()
+            .to_owned()
+    }
+
+    fn local_bookmarks(&self) -> String {
+        self.observe_jj(&[
+            "bookmark",
+            "list",
+            "-T",
+            "if(!remote, name ++ \" \" ++ normal_target.commit_id() ++ \"\\n\")",
+        ])
+    }
+
+    fn scan_all(&self) -> FixtureCommand<'_> {
+        let mut command = self.dots(&["publish", "--all"]);
+        self.real_scan(&mut command);
+        command
     }
 
     fn dots(&self, args: &[&str]) -> FixtureCommand<'_> {
@@ -876,6 +966,410 @@ fn assert_archive_skip_before_preview(terminal: bool) {
         );
         fixture.assert_no_publication();
     }
+}
+
+fn pdf_allowlist() -> String {
+    format!("{PDF_POLICY}\n[[allowlists]]\npaths = ['[.]pdf$']\n")
+}
+
+fn outgoing_pdf(fixture: &Publication) {
+    fs::write(fixture.workspace.join("outgoing.pdf"), PDF).unwrap();
+    fixture.jj(&["describe", "-m", "Add outgoing PDF"]);
+    fixture.jj(&["bookmark", "create", "wip/keep", "-r", "@"]);
+}
+
+fn decline(mut terminal: Pty) -> String {
+    terminal.send("n\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(1), "{transcript}");
+    transcript
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_diverged_all_uses_main_removed_allowlist_before_any_prompt() {
+    let fixture = Publication::with_seed(
+        None,
+        false,
+        &[(".gitleaks.toml", pdf_allowlist().as_bytes())],
+    );
+    outgoing_pdf(&fixture);
+    let working = fixture.working_oid();
+    let bookmarks = fixture.local_bookmarks();
+    fixture.change_main(".gitleaks.toml", PDF_POLICY.as_bytes());
+
+    let transcript = decline(Pty::spawn(fixture.scan_all()));
+    assert!(
+        transcript.contains("unsupported file format"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("[y/N]"), "{transcript}");
+    assert!(
+        !transcript.contains("Proposed pull request"),
+        "{transcript}"
+    );
+    let native = fixture.read_log("scan-stderr");
+    assert!(native.lines().any(|line| {
+        line.contains("skipping binary file")
+            && line.contains("mime_type=application/pdf")
+            && line.contains("outgoing.pdf")
+    }));
+    assert_eq!(fixture.working_oid(), working);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    assert_eq!(
+        fs::read(fixture.workspace.join("outgoing.pdf")).unwrap(),
+        PDF
+    );
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_diverged_all_uses_main_added_allowlist_and_keeps_only_the_approved_merge() {
+    let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
+    outgoing_pdf(&fixture);
+    fixture.jj(&["bookmark", "untrack", "main@origin"]);
+    let working = fixture.working_oid();
+    let bookmarks = fixture.local_bookmarks();
+    let policy = pdf_allowlist();
+    let main = fixture.change_main(".gitleaks.toml", policy.as_bytes());
+
+    let mut first = Pty::spawn(fixture.scan_all());
+    first.expect("Merge main@origin");
+    first.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    assert_eq!(fixture.working_oid(), working);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    decline(first);
+    assert_eq!(fixture.working_oid(), working);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    fixture.assert_no_publication();
+
+    fs::remove_file(fixture.log.join("scan-complete")).unwrap();
+    let mut second = Pty::spawn(fixture.scan_all());
+    second.expect("Merge main@origin");
+    second.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    second.send("y\n");
+    second.expect("[y/N]");
+    let merged = fixture.working_oid();
+    assert_ne!(merged, working);
+    assert_eq!(
+        fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+        main
+    );
+    assert_eq!(
+        fixture.git(&["show", &format!("{merged}:.gitleaks.toml")]),
+        policy
+    );
+    decline(second);
+    assert_eq!(fixture.working_oid(), merged);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    fixture.assert_no_publication();
+
+    let approved = fixture.approve(fixture.scan_all(), "@", &["outgoing.pdf"]);
+    assert_eq!(approved, merged);
+    assert_eq!(
+        fixture
+            .observe_jj(&["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+            .trim(),
+        approved
+    );
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_aggregate_merge_does_not_scan_main_only_pdf() {
+    let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
+    fixture.change(0);
+    let working = fixture.working_oid();
+    fixture.change_main("main-only.pdf", PDF);
+    let mut terminal = Pty::spawn(fixture.scan_all());
+    terminal.expect("Merge main@origin");
+    terminal.expect("[y/N]");
+    let inputs = fixture.read_log("scan-input");
+    assert!(inputs.lines().any(|path| path == "public-0.txt"));
+    assert!(!inputs.lines().any(|path| path == "main-only.pdf"));
+    decline(terminal);
+    assert_eq!(fixture.working_oid(), working);
+    fixture.assert_no_publication();
+}
+
+fn historical_merge() -> Publication {
+    let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
+    fixture.change(0);
+    let outgoing = fixture.working_oid();
+    let older_main = fixture.change_main("main-only.pdf", PDF);
+    fixture.git(&[
+        "fetch",
+        "--no-tags",
+        fixture.bare.to_str().unwrap(),
+        "refs/heads/main:refs/remotes/origin/main",
+    ]);
+    fixture.jj(&["git", "import"]);
+    fixture.jj(&["new", &outgoing, &older_main, "-m", "Previous source merge"]);
+    fixture
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_historical_merge_ignores_pdf_inherited_from_older_main_parent() {
+    let fixture = historical_merge();
+    fixture.change_main("later.txt", b"later reviewed main\n");
+    let working = fixture.working_oid();
+    let mut terminal = Pty::spawn(fixture.scan_all());
+    terminal.expect("Merge main@origin");
+    terminal.expect("[y/N]");
+    let inputs = fixture.read_log("scan-input");
+    assert!(inputs.lines().any(|path| path == "public-0.txt"));
+    assert!(!inputs.lines().any(|path| path == "main-only.pdf"));
+    decline(terminal);
+    assert_eq!(fixture.working_oid(), working);
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_historical_merge_scans_new_blob_at_the_same_main_path() {
+    let fixture = historical_merge();
+    let mut edited = PDF.to_vec();
+    edited.extend_from_slice(b"% Different outgoing PDF bytes\n");
+    fs::write(fixture.workspace.join("main-only.pdf"), &edited).unwrap();
+    fixture.jj(&["describe", "-m", "Previous merge with new PDF bytes"]);
+    fixture.change_main("later.txt", b"later reviewed main\n");
+    let working = fixture.working_oid();
+    let transcript = decline(Pty::spawn(fixture.scan_all()));
+    assert!(
+        transcript.contains("unsupported file format"),
+        "{transcript}"
+    );
+    assert!(!transcript.contains("[y/N]"), "{transcript}");
+    assert!(
+        fixture
+            .read_log("scan-input")
+            .lines()
+            .any(|path| path == "main-only.pdf")
+    );
+    assert_eq!(fixture.working_oid(), working);
+    assert_eq!(
+        fs::read(fixture.workspace.join("main-only.pdf")).unwrap(),
+        edited
+    );
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_conflict_is_screened_then_retained_only_after_merge_approval() {
+    let fixture = Publication::with_seed(None, false, &[("collision.txt", b"base content\n")]);
+    fs::write(
+        fixture.workspace.join("collision.txt"),
+        "outgoing content\n",
+    )
+    .unwrap();
+    fixture.jj(&["describe", "-m", "Edit the outgoing content"]);
+    fixture.jj(&["bookmark", "create", "wip/keep", "-r", "@"]);
+    fixture.jj(&["bookmark", "untrack", "main@origin"]);
+    let working = fixture.working_oid();
+    let bookmarks = fixture.local_bookmarks();
+    let main = fixture.change_main("collision.txt", b"reviewed main content\n");
+
+    let mut terminal = Pty::spawn(fixture.scan_all());
+    terminal.expect("Merge main@origin");
+    terminal.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    assert_eq!(fixture.working_oid(), working);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join("collision.txt")).unwrap(),
+        "outgoing content\n"
+    );
+    terminal.send("y\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(3), "{transcript}");
+    assert!(
+        transcript.to_ascii_lowercase().contains("conflict"),
+        "{transcript}"
+    );
+    assert_eq!(transcript.matches("[y/N]").count(), 1, "{transcript}");
+    let merged = fixture.working_oid();
+    assert_ne!(merged, working);
+    assert_eq!(
+        fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+        main
+    );
+    assert_eq!(
+        fixture
+            .observe_jj(&[
+                "log",
+                "--no-graph",
+                "-r",
+                "@",
+                "-T",
+                "if(conflict, \"yes\", \"no\")"
+            ])
+            .trim(),
+        "yes"
+    );
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
+    let ours = PDF_POLICY.replace("Synthetic fixture marker", "Outgoing fixture marker");
+    let theirs = PDF_POLICY.replace("Synthetic fixture marker", "Reviewed fixture marker");
+    for (file, base, outgoing, reviewed) in [
+        (".gitleaks.toml", PDF_POLICY, ours.as_str(), theirs.as_str()),
+        ("rules.toml", PDF_POLICY, ours.as_str(), theirs.as_str()),
+        (
+            ".gitleaksignore",
+            "# baseline\n",
+            "# outgoing\n",
+            "# reviewed\n",
+        ),
+    ] {
+        let mut seed = vec![(file, base.as_bytes())];
+        if file == "rules.toml" {
+            seed.push((".gitleaks.toml", b"[extend]\npath = 'rules.toml'\n"));
+        }
+        let fixture = Publication::with_seed(None, false, &seed);
+        fs::write(fixture.workspace.join(file), outgoing).unwrap();
+        fixture.jj(&["describe", "-m", "Edit outgoing policy"]);
+        let working = fixture.working_oid();
+        let bookmarks = fixture.local_bookmarks();
+        fixture.change_main(file, reviewed.as_bytes());
+
+        let diagnostic = decline(Pty::spawn(fixture.scan_all()));
+        assert!(
+            diagnostic.to_ascii_lowercase().contains("conflict"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("[y/N]"), "{diagnostic}");
+        assert!(
+            !diagnostic.contains("Proposed pull request"),
+            "{diagnostic}"
+        );
+        assert!(!fixture.log.join("scan-complete").exists(), "{diagnostic}");
+        assert_eq!(fixture.working_oid(), working);
+        assert_eq!(fixture.local_bookmarks(), bookmarks);
+        assert_eq!(
+            fs::read_to_string(fixture.workspace.join(file)).unwrap(),
+            outgoing
+        );
+        fixture.assert_no_publication();
+    }
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_unavailable_detached_operations_refuse_only_diverged_all() {
+    let diverged = Publication::new(None, false);
+    diverged.change(0);
+    let working = diverged.working_oid();
+    let bookmarks = diverged.local_bookmarks();
+    diverged.change_main("main.txt", b"reviewed main\n");
+    let mut command = diverged.dots(&["publish", "--all"]);
+    command.env("PUBLISH_NO_DETACHED", "1");
+    let diagnostic = decline(Pty::spawn(command));
+    let lower = diagnostic.to_ascii_lowercase();
+    assert!(
+        lower.contains("jj") && lower.contains("0.41"),
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("[y/N]"), "{diagnostic}");
+    assert!(
+        !diagnostic.contains("Proposed pull request"),
+        "{diagnostic}"
+    );
+    assert!(!diverged.log.join("scan-complete").exists(), "{diagnostic}");
+    assert_eq!(diverged.working_oid(), working);
+    assert_eq!(diverged.local_bookmarks(), bookmarks);
+    assert!(diverged.read_log("jj").contains("--no-integrate-operation"));
+    diverged.assert_no_publication();
+
+    let based = Publication::new(None, false);
+    based.change(0);
+    let mut command = based.dots(&["publish", "--all"]);
+    command.env("PUBLISH_NO_DETACHED", "1");
+    based.approve(command, "@", &["public-0.txt"]);
+    assert!(!based.read_log("jj").contains("--no-integrate-operation"));
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_diverged_all_rechecks_late_working_changes_without_integrating_candidate() {
+    for at_publication in [false, true] {
+        let fixture = Publication::new(None, false);
+        fixture.change(0);
+        fixture.jj(&["bookmark", "untrack", "main@origin"]);
+        let original = fixture.working_oid();
+        let bookmarks = fixture.local_bookmarks();
+        let main = fixture.change_main("main.txt", b"reviewed main\n");
+
+        let mut terminal = Pty::spawn(fixture.scan_all());
+        terminal.expect("Merge main@origin");
+        terminal.expect("[y/N]");
+        assert!(fixture.log.join("scan-complete").is_file());
+        assert_eq!(fixture.working_oid(), original);
+        let expected = if at_publication {
+            terminal.send("y\n");
+            terminal.expect("[y/N]");
+            let merged = fixture.working_oid();
+            assert_ne!(merged, original);
+            assert_eq!(
+                fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+                main
+            );
+            merged
+        } else {
+            original
+        };
+        let late = fixture.workspace.join("late.txt");
+        fs::write(&late, "late outgoing edit\n").unwrap();
+        terminal.send("y\n");
+        let (status, diagnostic) = terminal.finish();
+        assert_eq!(status.code(), Some(1), "{diagnostic}");
+        assert!(
+            diagnostic.to_ascii_lowercase().contains("chang"),
+            "{diagnostic}"
+        );
+        let prompts = if at_publication { 2 } else { 1 };
+        assert_eq!(diagnostic.matches("[y/N]").count(), prompts, "{diagnostic}");
+        assert_eq!(fixture.working_oid(), expected);
+        assert_eq!(fixture.local_bookmarks(), bookmarks);
+        assert_eq!(fs::read_to_string(late).unwrap(), "late outgoing edit\n");
+        assert_eq!(fixture.workspace.join("main.txt").exists(), at_publication);
+        fixture.assert_no_publication();
+    }
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_large_native_debug_stream_is_drained_without_disclosure() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    fixture.shim(
+        "gitleaks",
+        r#"if [ "${1:-}" = --version ] || [ "${1:-}" = version ]; then
+    printf '%s\n' 8.30.1
+    exit 0
+fi
+[ "${1:-}" = dir ]
+[ -f public-0.txt ]
+/usr/bin/awk 'BEGIN { for (i=0; i<20000; i++) printf "11:00PM DBG skipping file: global allowlist path=synthetic.pdf\n" }' >&2
+: > "$PUBLISH_LOG/scan-complete"
+"#,
+    );
+    let mut terminal = Pty::spawn(fixture.dots(&["publish"]));
+    terminal.expect("[y/N]");
+    assert!(fixture.log.join("scan-complete").is_file());
+    let transcript = decline(terminal);
+    assert!(!transcript.contains("skipping file: global allowlist"));
+    assert!(!transcript.contains("synthetic.pdf"));
+    assert!(transcript.len() < 16 * 1024);
+    fixture.assert_no_publication();
 }
 
 #[test]
@@ -1368,4 +1862,407 @@ fn new_publish_checks_effective_fetch_and_every_push_url_before_contact() {
         let diagnostic = fixture.denied_without_contact(1, false);
         assert!(!diagnostic.contains(&redirected), "{diagnostic}");
     }
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    let bookmark = "wip/dotfiles-all-dirty";
+    fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
+    fixture.jj(&["bookmark", "untrack", "main@origin"]);
+    let original = fixture.working_oid();
+    let local = fixture.local_bookmarks();
+    let branch = format!("refs/heads/{bookmark}");
+    fixture.git(&[
+        "push",
+        fixture.bare.to_str().unwrap(),
+        &format!("{original}:{branch}"),
+    ]);
+    let remote = || {
+        fixture.git(&[
+            "--git-dir",
+            fixture.bare.to_str().unwrap(),
+            "rev-parse",
+            &branch,
+        ])
+    };
+    fs::write(fixture.log.join("existing-pr.json"), format!(
+        r#"[{{"number":17,"state":"OPEN","url":"{PR_URL}","isCrossRepository":false,"baseRefName":"release"}}]"#,
+    )).unwrap();
+    let reviewed = fixture.change_main("late-main.txt", b"reviewed main\n");
+    fs::write(fixture.workspace.join("public-0.txt"), "dirty fixture\n").unwrap();
+
+    let mut first = Pty::spawn(fixture.scan_all());
+    first.expect("Merge main@origin");
+    first.expect("[y/N]");
+    decline(first);
+    assert_eq!(fixture.working_oid(), original);
+    assert_eq!(fixture.local_bookmarks(), local);
+    assert_eq!(remote().trim(), original);
+
+    let mut second = Pty::spawn(fixture.scan_all());
+    second.expect("Merge main@origin");
+    second.expect("[y/N]");
+    second.send("y\n");
+    second.expect("[y/N]");
+    let merged = fixture.working_oid();
+    assert_ne!(merged, original);
+    assert_eq!(
+        fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+        reviewed
+    );
+    assert_eq!(
+        fixture.git(&["show", &format!("{merged}:public-0.txt")]),
+        "dirty fixture\n"
+    );
+    decline(second);
+    assert_eq!(fixture.working_oid(), merged);
+    assert_eq!(fixture.local_bookmarks(), local);
+    assert_eq!(remote().trim(), original);
+    assert!(!fixture.optional_log("gh").contains("pr edit"));
+    assert!(!fixture.optional_log("gh").contains("pr create"));
+    assert!(
+        !fixture
+            .optional_log("git-transport")
+            .lines()
+            .any(|entry| entry == "push")
+    );
+
+    fs::remove_file(fixture.log.join("scan-status")).unwrap();
+    let mut third = Pty::spawn(fixture.scan_all());
+    third.expect("[y/N]");
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    third.send("y\n");
+    let (status, transcript) = third.finish();
+    assert!(
+        status.success() && transcript.contains(PR_URL),
+        "{status}\n{transcript}"
+    );
+    assert!(!transcript.contains("Merge main@origin"), "{transcript}");
+    assert_eq!(remote().trim(), merged);
+    let gh = fixture.read_log("gh");
+    assert!(
+        gh.lines()
+            .any(|line| line.split_ascii_whitespace().take(5).eq([
+                "pr",
+                "edit",
+                "--repo",
+                "github.com/example/p07-fixture",
+                "17"
+            ]) && !line
+                .split_ascii_whitespace()
+                .any(|arg| arg == "--base" || arg.starts_with("--base="))),
+        "{gh}"
+    );
+    assert!(!gh.contains("pr create"), "{gh}");
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_divergent_operation_heads_never_reconcile_during_verification() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    let older = fixture.observe_jj(&["operation", "log", "--no-graph", "--limit=1", "-T", "id"]);
+    fixture.jj(&["describe", "-m", "First independent operation"]);
+    fixture.jj(&[
+        "--at-op",
+        older.trim(),
+        "--ignore-working-copy",
+        "describe",
+        "-m",
+        "Second independent operation",
+    ]);
+    let heads = || {
+        let mut heads: Vec<_> = fs::read_dir(fixture.workspace.join(".jj/repo/op_heads/heads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        heads.sort();
+        heads
+    };
+    let refs = || fixture.git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let before = heads();
+    assert_eq!(before.len(), 2);
+    let original_refs = refs();
+    for missing_capability in [false, true] {
+        let mut command = fixture.scan_all();
+        if missing_capability {
+            command.env("PUBLISH_NO_DETACHED", "1");
+        }
+        let transcript = refusal(command, false);
+        assert!(
+            transcript.contains("JJ has multiple operation heads"),
+            "{transcript}"
+        );
+        assert_no_preview(&transcript);
+        assert_eq!(heads(), before);
+        assert_eq!(refs(), original_refs);
+        assert!(fixture.optional_log("git-transport").is_empty());
+        assert!(!fixture.log.join("scan-complete").exists());
+    }
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_interrupted_integration_retry_gives_native_recovery_command() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    fixture.jj(&["bookmark", "untrack", "main@origin"]);
+    let original = fixture.working_oid();
+    let checked_out = fixture.workspace.join("reviewed-after-recovery");
+    let main = fixture.change_main("reviewed-after-recovery", b"reviewed\n");
+    let mut command = fixture.scan_all();
+    command.env("PUBLISH_INTERRUPT_ON_INTEGRATE", "1");
+    let mut terminal = Pty::spawn(command);
+    terminal.expect("Merge main@origin");
+    terminal.expect("[y/N]");
+    terminal.send("y\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(130), "{transcript}");
+    assert!(fixture.log.join("integrated").is_file());
+    let merged = fixture.working_oid();
+    assert_ne!(merged, original);
+    assert_eq!(
+        fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+        main
+    );
+    assert!(!checked_out.exists());
+    let transcript = refusal(fixture.scan_all(), false);
+    assert!(
+        transcript.contains("jj workspace update-stale"),
+        "{transcript}"
+    );
+    assert_no_preview(&transcript);
+    assert_eq!(fixture.working_oid(), merged);
+    assert!(!checked_out.exists());
+    fixture.assert_no_publication();
+
+    fixture.jj(&["workspace", "update-stale"]);
+    assert_eq!(fixture.working_oid(), merged);
+    assert_eq!(fs::read_to_string(checked_out).unwrap(), "reviewed\n");
+    let mut again = Pty::spawn(fixture.scan_all());
+    again.expect("[y/N]");
+    let transcript = decline(again);
+    assert!(!transcript.contains("Merge main@origin"), "{transcript}");
+    assert_eq!(fixture.working_oid(), merged);
+    fixture.assert_no_publication();
+}
+
+fn nested_archive(note: &[u8]) -> Vec<u8> {
+    zipped("inner.zip", &zipped("note.txt", note))
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_conflict_projection_does_not_rescan_main_only_archive() {
+    let fixture = Publication::with_seed(None, false, &[("collision.txt", b"base content\n")]);
+    fs::write(
+        fixture.workspace.join("collision.txt"),
+        "outgoing content\n",
+    )
+    .unwrap();
+    fixture.jj(&["describe", "-m", "Edit a conflicted path"]);
+    fixture.jj(&["bookmark", "untrack", "main@origin"]);
+    let original = fixture.working_oid();
+    let bookmarks = fixture.local_bookmarks();
+    let archive = nested_archive(b"reviewed main archive\n");
+    fixture.change_main("main-only.zip", &archive);
+    let main = fixture.change_main("collision.txt", b"reviewed main content\n");
+    let mut first = Pty::spawn(fixture.scan_all());
+    first.expect("Merge main@origin");
+    first.expect("[y/N]");
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    decline(first);
+    assert_eq!(fixture.working_oid(), original);
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+
+    let mut accept = Pty::spawn(fixture.scan_all());
+    accept.expect("Merge main@origin");
+    accept.expect("[y/N]");
+    accept.send("y\n");
+    let (status, transcript) = accept.finish();
+    assert_eq!(status.code(), Some(3), "{transcript}");
+    assert_eq!(transcript.matches("[y/N]").count(), 1, "{transcript}");
+    let merged = fixture.working_oid();
+    assert_eq!(
+        fixture.git(&["rev-parse", &format!("{merged}^2")]).trim(),
+        main
+    );
+    let raw = fixture.git(&["ls-tree", "-r", "--name-only", &merged]);
+    assert!(
+        raw.lines()
+            .any(|line| line.starts_with(".jjconflict-side-") && line.ends_with("/main-only.zip")),
+        "{raw}"
+    );
+    assert!(
+        !fixture
+            .optional_log("scan-stderr")
+            .contains("exceeds max archive depth")
+    );
+    assert_eq!(fixture.local_bookmarks(), bookmarks);
+    fixture.assert_no_publication();
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_conflict_projection_still_screens_new_logical_resolution() {
+    const RULES: &[u8] = br#"[[rules]]
+id = "fixture-logical-resolution"
+description = "Adjacent synthetic fixture markers"
+regex = '''(?s)\AFIXTURE_LEFT_MARKER\n.*\nFIXTURE_RIGHT_MARKER\n\z'''
+"#;
+    for victim in ["resolution.txt", ".jjconflict-side-0/resolution.txt"] {
+        let base = b"base first\nsecond\nunchanged middle\nfourth\nbase last\n";
+        let fixture = Publication::with_seed(
+            None,
+            false,
+            &[
+                (".gitleaks.toml", RULES),
+                ("collision.txt", b"base\n"),
+                (victim, base),
+            ],
+        );
+        fs::write(
+            fixture.workspace.join(victim),
+            "FIXTURE_LEFT_MARKER\nsecond\nunchanged middle\nfourth\nbase last\n",
+        )
+        .unwrap();
+        fs::write(fixture.workspace.join("collision.txt"), "outgoing\n").unwrap();
+        fixture.jj(&["describe", "-m", "Edit one side of the logical resolution"]);
+        let original = fixture.working_oid();
+        fixture.change_main(
+            victim,
+            b"base first\nsecond\nunchanged middle\nfourth\nFIXTURE_RIGHT_MARKER\n",
+        );
+        fixture.change_main("collision.txt", b"reviewed\n");
+        let transcript = refusal(fixture.scan_all(), true);
+        assert!(
+            transcript.contains("gitleaks found potential secrets"),
+            "{transcript}"
+        );
+        assert_no_preview(&transcript);
+        assert!(!transcript.contains("FIXTURE_LEFT_MARKER"));
+        assert!(!transcript.contains("FIXTURE_RIGHT_MARKER"));
+        assert_eq!(fixture.read_log("scan-status"), "20\n");
+        let report: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture.read_log("findings.json")).unwrap();
+        assert!(
+            report.iter().any(|finding| {
+                finding["RuleID"] == "fixture-logical-resolution"
+                    && finding["Secret"] == "REDACTED"
+                    && finding["File"]
+                        .as_str()
+                        .is_some_and(|file| file.ends_with(victim))
+            }),
+            "{report:?}"
+        );
+        assert_eq!(fixture.working_oid(), original);
+        fixture.assert_no_publication();
+    }
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_legitimate_jjconflict_name_is_scanned() {
+    let fixture = Publication::new(None, false);
+    let directory = fixture.workspace.join(".jjconflict-side-0");
+    fs::create_dir(&directory).unwrap();
+    fs::write(
+        directory.join("outgoing.zip"),
+        nested_archive(b"outgoing archive\n"),
+    )
+    .unwrap();
+    fixture.jj(&[
+        "describe",
+        "-m",
+        "Add a normal directory with a similar name",
+    ]);
+    let original = fixture.working_oid();
+    let mut command = fixture.dots(&["publish"]);
+    fixture.real_scan(&mut command);
+    let transcript = refusal(command, true);
+    assert!(transcript.contains("one-level scan limit"), "{transcript}");
+    assert_no_preview(&transcript);
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    assert!(fixture.read_log("scan-stderr").lines().any(|line| {
+        line.contains("exceeds max archive depth")
+            && line.contains(".jjconflict-side-0/outgoing.zip")
+    }));
+    assert_eq!(fixture.working_oid(), original);
+    fixture.assert_no_publication();
+}
+
+fn merged_archive_fixture(change_and_restore: bool) -> Publication {
+    const ARCHIVE: &str = "inherited.zip";
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    let first = fixture.working_oid();
+    let archive = nested_archive(b"reviewed main archive\n");
+    let main = fixture.change_main(ARCHIVE, &archive);
+    fixture.git(&[
+        "fetch",
+        "--no-tags",
+        fixture.bare.to_str().unwrap(),
+        "refs/heads/main:refs/remotes/origin/main",
+    ]);
+    fixture.jj(&["git", "import"]);
+    fixture.jj(&["new", &main, "-m", "Second outgoing parent"]);
+    if change_and_restore {
+        fs::write(
+            fixture.workspace.join(ARCHIVE),
+            nested_archive(b"outgoing changed archive\n"),
+        )
+        .unwrap();
+        fixture.jj(&[
+            "describe",
+            "-m",
+            "Change inherited archive in unpublished history",
+        ]);
+        fixture.jj(&["new", "-m", "Restore reviewed archive bytes"]);
+        fs::write(fixture.workspace.join(ARCHIVE), archive).unwrap();
+    }
+    fixture.change(1);
+    let second = fixture.working_oid();
+    fixture.jj(&["new", &first, &second, "-m", "Merge both outgoing parents"]);
+    fixture.jj(&["bookmark", "create", "wip/merged-archive", "-r", "@"]);
+    fixture
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_archive_inherited_through_outgoing_parent_is_not_rescanned() {
+    let fixture = merged_archive_fixture(false);
+    let command = fixture.dots(&["publish", "--bookmark", "wip/merged-archive"]);
+    fixture.approve(
+        command,
+        "wip/merged-archive",
+        &["public-0.txt", "public-1.txt"],
+    );
+    assert!(
+        !fixture
+            .read_log("scan-stderr")
+            .contains("exceeds max archive depth")
+    );
+}
+
+#[test]
+#[ignore = "P-10 detached aggregate screening"]
+fn new_changed_then_restored_archive_in_outgoing_parent_is_scanned() {
+    let fixture = merged_archive_fixture(true);
+    let head = fixture.working_oid();
+    let mut command = fixture.dots(&["publish", "--bookmark", "wip/merged-archive"]);
+    fixture.real_scan(&mut command);
+    let transcript = refusal(command, true);
+    assert!(transcript.contains("one-level scan limit"), "{transcript}");
+    assert_no_preview(&transcript);
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    assert!(
+        fixture.read_log("scan-stderr").lines().any(
+            |line| line.contains("inherited.zip") && line.contains("exceeds max archive depth")
+        )
+    );
+    assert_eq!(fixture.working_oid(), head);
+    fixture.assert_no_publication();
 }

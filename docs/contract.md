@@ -519,7 +519,8 @@ Changes to packages, tools and the standalone mise come from comparing the state
 - The checkout is a plain Git checkout at the root of the repository, with `HEAD` on `dev` and at least one commit.
 - Sync stops with a single line on a detached `HEAD`, on a branch other than `dev` apart from the case below, with a `.jj` directory, or with state left by a pre-0.5 sync layout.
 - `dots bootstrap`, and a shared sync before anything else, move a checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, to `dev`.
-  Sync first validates the tree of that `dev` against this machine's local files and leaves `main` unchanged when validation fails; after a switch, its receipt opens with one line saying so, and it reports the change of configuration revision, if any.
+  Sync first checks that any `dots_source_repo` in the incoming `dev` still matches this checkout's `origin`, and validates the tree of that `dev` against this machine's local files; when either check fails, the checkout stays on `main` and the stopped sync exits 0 like any other.
+  After a switch, its receipt opens with one line saying so, and it reports the change of configuration revision, if any.
   When `origin` has no `dev`, the new `dev` starts at `main` and the run pushes it as described under [Remotes](#remotes).
   Any other shape has to be converted by hand.
 - Sync skips with a single line while a merge, rebase, cherry-pick, revert or bisect is under way, or while another sync of the same repository is running.
@@ -770,13 +771,13 @@ It records `SETUP_HISTORY_ORIGIN` as the history origin when that is set, and ke
 A full bootstrap is never run from it.
 
 **New in 0.5:** a fresh machine adopts a configuration through the installer's `--from`.
-The installer clones the repository, its `dev` branch when the remote has one, and checks the profile against `dots_profiles` in the cloned configuration.
+The installer clones the repository's `dev` branch when the remote has one, and otherwise `main`, and checks the profile against `dots_profiles` in the cloned configuration.
 A profile requested with `--profile` must be declared there, and must match a profile the machine has already saved.
 Without one, the saved profile is used, or else the only declared profile; with several, the installer asks when stdin is a terminal and refuses otherwise.
 A refusal exits with status 2, lists the declared profiles and prints the installer command to run again; the clone stays in place.
 Without a terminal, adoption proceeds only when `MISE_YES=1` is set, and otherwise exits 2 with the same command.
 When the configuration root is already the top of a checkout whose stored `origin` is the requested repository, the installer reuses it, so the same command continues after a failure; any other Git checkout there stops it unchanged, and a root that is not a Git checkout is first moved to `ROOT.before-dots-` followed by a UTC timestamp.
-When the remote has no `dev`, the clone stays on its default branch, and the first shared sync switches it as described under [Checkout shape](#checkout-shape).
+After a `main`-only clone, the first shared sync switches the checkout to `dev` and publishes it, as described under [Checkout shape](#checkout-shape).
 After mise's native bootstrap succeeds, the installer checks the profile again and runs `dots bootstrap persist-selected`, so the profile and machine ID are saved even when the configuration has no hook for that; only then does it select `dots`.
 
 `dots bootstrap complete` runs the following stages, printing a result line for each and a final count:

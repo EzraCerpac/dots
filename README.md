@@ -40,14 +40,14 @@ Each option is optional.
 
 - `--from` takes `OWNER/NAME`, an `https://` URL or an SSH address, with no credentials in it.
   Instead of running `dots init`, the installer clones the repository and runs mise's native bootstrap of it.
-  It clones `dev` when the remote has that branch, and otherwise the default branch, normally `main`; the first `dots up` then switches the checkout to `dev` and publishes it.
+  It clones `dev` when the remote has that branch, and otherwise `main`; after a `main`-only clone, the first shared `dots up` switches the checkout to `dev` and publishes it.
   Your Git `url.*.insteadOf` rewrites apply to the clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
 - If the configuration directory, normally `~/.config/mise`, is already a checkout of that repository, the installer continues with it, so rerunning the same command after a failure picks up where it stopped.
   It leaves any other Git checkout there alone and stops; anything else is first moved aside to the same path with `.before-dots-` and the UTC time appended.
 - `--profile` must name a profile that the configuration declares, and match the profile this machine has already saved, if any.
   Without it, the saved profile is used, or else the only declared one; with several, the installer asks in a terminal and refuses without one.
   A refusal exits with status 2, names the declared profiles and prints the command to rerun with a declared profile.
-- After the bootstrap succeeds, the installer saves the profile and machine ID on this machine, so the configuration needs no hook for that, and prints `Next: dots up`.
+- After the bootstrap succeeds, the installer saves the profile and machine ID on this machine, so the configuration needs no hook for that, and prints a `Next:` line with the `dots up` command to run.
 - Without a terminal, it adopts only with `MISE_YES=1` set for the receiving `sh`; otherwise it exits 2 and prints the command to rerun.
 - `--version X` installs release `X` rather than the latest; `DOTS_VERSION=X`, set for the receiving `sh`, does the same, and the flag wins.
 
@@ -61,8 +61,12 @@ Each option is optional.
   Native packages that a bootstrap installs, for example with apt, may still ask for your password.
 - It selects `dots` with `mise use -g`, which by default writes to `config.local.toml` in mise's configuration directory.
 - It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path.
-  When the launcher would not run first, it prints the line that puts `~/.local/bin` first on your `PATH`, for `fish` or for other shells.
-- Without a terminal and without `--from`, it installs and selects `dots` and prints `dots init` to run next in a terminal.
+- In a terminal without `--from`, it runs `dots init` and passes its output through unchanged.
+  Without a terminal, it prints the `dots init` command to run in one instead.
+- Each command it prints for you is plain `dots` when that already reaches the new installation.
+  Otherwise it names the launcher or the shim by its absolute path, quoted for the shell, and it sets a quoted `DOTS_ROOT` when the configuration is not in mise's default directory; after `dots init`, the installer then adds its own `Next:` line.
+- As it exits, it prints `PATH` advice on stderr, after the command: the line that puts `~/.local/bin` first, for `fish` or other shells, or, when something else is at `~/.local/bin/dots`, how to run the installed `dots` alongside it.
+  Follow that advice for new shells; the printed command works without it.
 
 </details>
 

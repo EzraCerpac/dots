@@ -77,9 +77,10 @@ Sync works on one shape only: a plain Git checkout at the repository root, with 
 
 - Sync stops with one line when `HEAD` is detached or on a branch other than `dev`, apart from the clean `main` case below, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
   The `.jj` check is only a refusal: `dots` neither needs nor runs JJ.
-- The installer's `--from` clones `dev` when the remote has it, and otherwise the default branch.
+- The installer's `--from` clones `dev` when the remote has it, and otherwise `main`.
   A checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, is switched to `dev` by `dots bootstrap`, or by the next shared sync.
-  Before it switches, sync validates the `dev` it would check out against this machine's local files and leaves `main` untouched if that fails; after a switch, its receipt begins with one line saying so.
+  Before it switches, sync checks that any `dots_source_repo` in the incoming `dev` still matches this checkout's `origin`, and validates that `dev` against this machine's local files.
+  If either check fails, the checkout stays on `main` and the stopped sync still exits 0; after a switch, its receipt begins with one line saying so.
   When `origin` has no `dev` yet, sync creates `dev` from `main` and pushes it.
   Every other checkout gets a one-time conversion by hand, which keeps its edits and unpushed commits.
 - Sync skips with one line during a merge, rebase, cherry-pick, revert or bisect, and while another sync holds the lock for the same repository.

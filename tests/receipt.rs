@@ -85,8 +85,10 @@ fi
 
 finding=0
 scan_text() {
-    if [ -f "$controls/scanned-content" ]; then
-        printf '%s %s\n' "$mode" "$1" >> "$controls/scanned-content"
+    if [ "$mode" = stdin ] && [ -f "$controls/scanned-stdin" ]; then
+        printf '%s\n' "$1" >> "$controls/scanned-stdin"
+    elif [ -f "$controls/scanned-content" ]; then
+        printf '%s\n' "$mode $1" >> "$controls/scanned-content"
     fi
     case "$1" in
       *STALL_SCAN*)
@@ -717,7 +719,9 @@ fn unchanged_replay_screens_both_file_versions_and_displayed_text() {
 
     let capture = f.prepare_pager();
     let scans = f.fixture.join("scanned-content");
+    let stdin = f.fixture.join("scanned-stdin");
     fs::write(&scans, "").unwrap();
+    fs::write(&stdin, "").unwrap();
     let replay = f.replay_to_pager(&capture);
     present(
         &replay,
@@ -729,23 +733,14 @@ fn unchanged_replay_screens_both_file_versions_and_displayed_text() {
             "+safe receipt body",
         ],
     );
-    let events = fs::read_to_string(scans).unwrap();
     present(
-        &events,
-        &[
-            &format!("dir {old}"),
-            &format!("dir {new}"),
-            "+DISPLAY_ONLY rendered bytes",
-        ],
+        &fs::read_to_string(scans).unwrap(),
+        &[&format!("dir {old}"), &format!("dir {new}")],
     );
-    let displayed = events
-        .split("stdin ")
-        .skip(1)
-        .filter_map(|event| event.split("dir ").next())
-        .any(|event| event.contains("+DISPLAY_ONLY rendered bytes"));
+    let displayed = fs::read_to_string(stdin).unwrap();
     assert!(
-        displayed,
-        "displayed bytes did not reach scanner stdin: {events}"
+        displayed.contains("+DISPLAY_ONLY rendered bytes"),
+        "displayed bytes did not reach scanner stdin: {displayed}"
     );
     excluded(
         &replay,

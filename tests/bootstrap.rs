@@ -628,9 +628,8 @@ fn new_rootless_bundle_rejects_invalid_secret_without_printing_it() {
 
 #[test]
 fn unchanged_bundle_round_trip_is_encrypted_and_exclusive() {
-    let Some(keygen) = program("age-keygen") else {
-        return;
-    };
+    let keygen = program("age-keygen")
+        .expect("age-keygen is required for the encrypted bundle round-trip test");
     let world = World::new();
     let identity = world.home().join("age-keys");
     let generated = run(fixture_command(&world, &keygen).arg("-o").arg(&identity));

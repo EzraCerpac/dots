@@ -314,12 +314,13 @@ impl Repo {
         .unwrap()
     }
 
-    fn path_without_gitleaks(&self) -> std::ffi::OsString {
-        for tool in [
-            "awk", "bash", "basename", "cat", "chmod", "cmp", "cp", "cut", "date", "dirname",
-            "env", "find", "grep", "head", "mkdir", "mktemp", "mv", "readlink", "rm", "sed",
-            "sort", "stat", "tail", "touch", "tr", "wc",
-        ] {
+    fn scanner_fixture_path(&self) -> std::ffi::OsString {
+        let tools: &[&str] = if self.oracle {
+            &["bash", "dirname", "grep", "sed", "tar"]
+        } else {
+            &["grep"]
+        };
+        for &tool in tools {
             let path = self.tools.join(tool);
             if !path.exists() {
                 let executable = executable_on_path(&self.world.git(), tool)
@@ -4005,10 +4006,10 @@ sync_case!(
         let f = Repo::new();
         let before = f.remote();
         fs::remove_file(f.tools.join("gitleaks")).unwrap();
-        let path = f.path_without_gitleaks();
         let mut command = f.dots(&f.a, &["--verbose", "sync"]);
-        command.env("PATH", path);
+        command.env("PATH", f.scanner_fixture_path());
         assert!(executable_on_path(&command, "gitleaks").is_none());
+        assert!(executable_on_path(&command, "cmp").is_none());
         f.write(&f.a, "local", "never publish without scanning\n");
         let receipt = dots_zero(&mut command);
         has(&receipt, "gitleaks");
@@ -4016,7 +4017,8 @@ sync_case!(
         assert_eq!(f.tip(&f.a), before);
         assert_eq!(read(&f.a.join("local")), "never publish without scanning\n");
         script(&f.tools.join("gitleaks"), GITLEAKS_FIXTURE);
-        f.sync(&f.a);
+        let recovery = dots_zero(&mut command);
+        assert_ne!(f.remote(), before, "{recovery}");
         assert_eq!(f.blob("dev", "local"), "never publish without scanning");
     }
 );

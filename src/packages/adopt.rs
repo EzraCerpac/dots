@@ -196,7 +196,7 @@ fn references(ctx: &Ctx, paths: &Paths) -> Result<Vec<(PathBuf, bool)>, Fail> {
         if let Some(table) = edit::table(&doc, DOTFILES)? {
             for (key, item) in table.iter() {
                 let target = declared(&paths.home, &paths.home, key, &path)?;
-                if same_name(&target, &paths.target) || uses_source(item, root, paths, &path)? {
+                if same_name(&target, &paths.target) || uses_paths(item, root, paths, &path)? {
                     let exact = key == paths.key
                         && item.as_table_like().is_some_and(|record| {
                             record.len() == 2
@@ -237,6 +237,22 @@ fn same_name(first: &Path, second: &Path) -> bool {
     if first == second {
         return true;
     }
+    if first.parent() == second.parent()
+        && let Ok(first_entry) = fs::symlink_metadata(first)
+        && let Ok(second_entry) = fs::symlink_metadata(second)
+        && (first_entry.dev(), first_entry.ino()) == (second_entry.dev(), second_entry.ino())
+    {
+        // Realpath reflects the spelling stored by the filesystem. Unlike
+        // comparing inodes alone, it distinguishes regular-file hardlinks.
+        if first_entry.nlink() == 1
+            || !first_entry.is_symlink()
+                && first
+                    .canonicalize()
+                    .is_ok_and(|a| second.canonicalize().is_ok_and(|b| a == b))
+        {
+            return true;
+        }
+    }
     #[cfg(target_os = "macos")]
     if first
         .as_os_str()
@@ -252,7 +268,7 @@ fn same_name(first: &Path, second: &Path) -> bool {
     false
 }
 
-fn uses_source(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
+fn uses_paths(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
     fn matches(value: &str, root: &Path, paths: &Paths, config: &Path) -> Result<bool, Fail> {
         let declared = declared(root, &paths.home, value, config)?;
         if same_name(&declared, &paths.source) {
@@ -272,6 +288,14 @@ fn uses_source(item: &Item, root: &Path, paths: &Paths, config: &Path) -> Result
         paths: &Paths,
         config: &Path,
     ) -> Result<bool, Fail> {
+        if let Some(target) = table.get("target").and_then(Item::as_str)
+            && same_name(
+                &declared(&paths.home, &paths.home, target, config)?,
+                &paths.target,
+            )
+        {
+            return Ok(true);
+        }
         if let Some(source) = table.get("source").and_then(Item::as_str)
             && matches(source, root, paths, config)?
         {
@@ -391,9 +415,10 @@ fn preflight_add(
         ));
     }
     if source.is_some() {
-        return Err(refusal(
-            &paths.source,
-            "source already exists; reconcile the file and source before retrying",
+        return Err(reconcile(
+            paths,
+            &records,
+            "source already exists; reconcile the adoption before retrying",
         ));
     }
     if let Some((file, _)) = records.first() {
@@ -467,23 +492,25 @@ impl Adoption {
             let source = create_source(&paths.source, &original)?;
             match edit.install() {
                 Ok(Some(written)) => {
+                    #[cfg(test)]
+                    tests::before_link_install();
                     if let Err(error) = link.install() {
                         return Err(edit::rollback(
                             error,
-                            [written.restore(), remove_owned(&paths.source, &source)],
+                            [written.restore(), retract_source(ctx, &paths, &source)],
                         ));
                     }
                 }
                 Ok(None) => {
                     return Err(edit::rollback(
                         Fail::new(1, "adoption declaration was not added"),
-                        [remove_owned(&paths.source, &source)],
+                        [retract_source(ctx, &paths, &source)],
                     ));
                 }
                 Err(error) => {
                     return Err(edit::rollback(
                         error,
-                        [remove_owned(&paths.source, &source)],
+                        [retract_source(ctx, &paths, &source)],
                     ));
                 }
             }
@@ -723,6 +750,20 @@ fn remove_owned(path: &Path, expected: &Entry) -> Result<(), Fail> {
     Stashed::new(path, expected).map(drop)
 }
 
+fn retract_source(ctx: &Ctx, paths: &Paths, expected: &Entry) -> Result<(), Fail> {
+    let records = references(ctx, paths)?;
+    let target = snapshot(&paths.target)
+        .map_err(|error| io_fail("could not inspect", &paths.target, error))?;
+    if !records.is_empty() || target.as_ref().is_some_and(|target| is_link(paths, target)) {
+        return Err(reconcile(
+            paths,
+            &records,
+            "kept the source because it is still referenced",
+        ));
+    }
+    remove_owned(&paths.source, expected)
+}
+
 fn staging_prefix(path: &Path) -> String {
     let digest = Sha256::digest(path.as_os_str().as_bytes());
     let prefix = u64::from_be_bytes(digest[..8].try_into().expect("eight SHA-256 bytes"));
@@ -818,16 +859,16 @@ impl Stashed {
     }
 }
 
-struct Replacement {
+pub(super) struct Replacement {
     path: PathBuf,
-    parked: PathBuf,
+    pub(super) parked: PathBuf,
     work: Option<TempDir>,
     original: Entry,
     installed: Option<Entry>,
 }
 
 impl Replacement {
-    fn new(path: &Path, original: Entry) -> Result<Self, Fail> {
+    pub(super) fn new(path: &Path, original: Entry) -> Result<Self, Fail> {
         let work = staging(path)?;
         let parked = work.path().join("original");
         Ok(Self {
@@ -839,7 +880,7 @@ impl Replacement {
         })
     }
 
-    fn install(&mut self) -> Result<(), Fail> {
+    pub(super) fn install(&mut self) -> Result<(), Fail> {
         if needed(&self.path)? != self.original {
             return Err(Fail::new(
                 1,
@@ -847,6 +888,8 @@ impl Replacement {
             ));
         }
         let installed = needed(&self.parked)?;
+        #[cfg(test)]
+        super::edit::tests::before_config_replace();
         exchange(&self.path, &self.parked)
             .map_err(|error| io_fail("could not replace", &self.path, error))?;
         self.installed = Some(installed);
@@ -948,5 +991,76 @@ fn rename(a: &Path, b: &Path, exchange: bool) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::{Env, Flags, config::Root, packages::github::test_env};
+
+    thread_local! {
+        static BEFORE_LINK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_link_install() {
+        if let Some(before_link) = BEFORE_LINK.take() {
+            before_link();
+        }
+    }
+
+    #[test]
+    fn adoption_keeps_the_source_if_a_later_edit_retains_its_declaration() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = base.join("config");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&root).unwrap();
+        let env = Env {
+            vars: test_env::private_environment(&base, &home, &root)
+                .into_iter()
+                .collect(),
+            cwd: root.clone(),
+        };
+        let ctx = Ctx {
+            root: Root::resolve(&env).unwrap(),
+            env,
+            flags: Flags::default(),
+        };
+        let config = root.join("config.toml");
+        fs::write(&config, "").unwrap();
+        let target = home.join("settings");
+        fs::write(&target, "original").unwrap();
+        let paths = paths(&ctx, &target).unwrap();
+        let source = paths.source.clone();
+        let original = snapshot(&target).unwrap();
+        let config_to_edit = config.clone();
+        let target_to_edit = target.clone();
+        BEFORE_LINK.set(Some(Box::new(move || {
+            fs::write(&target_to_edit, "replacement").unwrap();
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&config_to_edit)
+                .unwrap();
+            writeln!(file, "# keep my edit").unwrap();
+        })));
+        let error = Adoption {
+            paths,
+            config: config.clone(),
+            original,
+        }
+        .execute(&ctx)
+        .unwrap_err();
+        assert!(error.diagnostic.contains("kept a later edit"), "{error}");
+        assert_eq!(fs::read_to_string(target).unwrap(), "replacement");
+        let text = fs::read_to_string(config).unwrap();
+        assert!(
+            text.contains("# keep my edit") && text.contains("dotfiles/settings"),
+            "{text}"
+        );
+        assert_eq!(fs::read_to_string(source).unwrap(), "original");
     }
 }

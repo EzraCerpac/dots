@@ -92,8 +92,7 @@ fn inspect_zip(reader: impl Read + Seek) -> Result<Entries, Fail> {
                     .take((MAX_PATH + 1) as u64)
                     .read_to_string(&mut target)
                     .map_err(archive_error)?;
-                link_path(&name, &target, false)?;
-                Kind::Symlink
+                Kind::Symlink(link_path(&name, &target, false)?)
             }
             _ => {
                 return Err(failure(format!(
@@ -134,7 +133,7 @@ fn inspect_tar(reader: impl Read) -> Result<Entries, Fail> {
             if entry_type.is_hard_link() {
                 Kind::Hardlink(target)
             } else {
-                Kind::Symlink
+                Kind::Symlink(target)
             }
         } else {
             return Err(failure(format!(
@@ -188,7 +187,7 @@ struct Entries {
 enum Kind {
     File,
     Directory,
-    Symlink,
+    Symlink(PathBuf),
     Hardlink(PathBuf),
 }
 
@@ -233,16 +232,27 @@ impl Entries {
                     path.display()
                 )));
             }
-            if path.starts_with("__MACOSX")
-                || !path.ends_with("Contents/Info.plist")
-                || !matches!(kind, Kind::File | Kind::Hardlink(_))
-            {
+            if path.starts_with("__MACOSX") || !path.ends_with("Contents/Info.plist") {
                 continue;
             }
             if let Some(app) = path.parent().and_then(Path::parent)
                 && app.extension().is_some_and(|ext| ext == "app")
             {
-                apps.insert(app);
+                match kind {
+                    Kind::File | Kind::Hardlink(_) => {
+                        apps.insert(app);
+                    }
+                    Kind::Symlink(_) if self.plist_link_is_contained(app, path) => {
+                        apps.insert(app);
+                    }
+                    Kind::Symlink(_) => {
+                        return Err(failure(format!(
+                            "archive Info.plist link does not resolve to a regular file in the bundle: {}",
+                            path.display()
+                        )));
+                    }
+                    Kind::Directory => (),
+                }
             }
         }
         let distinct = apps
@@ -256,6 +266,37 @@ impl Entries {
                 "release contains multiple apps; automatic app installation is ambiguous",
             )),
         }
+    }
+
+    fn plist_link_is_contained(&self, app: &Path, path: &Path) -> bool {
+        let mut current = path.to_owned();
+        for _ in 0..40 {
+            if !current.starts_with(app) {
+                return false;
+            }
+            match self.by_path.get(&current) {
+                Some(Kind::File) => return true,
+                Some(Kind::Hardlink(target)) => {
+                    current = target.clone();
+                    continue;
+                }
+                _ => (),
+            }
+            let next = current
+                .ancestors()
+                .take_while(|path| path.starts_with(app))
+                .find_map(|path| {
+                    let Some(Kind::Symlink(target)) = self.by_path.get(path) else {
+                        return None;
+                    };
+                    Some(target.join(current.strip_prefix(path).expect("ancestor")))
+                });
+            let Some(next) = next else {
+                return false;
+            };
+            current = next;
+        }
+        false
     }
 }
 
@@ -328,6 +369,46 @@ mod tests {
     }
 
     #[test]
+    fn detects_a_bundle_with_a_contained_info_plist_symlink() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("Example.app/Contents/Real.plist", options)
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"fixture").unwrap();
+        zip.add_symlink("Example.app/Contents/Info.plist", "Real.plist", options)
+            .unwrap();
+        let mut zip = zip.finish().unwrap();
+        zip.set_position(0);
+        assert!(inspect_zip(zip).unwrap().contains_app().unwrap());
+    }
+
+    #[test]
+    fn refuses_info_plist_links_that_leave_the_app_or_lack_a_regular_target() {
+        for target in ["../../Other.plist", "Missing.plist", "."] {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut file = tar::Header::new_ustar();
+            file.set_mode(0o644);
+            file.set_size(1);
+            tar.append_data(&mut file, "Other.plist", b"x".as_slice())
+                .unwrap();
+            let mut link = tar::Header::new_ustar();
+            link.set_mode(0o777);
+            link.set_size(0);
+            link.set_entry_type(tar::EntryType::Symlink);
+            tar.append_link(&mut link, "Example.app/Contents/Info.plist", target)
+                .unwrap();
+            let bytes = tar.into_inner().unwrap();
+            assert!(
+                inspect_tar(bytes.as_slice())
+                    .unwrap()
+                    .contains_app()
+                    .is_err(),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_multiple_bundles_and_entries_below_links() {
         let mut entries = Entries::default();
         entries
@@ -339,7 +420,9 @@ mod tests {
         assert!(entries.contains_app().is_err());
 
         let mut entries = Entries::default();
-        entries.add("one", 0, Kind::Symlink).unwrap();
+        entries
+            .add("one", 0, Kind::Symlink("other".into()))
+            .unwrap();
         entries.add("./one/file", 1, Kind::File).unwrap();
         assert!(entries.contains_app().is_err());
     }

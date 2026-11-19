@@ -74,6 +74,7 @@ fn absent(text: &str, unwanted: &str) {
 fn native_mise_adapter_is_private_after_nested_environment_reset() {
     let world = IsolatedWorld::new();
     let fixture = world.root().parent().unwrap();
+    let boundary = fixture.parent().unwrap();
     let nested = fixture.join("native-call");
     fs::create_dir(&nested).unwrap();
     let native = fixture.join("observe-native-env");
@@ -150,9 +151,14 @@ exec {adapter} -C "$HOME" --version"#,
         }
         assert_eq!(values.get("MISE_OFFLINE"), Some(&"1"));
         assert_eq!(values.get("MISE_AUTO_INSTALL"), Some(&"0"));
+        let git_ceiling = std::env::join_paths([fixture, boundary]).unwrap();
+        assert_eq!(
+            values.get("GIT_CEILING_DIRECTORIES").copied(),
+            git_ceiling.to_str()
+        );
         fs::remove_file(&marker).unwrap();
     }
-    for path in [other.root(), &symlink] {
+    for path in [other.root(), &symlink, boundary] {
         for input in ["cwd", "argv"] {
             let output = finish(world.tool(&reset).arg(input).arg(path));
             assert!(!output.status.success(), "{output:?}");
@@ -176,6 +182,18 @@ exec {adapter} -C "$HOME" --version"#,
             assert!(!marker.exists());
         }
     }
+    let output = finish(
+        world
+            .tool(&reset)
+            .args(["env", "GIT_CEILING_DIRECTORIES"])
+            .arg(other.root()),
+    );
+    assert!(!output.status.success(), "{output:?}");
+    has(
+        &String::from_utf8_lossy(&output.stderr),
+        "GIT_CEILING_DIRECTORIES",
+    );
+    assert!(!marker.exists());
     let reader = world.fixture_reader();
     let local_body = fixture.join("body.md");
     put(&local_body, "fixture body\n");

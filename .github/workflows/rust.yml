@@ -257,7 +257,6 @@ jobs:
             "$seed/mise" run build -- --release --target x86_64-unknown-linux-musl
           install -m 0755 target/x86_64-unknown-linux-musl/release/dots "$seed/dots"
 
-      # This check is expected to fail while init or up is still a stub.
       - name: Run dots init and dots up in a fresh container
         run: |
           docker run --rm -i --mount "type=bind,src=$RUNNER_TEMP/dots-first-run,dst=/seed,readonly" \

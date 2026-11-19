@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+bin=$1
+version=0.9.152
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)
+    platform=x86_64-unknown-linux-musl
+    checksum=521c5f790ed07ee69d0a88403d9d86a8c8ab27977f12fc73f22aa4e7e14a0f71 ;;
+  Linux-aarch64)
+    platform=aarch64-unknown-linux-musl
+    checksum=f168dbfe9c9c3a4b247cf10d9c260f3dac90a1373f5c4b1bfd3b0b8ac8d77095 ;;
+  Darwin-*)
+    platform=universal-apple-darwin
+    checksum=2fadf57df4243e691f088ee3bff4f4ab9af16da0c95a1db84b5cb1685e098a76 ;;
+  *) echo 'Unsupported nextest platform' >&2; exit 2 ;;
+esac
+
+mkdir -p "$bin"
+archive=$(mktemp)
+trap 'rm -f "$archive"' EXIT
+name="cargo-nextest-$version"
+curl -fsSL --retry 3 "https://github.com/nextest-rs/nextest/releases/download/$name/$name-$platform.tar.gz" -o "$archive"
+printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c
+tar -xzf "$archive" -C "$bin" cargo-nextest
+"$bin/cargo-nextest" nextest --version

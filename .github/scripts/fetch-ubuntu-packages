@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool=$1
+destination=$2
+
+# These jobs use Ubuntu 24.04. The default security mirror has stalled
+# installs on hosted runners. Fetch the same Noble packages by checksum.
+arch=$(dpkg --print-architecture)
+case "$arch" in
+  amd64) mirrors=(https://azure.archive.ubuntu.com/ubuntu https://mirrors.edge.kernel.org/ubuntu https://mirrors.mit.edu/ubuntu) ;;
+  arm64) mirrors=(https://ports.ubuntu.com/ubuntu-ports) ;;
+  *) echo "Unsupported Ubuntu architecture: $arch" >&2; exit 2 ;;
+esac
+
+mkdir -p "$destination"
+cd "$destination"
+
+download() {
+  local path=$1 sha=$2 file=${1##*/} mirror
+  if [[ -f "$file" ]] && printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c; then
+    return
+  fi
+  for mirror in "${mirrors[@]}"; do
+    if curl -fsSL --connect-timeout 5 --max-time 15 "$mirror/pool/$path" -o "$file" &&
+      printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c; then
+      return
+    fi
+  done
+  echo "Could not fetch verified package: $file" >&2
+  return 1
+}
+
+case "$tool-$arch" in
+  musl-gcc-amd64)
+    download universe/m/musl/musl_1.2.4-2_amd64.deb 9f0883c20b4b746e05e947bafd99cb933f5494ffaaa6fcd360cbe1fbcf264883
+    download universe/m/musl/musl-dev_1.2.4-2_amd64.deb 4b451ecb6a0f8469883058cf22a807f3bd9cc16d115cc08b7efc35fe8eb44db2
+    download universe/m/musl/musl-tools_1.2.4-2_amd64.deb 46c01d212d3eb3a1322693089037f0a5c92383a089d39c392db3c86c19ffb229 ;;
+  musl-gcc-arm64)
+    download universe/m/musl/musl_1.2.4-2_arm64.deb 79a04df7e8f54c74720ad474c04966204c03370654f4a43bec2968e80821e39f
+    download universe/m/musl/musl-dev_1.2.4-2_arm64.deb 56e4fa8e6fcd2825ca9e262e8807d2038d4a0e91274bd51fce1653b219f5ae92
+    download universe/m/musl/musl-tools_1.2.4-2_arm64.deb 0ecd1f97fd8cf6727d492c6a7515e44a5a905f5af123fc90f35f954cabc50d60 ;;
+  zsh-amd64)
+    download main/z/zsh/zsh_5.9-6ubuntu2_amd64.deb bd5cc8dd3a01a6db38c0a815d75202c356a9c7f378674ba7bed9bc86dcba8af0 ;;
+  zsh-arm64)
+    download main/z/zsh/zsh_5.9-6ubuntu2_arm64.deb 3793dc77fa48800593cbef52339c6b3259faa845b0c2220bd64ea84861e548f6 ;;
+  *) echo "Unknown Ubuntu tool: $tool" >&2; exit 2 ;;
+esac
+if [[ "$tool" == zsh ]]; then
+  download main/z/zsh/zsh-common_5.9-6ubuntu2_all.deb 56d160585b417af0cc04d7372f74a3b734609d7cc43ef8ea6e92bfdfc27f77c3
+fi

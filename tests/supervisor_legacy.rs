@@ -309,11 +309,12 @@ fn new_plain_up_hook_reads_redirected_stdin() {
 #[test]
 fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
     let world = fixture();
+    // Alpha's tail stays in write order on one pipe. Beta still supplies stdout.
     hook(
         &world,
         "10-Alpha",
         &format!(
-            "#!/bin/sh\nprintf 'fixture-alpha-early\\n'\ni=0; while [ \"$i\" -lt 80 ]; do printf 'filler\\n'; i=$((i+1)); done\nprintf '{FAILURE_TAIL}\\n' >&2\nexit 7\n"
+            "#!/bin/sh\nexec 1>&2\nprintf 'fixture-alpha-early\\n'\ni=0; while [ \"$i\" -lt 80 ]; do printf 'filler\\n'; i=$((i+1)); done\nprintf '{FAILURE_TAIL}\\n'\nexit 7\n"
         ),
     );
     hook(

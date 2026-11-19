@@ -1,0 +1,26 @@
+name: Set up scenario tools
+description: Restore nextest and the pinned, fixture-safe dots scenario tools
+runs:
+  using: composite
+  steps:
+    - name: Cache pinned scenario tools and nextest
+      id: tools
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ${{ runner.temp }}/dots-scenario-tools
+        key: scenario-${{ runner.os }}-${{ runner.arch }}-${{ env.MISE_VERSION }}-${{ hashFiles('.github/scripts/setup-scenario-tools', '.github/scripts/setup-nextest', '.github/scripts/fetch-ubuntu-packages') }}
+    - name: Install pinned tools
+      if: steps.tools.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        prefix="$RUNNER_TEMP/dots-scenario-tools"
+        bash .github/scripts/setup-nextest "$prefix/bin"
+        bash .github/scripts/setup-scenario-tools "$prefix"
+        if [[ "$RUNNER_OS" == Linux ]]; then
+          bash .github/scripts/fetch-ubuntu-packages zsh "$prefix/ubuntu-packages"
+        fi
+    - name: Expose tools to subsequent steps
+      shell: bash
+      run: printf '%s\n' "$RUNNER_TEMP/dots-scenario-tools/bin" >> "$GITHUB_PATH"

@@ -33,9 +33,9 @@ case "$SUITE" in
     ;;
   */*) args=(--partition "slice:$SUITE") ;;
 esac
-# Overlap more Git and filesystem-heavy tests on Intel macOS.
-if [[ "${RUNNER_OS:-}" == macOS && "${RUNNER_ARCH:-}" == X64 ]]; then
-  args+=(--test-threads 6)
-fi
+# Overlap more Git and filesystem-heavy tests on x86_64 runners.
+case "$(uname -m)" in
+  x86_64) args+=(--test-threads 6) ;;
+esac
 cargo-nextest nextest run --profile ci --archive-file "$BUNDLE/tests.tar.zst" \
   --extract-to "$workspace" --workspace-remap "$workspace" "${args[@]}"

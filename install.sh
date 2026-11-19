@@ -50,9 +50,9 @@ find_mise() {
 }
 
 clone_root() {
-    set --
+    branch=main
     if git ls-remote --exit-code --heads -- "$repo" refs/heads/dev >/dev/null; then
-        set -- --branch dev
+        branch=dev
     elif [ "$?" -ne 2 ]; then
         exit 1
     fi
@@ -64,7 +64,7 @@ clone_root() {
         [ ! -e "$root" ] && [ ! -L "$root" ] || fail "could not move the existing configuration to $backup."
         printf 'Moved the existing configuration to %s.\n' "$backup"
     fi
-    git clone "$@" -- "$repo" "$root"
+    git clone --branch "$branch" -- "$repo" "$root"
     [ "$(git -C "$root" config --local --get-all remote.origin.url)" = "$repo" ] ||
         fail 'the saved origin does not match --from.'
 }
@@ -74,6 +74,7 @@ shell_word() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 retry() {
     printf 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | env '
     set -- "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --version "$version"
+    if [ "${MISE_YES:-}" = 1 ]; then set -- MISE_YES=1 "$@"; fi
     if [ -n "$archive" ]; then set -- "$@" --archive "$archive"; fi
     if [ -n "$profile" ]; then set -- "$@" --profile "$profile"; fi
     for arg do shell_word "$arg"; printf ' '; done
@@ -199,12 +200,8 @@ if [ -n "$source" ]; then
     printf 'Next: %s up\n' "$display"
 elif "$terminal"; then
     dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
-    if [ "$display" = dots ]; then "$dots" init; exit 0; fi
-    status=0
-    output=$("$dots" init) || status=$?
-    printf '%s\n' "$output" | sed '/^Next: dots up$/d'
-    [ "$status" -eq 0 ] || exit "$status"
-    printf 'Next: %s up\n' "$display"
+    "$dots" init
+    if [ "$display" != dots ]; then printf 'Next: %s up\n' "$display"; fi
 else
     printf '%s init\n' "$display"
 fi

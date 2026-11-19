@@ -21,6 +21,38 @@ pub(crate) use mise::{
     config_paths, mise_binary, quiet_probe, require_mise, tool_path, validate_selection,
 };
 
+pub(crate) fn fill_commit_identity<E>(
+    command: &mut Command,
+    mut git: impl FnMut(&[&str]) -> Result<std::process::Output, E>,
+) -> Result<(), E> {
+    for role in ["author", "committer"] {
+        let prefix = format!("GIT_{}", role.to_ascii_uppercase());
+        if git(&["var", &format!("{prefix}_IDENT")])?.status.success() {
+            continue;
+        }
+        for (field, fallback) in [("name", "dots"), ("email", "dots@localhost")] {
+            let key = format!("{prefix}_{}", field.to_ascii_uppercase());
+            let present = command.get_envs().any(|(name, value)| {
+                value.is_some() && (name == key.as_str() || field == "email" && name == "EMAIL")
+            });
+            if !present
+                && git(&[
+                    "config",
+                    "--name-only",
+                    "--get-regexp",
+                    &format!(r"^({role}|user)\.{field}$"),
+                ])?
+                .status
+                .code()
+                    == Some(1)
+            {
+                command.env(key, fallback);
+            }
+        }
+    }
+    Ok(())
+}
+
 const HOOK_ENV: &[&str] = &[
     "DOTS_CHANGES",
     "DOTS_TOOLS_OK",

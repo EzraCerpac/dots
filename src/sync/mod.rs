@@ -18,7 +18,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::config::{CheckoutShape, Vars, checkout_shape};
+use crate::config::{CheckoutShape, RepoSetting, Vars, checkout_shape};
 use crate::history::{self, CheckpointFailure};
 use crate::receipt::{self, ChangeGroup, Display, Issue, Receipt};
 use crate::report::Command;
@@ -184,13 +184,21 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
         "Could not read config.toml or its repository settings",
         CONFIG,
     )?;
-    let github = vars
-        .source_repo
+    let origin = checked_origin(git, vars.source_repo)?;
+    if origin.is_none() {
+        crate::config::selection::read(&ctx.root, &ctx.env)
+            .or_note("The profile or machine selection could not be read", CONFIG)?;
+    }
+    Ok(origin)
+}
+
+fn checked_origin(git: &Git<'_>, setting: Option<RepoSetting>) -> Result<Option<Origin>, Note> {
+    let github = setting
         .as_ref()
         .and_then(|repo| repo.github())
         .filter(|name| name.len() <= 140)
         .map(str::to_owned);
-    let origin = Origin::load(git, vars.source_repo).map_err(|_| {
+    Origin::load(git, setting).map_err(|_| {
         let diagnostic = match github {
             Some(name) => {
                 format!("origin is missing, unsafe, or differs from configured repository {name}")
@@ -199,12 +207,7 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
             None => "origin is missing, unsafe, or differs from the configured repository".into(),
         };
         Note(diagnostic, REMOTE)
-    })?;
-    if origin.is_none() {
-        crate::config::selection::read(&ctx.root, &ctx.env)
-            .or_note("The profile or machine selection could not be read", CONFIG)?;
-    }
-    Ok(origin)
+    })
 }
 
 pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display) -> Receipt {
@@ -448,7 +451,8 @@ fn synchronize(
                     .or_note("Could not inspect or switch the source checkout", GIT)
             },
             |main, candidate| {
-                read_origin(ctx, &git)?.ok_or(Note::new("Could not verify Git origin", REMOTE))?;
+                let origin = read_origin(ctx, &git)?
+                    .ok_or(Note::new("Could not verify Git origin", REMOTE))?;
                 crate::config::selection::read(&ctx.root, &ctx.env).or_note(
                     "The profile and machine selection could not be read",
                     CONFIG,
@@ -472,6 +476,9 @@ fn synchronize(
                         "Configuration files changed during validation",
                         RERUN,
                     ));
+                }
+                if checked_origin(&git, validated.source_repo)?.as_ref() != Some(&origin) {
+                    return Err(Note::new("Origin changed before switching to dev", REMOTE));
                 }
                 verify_dirs()?;
                 active(run)
@@ -606,10 +613,15 @@ fn synchronize(
         })?;
 
     active(run)?;
-    let unscanned = scratch.capture(&before).or_note(
-        "Could not snapshot local edits",
-        "Check Git identity, repository state and free space; your edits remain on disk.",
-    )?;
+    let unscanned = scratch.capture(&before).map_err(|error| {
+        let reason = error.to_string();
+        let fix = if git::identity_unknown(&reason) {
+            "Set git config --global user.name \"Your Name\" and git config --global user.email \"you@example.com\", then rerun dots sync."
+        } else {
+            "Check Git identity, repository state and free space; your edits remain on disk."
+        };
+        Note(format!("Could not snapshot local edits: {reason}").into(), fix)
+    })?;
     let candidate_tree = scratch
         .git
         .tree(&unscanned)

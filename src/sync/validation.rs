@@ -39,6 +39,7 @@ pub(super) struct Validated {
     _preview: tempfile::TempDir,
     revision: String,
     pub apply: ApplyPlan,
+    pub source_repo: Option<config::RepoSetting>,
     pub retired: Vec<Retirement>,
     local: BTreeMap<PathBuf, Image>,
     public_before: BTreeMap<PathBuf, Image>,
@@ -205,7 +206,7 @@ pub(super) fn validate(
         cwd: root.clone(),
     };
     let selected_root = config::Root::resolve(&env).map_err(io::Error::other)?;
-    config::Vars::read(&selected_root).map_err(io::Error::other)?;
+    let vars = config::Vars::read(&selected_root).map_err(io::Error::other)?;
     let selection = config::selection::read(&selected_root, &env).map_err(io::Error::other)?;
     let config = probe(run, &root, MiseProbe::ConfigList, true)?;
     #[derive(Deserialize)]
@@ -267,6 +268,7 @@ pub(super) fn validate(
         _preview: preview,
         revision: revision.into(),
         apply,
+        source_repo: vars.source_repo,
         retired,
         local,
         public_before,

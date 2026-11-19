@@ -40,6 +40,11 @@ case "$1" in
         fi
         ;;
     outdated)
+        if [ -f "$FIXTURE/latest-download-changed" ]; then
+            case " $* " in
+                *' --greedy '*|*' --greedy-latest '*) printf 'widget\n'; exit 1 ;;
+            esac
+        fi
         if [ -f "$FIXTURE/outdated" ]; then
             printf 'widget\n'
             exit 1
@@ -359,6 +364,17 @@ fn new_brew_update_cask() {
         format!("Already installed: {QUALIFIED_CASK}\n")
     );
     assert!(!fixture.read("calls").contains("outdated"));
+    fixture.remove("outdated");
+    fixture.remove("running");
+    fixture.write("latest-download-changed", "");
+    let output = fixture.run(&update);
+    status(&output, 0);
+    assert_eq!(stdout(&output), format!("Unchanged: {QUALIFIED_CASK}\n"));
+    assert!(!fixture.read("calls").contains("upgrade "));
+    fixture.remove("latest-download-changed");
+    fixture.write("outdated", "");
+    fixture.write("running", "");
+
     let output = fixture.run(&update);
     status(&output, 3);
     assert!(stdout(&output).contains("before upgrading"));
@@ -371,14 +387,13 @@ fn new_brew_update_cask() {
             .any(|line| line == format!("install --cask {QUALIFIED_CASK}"))
     );
     assert!(
-        calls
-            .lines()
-            .any(|line| line == format!("outdated --cask --quiet --greedy {QUALIFIED_CASK}"))
+        calls.lines().any(|line| line
+            == format!("outdated --cask --quiet --greedy-auto-updates {QUALIFIED_CASK}"))
     );
     assert!(
         calls
             .lines()
-            .any(|line| line == format!("upgrade --cask --greedy {QUALIFIED_CASK}"))
+            .any(|line| line == format!("upgrade --cask --greedy-auto-updates {QUALIFIED_CASK}"))
     );
     assert_eq!(
         fixture.read("changes"),

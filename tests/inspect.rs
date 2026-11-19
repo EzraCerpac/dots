@@ -1,6 +1,7 @@
 mod support;
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -19,12 +20,18 @@ fn minimal(world: &World, declarations: &str) {
 }
 
 fn real_mise() -> PathBuf {
-    env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+    mise_on_path(&env::var_os("PATH").unwrap_or_default()).expect("standalone mise on PATH")
+}
+
+fn mise_on_path(search: &OsStr) -> Option<PathBuf> {
+    env::split_paths(search)
         .map(|directory| directory.join("mise"))
-        .find(|path| path.is_absolute() && path.is_file())
-        .expect("standalone mise on PATH")
+        .find(|path| {
+            path.is_absolute()
+                && fs::metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                })
+        })
 }
 
 fn with_mise(world: &World) -> FixtureCommand<'_> {
@@ -62,6 +69,22 @@ fn read_report(world: &World) -> serde_json::Value {
         0o600
     );
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn mise_lookup_skips_a_non_executable_path_entry() {
+    let world = World::new();
+    let blocked = world.home().join("blocked");
+    let bin = world.home().join("bin");
+    fs::create_dir(&blocked).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let non_executable = blocked.join("mise");
+    fs::write(&non_executable, "").unwrap();
+    fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    let mise = bin.join("mise");
+    script(&mise, "exit 0");
+    let search = env::join_paths([blocked, bin]).unwrap();
+    assert_eq!(mise_on_path(&search), Some(mise));
 }
 
 #[test]

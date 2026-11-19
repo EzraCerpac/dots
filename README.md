@@ -26,7 +26,6 @@ dots sync                              # scan and share your edits, take the oth
 curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh
 ```
 
-**Not ready yet:** the installer installs the latest `dots` release and needs 0.5.0, which has not been released.
 It installs `dots` through mise, installing mise first when needed, links `~/.local/bin/dots`, and in a terminal runs `dots init`.
 
 <details>
@@ -72,8 +71,6 @@ Each option is optional.
 
 <details>
 <summary>Install with mise instead</summary>
-
-Once 0.5.0 is released, this will also work:
 
 ```sh
 mise use -g github:EzraCerpac/dots@0.5.0

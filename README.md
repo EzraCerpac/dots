@@ -41,7 +41,7 @@ Each option is optional.
   Instead of running `dots init`, the installer clones the repository and runs mise's native bootstrap of it.
   It clones `dev` when the remote has that branch, and otherwise `main`; after a `main`-only clone, the first shared `dots up` switches the checkout to `dev` and publishes it.
   Your Git `url.*.insteadOf` rewrites apply to the clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
-- If the configuration directory, normally `~/.config/mise`, is already a checkout of that repository, the installer continues with it, so rerunning the same command after a failure picks up where it stopped.
+- If the configuration directory, normally `~/.config/mise`, is already a checkout of that repository, the installer reuses it, so the same command can be rerun after a failure; the rerun runs the native bootstrap again before saving the profile, so work it already did may repeat.
   It leaves any other Git checkout there alone and stops; anything else is first moved aside to the same path with `.before-dots-` and the UTC time appended.
 - `--profile` must name a profile that the configuration declares, and match the profile this machine has already saved, if any.
   Without it, the saved profile is used, or else the only declared one; with several, the installer asks in a terminal and refuses without one.

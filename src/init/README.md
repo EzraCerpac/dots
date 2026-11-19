@@ -173,7 +173,7 @@ base	example-tool	hold=brew:example
 - `dots exceptions` exits 2 on a row with a fourth column, an unknown profile, an invalid name or an unknown flag.
   Under `dots bootstrap`, the same row fails the exceptions stage; later stages still run, and the bootstrap exits 1 when it finishes.
 - `install-only` makes `dots up` pass `--install-only`, so the recipe installs the app only when it is missing; it suits apps that update themselves.
-- `hold=MANAGER:NAME` declares that the recipe pins that package, and `dots add` then refuses the package whatever tap prefix or `@version` the request carries.
+- `hold=MANAGER:NAME` declares that the recipe manages that package, and `dots add` then refuses the package whatever tap prefix or `@version` the request carries.
 - `dots bootstrap` and `dots exceptions` pass `--install-only` every time.
 - Under `dots up`, recipes receive `DOTS_CHANGES` exactly as update hooks do.
 - Recipes use the same exit statuses as the [hook table](#hooks).
@@ -211,7 +211,7 @@ exec dots brew update-cask --admin example-app 'Example App' "$@"
 Here `example-app` stands for the cask token and `Example App` for the name of the app's running process.
 The recipe needs a Homebrew source that provides that cask, and administrator access when an install or upgrade is due.
 
-`exceptions/example-tool`, which pins a formula:
+`exceptions/example-tool`, which checks a formula's installed version:
 
 ```sh
 #!/bin/sh
@@ -219,8 +219,8 @@ exec dots brew hold-formula example 1.2.3 'example plugin needs 1.2'
 ```
 
 `example` and `1.2.3` are placeholders, and the formula must already be installed at exactly that version.
-`hold-formula` only checks that; it neither installs nor pins the formula.
-The hold itself comes from the row with `hold=brew:example` in `exceptions.tsv`, shown under [Installer exceptions](#installer-exceptions).
+`hold-formula` verifies exactly that and installs nothing.
+The row with `hold=brew:example` in `exceptions.tsv`, shown under [Installer exceptions](#installer-exceptions), makes `dots add` refuse the formula; neither that row nor this recipe stops Homebrew from upgrading it.
 
 ## Retired dotfiles and retired declarations
 

@@ -317,6 +317,10 @@ test "${MISE_GLOBAL_CONFIG_FILE+x}" != x
 test "${MISE_SHARED_INSTALL_DIRS+x}" != x
 test "${__MISE_DIFF+x}" != x
 case "$HOME" in "$EXPECTED_FIXTURE"/tmp/*) ;; *) exit 80 ;; esac
+test "$(find "$HOME" -prune -perm 0700)" = "$HOME"
+for file in "$MISE_CONFIG_DIR/miserc.toml" "$MISE_CONFIG_DIR/config.local.toml"; do
+    test "$(find "$file" -prune -perm 0600)" = "$file"
+done
 for dir in "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" \
     "$TMPDIR" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$MISE_CONFIG_DIR" "$MISE_SYSTEM_CONFIG_DIR" \
     "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR" "$MISE_TMP_DIR" \
@@ -591,7 +595,9 @@ rm "$1"
 mkdir -p "${1%/*}"
 printf '#!/bin/sh\nprintf "new version\\n"\n' > "$1"
 chmod +x "$1"
-command -v dots
+pin=$(command -v dots)
+test "$(find "${pin%/*}" -prune -perm 0700)" = "${pin%/*}"
+printf '%s\n' "$pin"
 dots --version
 "#,
     );

@@ -310,7 +310,12 @@ fn new_missing_configuration_saves_one_startup_issue_without_a_child() {
         fs::remove_file(world.root().join("config.toml")).unwrap();
         let mise = world.home().join("unwanted-mise");
         script(&mise, r#": > "$HOME/mise-ran"; exit 99"#);
-        let result = output(world.dots().env("DOTS_MISE_BIN", mise).arg(command), 2);
+        let mut invocation = world.dots();
+        invocation.env("DOTS_MISE_BIN", mise).arg(command);
+        if command == "apply" {
+            invocation.args(["--dry-run", "shell"]);
+        }
+        let result = output(&mut invocation, 2);
         assert!(result.stdout.is_empty(), "{result:?}");
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert_eq!(stderr.lines().count(), 1);
@@ -324,6 +329,16 @@ fn new_missing_configuration_saves_one_startup_issue_without_a_child() {
         let issues = stages[0]["issues"].as_array().unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0]["diagnostic"], stderr.trim_end());
+        if command == "apply" {
+            assert!(
+                issues[0]["next"]
+                    .as_str()
+                    .unwrap()
+                    .contains("same arguments"),
+                "unsafe startup recovery advice: {}",
+                issues[0]["next"]
+            );
+        }
     }
 }
 

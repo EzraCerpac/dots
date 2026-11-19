@@ -39,7 +39,7 @@ def open_inside(base, path, *, required=False, directory=False):
             os.close(fd)
 
 
-def check_paths(base, args):
+def check_paths(base, boundary, args):
     check_directory(base, os.getcwd())
     for index, arg in enumerate(args):
         if arg in ("-C", "--cd"):
@@ -78,6 +78,11 @@ def check_paths(base, args):
     for key, values in paths.items():
         for value in values:
             try:
+                # Git ignores a ceiling equal to its starting directory.
+                # Only the exact private parent is allowed as the fallback ceiling.
+                if key == "GIT_CEILING_DIRECTORIES" and value == boundary:
+                    check_directory(boundary, value)
+                    continue
                 fd = open_inside(base, value)
                 if fd is not None:
                     os.close(fd)
@@ -90,7 +95,7 @@ def check_directory(base, path):
 
 
 def main():
-    base, mode, *args = sys.argv[1:]
+    base, boundary, mode, *args = sys.argv[1:]
     if mode == "read":
         path, = args
         fd = open_inside(base, os.path.join(os.getcwd(), path), required=True)
@@ -101,7 +106,7 @@ def main():
             sys.stdout.buffer.write(source.read())
     elif mode == "mise":
         executable, *argv = args
-        check_paths(base, argv)
+        check_paths(base, boundary, argv)
         os.execv(executable, [executable, *argv])
     else:
         raise ValueError("unknown fixture boundary operation")

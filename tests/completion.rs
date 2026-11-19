@@ -310,6 +310,13 @@ fn new_completion_contract_grammar() {
         ("dots add --asset glob ", &["https://github.com/"]),
         ("dots add --asset=glob npm", &[]),
         ("dots add --asset glob https://github.com/owner/tool ", &[]),
+        ("dots add --as", &["--asset"]),
+        ("dots add https://github.com/owner/tool --as", &["--asset"]),
+        ("dots add apt:curl --as", &[]),
+        (
+            "dots add https://github.com/owner/tool https://github.com/owner/other --as",
+            &[],
+        ),
         ("dots init --bo", &[]),
         ("dots init -- --bo", &["--bogus"]),
         ("dots init ./--bo", &["./--bogus"]),
@@ -635,6 +642,45 @@ fn new_completion_fish_prior_home_spelling() {
 }
 
 #[test]
+fn new_completion_fish_continuation_preserves_prior_home_spelling() {
+    let world = CompletionWorld::new();
+    fixture(
+        &world.home.join("chosen.toml"),
+        "[tools]\nripgrep = 'latest'\n",
+        0o600,
+    );
+    fixture(
+        &world.cwd().join("~/chosen.toml"),
+        "[tools]\nripple = 'latest'\n",
+        0o600,
+    );
+    let output = world
+        .shell("fish")
+        .args([
+            "--no-config",
+            "-c",
+            r#"dots completions fish | source
+               complete -C "$argv[1]""#,
+            "dots remove --path \\\n~/chosen.toml rip",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(output.stdout, b"ripgrep\tmise tool\n");
+}
+
+#[test]
+fn new_completion_zsh_matches_the_suffix_inside_a_word() {
+    let world = CompletionWorld::new();
+    let mut zsh = world.session("zsh", false);
+    zsh.send(b"setopt COMPLETE_IN_WORD\n");
+    let mut keys = b"dots bootstrap --prune-dotfiles".to_vec();
+    keys.extend(std::iter::repeat_n(2, "une-dotfiles".len()));
+    keys.extend_from_slice(b"\tmore");
+    zsh.expect(&keys, &["bootstrap", "--prune-dotfiles", "more"]);
+}
+
+#[test]
 fn new_completion_bash_keeps_npm_scope_after_a_word_break() {
     let world = CompletionWorld::new();
     fixture(
@@ -656,6 +702,27 @@ fn new_completion_bash_decodes_ansi_c_paths() {
         "[tools]\nripgrep = 'latest'\n",
         0o600,
     );
+    let control_path = world
+        .shell("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            r"printf '%s' $'config\c?local.toml'",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&control_path);
+    let control_path = std::str::from_utf8(&control_path.stdout).unwrap();
+    assert!(matches!(
+        control_path,
+        "config\x1flocal.toml" | "config\x7flocal.toml"
+    ));
+    fixture(
+        &world.cwd().join(control_path),
+        "[tools]\nripgrep = 'latest'\n",
+        0o600,
+    );
     let mut bash = world.session("bash", false);
     bash.expect(
         b"dots remove --path $'config\\tlocal.toml' rip\t",
@@ -664,6 +731,14 @@ fn new_completion_bash_decodes_ansi_c_paths() {
     bash.expect(
         b"dots remove --path=$'config\\011local.toml' rip\t",
         &["remove", "--path=config\tlocal.toml", "ripgrep"],
+    );
+    bash.expect(
+        b"dots remove --path $'config\\cIlocal.toml' rip\t",
+        &["remove", "--path", "config\tlocal.toml", "ripgrep"],
+    );
+    bash.expect(
+        b"dots remove --path $'config\\c?local.toml' rip\t",
+        &["remove", "--path", control_path, "ripgrep"],
     );
 }
 

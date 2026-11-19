@@ -75,6 +75,10 @@ impl World {
         &self.base
     }
 
+    pub fn boundary(&self) -> &Path {
+        self.base.parent().unwrap()
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
@@ -150,7 +154,7 @@ impl World {
 
     pub fn command(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
         // Git ignores a ceiling equal to its starting directory.
-        let boundary = self.base.parent().unwrap();
+        let boundary = self.boundary();
         let git_ceiling =
             env::join_paths([self.base.as_path(), boundary]).expect("valid Git ceiling paths");
         let mut command = Command::new(program);

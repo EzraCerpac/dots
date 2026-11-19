@@ -184,6 +184,7 @@ See [the 1.0 sync rules and receipt](docs/contract.md#dots-sync) for the order o
 ## Optional, later
 
 - `dots publish [--all | --bookmark NAME]` opens a pull request to `main` from a separate colocated JJ workspace of a configuration hosted on GitHub. Updating an existing pull request keeps its base.
+  Gitleaks' built-in allowlists can skip some binary and lock files in the outgoing file scan without reporting a skip.
 - `dots backup` saves a local checkpoint of this machine's encrypted app settings, then publishes it to a separate private repository. It reports publication only when the remote host branch contains the saved checkpoint. If reconciliation is still pending, the checkpoint stays local and backup points to `mise dot status`; if the readback cannot verify publication, whether it was published is unknown, even if a push happened, and backup says to check the private history remote. Both exit 1.
 - `dots restore` fetches those settings back after safety checks and never pushes. It may save encrypted undo checkpoints of the files it replaces locally; a later explicit `dots backup` that succeeds publishes them.
 - [`dots bootstrap`](docs/contract.md#dots-bootstrap) sets up the local machine. `dots remote HOST --profile P` sets up a machine over SSH and leaves its mise history settings alone.

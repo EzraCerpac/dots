@@ -117,8 +117,14 @@ Sync never force-pushes, skips validation or writes conflict markers into live f
 - When sync takes over or displaces an existing copied dotfile, it verifies the displaced file and creates the replacement only at an empty path.
   When another writer claims the path, sync leaves it alone and prints where the moved file is.
 - The original inode stays at a printed private path on the same filesystem, so an editor that still has it open can finish saving.
-- For a directory copy, sync verifies the bytes and permissions of each leaf it replaces; edited and unmanaged files stay.
-  When a leaf's deployed mode cannot be verified, it is updated only if its current mode can stay.
+- For a directory copy, mise stages the desired tree privately.
+  When sync would replace an existing file in a directory copy, it compares the file with the source previously deployed at that path.
+  If both bytes and permissions match, sync treats the file as deployed regardless of who created it and updates it to the new source without reporting it as kept.
+  If the bytes or verified permissions differ at the target, including a change detected after the initial comparison, sync leaves the file there and reports it as kept.
+  If sync detects an edit to the moved original before installing its replacement, it restores the edited original at the target when possible.
+  If the replacement is already installed or the original cannot be restored, sync keeps the original and its edits at the printed private recovery path.
+  When the deployed mode cannot be verified, sync updates the file only if its bytes match the previously deployed source and its current mode can stay.
+  Unmatched local files stay in place.
 - When recovery files cannot stay on the target's filesystem, sync reports the path and keeps both versions; a checkout whose Git metadata shares the file's filesystem resumes automatic capture.
 - Template and inline targets are installed by mise's own apply on the live files.
   mise 2026.11.9 can overwrite a file that another program creates between mise's planning and its installation, losing that file.

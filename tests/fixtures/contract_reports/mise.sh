@@ -37,9 +37,9 @@ case "${1-} ${2-} ${3-}" in
     'bootstrap dotfiles status')
         printf '{"files":[],"edits":[]}\n'
         ;;
-    'bootstrap dotfiles paths') printf '{"entries":[]}\n' ;;
+    'bootstrap dotfiles paths'|'bootstrap dotfiles --local') printf '{"entries":[],"invalid":[]}\n' ;;
     'bootstrap dotfiles save') exit 0 ;;
-    'config ls --json') printf '[]\n' ;;
+    'config ls --json') printf '[{"path":"%s/config.toml"}]\n' "$MISE_CONFIG_DIR" ;;
     '--version  ') printf '2026.11.9\n' ;;
     *)
         if [ "${1-}" = exec ]; then

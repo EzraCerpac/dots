@@ -11,26 +11,57 @@ fn isolated(world: &Path, program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", world.join("home"))
-        .env("XDG_CONFIG_HOME", world.join("xdg-config"))
-        .env("XDG_DATA_HOME", world.join("xdg-data"))
-        .env("XDG_STATE_HOME", world.join("cannot-create-state"))
-        .env("XDG_CACHE_HOME", world.join("xdg-cache"))
-        .env("CODEX_HOME", world.join("codex"))
-        .env("CLAUDE_CONFIG_DIR", world.join("claude"))
-        .env("MISE_CONFIG_DIR", world.join("mise-config"))
-        .env("MISE_DATA_DIR", world.join("mise-data"))
-        .env("MISE_STATE_DIR", world.join("mise-state"))
-        .env("MISE_CACHE_DIR", world.join("mise-cache"))
-        .env("MISE_SYSTEM_CONFIG_DIR", world.join("mise-system"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("JJ_CONFIG", world.join("jj"))
-        .env("TMPDIR", world.join("tmp"))
-        .env("DOTS_ROOT", world.join("checkout"))
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("MISE_OFFLINE", "1")
+        .env("MISE_AUTO_INSTALL", "0")
+        .env("MISE_EXEC_AUTO_INSTALL", "0")
+        .env("MISE_NOT_FOUND_AUTO_INSTALL", "0")
+        .env("MISE_AUTO_UPDATE", "0")
         .env("DOTS_SKILL_LINKS", "0")
         .current_dir(world.join("checkout"));
+    for (key, path) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_CONFIG_DIRS", "xdg-config"),
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_DATA_DIRS", "xdg-data"),
+        ("XDG_STATE_HOME", "cannot-create-state"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_RUNTIME_DIR", "tmp"),
+        ("CODEX_HOME", "codex"),
+        ("CLAUDE_CONFIG_DIR", "claude"),
+        ("GH_CONFIG_DIR", "gh"),
+        ("MISE_CONFIG_DIR", "mise-config"),
+        ("MISE_DATA_DIR", "mise-data"),
+        ("MISE_STATE_DIR", "mise-state"),
+        ("MISE_CACHE_DIR", "mise-cache"),
+        ("MISE_TMP_DIR", "tmp"),
+        ("MISE_INSTALLS_DIR", "mise-data/installs"),
+        ("MISE_INSTALL_STORE_DIR", "mise-data/store"),
+        ("MISE_DOWNLOADS_DIR", "mise-data/downloads"),
+        ("MISE_PLUGINS_DIR", "mise-data/plugins"),
+        ("MISE_SHIMS_DIR", "mise-data/shims"),
+        ("MISE_SHARED_INSTALL_DIRS", "mise-data/shared-installs"),
+        ("MISE_SYSTEM_DIR", "mise-system"),
+        ("MISE_SYSTEM_CONFIG_DIR", "mise-system"),
+        ("MISE_SYSTEM_CONFIG_FILE", "mise-system/config.toml"),
+        ("MISE_SYSTEM_DATA_DIR", "mise-system/data"),
+        ("MISE_SYSTEM_INSTALLS_DIR", "mise-system/data/installs"),
+        ("MISE_SYSTEM_SHIMS_DIR", "mise-system/data/shims"),
+        ("MISE_SYSTEM_PLUGINS_DIRS", "mise-system/data/plugins"),
+        ("MISE_CEILING_PATHS", ""),
+        ("GIT_CONFIG_GLOBAL", "gitconfig"),
+        ("GIT_CONFIG_SYSTEM", "system.gitconfig"),
+        ("GIT_CEILING_DIRECTORIES", ""),
+        ("GIT_TEMPLATE_DIR", "git-template"),
+        ("JJ_CONFIG", "jj"),
+        ("TMPDIR", "tmp"),
+        ("DOTS_ROOT", "checkout"),
+    ] {
+        cmd.env(key, world.join(path));
+    }
     cmd
 }
 
@@ -38,10 +69,23 @@ pub(super) fn git_fixture() -> (tempfile::TempDir, Ctx) {
     git_fixture_with_format("sha1")
 }
 
+fn require_shared_sync_tools(world: &Path) {
+    for (tool, version_arg) in [("mise", "--version"), ("gitleaks", "version")] {
+        let output = isolated(world, tool)
+            .arg(version_arg)
+            .output()
+            .unwrap_or_else(|error| panic!("shared sync fixture requires real {tool}: {error}"));
+        assert!(
+            output.status.success(),
+            "{tool} admission failed: {output:?}"
+        );
+    }
+}
+
 fn git_fixture_with_format(format: &str) -> (tempfile::TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let world = tmp.path().canonicalize().unwrap();
-    for directory in ["home", "checkout", "tmp", "jj"] {
+    for directory in ["home", "checkout", "tmp", "jj", "git-template"] {
         fs::create_dir(world.join(directory)).unwrap();
     }
     fs::write(
@@ -71,6 +115,7 @@ fn git_fixture_with_format(format: &str) -> (tempfile::TempDir, Ctx) {
         &format!("--object-format={format}"),
     ])
     .unwrap();
+    fs::create_dir_all(world.join("checkout/.git/hooks")).unwrap();
     git.get(["add", "config.toml"]).unwrap();
     (tmp, ctx)
 }
@@ -230,13 +275,11 @@ fn push_source_ignores_a_branch_named_like_the_verified_oid() {
 }
 
 #[test]
-#[ignore = "requires the hosted mise and gitleaks lane and real history checkpoint"]
 fn failed_capture_journal_still_shares_an_unrelated_edit_and_retries() {
     capture_failure_still_shares(super::dotfiles::CaptureFailure::Journal);
 }
 
 #[test]
-#[ignore = "requires the hosted mise and gitleaks lane and real history checkpoint"]
 fn cross_device_capture_still_shares_an_unrelated_edit_and_retries() {
     capture_failure_still_shares(super::dotfiles::CaptureFailure::Device);
 }
@@ -250,6 +293,7 @@ fn capture_failure_still_shares(fault: super::dotfiles::CaptureFailure) {
 
     let (fixture, mut ctx) = git_fixture();
     let world = fixture.path().canonicalize().unwrap();
+    require_shared_sync_tools(&world);
     let root = ctx.root.path();
     ctx.env.vars.insert(
         "MISE_TRUSTED_CONFIG_PATHS".into(),
@@ -351,6 +395,7 @@ fn shared_mise_fixture(declarations: &str) -> (tempfile::TempDir, Ctx) {
 fn shared_mise_fixture_with_format(declarations: &str, format: &str) -> (tempfile::TempDir, Ctx) {
     let (fixture, mut ctx) = git_fixture_with_format(format);
     let world = fixture.path().canonicalize().unwrap();
+    require_shared_sync_tools(&world);
     let root = ctx.root.path();
     for key in ["MISE_TRUSTED_CONFIG_PATHS", "MISE_CEILING_PATHS"] {
         ctx.env.vars.insert(key.into(), root.as_os_str().to_owned());
@@ -418,7 +463,6 @@ fn native_dotfile_apply(ctx: &Ctx) {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn absent_keeps_an_edited_copy_known_only_to_mise() {
     let (fixture, ctx) = shared_mise_fixture(
         "[dotfiles]\n'~/edited' = { mode = 'copy', source = 'source' }\n'~/clean' = { mode = 'copy', source = 'source' }\n",
@@ -466,7 +510,6 @@ fn absent_keeps_an_edited_copy_known_only_to_mise() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn sha256_preview_preserves_ignores_and_manifest_with_sha1_default() {
     let (fixture, mut ctx) = shared_mise_fixture_with_format(
         "[dotfiles]\n'~/tree' = { mode = 'copy', source = 'tree', manifest = 'git' }\n",
@@ -526,7 +569,6 @@ fn sha256_preview_preserves_ignores_and_manifest_with_sha1_default() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn validated_crlf_config_deploys_the_copy() {
     let (fixture, ctx) =
         shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");
@@ -557,7 +599,6 @@ fn validated_crlf_config_deploys_the_copy() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn ordinary_crlf_sources_deploy_as_checked_out() {
     let (fixture, ctx) = shared_mise_fixture(
         "[dotfiles]\n'~/copied' = { mode = 'copy', source = 'source' }\n'~/linked' = { mode = 'symlink', source = 'source' }\n",
@@ -633,7 +674,6 @@ fn ordinary_crlf_sources_deploy_as_checked_out() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn native_copy_deployment_supplies_the_provisional_baseline() {
     use crate::run::{Run, Sink};
     use std::os::unix::fs::PermissionsExt;
@@ -758,7 +798,6 @@ fn native_copy_deployment_supplies_the_provisional_baseline() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn rendered_variant_preserves_declaring_rules() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
@@ -781,7 +820,6 @@ fn rendered_variant_preserves_declaring_rules() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn adopted_directory_copy_keeps_a_locally_changed_leaf_mode() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -832,7 +870,6 @@ fn adopted_directory_copy_keeps_a_locally_changed_leaf_mode() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn create_only_sources_and_existing_targets_are_preserved() {
     let (fixture, ctx) = shared_mise_fixture(
         "[dotfiles]\n'~/copy' = { mode = 'copy', source = 'source', create_if_missing = true }\n'~/template' = { mode = 'template', source = 'template.tera', create_if_missing = true }\n'~/missing' = { mode = 'copy', source = 'source', create_if_missing = true }\n",
@@ -867,7 +904,6 @@ fn create_only_sources_and_existing_targets_are_preserved() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn a_flagged_live_source_is_never_deployed() {
     let (fixture, ctx) =
         shared_mise_fixture("[dotfiles]\n'~/deployed' = { mode = 'copy', source = 'source' }\n");
@@ -895,7 +931,6 @@ fn a_flagged_live_source_is_never_deployed() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn flagged_staged_entries_survive_sharing_the_clean_remainder() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -954,7 +989,6 @@ fn flagged_staged_entries_survive_sharing_the_clean_remainder() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn generated_copy_contents_are_published_on_the_next_sync() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
@@ -986,7 +1020,6 @@ pre-dotfiles = "printf 'generated\\n' > source"
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn rejected_group_blocks_its_dependent_by_group_name() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
@@ -1075,7 +1108,6 @@ fi
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn guarded_hook_replay_does_not_displace_a_competing_live_source() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1105,7 +1137,6 @@ pre-dotfiles = "git ls-files --error-unmatch source >/dev/null; printf 'generate
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn a_new_target_claimed_during_push_keeps_the_competing_bytes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1140,7 +1171,6 @@ fn a_new_target_claimed_during_push_keeps_the_competing_bytes() {
 }
 
 #[test]
-#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn failed_reload_remains_pending_after_a_completed_copy_write() {
     let (fixture, ctx) = shared_mise_fixture(
         r#"[dotfiles]
@@ -1210,6 +1240,69 @@ fn unconfirmed_push_record_retains_both_exact_tips_and_expected_absence() {
                 .contains("Compare refs/heads/dev")
         );
     }
+}
+
+#[test]
+fn sync_recovers_a_pending_configuration_before_classifying_origin() {
+    let (fixture, ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let git = Git::new(&ctx, ctx.root.path());
+    let config = git.root().join("config.toml");
+    let before = fixture_commit(&git, "before");
+    git.get(["branch", "main", &before]).unwrap();
+    let replacement = b"[vars]\ndots_profiles = 'default'\n# Recovered configuration\n";
+    fs::write(&config, replacement).unwrap();
+    git.get(["add", "config.toml"]).unwrap();
+    let after = fixture_commit(&git, "incoming configuration");
+    git.get(["reset", "--hard", &before]).unwrap();
+
+    let dir = git.root().join(".git");
+    super::checkout::begin(
+        &git,
+        &dir,
+        &super::checkout::index_snapshot(&dir).unwrap(),
+        &before,
+        &after,
+        true,
+    )
+    .unwrap();
+    let pending = dir.join("dots-sync-pending");
+    fs::rename(&config, pending.join("old-0")).unwrap();
+    assert!(!config.exists());
+    let sync = || {
+        let child = isolated(&world, std::env::current_exe().unwrap())
+            .env(RECEIPT_CHILD, "1")
+            .args([
+                "--exact",
+                "sync::tests::receipt_save_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        String::from_utf8(child.stdout).unwrap()
+    };
+    git.get(["symbolic-ref", "HEAD", "refs/heads/main"])
+        .unwrap();
+    let refused = sync();
+    assert!(refused.contains("HEAD on a dev branch"), "{refused}");
+    assert!(!refused.contains("local-only"));
+    assert!(pending.join("old-0").exists());
+    assert!(!config.exists());
+
+    git.get(["symbolic-ref", "HEAD", "refs/heads/dev"]).unwrap();
+    let recovered = sync();
+    assert!(
+        recovered.contains("Finished pending checkout"),
+        "{recovered}"
+    );
+    assert!(
+        recovered.contains("finished pending writes; add a remote"),
+        "{recovered}"
+    );
+    assert_eq!(fs::read(config).unwrap(), replacement);
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    assert!(!pending.exists());
 }
 
 #[test]
@@ -1297,5 +1390,125 @@ fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_recei
                 .any(|line| line.strip_prefix("Recovery copy at ") == backup.to_str())
         );
         assert_eq!(fs::read(backup).unwrap(), b"old working version");
+    }
+}
+
+#[test]
+fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
+    use std::os::unix::fs::MetadataExt;
+
+    for conflict in ["staged index", "late file"] {
+        let (fixture, ctx) = git_fixture();
+        let world = fixture.path().canonicalize().unwrap();
+        let git = Git::new(&ctx, ctx.root.path());
+        let early = git.root().join("alpha");
+        let late = git.root().join("zeta");
+        fs::write(&early, b"original alpha\n").unwrap();
+        fs::write(&late, b"original zeta\n").unwrap();
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let before = fixture_commit(&git, "private before");
+        fs::write(&early, b"incoming alpha\n").unwrap();
+        fs::write(&late, b"incoming zeta\n").unwrap();
+        git.get(["add", "alpha", "zeta"]).unwrap();
+        let after = fixture_commit(&git, "private after");
+        git.get(["reset", "--hard", &before]).unwrap();
+
+        let dir = git.root().join(".git");
+        super::checkout::begin(
+            &git,
+            &dir,
+            &super::checkout::index_snapshot(&dir).unwrap(),
+            &before,
+            &after,
+            true,
+        )
+        .unwrap();
+        // Enter the real checkout and stop only after alpha was replaced.
+        let interrupted = super::checkout::finish(&git, &dir, || {
+            fs::read(&early).is_ok_and(|bytes| bytes == b"incoming alpha\n")
+        });
+        assert!(interrupted.is_err());
+        let pending = dir.join("dots-sync-pending");
+        assert!(pending.join("started").is_file());
+        assert!(pending.join("done-0").is_file());
+        assert!(!pending.join("done-1").exists());
+        let original = pending.join("old-0");
+        assert_eq!(fs::read(&original).unwrap(), b"original alpha\n");
+
+        if conflict == "staged index" {
+            // Simulate the owner releasing its reserved lock to allow a real
+            // competing git add. Only release our fixture's hard-linked lock.
+            let lock = dir.join("index.lock");
+            let held = fs::metadata(&lock).unwrap();
+            let staged = fs::metadata(pending.join("index.after")).unwrap();
+            assert_eq!((held.dev(), held.ino()), (staged.dev(), staged.ino()));
+            fs::remove_file(lock).unwrap();
+            fs::write(&late, b"competing staged contents\n").unwrap();
+            git.get(["add", "zeta"]).unwrap();
+        }
+        fs::write(&late, b"competing live contents\n").unwrap();
+        let staging = git
+            .get(["ls-files", "--stage", "--", "alpha", "zeta"])
+            .unwrap();
+        let snapshot = super::checkout::index_snapshot(&dir).unwrap();
+        let expected_staged: &[u8] = if conflict == "staged index" {
+            b"competing staged contents\n"
+        } else {
+            b"original zeta\n"
+        };
+        assert_eq!(git.get(["show", ":zeta"]).unwrap(), expected_staged);
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+
+        let cli = |mode| {
+            let child = isolated(&world, std::env::current_exe().unwrap())
+                .env(RECEIPT_CHILD, mode)
+                .args([
+                    "--exact",
+                    "sync::tests::receipt_save_failure_child",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(child.status.success(), "{child:?}");
+            String::from_utf8(child.stdout).unwrap()
+        };
+        for receipt in [cli("1"), cli("replay")] {
+            assert!(
+                receipt.contains(&format!("recorded revisions {before} to {after}")),
+                "{receipt}"
+            );
+            assert!(
+                receipt.contains("reconcile the index and checkout"),
+                "{receipt}"
+            );
+            assert!(
+                receipt.contains("A guarded checkout is pending"),
+                "{receipt}"
+            );
+            assert!(receipt.contains("rerun dots sync"), "{receipt}");
+            assert_eq!(
+                receipt.contains("Kept a late edit"),
+                conflict == "late file",
+                "{receipt}"
+            );
+            assert!(
+                receipt
+                    .lines()
+                    .any(|line| { line.strip_prefix("Recovery copy at ") == original.to_str() }),
+                "{receipt}"
+            );
+        }
+        assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+        assert_eq!(super::checkout::index_snapshot(&dir).unwrap(), snapshot);
+        assert_eq!(
+            git.get(["ls-files", "--stage", "--", "alpha", "zeta"])
+                .unwrap(),
+            staging
+        );
+        assert_eq!(git.get(["show", ":zeta"]).unwrap(), expected_staged);
+        assert_eq!(fs::read(&early).unwrap(), b"incoming alpha\n");
+        assert_eq!(fs::read(&late).unwrap(), b"competing live contents\n");
+        assert_eq!(fs::read(original).unwrap(), b"original alpha\n");
+        assert!(pending.join("started").is_file());
     }
 }

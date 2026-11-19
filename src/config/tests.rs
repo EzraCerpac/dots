@@ -120,7 +120,7 @@ fn base_vars_keep_raw_strings_and_atomic_doc_edits_keep_the_referent_mode() {
     assert_eq!(vars.profiles, ["laptop", "server"]);
     assert_eq!(vars.self_updating_casks, ["one", "two"]);
     let mut doc = Doc::open(&config).unwrap();
-    doc.document["vars"]["dots_publish_on_behalf_of"] = toml_edit::value("Example");
+    doc.document["vars"]["dots_source_repo"] = toml_edit::value("example/dotfiles");
     doc.install().unwrap();
     assert!(fs::read_to_string(&referent).unwrap().starts_with(source));
     assert_eq!(fs::read_link(config).unwrap(), referent);

@@ -56,7 +56,6 @@ fn isolated(world: &Path, program: impl AsRef<std::ffi::OsStr>) -> Command {
         ("GIT_CONFIG_SYSTEM", "system.gitconfig"),
         ("GIT_CEILING_DIRECTORIES", ""),
         ("GIT_TEMPLATE_DIR", "git-template"),
-        ("JJ_CONFIG", "jj"),
         ("TMPDIR", "tmp"),
         ("DOTS_ROOT", "checkout"),
     ] {
@@ -85,7 +84,7 @@ fn require_shared_sync_tools(world: &Path) {
 fn git_fixture_with_format(format: &str) -> (tempfile::TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let world = tmp.path().canonicalize().unwrap();
-    for directory in ["home", "checkout", "tmp", "jj", "git-template"] {
+    for directory in ["home", "checkout", "tmp", "git-template"] {
         fs::create_dir(world.join(directory)).unwrap();
     }
     fs::write(

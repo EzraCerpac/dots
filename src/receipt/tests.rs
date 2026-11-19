@@ -119,7 +119,6 @@ pub(super) fn isolated_env(dir: &Path) -> Env {
         ("XDG_DATA_HOME", "data"),
         ("CODEX_HOME", "config/codex"),
         ("CLAUDE_CONFIG_DIR", "config/claude"),
-        ("JJ_CONFIG", "config/jj/config.toml"),
         ("GIT_CONFIG_GLOBAL", "config/git/config"),
         ("GIT_CONFIG_SYSTEM", "config/git/system"),
         ("DOTS_ROOT", "checkout"),

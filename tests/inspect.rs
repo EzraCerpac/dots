@@ -106,7 +106,15 @@ fn new_status_prints_missing_programs_and_unreadable_versions_before_config_erro
     assert!(
         stdout
             .lines()
-            .any(|line| line.contains("gh") && line.contains("found, version unavailable")),
+            .any(|line| line.trim_start().starts_with("gh ")
+                && line.contains("found, version unavailable")
+                && line.contains("init (remote offer)")),
+        "{stdout}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("jj ")),
         "{stdout}"
     );
     assert!(!stdout.contains("Agent skill links"), "{stdout}");

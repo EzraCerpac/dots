@@ -28,12 +28,12 @@ const PROGRAMS: &[Program] = &[
     Program {
         name: "git",
         version_arg: "--version",
-        used_by: "init, sync, up (sync), backup, restore, bootstrap, publish, add FILE",
+        used_by: "init, sync, up (sync), backup, restore, bootstrap, add FILE",
     },
     Program {
         name: "gitleaks",
         version_arg: "version",
-        used_by: "sync, up (sharing), publish, sync --last (patches)",
+        used_by: "sync, up (sharing), sync --last (patches)",
     },
     Program {
         name: "age",
@@ -53,12 +53,7 @@ const PROGRAMS: &[Program] = &[
     Program {
         name: "gh",
         version_arg: "--version",
-        used_by: "publish, init (remote offer)",
-    },
-    Program {
-        name: "jj",
-        version_arg: "--version",
-        used_by: "publish",
+        used_by: "init (remote offer)",
     },
     Program {
         name: "brew",

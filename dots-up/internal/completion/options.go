@@ -36,10 +36,6 @@ var commandOptions = map[string][]option{
 		{name: "--prune", description: "Remove stale dotfiles deployed by groups"},
 		{name: "--prompt-secrets", description: "Prompt for missing template secrets"},
 	},
-	"publish": {
-		{name: "--all", description: "Publish the unpublished setup stack", group: "publish"},
-		{name: "--bookmark", description: "Publish a private bookmark", group: "publish", value: "text"},
-	},
 	"restore": {{name: "--initialize-history", description: "Initialize settings history"}},
 	"atuin-login": {
 		{name: "--browser", description: "Log in through Atuin Hub"},

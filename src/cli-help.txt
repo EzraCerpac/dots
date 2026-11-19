@@ -17,7 +17,6 @@ Everyday:
   add REQUEST...        Install software or adopt a dotfile, and record it
   remove TARGET...      Uninstall software or restore an adopted dotfile
   test [ARGS...]        Run the configuration's tests/run
-  publish               Open a pull request from a JJ workspace
 
 New machines and private settings:
   init [DIR]            Create a configuration and its Git repository

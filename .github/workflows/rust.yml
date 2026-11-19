@@ -129,7 +129,7 @@ jobs:
           test "$("$mise_bin" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
           printf '%s\n' "${mise_bin%/*}" >> "$GITHUB_PATH"
           cd "$RUNNER_TEMP"
-          "$mise_bin" use --global node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest
+          "$mise_bin" use --global node@latest python@3.13 uv@latest age@latest gitleaks@latest
           # World replaces HOME and XDG paths. Give it installed binaries instead of shims.
           "$mise_bin" bin-paths >> "$GITHUB_PATH"
 
@@ -161,7 +161,7 @@ jobs:
           DOTS_TEST_ORACLE: v0.4.0
         run: |
           export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
-          for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
+          for tool in mise git bash zsh fish node python3 uv age age-keygen gitleaks jq gh rsync less; do
             command -v "$tool"
           done
           # Discover every integration suite. Libtest's default filter matches substrings.

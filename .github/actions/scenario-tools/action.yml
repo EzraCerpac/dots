@@ -8,7 +8,7 @@ runs:
       uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ${{ runner.temp }}/dots-scenario-tools
-        key: scenario-${{ runner.os }}-${{ runner.arch }}-${{ env.MISE_VERSION }}-${{ hashFiles('.github/scripts/setup-scenario-tools', '.github/scripts/setup-nextest', '.github/scripts/install-ubuntu-tool') }}
+        key: scenario-${{ runner.os }}-${{ runner.arch }}-${{ env.MISE_VERSION }}-${{ hashFiles('.github/scripts/setup-scenario-tools', '.github/scripts/setup-nextest', '.github/scripts/fetch-ubuntu-packages') }}
     - name: Install pinned tools
       if: steps.tools.outputs.cache-hit != 'true'
       shell: bash
@@ -19,7 +19,7 @@ runs:
         bash .github/scripts/setup-nextest "$prefix/bin"
         bash .github/scripts/setup-scenario-tools "$prefix"
         if [[ "$RUNNER_OS" == Linux ]]; then
-          bash .github/scripts/install-ubuntu-tool zsh "$prefix/ubuntu-packages"
+          bash .github/scripts/fetch-ubuntu-packages zsh "$prefix/ubuntu-packages"
         fi
     - name: Expose tools to subsequent steps
       shell: bash

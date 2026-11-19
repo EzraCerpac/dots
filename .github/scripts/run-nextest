@@ -33,5 +33,9 @@ case "$SUITE" in
     ;;
   */*) args=(--partition "slice:$SUITE") ;;
 esac
+# The Intel runner spends much of each shard waiting on Git and filesystem I/O.
+if [[ "${RUNNER_OS:-}" == macOS && "${RUNNER_ARCH:-}" == X64 ]]; then
+  args+=(--test-threads 6)
+fi
 cargo-nextest nextest run --profile ci --archive-file "$BUNDLE/tests.tar.zst" \
   --extract-to "$workspace" --workspace-remap "$workspace" "${args[@]}"

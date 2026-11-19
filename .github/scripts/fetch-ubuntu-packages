@@ -2,10 +2,7 @@
 set -euo pipefail
 
 tool=$1
-destination=${2:-}
-if [[ -z "$destination" ]] && command -v "$tool" >/dev/null; then
-  exit 0
-fi
+destination=$2
 
 # These jobs use Ubuntu 24.04. The default security mirror has stalled
 # installs on hosted runners. Fetch the same Noble packages by checksum.
@@ -16,17 +13,14 @@ case "$arch" in
   *) echo "Unsupported Ubuntu architecture: $arch" >&2; exit 2 ;;
 esac
 
-if [[ -n "$destination" ]]; then
-  mkdir -p "$destination"
-  cd "$destination"
-else
-  scratch=$(mktemp -d "$RUNNER_TEMP/ubuntu-packages.XXXXXX")
-  trap 'rm -rf -- "$scratch"' EXIT
-  cd "$scratch"
-fi
+mkdir -p "$destination"
+cd "$destination"
 
 download() {
   local path=$1 sha=$2 file=${1##*/} mirror
+  if [[ -f "$file" ]] && printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c; then
+    return
+  fi
   for mirror in "${mirrors[@]}"; do
     if curl -fsSL --connect-timeout 5 --max-time 15 "$mirror/pool/$path" -o "$file" &&
       printf '%s  %s\n' "$sha" "$file" | shasum -a 256 -c; then
@@ -54,8 +48,4 @@ case "$tool-$arch" in
 esac
 if [[ "$tool" == zsh ]]; then
   download main/z/zsh/zsh-common_5.9-6ubuntu2_all.deb 56d160585b417af0cc04d7372f74a3b734609d7cc43ef8ea6e92bfdfc27f77c3
-fi
-if [[ -z "$destination" ]]; then
-  sudo dpkg -i ./*.deb
-  command -v "$tool"
 fi

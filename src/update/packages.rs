@@ -378,7 +378,7 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
             self.run.issue(
                 id,
                 Issue::new(
-                    "Mac App Store updates need an available mas tool.",
+                    "Mac App Store updates need mas to be installed and available.",
                     "Install or repair mas, then rerun dots up --mas.",
                 ),
             );

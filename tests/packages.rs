@@ -526,6 +526,7 @@ for directory in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "
     "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$MISE_CONFIG_DIR" "$MISE_STATE_DIR" "$MISE_CACHE_DIR" \
     "$MISE_DATA_DIR" "$MISE_SYSTEM_CONFIG_DIR" "$MISE_SYSTEM_DATA_DIR" "$MISE_TMP_DIR" \
     "$MISE_DEFAULT_CONFIG_DIR" "$MISE_SYSTEM_DIR" "$MISE_PLUGINS_DIR" "$MISE_SYSTEM_PLUGINS_DIR" \
+    "$MISE_SYSTEM_PLUGINS_DIRS" "$MISE_SYSTEM_SHIMS_DIR" \
     "$MISE_DOWNLOADS_DIR" "$MISE_INSTALLS_DIR" "$MISE_SYSTEM_INSTALLS_DIR" "$MISE_INSTALL_STORE_DIR" \
     "$MISE_SHARED_INSTALL_DIR" "$MISE_SHIMS_DIR" "$MISE_SYSTEM_CONFIG_FILE"; do
     case "$directory" in "$FIXTURE_SANDBOX"|"$FIXTURE_SANDBOX"/*) :;;
@@ -615,7 +616,7 @@ esac"#,
     script(
         &bin(world).join("sudo"),
         r#"
-if [ "$*" = "-n true" ]; then
+if [ "$*" = "-n true" ] || [ "$*" = "-n -v" ]; then
     [ "${FIXTURE_SUDO:-0}" = 1 ]
 elif [ "$1" = "--" ]; then shift; exec "$@"
 else exec "$@"
@@ -696,7 +697,6 @@ fn unchanged_native_add_keeps_earlier_success_and_honors_versions() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_empty_host_never_calls_a_package_manager() {
     if !cfg!(target_os = "macos") {
         return;
@@ -711,7 +711,6 @@ fn unchanged_empty_host_never_calls_a_package_manager() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_routine_packages_respect_exception_holds() {
     let world = fixture(
         "\n[bootstrap.packages]\n\"apt:held\" = \"latest\"\n\"apt:regular\" = \"latest\"\n",
@@ -738,7 +737,6 @@ fn unchanged_routine_packages_respect_exception_holds() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_cask_discovery_respects_toml_forms_profiles_and_filters() {
     if !cfg!(target_os = "macos") {
         return;
@@ -779,7 +777,6 @@ fn unchanged_cask_discovery_respects_toml_forms_profiles_and_filters() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_app_store_requires_opt_in_and_authorization() {
     if !cfg!(target_os = "macos") {
         return;
@@ -804,7 +801,6 @@ fn unchanged_app_store_requires_opt_in_and_authorization() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_resolves_bare_packages_and_respects_holds() {
     if !cfg!(target_os = "macos") {
         return;
@@ -833,7 +829,6 @@ fn unchanged_mas_resolves_bare_packages_and_respects_holds() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_tool_formula_keeps_its_normal_brew_pass() {
     if !cfg!(target_os = "macos") {
         return;
@@ -871,7 +866,6 @@ fn no_path_mas(world: &World) -> FixtureCommand<'_> {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_defers_when_the_tool_and_brew_are_unavailable() {
     if !cfg!(target_os = "macos") {
         return;
@@ -890,7 +884,6 @@ fn unchanged_mas_defers_when_the_tool_and_brew_are_unavailable() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_can_use_the_brew_tool_outside_path() {
     if !cfg!(target_os = "macos") {
         return;
@@ -980,7 +973,7 @@ fn unchanged_status_and_plan_do_not_probe_the_app_store() {
 }
 
 #[test]
-#[ignore = "P-04 and P-08"]
+#[ignore = "P-08"]
 fn unchanged_add_sync_up_and_repeat() {
     let remote_config = "dots_source_repo = \"fixture/packages\"\n";
     let a = fixture(remote_config);

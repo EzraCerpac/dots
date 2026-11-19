@@ -809,6 +809,91 @@ pre-dotfiles = "printf 'generated\\n' > source"
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn rejected_variant_blocks_its_dependent_by_declaration_name() {
+    let (fixture, ctx) = shared_mise_fixture(
+        r#"[dotfiles]
+'~/predecessor-alias' = { mode = "copy", source = "predecessor.txt", variants = [{ profile = "default", target = "~/predecessor" }] }
+'~/consumer' = { mode = "copy", source = "consumer.txt", depends = ["~/predecessor-alias"] }
+'~/independent' = { mode = "copy", source = "independent.txt" }
+[bootstrap.hooks]
+pre-dotfiles = '''
+if test -e "$HOME/reject"; then
+    sed 's/source = "predecessor.txt"/source = "other.txt"/' config.toml > new-config
+    mv new-config config.toml
+fi
+'''
+"#,
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    for name in ["predecessor", "consumer", "independent", "other"] {
+        fs::write(
+            root.join(format!("{name}.txt")),
+            format!("original {name}\n"),
+        )
+        .unwrap();
+    }
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "dependency alias fixture");
+    let first = shared_mise_sync(&ctx);
+    assert!(first.issues.is_empty(), "{:?}", first.issues);
+    let home = fixture.path().join("home");
+    assert_eq!(
+        fs::read(home.join("predecessor")).unwrap(),
+        b"original predecessor\n"
+    );
+    assert_eq!(
+        fs::read(home.join("consumer")).unwrap(),
+        b"original consumer\n"
+    );
+    assert!(!home.join("predecessor-alias").exists());
+
+    fs::write(home.join("reject"), "").unwrap();
+    for name in ["predecessor", "consumer", "independent"] {
+        fs::write(
+            root.join(format!("{name}.txt")),
+            format!("updated {name}\n"),
+        )
+        .unwrap();
+    }
+    let receipt = shared_mise_sync(&ctx);
+    assert!(
+        receipt.issues.iter().any(|issue| {
+            issue.diagnostic.contains("validated selector changed")
+                && issue.diagnostic.contains("predecessor")
+        }),
+        "{:?}",
+        receipt.issues
+    );
+    assert!(
+        receipt.issues.iter().any(|issue| {
+            issue.diagnostic.contains("dependency was blocked")
+                && issue.diagnostic.contains("consumer")
+        }),
+        "{:?}",
+        receipt.issues
+    );
+    assert!(
+        fs::read_to_string(root.join("config.toml"))
+            .unwrap()
+            .contains("source = \"other.txt\"")
+    );
+    assert_eq!(
+        fs::read(home.join("predecessor")).unwrap(),
+        b"original predecessor\n"
+    );
+    assert_eq!(
+        fs::read(home.join("consumer")).unwrap(),
+        b"original consumer\n"
+    );
+    assert_eq!(
+        fs::read(home.join("independent")).unwrap(),
+        b"updated independent\n"
+    );
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn guarded_hook_replay_does_not_displace_a_competing_live_source() {
     use std::os::unix::fs::PermissionsExt;
 

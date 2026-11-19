@@ -648,11 +648,30 @@ impl Copies {
         } = &validated.apply;
         let mut jobs = BTreeMap::new();
         let mut results = BTreeMap::new();
+        let mut planned_paths = BTreeSet::new();
+        let mut group_members = BTreeMap::<String, Vec<PathBuf>>::new();
         for target in targets {
             if matches!(target.mode.as_str(), "track" | "track-local") {
                 continue;
             }
             let path = absolute_target(run, &target.target)?;
+            planned_paths.insert(path.clone());
+            let declaration = configs.definition(run, target, &path);
+            let group = declaration
+                .and_then(|decl| decl.group)
+                .or_else(|| configs.group(run, target, &path));
+            for name in [
+                group.map(|(name, _)| name),
+                declaration.map(|decl| decl.name),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                group_members
+                    .entry(name.to_owned())
+                    .or_default()
+                    .push(path.clone());
+            }
             let Some(selected) = active
                 .iter()
                 .find(|selected| selected.matches(target, hook_permissions))
@@ -666,11 +685,7 @@ impl Copies {
                 results.insert(path, false);
                 continue;
             };
-            let declaration = configs.definition(run, target, &path);
             let definition = declaration.map(|decl| decl.item.clone());
-            let group = declaration
-                .and_then(|decl| decl.group)
-                .or_else(|| configs.group(run, target, &path));
             if configs.declaration_signature(run, target, &path, hook_permissions)
                 != active_configs.declaration_signature(run, selected, &path, hook_permissions)
             {
@@ -699,30 +714,11 @@ impl Copies {
                 .filter_map(|item| item.get("depends"))
                 .flat_map(strings)
                 .collect::<Vec<_>>();
-            jobs.insert(
-                path,
-                (
-                    selected,
-                    definition,
-                    depends,
-                    group.map(|(name, _)| name.to_owned()),
-                    declaration.map(|decl| decl.name.to_owned()),
-                ),
-            );
+            jobs.insert(path, (selected, definition, depends));
         }
 
         let mut observed = validated.apply.observed.clone();
         observed.append(&mut self.observed);
-        let all_jobs = jobs.keys().cloned().collect::<BTreeSet<_>>();
-        let mut group_members = BTreeMap::<String, Vec<PathBuf>>::new();
-        for (path, (_, _, _, group, declaration)) in &jobs {
-            for name in [group, declaration].into_iter().flatten() {
-                group_members
-                    .entry(name.clone())
-                    .or_default()
-                    .push(path.clone());
-            }
-        }
         let dependencies = |names: &[String], current: &Path| {
             names
                 .iter()
@@ -757,7 +753,7 @@ impl Copies {
             }
             let next = jobs
                 .iter()
-                .find(|(path, (_, _, deps, _, _))| {
+                .find(|(path, (_, _, deps))| {
                     dependencies(deps, path)
                         .iter()
                         .all(|dep| !jobs.contains_key(dep))
@@ -771,7 +767,7 @@ impl Copies {
                 );
                 break;
             };
-            let (target, definition, depends, _, _) = jobs.remove(&path).expect("job was present");
+            let (target, definition, depends) = jobs.remove(&path).expect("job was present");
             let waiting_for = dependencies(&depends, &path);
             if waiting_for
                 .iter()
@@ -807,7 +803,7 @@ impl Copies {
                     target,
                     definition.as_ref(),
                     validated,
-                    &all_jobs,
+                    &planned_paths,
                     &sealed_sources,
                     former_directory_leaf,
                 )
@@ -975,7 +971,7 @@ impl Copies {
         target: &Target,
         definition: Option<&Item>,
         validated: &Validated,
-        all_jobs: &BTreeSet<PathBuf>,
+        planned_paths: &BTreeSet<PathBuf>,
         sealed_sources: &BTreeSet<PathBuf>,
         former_directory_leaf: bool,
     ) -> io::Result<bool> {
@@ -1047,7 +1043,7 @@ impl Copies {
                         continue;
                     }
                     let path = destination.join(relative);
-                    if !all_jobs.contains(&path) {
+                    if !planned_paths.contains(&path) {
                         desired.insert(path, image);
                     }
                 }

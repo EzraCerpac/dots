@@ -87,7 +87,7 @@ If the step fails, its report gives the exit status and next action and says “
 In concise output, including headless and `--plain` updates, the child reads the caller's stdin and its output goes to a private log.
 A failure includes the last lines of that log. With `--verbose`, the output is also displayed as it arrives.
 
-If you run `dots` directly as a terminal session leader without a job-control shell, Ctrl-Z suspends it until another process sends `SIGCONT`.
+If Ctrl-Z suspends `dots` in a session without a job-control shell, send `SIGCONT` to the `dots` process from another session to resume it.
 
 ### Update hooks
 

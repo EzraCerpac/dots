@@ -1,6 +1,6 @@
 # dots
 
-[README.md](README.md) describes the manager and its commands, and [the contract](docs/contract.md) what 1.0 promises.
+[README.md](README.md) describes the manager and its commands, and [the contract](docs/contract.md) what 0.5 promises.
 
 Run the Rust tests with `cargo test --locked`, or a focused set with `cargo test --locked FILTER`, using the Rust that `mise.toml` pins; `mise run test` does the same.
 `dots test` is different: it runs a configuration's own `tests/run`, not this repository's tests.

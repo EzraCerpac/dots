@@ -907,7 +907,7 @@ fn finish_pending(
                     RERUN,
                 );
             }
-            if let Some((before, after)) = error.recorded_revisions {
+            if let Some((before, after)) = error.recorded_revisions.as_deref() {
                 return Err(Note(
                     format!("A guarded checkout is pending; sync kept your files (recorded revisions {before} to {after})").into(),
                     "Preserve your edits, reconcile the index and checkout with the recorded revisions and any recovery copies, then rerun dots sync.",

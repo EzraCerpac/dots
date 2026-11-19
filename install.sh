@@ -51,43 +51,40 @@ find_mise() {
 
 # shellcheck disable=SC2016
 adopt='
-mise=$1 dots=$2 root=$3 source=$4 profile=$5
-export MISE_CONFIG_DIR="$root" MISE_GLOBAL_CONFIG_FILE= MISE_CONFIG_FILE= MISE_HISTORY_ENABLED=0
-set -- "$mise" -C "$HOME" bootstrap --skip-dirty --adopt "$source"
-if [ -e "$root/.git" ]; then
-    origin=$(unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG
-        git -C "$root" config --local --get-all remote.origin.url 2>/dev/null) || origin=
-    case "$origin" in
-        *://*@*)
-            # An equivalent SSH URI is already recorded. Bootstrap in place
-            # without sending the URI back to mise or changing the origin.
-            case "$source" in
-                *@*:/?*|*@*:~/*|git@github.com:?*)
-                    repo=${source#*:}
-                    expected=ssh://${source%%:*}/${repo#/}
-                    [ "$origin" = "$expected" ] || origin= ;;
-                *) origin= ;;
-            esac
-            if [ -z "$origin" ]; then
-                printf "dots installer: the saved origin does not match --from.\n" >&2
-                exit 2
-            fi
-            root=$(cd -P "$root" && pwd -P)
-            case "$root" in
-                *:*) printf "dots installer: the checkout path cannot contain a colon.\n" >&2; exit 2 ;;
-            esac
-            export MISE_TRUSTED_CONFIG_PATHS=${MISE_TRUSTED_CONFIG_PATHS:+$MISE_TRUSTED_CONFIG_PATHS:}$root
-            set -- "$mise" -C "$root" bootstrap --skip-dirty ;;
-    esac
+mise=$1 dots=$2 root=$3 source=$4 profile=$5 retry=$6
+case "$source" in *:*) ;; *) source=https://github.com/$source ;; esac
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG GIT_INDEX_FILE
+unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+if [ ! -e "$root/.git" ]; then
+    git clone -- "$source" "$root"
 fi
-if [ -n "$profile" ]; then
-    if [ -e "$root/miserc.toml" ] || [ -e "$root/config.local.toml" ]; then
-        "$dots" __check-bootstrap-profile "$profile"
-    fi
-    export SETUP_PROFILE="$profile"
-    set -- "$@" --env "$profile"
+origin=$(git -C "$root" config --local --get-all remote.origin.url 2>/dev/null) || origin=
+case "$source" in
+    https://github.com/*) source=${source%.git}; origin=${origin%.git} ;;
+    *@*:/?*|*@*:~/*|git@github.com:?*)
+        repo=${source#*:}
+        expected=ssh://${source%%:*}/${repo#/}
+        if [ "$origin" = "$expected" ]; then origin=$source; fi ;;
+esac
+if [ "$origin" != "$source" ]; then
+    printf "dots installer: the saved origin does not match --from.\n" >&2
+    exit 2
 fi
-exec "$@"
+cd -P "$root"
+root=$PWD
+case "$root" in *:*) printf "dots installer: the checkout path cannot contain a colon.\n" >&2; exit 2 ;; esac
+export DOTS_ROOT="$root" MISE_CONFIG_DIR="$root" MISE_GLOBAL_CONFIG_FILE= MISE_CONFIG_FILE= MISE_HISTORY_ENABLED=0
+if selected=$("$dots" __check-bootstrap-profile "$profile"); then
+    export SETUP_PROFILE="$selected"
+else
+    status=$?
+    if [ -n "$selected" ]; then printf "Rerun with a declared profile:\n%s%s\n" "$retry" "$selected" >&2; fi
+    exit "$status"
+fi
+export MISE_TRUSTED_CONFIG_PATHS=${MISE_TRUSTED_CONFIG_PATHS:+$MISE_TRUSTED_CONFIG_PATHS:}$root
+"$mise" bootstrap --skip-dirty --env "$selected"
+"$dots" __check-bootstrap-profile "$selected" >/dev/null
+"$dots" bootstrap persist-selected
 '
 
 # Keep separators so the first headless init continuation fits on one line.
@@ -149,7 +146,6 @@ main() {
         esac
     done
     [ -n "$source" ] || [ -z "$profile" ] || fail "--profile requires --from."
-    case "$profile" in -*|*[!a-z0-9-]*) fail "invalid profile name." ;; esac
     case "$version" in *[!a-zA-Z0-9._+-]*) fail "invalid version." ;; esac
     case "$(uname -s):$(uname -m)" in
         Darwin:x86_64|Darwin:amd64|Darwin:arm64|Darwin:aarch64|\
@@ -187,7 +183,14 @@ main() {
     dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
     setup_path=${dots%/*}:${mise%/*}:$PATH
     if [ -n "$source" ]; then
-        set -- sh -ec "$adopt" sh "$mise" "$dots" "$root" "$source" "$profile"
+        if [ -n "$archive" ]; then set -- --archive "$archive"; fi
+        retry=$(
+            printf 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | '
+            for arg in env "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --from "$source" --version "$version" "$@" --profile; do
+                quote "$arg"; printf ' '
+            done
+        )
+        set -- sh -ec "$adopt" sh "$mise" "$dots" "$root" "$source" "$profile" "$retry"
     else
         set -- "$dots" init
     fi

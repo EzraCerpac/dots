@@ -1,12 +1,13 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::libc;
 
-use crate::support::FixtureCommand;
+use crate::support::{FixtureCommand, World};
 
 fn check(result: libc::c_int) -> io::Result<()> {
     if result == -1 {
@@ -49,6 +50,73 @@ pub fn foreground_terminal(command: &mut FixtureCommand<'_>) -> File {
         });
         terminal
     }
+}
+
+pub fn headless_session(command: &mut FixtureCommand<'_>) {
+    // A redirected stdin alone can still leave a controlling terminal.
+    command.stdin(Stdio::null());
+    unsafe {
+        command.pre_exec(|| check(libc::setsid()));
+    }
+}
+
+#[derive(Debug)]
+pub struct ProcessState {
+    state: char,
+    pub parent: libc::pid_t,
+    pub group: libc::pid_t,
+}
+
+impl ProcessState {
+    pub fn zombie(&self) -> bool {
+        self.state == 'Z'
+    }
+
+    fn parse(fields: &str) -> Self {
+        let mut fields = fields.split_whitespace();
+        Self {
+            state: fields.next().unwrap().chars().next().unwrap(),
+            parent: fields.next().unwrap().parse().unwrap(),
+            group: fields.next().unwrap().parse().unwrap(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_state(world: &World, pid: libc::pid_t) -> Option<ProcessState> {
+    // Darwin proc_pidinfo can omit zombies while kernel ps still lists them.
+    let result = world
+        .command("/bin/ps")
+        .args(["-o", "state=,ppid=,pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    if result.status.code() == Some(1) && result.stdout.is_empty() && result.stderr.is_empty() {
+        return None;
+    }
+    assert!(
+        result.status.success(),
+        "could not read fixture process state"
+    );
+    Some(ProcessState::parse(
+        std::str::from_utf8(&result.stdout).unwrap(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_state(_world: &World, pid: libc::pid_t) -> Option<ProcessState> {
+    // /proc is available on the Linux CI images, including BusyBox Alpine.
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return None;
+        }
+        Err(error) => panic!("could not read fixture process state: {error}"),
+    };
+    let (_, fields) = stat.rsplit_once(") ").expect("Linux process stat fields");
+    Some(ProcessState::parse(fields))
 }
 
 // Peek without reaping. The fixture PID remains reserved while we clean up its session.

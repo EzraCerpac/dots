@@ -105,7 +105,7 @@ fn with_report(ctx: &Ctx, command: Report, action: impl FnOnce(Run<'_>) -> u8) -
             run,
             error,
             &format!(
-                "Create a configuration with dots init or set DOTS_ROOT, then rerun dots {}.",
+                "Create a configuration with dots init or set DOTS_ROOT, then rerun your original dots {} command with the same arguments.",
                 command.name()
             ),
         );

@@ -670,34 +670,30 @@ fn synchronize(
 
         let blocked = checkout::preflight(&scratch.git, &approved, &local_tree, &merged_tree)
             .or_note("Could not verify incoming checkout paths", RERUN)?;
-        let sharing = if heads.dev() == Some(merged.as_str()) {
-            None
-        } else {
-            let published_tree = match heads.dev() {
-                Some(head) => git
-                    .tree(head)
+        let published_tree = match heads.dev() {
+            Some(head) if head == merged => Cow::Borrowed(&merged_tree),
+            Some(head) => Cow::Owned(
+                git.tree(head)
                     .or_note("Could not verify the published dev tree", GIT)?,
-                None => git::Tree::new(),
-            };
-            Some(ChangeGroup::new(
+            ),
+            None => Cow::Owned(git::Tree::new()),
+        };
+        let sharing = (heads.dev() != Some(merged.as_str())).then(|| {
+            ChangeGroup::new(
                 heads.dev().map(str::to_owned),
                 Some(merged.clone()),
                 changed(&published_tree, &merged_tree),
-            ))
-        };
-        let already_shared = if let Some(tip) = heads.dev()
+            )
+        });
+        let peer_published_snapshot = if let Some(tip) = heads.dev()
             && !receipt.saved.is_empty()
-            && git.ancestor(&approved, tip).or_note(
+        {
+            git.ancestor(&approved, tip).or_note(
                 "Could not verify the saved snapshot against origin/dev",
                 GIT,
-            )? {
-            receipt
-                .saved
-                .iter()
-                .map(|group| group.paths.len())
-                .sum::<usize>()
+            )?
         } else {
-            0
+            false
         };
         active(run)?;
         dense_index(&git)?;
@@ -717,6 +713,11 @@ fn synchronize(
             }
         };
         if pushed {
+            let already_shared = if peer_published_snapshot {
+                exclude_peer_shared_paths(receipt, &local_tree, &published_tree, &merged_tree)
+            } else {
+                0
+            };
             let outcome = if let Some(sharing) = sharing {
                 receipt.shared.push(sharing);
                 "pushed dev"
@@ -726,9 +727,6 @@ fn synchronize(
             receipt.outcome = if already_shared == 0 {
                 outcome.into()
             } else {
-                // The snapshot was already present in the verified remote tip.
-                // An ordinary push still reports the files saved locally.
-                receipt.saved.clear();
                 let unit = if already_shared == 1 { "file" } else { "files" };
                 format!("already shared {already_shared} {unit} · {outcome}")
             };
@@ -836,6 +834,25 @@ fn synchronize(
         "NOT SHARED: the conditional dev push was rejected",
         "Check origin, credentials and remote branch policies, then rerun dots sync.",
     ))
+}
+
+fn exclude_peer_shared_paths(
+    receipt: &mut Receipt,
+    local: &git::Tree,
+    published: &git::Tree,
+    confirmed: &git::Tree,
+) -> usize {
+    let mut already_shared = 0;
+    receipt.saved.retain_mut(|group| {
+        group.paths.retain(|path| {
+            let entry = local.get(path);
+            let shared = published.get(path) == entry && confirmed.get(path) == entry;
+            already_shared += usize::from(shared);
+            !shared
+        });
+        !group.paths.is_empty()
+    });
+    already_shared
 }
 
 fn dense_index(git: &Git<'_>) -> Result<(), Note> {

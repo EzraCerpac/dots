@@ -745,6 +745,43 @@ sync_case!(
     }
 );
 
+#[test]
+fn new_peer_revert_keeps_the_reverted_path_in_saved_locally() {
+    let f = Repo::new();
+    let published = f.scratch.join("peer-published");
+    let hook = f.validation_hook(&format!(
+        "if [ -e {published} ]; then exit 0; fi\n\
+         git -C {peer} fetch -q {local} dev\n\
+         git -C {peer} push -q origin FETCH_HEAD:dev\n\
+         git -C {peer} rev-parse FETCH_HEAD > {published}\n\
+         git -C {peer} reset -q --hard FETCH_HEAD\n\
+         git -C {peer} rm -q -- notes\n\
+         git -C {peer} commit -qm 'Revert notes only'\n\
+         git -C {peer} push -q origin HEAD:dev",
+        published = sh(&published),
+        peer = sh(&f.b),
+        local = sh(&f.a),
+    ));
+    f.write(&f.a, "notes", "saved before peer revert\n");
+    f.write(&f.a, "peer-kept", "still at the published tip\n");
+    let live = f.sync_env(&f.a, &[("FIXTURE_VALIDATE", hook.to_str().unwrap())]);
+    let replay = f.replay(&f.a);
+    let published = read(&published).trim().to_owned();
+    assert_ne!(published, f.remote());
+    f.check_ancestor(&published, "dev");
+    assert_eq!(f.blob(&published, "notes"), "saved before peer revert");
+    assert_eq!(f.blob("dev", "peer-kept"), "still at the published tip");
+    assert!(!f.tree().lines().any(|path| path == "notes"));
+    assert_eq!(f.tip(&f.a), f.remote());
+    for receipt in [live, replay] {
+        has(&receipt, "already shared 1 file");
+        has(&receipt, "saved 1 locally");
+        has(&receipt, "Saved locally\n  notes");
+        absent(&receipt, "peer-kept");
+        absent(&receipt, "Shared on dev");
+    }
+}
+
 fn failing_apply_fixture(f: &Repo) -> (PathBuf, PathBuf) {
     f.write(
         &f.a,

@@ -3,14 +3,14 @@
 `dots` keeps your tools, native packages and dotfiles in one ordinary [mise](https://mise.jdx.dev) configuration, and `dots up` brings a machine up to date with it in one command.
 An optional Git remote shares that configuration between your machines, and `dots sync` scans your changes for secrets before it pushes them.
 
-> **TODO (A-03):** Record the integrated 1.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal.
+<!-- TODO (A-03): Record the integrated 1.0 binary running `dots init`, `dots add` and a step-by-step `dots up` in the terminal. -->
 
 ## Install
 
 For the local quickstart on macOS, Linux or WSL, install mise 2026.11.8 or newer and Git.
 Choose one way to install the self-contained `dots` binary.
 
-> **TODO (D-01, C-01, G-2):** Verify these alternatives against the published 1.0 artifacts. The current tap installs 0.4.0.
+<!-- TODO (D-01, C-01, G-2): Verify these alternatives against the published 1.0 artifacts. The current tap installs 0.4.0. -->
 
 **With mise**, activate mise in your shell or add its shims to your `PATH`.
 
@@ -108,7 +108,7 @@ Details and logs · dots up --last
 
 </details>
 
-> **TODO (I-01):** Replace this output with the released 1.0 binary's once it exists.
+<!-- TODO (I-01): Replace this output with the released 1.0 binary's once it exists. -->
 
 `dots init` sets up the configuration:
 

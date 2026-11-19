@@ -4901,6 +4901,45 @@ fn new_flagged_copy_declaration_stays_local_while_other_edits_share() {
 }
 
 #[test]
+fn new_flagged_retarget_restores_the_published_declaration() {
+    let mut f = Repo::new();
+    f.mise = f.mise_real.clone().expect("real mise on fixture PATH");
+    script(&f.tools.join("gitleaks"), FLAG_SCANNER);
+    let original = format!(
+        "{}\n[dotfiles]\n'~/.retarget' = {{ source = 'original', mode = 'copy' }}\n",
+        f.config
+    );
+    f.write(&f.a, "original", "published bytes\n");
+    f.write(&f.a, "config.toml", &original);
+    let before = f.commit(&f.a, "Publish original declaration");
+    f.git(&f.a, &["push", "origin", "dev"]);
+
+    let retarget = format!(
+        "{}\n# unrelated edit\n",
+        original.replace("source = 'original'", "source = 'held'")
+    );
+    f.write(&f.a, "config.toml", &retarget);
+    f.write(&f.a, "held", "FIXTURE_SCAN_MATCH\n");
+    f.write(&f.a, "fine", "ordinary edit\n");
+    let receipt = f.sync(&f.a);
+    has(&receipt, "held:1");
+    absent(&receipt, "FIXTURE_SCAN_MATCH");
+    assert!(
+        !f.git(&f.origin, &["rev-list", "--objects", "--all"])
+            .lines()
+            .any(|line| line.ends_with(" held"))
+    );
+    assert_eq!(read(&f.a.join("held")), "FIXTURE_SCAN_MATCH\n");
+    assert_eq!(read(&f.a.join("config.toml")), retarget);
+    assert_ne!(f.remote(), before, "{receipt}");
+    let shared = f.blob("dev", "config.toml");
+    has(&shared, "source = 'original'");
+    has(&shared, "# unrelated edit");
+    absent(&shared, "source = 'held'");
+    assert_eq!(f.blob("dev", "fine"), "ordinary edit");
+}
+
+#[test]
 fn new_sync_reports_the_runtime_mise_version_error_once() {
     let f = Repo::new();
     script(&f.mise, "printf '2026.11.7\\n'");

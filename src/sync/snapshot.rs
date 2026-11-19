@@ -209,7 +209,10 @@ impl<'a> Scratch<'a> {
             };
             let omit: Vec<_> = declarations
                 .iter()
-                .filter(|(target, _)| !old.is_some_and(|table| table.contains_key(target)))
+                .filter(|(target, item)| {
+                    old.and_then(|table| table.get(target))
+                        .is_none_or(|previous| previous.to_string() != item.to_string())
+                })
                 .filter(|(_, item)| names_source(item, self.live.root(), home, rejected))
                 .map(|(target, _)| target.to_owned())
                 .collect();
@@ -222,7 +225,11 @@ impl<'a> Scratch<'a> {
                 continue;
             }
             for target in omit {
-                declarations.remove(&target);
+                if let Some(previous) = old.and_then(|table| table.get(&target)) {
+                    declarations.insert(&target, previous.clone());
+                } else {
+                    declarations.remove(&target);
+                }
             }
             if declarations.is_empty() && old.is_none() {
                 doc.remove("dotfiles");

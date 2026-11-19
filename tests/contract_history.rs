@@ -232,6 +232,18 @@ exec git "$@"
             .unwrap()
     }
 
+    fn update_hook_marker(&self) -> PathBuf {
+        write(
+            &self
+                .world
+                .root()
+                .join("dots/hooks/update.d/50-History-guard"),
+            "#!/bin/sh\nprintf 'hook ran\\n' > \"$HOME/history-update-hook\"\n",
+            0o755,
+        );
+        self.world.home().join("history-update-hook")
+    }
+
     fn history_store(&self) -> PathBuf {
         let command = self.dots();
         let state = command
@@ -529,15 +541,17 @@ fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
     assert_history_calls(&h, &["save", "sync"]);
 
     fs::write(&h.log, "").unwrap();
-    expect(
-        &h.world
-            .git()
-            .args(["config", "--global", "--add", &key, &other])
-            .output()
-            .unwrap(),
-        0,
-        &[],
-    );
+    for url in [&other, &state] {
+        expect(
+            &h.world
+                .git()
+                .args(["config", "--global", "--add", &key, url])
+                .output()
+                .unwrap(),
+            0,
+            &[],
+        );
+    }
     expect(&h.backup(&inventory, effective), 2, &["destination"]);
     assert_history_calls(&h, &[]);
 }
@@ -545,10 +559,12 @@ fn new_backup_accepts_a_local_state_url_and_checks_every_push_url() {
 #[test]
 fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
     let h = History::new();
+    let hook = h.update_hook_marker();
     h.tracked_file();
     h.declarations(&[TRACKED], None, false);
     expect(&h.up(&h.inventory(&[TRACKED], None)), 1, &["checkpoint"]);
     assert_history_calls(&h, &[]);
+    assert!(!hook.exists());
     assert!(
         !h.log().lines().any(|line| line == "install"),
         "{}",
@@ -559,10 +575,12 @@ fn unchanged_up_stops_before_updates_when_the_checkpoint_is_unsafe() {
 #[test]
 fn unchanged_up_saves_encrypted_entries_twice() {
     let h = History::new();
+    let hook = h.update_hook_marker();
     h.tracked_file();
     h.declarations(&[TRACKED], None, true);
     expect(&h.up(&h.inventory(&[TRACKED], None)), 0, &[]);
     assert_history_calls(&h, &["save", "save"]);
+    assert_eq!(fs::read_to_string(hook).unwrap(), "hook ran\n");
 }
 
 #[test]

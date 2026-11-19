@@ -1,0 +1,66 @@
+name: Set up pinned Rust
+description: Install the repository toolchain and restore the target's Cargo cache
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  components:
+    description: Comma-delimited rustup components
+    default: ''
+runs:
+  using: composite
+  steps:
+    - id: versions
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+      run: |
+        version="$(sed -n 's/^rust = "\([^"]*\)"$/\1/p' mise.toml)"
+        test -n "$version"
+        printf 'rust=%s\n' "$version" >> "$GITHUB_OUTPUT"
+        case "$TARGET" in
+          *-linux-musl) host="${TARGET%musl}gnu" ;;
+          *) host="$TARGET" ;;
+        esac
+        printf 'toolchain=%s-%s\n' "$version" "$host" >> "$GITHUB_OUTPUT"
+
+    - name: Cache the pinned Rust toolchain
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.rustup/toolchains/${{ steps.versions.outputs.toolchain }}
+        key: rustup-v1-${{ inputs.target }}-${{ steps.versions.outputs.rust }}-${{ inputs.components }}
+
+    - name: Install Rust and configure the linker
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        RUST_VERSION: ${{ steps.versions.outputs.rust }}
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        case "$TARGET:$(uname -m)" in
+          x86_64-*:x86_64|aarch64-*:aarch64|aarch64-apple-darwin:arm64) ;;
+          *) echo "Unexpected host for $TARGET" >&2; exit 1 ;;
+        esac
+        components=()
+        if [[ -n "$COMPONENTS" ]]; then
+          components=(--component "$COMPONENTS")
+        fi
+        rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET" "${components[@]}"
+        printf 'RUSTUP_TOOLCHAIN=%s\nCARGO_INCREMENTAL=0\nCARGO_PROFILE_DEV_DEBUG=0\n' \
+          "$RUST_VERSION" >> "$GITHUB_ENV"
+        if [[ "$TARGET" == *-linux-musl ]]; then
+          if ! command -v musl-gcc >/dev/null; then
+            sudo apt-get install -y -qq --no-install-recommends musl-tools || {
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends musl-tools
+            }
+          fi
+          printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
+            "$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
+        fi
+
+    - name: Cache Cargo dependencies and build output
+      uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      with:
+        shared-key: ${{ inputs.target }}-${{ inputs.components }}
+        cache-bin: false

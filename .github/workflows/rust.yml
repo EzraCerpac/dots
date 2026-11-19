@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   pull_request:
@@ -12,280 +12,121 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  RUST_VERSION: "1.100.0"
-  MISE_VERSION: v2026.11.9
-  CARGO_TEST_FLAGS: >-
-    ${{ (github.ref == 'refs/heads/rust' ||
-         (github.base_ref == 'main' && github.head_ref == 'rust')) && '--no-fail-fast' || '' }}
-
 jobs:
-  rust:
-    name: Rust (${{ matrix.host[matrix.platform].target }})
-    runs-on: ${{ matrix.host[matrix.platform].runner }}
-    timeout-minutes: ${{ matrix.platform == 'macos' && 35 || 20 }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # Module PRs run Linux. Integrated pushes and main-bound PRs also run both Macs.
-        platform: ${{ fromJSON(github.base_ref == 'rust' && '["linux"]' || '["linux","macos"]') }}
-        host:
-          - linux: { runner: ubuntu-24.04, arch: x86_64, target: x86_64-unknown-linux-musl }
-            macos: { runner: macos-15-intel, arch: x86_64, target: x86_64-apple-darwin }
-          - linux: { runner: ubuntu-24.04-arm, arch: aarch64, target: aarch64-unknown-linux-musl }
-            macos: { runner: macos-15, arch: arm64, target: aarch64-apple-darwin }
-    env:
-      ARCH: ${{ matrix.host[matrix.platform].arch }}
-      CARGO_BUILD_TARGET: ${{ matrix.host[matrix.platform].target }}
-      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-
-      - name: Install Linux test dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends musl-tools git bash zsh fish python3 jq
-          printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
-            "$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
-
-      - name: Install Fish and Git on macOS
-        if: runner.os == 'macOS'
-        run: brew install fish git
-
-      - name: Verify shell executables
-        run: |
-          bash --version
-          zsh --version
-          fish --version
-
-      - name: Install the pinned Rust toolchain and target
-        run: |
-          test "$(uname -m)" = "$ARCH"
-          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --target "$CARGO_BUILD_TARGET"
-
-      - name: Install native scenario tools
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          prefix="$RUNNER_TEMP/dots-scenario-tools"
-          bash .github/scripts/setup-scenario-tools "$prefix"
-          printf '%s\n' "$prefix/bin" >> "$GITHUB_PATH"
-
-      - name: Check formatting
-        run: rustup run "$RUST_VERSION" cargo fmt --all -- --check
-
-      - name: Lint
-        run: mise run clippy
-
-      - name: Run all tests natively
-        run: |
-          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
-          mise run test -- ${{ env.CARGO_TEST_FLAGS }}
-
-  legacy-oracle:
-    name: v0.4.0 oracle (${{ matrix.os }})
-    if: >-
-      (github.event_name == 'push' && github.ref == 'refs/heads/rust') ||
-      (github.event_name == 'pull_request' &&
-       (github.base_ref == 'rust' || (github.base_ref == 'main' && github.head_ref == 'rust')))
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(github.base_ref == 'rust' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
-    env:
-      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-
-      - name: Install system packages (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends fish jq rsync zsh
-
-      - name: Install Fish on macOS
-        if: runner.os == 'macOS'
-        run: brew install fish
-
-      - name: Install the pinned Rust toolchain and oracle tools
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          MISE_YES: "1"
-        run: |
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          curl -fsSL https://mise.run | sh
-          mise_bin="$HOME/.local/bin/mise"
-          test "$("$mise_bin" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
-          printf '%s\n' "${mise_bin%/*}" >> "$GITHUB_PATH"
-          cd "$RUNNER_TEMP"
-          "$mise_bin" use --global node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest
-          # World replaces HOME and XDG paths. Give it installed binaries instead of shims.
-          "$mise_bin" bin-paths >> "$GITHUB_PATH"
-
-      - name: Verify and unpack the pinned oracle
-        env:
-          PLATFORM: ${{ matrix.os == 'macos-15' && 'darwin-arm64' || 'linux-amd64' }}
-        run: |
-          repo=https://github.com/EzraCerpac/dots
-          tag=v0.4.0
-          commit=f5c8a0e83b333dbea6c0b5f19725cc818ffca674
-          test "$(git ls-remote "$repo.git" "refs/tags/$tag" | cut -f1)" = "$commit"
-          archive="dots-${tag#v}-$PLATFORM"
-          oracle="$(mktemp -d "$RUNNER_TEMP/dots-oracle.XXXXXX")"
-          cd "$oracle"
-          for asset in SHA256SUMS "$archive.tar.gz"; do
-            curl -fsSL --retry 3 "$repo/releases/download/$tag/$asset" -o "$asset"
-          done
-          # Pin the published manifest so replaced assets can't change the oracle.
-          printf '%s  SHA256SUMS\n' dc1319f9a2087383ef4fb443b96cd117b3d7c2d18a2fc784dc4e1a3fe864f6c3 | shasum -a 256 -c
-          awk -v asset="$archive.tar.gz" '$2 == asset' SHA256SUMS | shasum -a 256 -c
-          tar -xzf "$archive.tar.gz"
-          test "$(cat "$archive/VERSION")" = "${tag#v}"
-          test -x "$archive/bin/dots"
-          test -x "$archive/bin/dots-up"
-          printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"
-
-      - name: Run unchanged black-box scenarios against the archive
-        env:
-          DOTS_TEST_ORACLE: v0.4.0
-        run: |
-          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
-          for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
-            command -v "$tool"
-          done
-          # Discover every integration suite. Libtest's default filter matches substrings.
-          listing="$(mise run test -- --test '*' -- --list --format terse)"
-          scenarios=()
-          while IFS= read -r entry; do
-            case "${entry##*::}" in
-              unchanged_*': test') scenarios+=("${entry%: test}") ;;
-            esac
-          done <<< "$listing"
-          if (( ${#scenarios[@]} == 0 )); then
-            echo 'No unchanged black-box scenarios found' >&2
-            exit 1
-          fi
-          DOTS_TEST_TOOL_PATH="$PATH" mise run test -- --no-fail-fast --test '*' -- --include-ignored --exact "${scenarios[@]}"
-
-  rust-distros:
-    name: Rust scenarios (${{ matrix.distro }})
+  changes:
+    name: Classify changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 3
+    outputs:
+      docs: ${{ steps.classify.outputs.docs }}
+      rust: ${{ steps.classify.outputs.rust }}
+      legacy: ${{ steps.classify.outputs.legacy }}
+      other: ${{ steps.classify.outputs.other }}
+      non_docs: ${{ steps.classify.outputs.non_docs }}
+      full: ${{ steps.classify.outputs.full }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_REF: ${{ github.base_ref }}
+        run: bash .github/scripts/classify-changes
+
+  lint:
+    name: Rust lint
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: x86_64-unknown-linux-gnu
+          components: rustfmt,clippy
+      - run: .mise/rust-cargo fmt --all -- --check
+      - run: .mise/rust-cargo clippy --locked --all-targets -- -D warnings
+
+  linux:
+    name: Linux x86_64
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/rust-target.yml
+    with:
+      runner: ubuntu-24.04
+      target: x86_64-unknown-linux-musl
+      suites: >-
+        ${{ needs.changes.outputs.full == 'true'
+            && '["native","Fedora","Arch","Alpine","oracle"]'
+            || '["native","Fedora","Arch","Alpine"]' }}
+      first-run: ${{ needs.changes.outputs.full == 'true' }}
+
+  extended:
+    name: ${{ matrix.target }}
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
-          - distro: Fedora
-            image: fedora:latest
-          - distro: Arch
-            image: archlinux:base
-          - distro: Alpine
-            image: alpine:3.23
-    env:
-      DISTRO: ${{ matrix.distro }}
-      IMAGE: ${{ matrix.image }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suites: '["native"]'
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            suites: '["1/2","2/2","oracle"]'
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            suites: '["1/2","2/2"]'
+    uses: ./.github/workflows/rust-target.yml
+    with:
+      runner: ${{ matrix.runner }}
+      target: ${{ matrix.target }}
+      suites: ${{ matrix.suites }}
 
-      - name: Run Rust scenarios in the distribution
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          # Keep Actions' checkout runtime on Ubuntu, including for musl Alpine.
-          docker run --rm -i --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
-            --workdir /workspace -e DISTRO -e RUST_VERSION -e MISE_VERSION -e GITHUB_TOKEN \
-            -e MISE_TRUSTED_CONFIG_PATHS=/workspace "$IMAGE" sh -eu <<'SH'
-          setup_token=$GITHUB_TOKEN
-          unset GITHUB_TOKEN GH_TOKEN
-          rust_host=x86_64-unknown-linux-gnu
-          case "$DISTRO" in
-            Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip python3 jq ;;
-            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git python jq ;;
-            Alpine)
-              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git python3 jq
-              rust_host=x86_64-unknown-linux-musl
-              ;;
-            *) exit 2 ;;
-          esac
+  legacy-and-secrets:
+    name: Legacy and secrets
+    needs: changes
+    if: needs.changes.outputs.non_docs == 'true'
+    uses: ./.github/workflows/test.yml
+    with:
+      secrets-only: ${{ needs.changes.outputs.legacy != 'true' }}
 
-          curl -fsSL "https://static.rust-lang.org/rustup/dist/$rust_host/rustup-init" -o /tmp/rustup-init
-          chmod +x /tmp/rustup-init
-          /tmp/rustup-init -y --no-modify-path --default-host "$rust_host" \
-            --profile minimal --default-toolchain "$RUST_VERSION"
-          prefix=/tmp/dots-scenario-tools
-          GITHUB_TOKEN="$setup_token" bash .github/scripts/setup-scenario-tools "$prefix"
-          unset setup_token
-          export PATH="/workspace/.github/scripts/scenario-bin:$prefix/bin:$HOME/.cargo/bin:$PATH"
-          mise run test -- ${{ env.CARGO_TEST_FLAGS }}
-          SH
-
-  rust-first-run:
-    name: Rust first run (mise and Git)
+  ci:
+    name: ci
+    if: always()
+    needs: [changes, lint, linux, extended, legacy-and-secrets]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 2
     env:
-      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+      DOCS: ${{ needs.changes.outputs.docs }}
+      RUST: ${{ needs.changes.outputs.rust }}
+      LEGACY: ${{ needs.changes.outputs.legacy }}
+      OTHER: ${{ needs.changes.outputs.other }}
+      NON_DOCS: ${{ needs.changes.outputs.non_docs }}
+      FULL: ${{ needs.changes.outputs.full }}
+      RESULTS: ${{ toJSON(needs) }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-
-      - name: Build the Linux release binary
+      - name: Summarize and check results
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends musl-tools
-          rustup toolchain install "$RUST_VERSION" --profile minimal --target x86_64-unknown-linux-musl
-          seed="$RUNNER_TEMP/dots-first-run"
-          mkdir -p "$seed"
-          curl -fsSL "https://github.com/jdx/mise/releases/download/$MISE_VERSION/mise-$MISE_VERSION-linux-x64-musl.tar.gz" \
-            -o "$RUNNER_TEMP/mise.tar.gz"
-          tar -xzf "$RUNNER_TEMP/mise.tar.gz" -C "$RUNNER_TEMP" mise/bin/mise
-          install -m 0755 "$RUNNER_TEMP/mise/bin/mise" "$seed/mise"
-          "$seed/mise" --version
-          CC=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-            "$seed/mise" run build -- --release --target x86_64-unknown-linux-musl
-          install -m 0755 target/x86_64-unknown-linux-musl/release/dots "$seed/dots"
-
-      - name: Run dots init and dots up in a fresh container
-        run: |
-          docker run --rm -i --mount "type=bind,src=$RUNNER_TEMP/dots-first-run,dst=/seed,readonly" \
-            alpine:3.23 sh -eu <<'SH'
-          apk add --no-cache git ca-certificates
-          adduser -D smoke
-          su -l smoke <<'SMOKE'
-          set -eu
-          fixture=$(mktemp -d /tmp/dots-first-run.XXXXXXXX)
-          export HOME="$fixture/home" TMPDIR="$fixture/tmp"
-          export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
-          export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
-          export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
-          export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
-          export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
-          export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
-          export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
-          export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
-          export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
-          export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
-          export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
-          export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
-          mkdir -p "$HOME/.local/bin" "$TMPDIR"
-          cp /seed/mise /seed/dots "$HOME/.local/bin/"
-          export PATH="$HOME/.local/bin:/usr/bin:/bin"
-          cd "$HOME"
-          dots init </dev/null
-          dots up </dev/null
-          SMOKE
-          SH
+          {
+            echo '### CI'
+            printf 'Paths detected: docs=%s, Rust=%s, legacy=%s, other=%s.\n\n' "$DOCS" "$RUST" "$LEGACY" "$OTHER"
+            echo '| Job group | Result | Selection |'
+            echo '| --- | --- | --- |'
+            printf '| Classification | %s | Every run |\n' "$(jq -r '.changes.result' <<< "$RESULTS")"
+            printf '| Rust lint and Linux x86_64 | %s / %s | Rust changes (%s) |\n' \
+              "$(jq -r '.lint.result' <<< "$RESULTS")" "$(jq -r '.linux.result' <<< "$RESULTS")" "$RUST"
+            printf '| Linux ARM and macOS | %s | Rust changes (%s) on full-matrix events (%s) |\n' \
+              "$(jq -r '.extended.result' <<< "$RESULTS")" "$RUST" "$FULL"
+            printf '| Legacy and secrets | %s | Legacy suites for legacy changes (%s). Secret scan for non-docs changes (%s). |\n' \
+              "$(jq -r '."legacy-and-secrets".result' <<< "$RESULTS")" "$LEGACY" "$NON_DOCS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"

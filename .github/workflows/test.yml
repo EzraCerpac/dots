@@ -1,11 +1,12 @@
 name: Tests
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      secrets-only:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -16,6 +17,7 @@ concurrency:
 
 jobs:
   test:
+    if: ${{ !inputs.secrets-only }}
     name: tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -78,6 +80,7 @@ jobs:
         run: tests/run
 
   go:
+    if: ${{ !inputs.secrets-only }}
     name: go (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
@@ -99,6 +102,7 @@ jobs:
           go test ./...
 
   packaging:
+    if: ${{ !inputs.secrets-only }}
     name: packaging (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20

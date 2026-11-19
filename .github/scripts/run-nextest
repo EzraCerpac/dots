@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUNDLE=${BUNDLE:-"$RUNNER_TEMP/dots-build"}
+workspace=$(pwd -P)
+# These integration tests embed CARGO_MANIFEST_DIR and CARGO_BIN_EXE_dots.
+# Preserve both build-time paths when restoring the archive.
+if [[ "$workspace" != "$(cat "$BUNDLE/workspace")" ]]; then
+  echo "The archived tests require the workspace at $(cat "$BUNDLE/workspace")" >&2
+  exit 1
+fi
+
+tools="$BUNDLE/tools"
+mkdir -p "$tools"
+tar -xzf "$BUNDLE/tools.tar.gz" -C "$tools"
+export PATH="$workspace/.github/scripts/scenario-bin:$tools/bin:$PATH"
+for tool in bash zsh fish git python3 jq; do
+  command -v "$tool"
+done
+git --version | awk -F '[ .]+' 'END {exit !($3+0 > 2 || ($3+0 == 2 && $4+0 >= 43))}'
+
+args=()
+case "$SUITE" in
+  oracle)
+    export DOTS_TEST_ORACLE=v0.4.0 DOTS_TEST_TOOL_PATH="$PATH"
+    args=(--run-ignored all -E 'kind(test) & test(/(^|::)unchanged_/)' --no-tests fail)
+    ;;
+  */*) args=(--partition "slice:$SUITE") ;;
+esac
+cargo-nextest nextest run --profile ci --archive-file "$BUNDLE/tests.tar.zst" \
+  --extract-to "$workspace" --workspace-remap "$workspace" "${args[@]}"

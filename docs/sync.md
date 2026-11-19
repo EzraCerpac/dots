@@ -145,6 +145,21 @@ Issues and their next actions come before the summary. Any recovery copies and n
 - **Updated in this checkout**: files that reached the configuration checkout; a later failure to deploy a dotfile is reported separately.
 - **Finished pending checkout**: an interrupted update this run finished.
 
+For example, this receipt followed an edit to `config.toml` next to a new file holding a secret.
+It comes from `dots` 1.0.0-rc.1 at `rust` `9a35df0`, in a disposable home directory with a local bare `origin`:
+
+```text
+NOT SHARED: gitleaks flagged a local file; it stays on disk: "leak.toml:2" (generic-api-key)
+  Remove or rotate the secret before sharing this path.
+dots sync: saved 1 locally · kept 1 files on disk · pulled dev +0, main +0 · pushed dev
+Shared on dev
+  config.toml
+Saved locally
+  config.toml
+```
+
+`dots sync --last` printed the same receipt under a `Latest sync` heading.
+
 When stdin and stdout are terminals, a standalone sync without `--plain` may show complete small text diffs for up to two paths and twelve displayed lines.
 A patch appears only when gitleaks returns a clean JSON report for both file versions and for the displayed text; screening has three seconds.
 Piped output, `--plain` output and saved reports carry metadata only, never file contents.
@@ -203,6 +218,24 @@ Reviewed changes reach `main` through a pull request from a task branch or a JJ 
 To extract a change made on `dev`, create a task branch from `origin/main`, copy or cherry-pick only that change, and review its diff against `main`.
 Do not move `dev` by hand or merge it wholesale into `main`.
 
-`dots publish` is optional and works only with a GitHub repository.
-It runs in a colocated JJ workspace of the configuration repository, scans the outgoing commits with gitleaks, asks for confirmation, pushes a bookmark without force and opens or updates the pull request.
-It exits 3 when conflicts stop it.
+### `dots publish`
+
+`dots publish` is optional: it does that extraction and opens the pull request for you.
+It works only with a configuration on GitHub, because it opens or updates the pull request with `gh`.
+Before it looks for JJ, `gh` or gitleaks, it checks that `origin`, both in the live checkout and where you run it, is the configured GitHub repository.
+
+It uses JJ to assemble a clean change on top of `main` without touching your live checkout.
+Run it in a separate JJ clone of the configuration repository, for example one made with `jj git clone --colocate URL DIR`, never in the live checkout.
+There it builds the pull request on `main@origin`, while the live checkout keeps `dev` and your edits as they are.
+
+- By default it publishes exactly one change, the working change `@`, which must sit directly on `main@origin`.
+- `--bookmark NAME` publishes an existing private `wip/...` bookmark instead of `@`.
+- `--all` publishes the whole current stack as one pull request.
+  When the stack has diverged from `main@origin`, it first offers to merge `main@origin` into it, which needs JJ 0.41 or newer.
+
+It stops before any push when `main` does not exist on GitHub, or when the change builds on `dev` work that `main` lacks; extract a focused change onto a branch based on `main` instead.
+It scans the outgoing commits with gitleaks, shows a preview and asks for confirmation, then pushes a bookmark without force and opens or updates the pull request.
+Gitleaks' built-in allowlists can skip some binary and lock files in that scan without reporting a skip.
+A new pull request targets `main`; an open one for the same bookmark keeps its base, even one other than `main`.
+It needs Git, JJ, `gh` signed in and gitleaks, and exits 3 when conflicts stop it.
+See [the contract](contract.md#dots-publish) for every check.

@@ -37,7 +37,7 @@ struct Publication {
     fixture_reader: PathBuf,
     real_git: PathBuf,
     real_jj: PathBuf,
-    real_gitleaks: Option<PathBuf>,
+    real_gitleaks: PathBuf,
 }
 
 impl Publication {
@@ -78,7 +78,8 @@ impl Publication {
         symlink(&real_git, log.join("scan-bin/git")).unwrap();
         let real_jj =
             executable_on_path(&world.dots(), "jj").expect("publish scenarios require jj");
-        let real_gitleaks = executable_on_path(&world.dots(), "gitleaks");
+        let real_gitleaks = executable_on_path(&world.dots(), "gitleaks")
+            .expect("publish scenarios require gitleaks");
         let fixture_reader = world.fixture_reader();
         let config = match on_behalf_of {
             Some(person) => format!(
@@ -361,8 +362,7 @@ esac
         self.shim(
             "gitleaks",
             r#"if [ "${1-}" = version ] || [ "${1-}" = --version ]; then
-    printf '%s\n' '8.30.1'
-    exit 0
+    exec "$PUBLISH_GITLEAKS" "$@"
 fi
 cwd=$(pwd -P)
 for operand do :; done
@@ -427,15 +427,16 @@ sys.exit(scanned.read_bytes() != approved.read_bytes())
     *) exit 88 ;;
 esac
 status=0
-if [ "${PUBLISH_REAL_SCAN-}" = 1 ]; then
-    command=$1
-    shift
-    PATH="$PUBLISH_LOG/scan-bin" "$PUBLISH_GITLEAKS" "$command" \
-        --report-format json --report-path "$PUBLISH_LOG/findings.json" "$@" \
-        2> "$PUBLISH_LOG/scan-stderr" || status=$?
-    cat "$PUBLISH_LOG/scan-stderr" >&2
-    printf '%s\n' "$status" > "$PUBLISH_LOG/scan-status"
+command=$1
+shift
+PATH="$PUBLISH_LOG/scan-bin" "$PUBLISH_GITLEAKS" "$command" \
+    --report-format json --report-path "$PUBLISH_LOG/findings.json" "$@" \
+    2> "$PUBLISH_LOG/scan-stderr" || status=$?
+cat "$PUBLISH_LOG/scan-stderr" >&2
+if [ -f "$PUBLISH_LOG/extra-scan-stderr" ]; then
+    cat "$PUBLISH_LOG/extra-scan-stderr" >&2
 fi
+printf '%s\n' "$status" > "$PUBLISH_LOG/scan-status"
 : > "$PUBLISH_LOG/scan-complete"
 exit "$status"
 "#,
@@ -510,9 +511,7 @@ exit "$status"
     }
 
     fn scan_all(&self) -> FixtureCommand<'_> {
-        let mut command = self.dots(&["publish", "--all"]);
-        self.real_scan(&mut command);
-        command
+        self.dots(&["publish", "--all"])
     }
 
     fn dots(&self, args: &[&str]) -> FixtureCommand<'_> {
@@ -538,21 +537,11 @@ exit "$status"
             .env("PUBLISH_WORKSPACE", &self.workspace)
             .env("PUBLISH_GIT", &self.real_git)
             .env("PUBLISH_JJ", &self.real_jj)
+            .env("PUBLISH_GITLEAKS", &self.real_gitleaks)
             .env("PUBLISH_PR_URL", PR_URL)
             .env("PUBLISH_READ_FILE", &self.fixture_reader)
             .env_remove("DOTS_PUBLISH_MODEL");
-        if let Some(gitleaks) = &self.real_gitleaks {
-            command.env("PUBLISH_GITLEAKS", gitleaks);
-        }
         command
-    }
-
-    fn real_scan(&self, command: &mut FixtureCommand<'_>) {
-        assert!(
-            self.real_gitleaks.is_some(),
-            "real-scanner scenario requires gitleaks"
-        );
-        command.env("PUBLISH_REAL_SCAN", "1");
     }
 
     fn read_log(&self, name: &str) -> String {
@@ -653,7 +642,6 @@ exit "$status"
         command
             .env("PUBLISH_SCAN_BASE", main.trim())
             .env("PUBLISH_SCAN_HEAD", approved);
-        self.real_scan(&mut command);
         let mut terminal = Pty::spawn(command);
         terminal.expect("[y/N]");
         assert!(
@@ -729,8 +717,7 @@ exit "$status"
     }
 
     fn reject_secret(&self, bookmark: &str, terminal: bool) -> String {
-        let mut command = self.dots(&["publish", "--bookmark", bookmark]);
-        self.real_scan(&mut command);
+        let command = self.dots(&["publish", "--bookmark", bookmark]);
         let transcript = refusal(command, terminal);
         let report = fs::read_to_string(self.log.join("findings.json")).unwrap_or_else(|error| {
             panic!(
@@ -835,7 +822,6 @@ fn zipped(name: &str, contents: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_finds_a_redacted_secret_one_archive_level_deep() {
     for terminal in [false, true] {
         assert_archive_finding_before_preview(terminal);
@@ -859,8 +845,7 @@ fn assert_archive_finding_before_preview(terminal: bool) {
     let bookmark = "wip/archive";
     fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
     let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
-    let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
-    fixture.real_scan(&mut command);
+    let command = fixture.dots(&["publish", "--bookmark", bookmark]);
     let transcript = refusal(command, terminal);
     assert!(transcript.contains("gitleaks found potential secrets"));
     assert_no_preview(&transcript);
@@ -891,7 +876,6 @@ fn assert_archive_finding_before_preview(terminal: bool) {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_allows_a_clean_one_level_archive_to_reach_confirmation() {
     let fixture = Publication::new(None, false);
     fs::write(
@@ -900,20 +884,15 @@ fn new_publish_allows_a_clean_one_level_archive_to_reach_confirmation() {
     )
     .unwrap();
     fixture.jj(&["describe", "-m", "Add a clean archive"]);
-    let mut command = fixture.dots(&["publish"]);
-    fixture.real_scan(&mut command);
-    fixture.approve(command, "@", &["payload.zip"]);
+    fixture.approve(fixture.dots(&["publish"]), "@", &["payload.zip"]);
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_allows_native_success_without_a_skip_signal() {
     let fixture = Publication::new(None, false);
     fs::write(fixture.workspace.join("opaque.bin"), [0, 129, 254, 7]).unwrap();
     fixture.jj(&["describe", "-m", "Add opaque binary data"]);
-    let mut command = fixture.dots(&["publish"]);
-    fixture.real_scan(&mut command);
-    fixture.approve(command, "@", &["opaque.bin"]);
+    fixture.approve(fixture.dots(&["publish"]), "@", &["opaque.bin"]);
     assert_eq!(fixture.read_log("scan-status"), "0\n");
     let native_log = fixture.read_log("scan-stderr");
     assert!(!native_log.contains("exceeds max archive depth"));
@@ -921,7 +900,6 @@ fn new_publish_allows_native_success_without_a_skip_signal() {
 }
 
 #[test]
-#[ignore = "P-10 archive screening"]
 fn new_publish_refuses_explicit_native_format_and_depth_skips_before_confirmation() {
     for terminal in [false, true] {
         assert_archive_skip_before_preview(terminal);
@@ -954,8 +932,7 @@ fn assert_archive_skip_before_preview(terminal: bool) {
         let bookmark = "wip/archive";
         fixture.jj(&["bookmark", "create", bookmark, "-r", "@"]);
         let head = fixture.jj(&["log", "--no-graph", "-r", bookmark, "-T", "commit_id"]);
-        let mut command = fixture.dots(&["publish", "--bookmark", bookmark]);
-        fixture.real_scan(&mut command);
+        let command = fixture.dots(&["publish", "--bookmark", bookmark]);
         let transcript = refusal(command, terminal);
         assert_no_preview(&transcript);
         assert!(transcript.contains(diagnostic), "{transcript}");
@@ -996,7 +973,6 @@ fn decline(mut terminal: Pty) -> String {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_uses_main_removed_allowlist_before_any_prompt() {
     let fixture = Publication::with_seed(
         None,
@@ -1034,7 +1010,6 @@ fn new_diverged_all_uses_main_removed_allowlist_before_any_prompt() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_uses_main_added_allowlist_and_keeps_only_the_approved_merge() {
     let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
     outgoing_pdf(&fixture);
@@ -1088,7 +1063,6 @@ fn new_diverged_all_uses_main_added_allowlist_and_keeps_only_the_approved_merge(
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_aggregate_merge_does_not_scan_main_only_pdf() {
     let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", PDF_POLICY.as_bytes())]);
     fixture.change(0);
@@ -1122,7 +1096,6 @@ fn historical_merge() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_historical_merge_ignores_pdf_inherited_from_older_main_parent() {
     let fixture = historical_merge();
     fixture.change_main("later.txt", b"later reviewed main\n");
@@ -1139,7 +1112,6 @@ fn new_historical_merge_ignores_pdf_inherited_from_older_main_parent() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_historical_merge_scans_new_blob_at_the_same_main_path() {
     let fixture = historical_merge();
     let mut edited = PDF.to_vec();
@@ -1169,7 +1141,6 @@ fn new_historical_merge_scans_new_blob_at_the_same_main_path() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflict_is_screened_then_retained_only_after_merge_approval() {
     let fixture = Publication::with_seed(None, false, &[("collision.txt", b"base content\n")]);
     fs::write(
@@ -1226,7 +1197,6 @@ fn new_conflict_is_screened_then_retained_only_after_merge_approval() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
     let ours = PDF_POLICY.replace("Synthetic fixture marker", "Outgoing fixture marker");
     let theirs = PDF_POLICY.replace("Synthetic fixture marker", "Reviewed fixture marker");
@@ -1273,7 +1243,6 @@ fn new_conflicted_scan_policy_is_never_read_from_a_single_git_side() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_unavailable_detached_operations_refuse_only_diverged_all() {
     let diverged = Publication::new(None, false);
     diverged.change(0);
@@ -1308,7 +1277,6 @@ fn new_unavailable_detached_operations_refuse_only_diverged_all() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_diverged_all_rechecks_late_working_changes_without_integrating_candidate() {
     for at_publication in [false, true] {
         let fixture = Publication::new(None, false);
@@ -1356,25 +1324,19 @@ fn new_diverged_all_rechecks_late_working_changes_without_integrating_candidate(
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_large_native_debug_stream_is_drained_without_disclosure() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
-    fixture.shim(
-        "gitleaks",
-        r#"if [ "${1:-}" = --version ] || [ "${1:-}" = version ]; then
-    printf '%s\n' 8.30.1
-    exit 0
-fi
-[ "${1:-}" = dir ]
-[ -f public-0.txt ]
-/usr/bin/awk 'BEGIN { for (i=0; i<20000; i++) printf "11:00PM DBG skipping file: global allowlist path=synthetic.pdf\n" }' >&2
-: > "$PUBLISH_LOG/scan-complete"
-"#,
-    );
+    fs::write(
+        fixture.log.join("extra-scan-stderr"),
+        "11:00PM DBG skipping file: global allowlist path=synthetic.pdf\n".repeat(20_000),
+    )
+    .unwrap();
     let mut terminal = Pty::spawn(fixture.dots(&["publish"]));
     terminal.expect("[y/N]");
     assert!(fixture.log.join("scan-complete").is_file());
+    assert_eq!(fixture.read_log("scan-input"), "public-0.txt\n");
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
     let transcript = decline(terminal);
     assert!(!transcript.contains("skipping file: global allowlist"));
     assert!(!transcript.contains("synthetic.pdf"));
@@ -1383,7 +1345,6 @@ fi
 }
 
 #[test]
-#[ignore = "P-10 publish approval cancellation"]
 fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1410,6 +1371,7 @@ fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
     let mut terminal = Pty::spawn(command);
     terminal.expect("[y/N]");
     assert!(fixture.log.join("scan-complete").is_file());
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
     fixture.assert_no_publication();
     terminal.send("\x03");
     let (status, transcript) = terminal.finish();
@@ -1467,7 +1429,6 @@ fn new_publish_cancels_at_approval_without_mutation_and_records_a_report() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_default_publication_scans_exactly_the_unpublished_commits_before_asking() {
     // A secret already in remote main is outside this publication's outgoing set.
     // The removed-secret and merge-resolution cases independently prove coverage
@@ -1476,14 +1437,12 @@ fn unchanged_default_publication_scans_exactly_the_unpublished_commits_before_as
     fixture.change(0);
     let mut command = fixture.dots(&["publish"]);
     command.env("DOTS_PUBLISH_MODEL", MODEL);
-    fixture.real_scan(&mut command);
     fixture.approve(command, "@", &["public-0.txt"]);
     assert!(fixture.read_log("body").contains(MODEL));
     assert!(fixture.read_log("body").contains("Sam"));
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_real_gitleaks_refuses_a_token_committed_and_then_removed() {
     let fixture = token_history();
     fixture.reject_secret("wip/token", false);
@@ -1501,7 +1460,6 @@ fn token_history() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn new_publish_never_previews_the_rejected_secret() {
     let token = synthetic_token();
     for terminal in [false, true] {
@@ -1517,7 +1475,6 @@ fn new_publish_never_previews_the_rejected_secret() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_real_gitleaks_scans_content_that_only_a_merge_resolution_adds() {
     merge_resolution().reject_secret("wip/merge", false);
 }
@@ -1543,7 +1500,6 @@ fn merge_resolution() -> Publication {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_default_publication_refuses_a_private_stack_above_main_origin() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1558,7 +1514,6 @@ fn unchanged_default_publication_refuses_a_private_stack_above_main_origin() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_publication_uses_the_callers_jj_workspace() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1580,10 +1535,10 @@ fn unchanged_publication_uses_the_callers_jj_workspace() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_one_line() {
     let fixture = Publication::new(None, false);
     let foreign = fixture.world.root().parent().unwrap().join("foreign");
+    let foreign_origin = "https://github.com/example/foreign-fixture.git";
     success(
         fixture
             .world
@@ -1597,12 +1552,7 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
         fixture
             .world
             .git()
-            .args([
-                "remote",
-                "set-url",
-                "origin",
-                "https://github.com/example/foreign-fixture.git",
-            ])
+            .args(["remote", "set-url", "origin", foreign_origin])
             .current_dir(&foreign),
     );
     success(
@@ -1632,10 +1582,13 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
             1,
             "{candidate:?}: {diagnostics}"
         );
-        assert!(
-            diagnostics.to_lowercase().contains("workspace"),
-            "{diagnostics}"
-        );
+        let summary = diagnostics.to_ascii_lowercase();
+        if candidate == foreign && summary.contains("origin does not match") {
+            assert!(summary.contains("github repository"), "{diagnostics}");
+            assert!(!diagnostics.contains(foreign_origin), "{diagnostics}");
+        } else {
+            assert!(summary.contains("workspace"), "{diagnostics}");
+        }
         assert!(
             !fixture.optional_log("jj").contains("git fetch"),
             "attempted to fetch from rejected workspace {candidate:?}"
@@ -1646,7 +1599,6 @@ fn unchanged_publication_outside_a_jj_workspace_of_the_configuration_stops_with_
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_disclosure_note_is_optional_and_names_the_configured_person() {
     for (person, model) in [
         (None, None),
@@ -1696,7 +1648,6 @@ fn set_shared_dev(fixture: &Publication, args: &[&str], already_in_main: bool) {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_shared_dev_outside_main_blocks_each_publication_mode() {
     for args in [&[][..], &["--all"], &["--bookmark", "wip/fixture-publish"]] {
         let fixture = Publication::new(None, false);
@@ -1714,7 +1665,6 @@ fn unchanged_shared_dev_outside_main_blocks_each_publication_mode() {
 }
 
 #[test]
-#[ignore = "P-10"]
 fn unchanged_shared_dev_already_in_main_allows_each_publication_mode() {
     for args in [&[][..], &["--all"], &["--bookmark", "wip/fixture-publish"]] {
         let fixture = Publication::new(None, false);
@@ -1871,7 +1821,6 @@ fn new_publish_checks_effective_fetch_and_every_push_url_before_contact() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -1966,7 +1915,6 @@ fn new_dirty_bookmarked_stack_keeps_exact_bookmark_on_both_declines() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_divergent_operation_heads_never_reconcile_during_verification() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -2011,7 +1959,6 @@ fn new_divergent_operation_heads_never_reconcile_during_verification() {
 }
 
 #[test]
-#[ignore = "P-10 detached aggregate screening"]
 fn new_interrupted_integration_retry_gives_native_recovery_command() {
     let fixture = Publication::new(None, false);
     fixture.change(0);
@@ -2183,8 +2130,7 @@ fn new_legitimate_jjconflict_name_is_scanned() {
         "Add a normal directory with a similar name",
     ]);
     let original = fixture.working_oid();
-    let mut command = fixture.dots(&["publish"]);
-    fixture.real_scan(&mut command);
+    let command = fixture.dots(&["publish"]);
     let transcript = refusal(command, true);
     assert!(transcript.contains("one-level scan limit"), "{transcript}");
     assert_no_preview(&transcript);
@@ -2253,8 +2199,7 @@ fn new_archive_inherited_through_outgoing_parent_is_not_rescanned() {
 fn new_changed_then_restored_archive_in_outgoing_parent_is_scanned() {
     let fixture = merged_archive_fixture(true);
     let head = fixture.working_oid();
-    let mut command = fixture.dots(&["publish", "--bookmark", "wip/merged-archive"]);
-    fixture.real_scan(&mut command);
+    let command = fixture.dots(&["publish", "--bookmark", "wip/merged-archive"]);
     let transcript = refusal(command, true);
     assert!(transcript.contains("one-level scan limit"), "{transcript}");
     assert_no_preview(&transcript);

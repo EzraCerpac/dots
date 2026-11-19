@@ -3214,7 +3214,7 @@ copies_case!(
 );
 
 copies_case!(
-    unchanged_dirty_copy_survives_incoming_source_and_retry,
+    active unchanged_dirty_copy_survives_incoming_source_and_retry,
     false,
     |f, a, b, _config| {
         const DIRTY: &str = "my dirty copy\n";
@@ -3452,7 +3452,7 @@ sync_case!(
 );
 
 copies_case!(
-    unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
+    active unchanged_old_bytes_redeployed_by_mise_do_not_revive_stale_copy_base,
     false,
     |_f, a, _b, config| {
         fs::remove_file(a.home.join(".copied")).unwrap();

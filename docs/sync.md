@@ -53,10 +53,13 @@ Machine-local files (`miserc.toml`, `config.local.toml`, `config.host-*.toml`, m
    If a writer claims that path, sync leaves it alone and prints the recovery path for any file it moved aside.
    A successful replacement keeps the previous inode at the printed private path so an editor that still has it open can finish saving it.
    For a directory copy, mise stages the desired tree privately.
-   Sync verifies the bytes and permissions of each leaf it replaces.
-   An older Git version can verify bytes while the deployed mode is unknown.
-   In that case sync updates the leaf only if its current mode can stay as is.
-   Edited and unmanaged files stay in place.
+   When sync would replace an existing file in a directory copy, it compares the file with the source previously deployed at that path.
+   If both bytes and permissions match, sync treats the file as deployed regardless of who created it and updates it to the new source without reporting it as kept.
+   If the bytes or verified permissions differ at the target, including a change detected after the initial comparison, sync leaves the file there and reports it as kept.
+   If sync detects an edit to the moved original before installing its replacement, it restores the edited original at the target when possible.
+   If the replacement is already installed or the original cannot be restored, sync keeps the original and its edits at the printed private recovery path.
+   When the deployed mode cannot be verified, sync updates the file only if its bytes match the previously deployed source and its current mode can stay.
+   Unmatched local files stay in place.
    Mise runs the usual hooks and applies the other targets in dependency order.
    A target that requires a retained copy waits for reconciliation.
    Matching `[history.reload]` commands run once after the writes

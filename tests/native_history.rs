@@ -1679,7 +1679,16 @@ fn new_first_restore_reobserves_before_native_pull_and_can_undo() {
 }
 
 #[test]
+fn new_first_restore_rebinds_a_previously_missing_parent_after_offline_fetch() {
+    restore_rebinds_a_previously_missing_parent_after_offline_fetch(false);
+}
+
+#[test]
 fn new_established_restore_rebinds_a_previously_missing_parent_after_offline_fetch() {
+    restore_rebinds_a_previously_missing_parent_after_offline_fetch(true);
+}
+
+fn restore_rebinds_a_previously_missing_parent_after_offline_fetch(established: bool) {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");
     let (key, public) = seed.key("recovery");
@@ -1698,13 +1707,17 @@ fn new_established_restore_rebinds_a_previously_missing_parent_after_offline_fet
             .unwrap();
     }
     seed.seed(&remote, FIRST);
-    ok(&mut fixture.dots(&["restore"], &remote));
+    fixture.write(DEFAULT, 0o600);
+    if established {
+        ok(&mut fixture.dots(&["restore"], &remote));
+    }
+    let live = if established { FIRST } else { DEFAULT };
     let offline = fixture.offline_dots("restore", &remote);
     assert!(messages(&offline).contains("mise could not fetch encrypted history"));
     let marker = fixture.store().join("dots-restore-pending");
     let fetching = fs::read(&marker).unwrap();
     let journal: serde_json::Value = serde_json::from_slice(&fetching).unwrap();
-    assert_eq!(journal["initial"], false);
+    assert_eq!(journal["initial"], !established);
     assert!(journal["progress"]["Fetching"].is_object());
 
     let seed_parent = seed.world.home().join("new-parent");
@@ -1726,7 +1739,7 @@ fn new_established_restore_rebinds_a_previously_missing_parent_after_offline_fet
         messages(&refused)
     );
     assert_eq!(fs::read(&marker).unwrap(), fetching);
-    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    assert_eq!(fs::read(fixture.active()).unwrap(), live);
     fs::remove_file(&parent).unwrap();
 
     fs::write(&parent, LOCAL_EDIT).unwrap();
@@ -1745,6 +1758,10 @@ fn new_established_restore_rebinds_a_previously_missing_parent_after_offline_fet
     ok(&mut fixture.dots(&["restore"], &remote));
     assert!(!marker.exists());
     assert_eq!(fs::read(parent.join("selected")).unwrap(), SECOND);
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    if !established {
+        assert_restore_undo(&fixture, "rollback", DEFAULT);
+    }
     assert_eq!(seed.tip(&remote, REF), tip);
 }
 

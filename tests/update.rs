@@ -794,6 +794,70 @@ fn new_filtered_bare_cask_fails_before_discarding_its_options() {
 
 #[test]
 #[ignore = "P-06"]
+fn new_qualified_cask_pass_cannot_reinstall_an_excluded_bare_dependency() {
+    for held in [false, true] {
+        let fixture = Fixture::new();
+        fixture.write(
+            "config.toml",
+            "[vars]\ndots_profiles = 'laptop'\n[bootstrap.packages]\n'brew-cask:parent' = 'latest'\n         'helper' = { appdir = '~/fixture-apps', adopt = true }\n",
+        );
+        if held {
+            fixture.recipe("held-helper", "#!/bin/sh\nexit 0\n");
+            fixture.write(
+                "dots/exceptions.tsv",
+                "base\theld-helper\thold=brew-cask:helper\n",
+            );
+        }
+        fixture.write(
+            "packages.json",
+            &serde_json::json!({
+                "brew-cask": {"available": true, "packages": [declared_fixture_package("parent")]},
+                "unprefixed": {"available": false, "packages": [declared_fixture_package("helper")]}
+            })
+            .to_string(),
+        );
+        fixture.write(
+            "resolved-packages.json",
+            &serde_json::json!({
+                "brew-cask": {
+                    "available": true,
+                    "packages": [declared_fixture_package("parent"), declared_fixture_package("helper")]
+                }
+            })
+            .to_string(),
+        );
+        let report = fixture.run(i32::from(held));
+        let calls = fixture.calls();
+        assert!(calls.contains("install tools"), "{calls}");
+        if held {
+            assert!(
+                !calls.contains("packages apply --manager brew-cask"),
+                "{calls}"
+            );
+            assert!(
+                !calls.contains("packages upgrade --manager brew-cask"),
+                "{calls}"
+            );
+            let stages = report["stages"].as_array().unwrap();
+            let stage = stages
+                .iter()
+                .find(|stage| stage["label"] == "brew-cask packages")
+                .unwrap();
+            assert_eq!(stage["outcome"], "failed");
+            let diagnostic = stage["issues"][0]["diagnostic"].as_str().unwrap();
+            assert!(diagnostic.contains("held brew-cask:helper as a dependency"));
+            assert!(diagnostic.contains("appdir or adopt"));
+        } else {
+            assert!(
+                calls.contains("packages apply --manager brew-cask --yes\n"),
+                "{calls}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "P-06"]
 fn new_failed_grouped_status_skips_unconfirmed_bare_only_managers() {
     let fixture = Fixture::new();
     fixture.write(

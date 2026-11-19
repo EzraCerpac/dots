@@ -235,16 +235,21 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
         filtered: bool,
         resolved: bool,
     ) -> Result<Option<Specs>, Issue> {
-        let specs = select_rows(
+        let Some(specs) = select_rows(
             packages,
             &self.config.exceptions,
             &self.config.profile,
             manager,
             filtered,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
+        if specs.0.is_empty() {
+            return Ok(Some(specs));
+        }
         if self.scope.has_bare()
             && !resolved
-            && specs.as_ref().is_some_and(|specs| !specs.0.is_empty())
             && packages
                 .iter()
                 .any(|pkg| !self.scope.declares(manager, &pkg.package))
@@ -256,22 +261,39 @@ impl<'a, 'ctx> Update<'a, 'ctx> {
                 "Qualify the package declarations with manager names or fix the manager status error, then rerun dots up.",
             ));
         }
-        if manager == "brew-cask"
-            && let Some(spec) = specs.as_ref().and_then(|specs| {
-                specs.0.iter().find(|spec| {
-                    spec.strip_prefix("brew-cask:")
-                        .is_some_and(|name| !self.scope.declares(manager, name))
+        if manager == "brew-cask" {
+            if let Some(spec) = specs.0.iter().find(|spec| {
+                spec.strip_prefix("brew-cask:")
+                    .is_some_and(|name| !self.scope.declares(manager, name))
+            }) {
+                return Err(Issue::new(
+                    format!(
+                        "Cannot filter the brew-cask pass: a positional {spec} cannot preserve appdir or adopt from its unqualified declaration."
+                    ),
+                    "Qualify the cask declaration as brew-cask:NAME, then rerun dots up.",
+                ));
+            }
+            // A positional parent can install excluded cask dependencies.
+            // Mise builds its appdir and adopt options from the named specs.
+            if let Some(held) = packages
+                .iter()
+                .map(|pkg| format!("brew-cask:{}", pkg.package))
+                .find(|spec| {
+                    self.config
+                        .exceptions
+                        .held_by_for(spec, &self.config.profile)
+                        .is_some()
                 })
-            })
-        {
-            return Err(Issue::new(
-                format!(
-                    "Cannot filter the brew-cask pass: a positional {spec} cannot preserve appdir or adopt from its unqualified declaration."
-                ),
-                "Qualify the cask declaration as brew-cask:NAME, then rerun dots up.",
-            ));
+            {
+                return Err(Issue::new(
+                    format!(
+                        "Cannot filter the brew-cask pass: mise can install held {held} as a dependency without preserving its appdir or adopt settings."
+                    ),
+                    "Manage the dependent cask through an installer exception, or remove the hold if mise can manage it, then rerun dots up.",
+                ));
+            }
         }
-        Ok(specs)
+        Ok(Some(specs))
     }
 
     fn prepare_store_tool(&self) -> Option<(Tool, bool)> {

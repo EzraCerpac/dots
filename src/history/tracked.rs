@@ -509,6 +509,23 @@ impl TrackedPaths {
         reopen(home, source, self.binding(), false).map(drop)
     }
 
+    pub(super) fn open_file(&self, path: &Path) -> Result<Option<File>, Fail> {
+        if self
+            .0
+            .targets
+            .binary_search_by(|target| target.as_path().cmp(path))
+            .is_err()
+        {
+            return Err(invalid(
+                "history observation lies outside the tracked inventory",
+            ));
+        }
+        let binding = self.0.for_targets(&[path.to_owned()]);
+        let source = binding.source.as_ref().map(|(root, _)| root.as_path());
+        let mut files = reopen(binding.home.clone(), source, &binding, true)?;
+        Ok(files.pop())
+    }
+
     pub(super) fn secure(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
         let home = physical_home(native.home()?)?;
         let source = self.0.source.as_ref().map(|_| native.ctx.root.path());

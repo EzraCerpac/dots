@@ -121,13 +121,10 @@ impl LocalSettings {
         identity: &Path,
         recipients: &BTreeSet<String>,
     ) -> Result<(), Fail> {
-        let identity = path_text(identity)?;
         self.set_origin(branch, origin)?;
+        self.set_recovery_identity(identity, false)?;
+        let identity = path_text(identity)?;
         let root = self.document.as_table_mut();
-        let env = table(root, "env")?;
-        if !env.contains_key("SETUP_AGE_IDENTITY") {
-            env.insert("SETUP_AGE_IDENTITY", value(identity));
-        }
         let settings = table(root, "settings")?;
         table(settings, "history")?.insert("sync", value("manual"));
         let age = table(settings, "age")?;
@@ -167,9 +164,11 @@ impl LocalSettings {
         Ok(())
     }
 
-    pub fn set_recovery_identity(&mut self, identity: &Path) -> Result<(), Fail> {
-        table(self.document.as_table_mut(), "env")?
-            .insert("SETUP_AGE_IDENTITY", value(path_text(identity)?));
+    pub fn set_recovery_identity(&mut self, identity: &Path, replace: bool) -> Result<(), Fail> {
+        let env = table(self.document.as_table_mut(), "env")?;
+        if replace || !env.contains_key("SETUP_AGE_IDENTITY") {
+            env.insert("SETUP_AGE_IDENTITY", value(path_text(identity)?));
+        }
         Ok(())
     }
 

@@ -41,6 +41,7 @@ pub(super) struct Validated {
     pub apply: ApplyPlan,
     pub retired: Vec<Retirement>,
     local: BTreeMap<PathBuf, Image>,
+    public_before: BTreeMap<PathBuf, Image>,
     configs: BTreeMap<PathBuf, Image>,
 }
 
@@ -49,7 +50,12 @@ impl Validated {
         &self.revision
     }
 
-    pub fn still_current(&self, root: &Path) -> io::Result<bool> {
+    pub fn pre_install_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
+        Ok(self.local == local_files(root)?
+            && (self.retired.is_empty() || self.public_before == public_root_configs(root)?))
+    }
+
+    pub fn retirement_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
         if self.local != local_files(root)? {
             return Ok(false);
         }
@@ -167,6 +173,11 @@ pub(super) fn validate(
     let retired = retire(&root, &documents, &local, |source| {
         Ok(!current.contains_key(source) && source_exists(scratch.live.root(), source)?)
     })?;
+    let public_before = if retired.is_empty() {
+        BTreeMap::new()
+    } else {
+        public_root_configs(scratch.live.root())?
+    };
     for row in &retired {
         let path = root.join(&row.path);
         fs::remove_file(&path)?;
@@ -247,8 +258,22 @@ pub(super) fn validate(
         apply,
         retired,
         local,
+        public_before,
         configs,
     })
+}
+
+fn public_root_configs(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
+    let anchored = Dir::open(root)?;
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root)? {
+        let path = PathBuf::from(entry?.file_name());
+        if is_mise_config(&path) && !local(&path) {
+            let image = anchored.read_path(&path)?;
+            files.insert(path, image);
+        }
+    }
+    Ok(files)
 }
 
 fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {

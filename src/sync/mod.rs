@@ -638,11 +638,11 @@ fn synchronize(
         };
 
         if !validated
-            .still_current(git.root())
-            .or_note("Could not recheck machine-local files", RERUN)?
+            .pre_install_inputs_unchanged(git.root())
+            .or_note("Could not recheck configuration files", RERUN)?
         {
             return Err(Note::new(
-                "Machine-local files changed during validation",
+                "Configuration files changed during validation",
                 RERUN,
             ));
         }
@@ -748,7 +748,7 @@ fn synchronize(
                 .reconcile_captures(&git, &shared.dir, &approved, &merged, &merged_tree, receipt)
                 .or_note("Could not reconcile captured copy baselines", RERUN)?;
             if !validated
-                .still_current(git.root())
+                .retirement_inputs_unchanged(git.root())
                 .or_note("Could not recheck configuration files before apply", RERUN)?
             {
                 return Err(Note::new(

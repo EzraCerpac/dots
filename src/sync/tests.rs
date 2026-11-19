@@ -924,7 +924,8 @@ fn cr18_retirement_refuses_a_late_public_declaration() {
     let tree = git.tree(&revision).unwrap();
     let validated = super::validation::validate(&run, &scratch, &revision, &tree, &tree).unwrap();
     assert_eq!(validated.retired.len(), 1);
-    assert!(validated.still_current(root).unwrap());
+    assert!(validated.pre_install_inputs_unchanged(root).unwrap());
+    assert!(validated.retirement_inputs_unchanged(root).unwrap());
     use std::io::Write;
     fs::OpenOptions::new()
         .append(true)
@@ -932,9 +933,56 @@ fn cr18_retirement_refuses_a_late_public_declaration() {
         .unwrap()
         .write_all(b"\n[dotfiles.example]\nsource = 'templates/retired'\n")
         .unwrap();
-    assert!(!validated.still_current(root).unwrap());
+    assert!(!validated.pre_install_inputs_unchanged(root).unwrap());
+    assert!(!validated.retirement_inputs_unchanged(root).unwrap());
     assert_eq!(fs::read(root.join("config.local.toml")).unwrap(), local);
     let _ = run.end(0);
+}
+
+#[test]
+fn cr18_retirement_follows_the_approved_incoming_public_config() {
+    let (_fixture, ctx) = shared_mise_fixture("");
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    let config = root.join("config.toml");
+    let local = root.join("config.local.toml");
+    let original = b"[dotfiles.example]\nsource = 'templates/retired'\nmode = 'template'\nvariants = [{ target = '~/.retired-fixture' }]\n";
+    fs::write(&local, original).unwrap();
+    fs::create_dir(root.join("templates")).unwrap();
+    fs::write(root.join("templates/retired"), b"previous source\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    let before = fixture_commit(&git, "original public config");
+    git.get(["push", "origin", "dev"]).unwrap();
+
+    git.get(["switch", "-qc", "peer"]).unwrap();
+    let incoming = b"[vars]\ndots_profiles = 'default'\n# approved incoming settings\n";
+    fs::write(&config, incoming).unwrap();
+    git.get(["rm", "templates/retired"]).unwrap();
+    fs::create_dir(root.join("dots")).unwrap();
+    fs::write(
+        root.join("dots/retired-declarations"),
+        "dotfiles.example\ttemplates/retired\n",
+    )
+    .unwrap();
+    git.get(["add", "."]).unwrap();
+    let after = fixture_commit(&git, "replace public config and retire obsolete source");
+    git.get(["push", "origin", "peer:dev"]).unwrap();
+    git.get(["switch", "-q", "dev"]).unwrap();
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(fs::read(&local).unwrap(), original);
+    assert_ne!(fs::read(&config).unwrap(), incoming);
+
+    let receipt = shared_mise_sync(&ctx);
+    assert!(receipt.issues.is_empty(), "{:?}", receipt.issues);
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), after);
+    assert_eq!(fs::read(config).unwrap(), incoming);
+    assert!(fs::read(local).unwrap().is_empty());
+    assert!(
+        receipt
+            .recovery_files
+            .iter()
+            .any(|file| fs::read(file).is_ok_and(|bytes| bytes == original))
+    );
 }
 
 #[test]

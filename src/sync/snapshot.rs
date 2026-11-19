@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tempfile::TempDir;
-use toml_edit::{DocumentMut, Item, Value};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::{process::Cwd, run::Run};
 
@@ -140,11 +140,12 @@ impl<'a> Scratch<'a> {
         base: &str,
         candidate: &str,
         rejected: &mut BTreeSet<PathBuf>,
+        home: Option<&Path>,
     ) -> io::Result<String> {
         let before = self.git.tree(base)?;
         let after = self.git.tree(candidate)?;
         let mut index_info = Vec::new();
-        self.omit_adoptions(base, &before, &after, rejected, &mut index_info)?;
+        self.omit_declarations(base, &before, &after, rejected, &mut index_info, home)?;
         for path in after.keys().filter(|path| overlaps(rejected, path)) {
             index_row(&mut index_info, path, None, base.len());
         }
@@ -169,17 +170,15 @@ impl<'a> Scratch<'a> {
         }
     }
 
-    fn omit_adoptions(
+    fn omit_declarations(
         &self,
         base: &str,
         before: &Tree,
         after: &Tree,
         rejected: &mut BTreeSet<PathBuf>,
         index: &mut Vec<u8>,
+        home: Option<&Path>,
     ) -> io::Result<()> {
-        if !rejected.iter().any(|path| path.starts_with("dotfiles")) {
-            return Ok(());
-        }
         let staged = self.live.get([
             "diff",
             "--cached",
@@ -210,17 +209,9 @@ impl<'a> Scratch<'a> {
             };
             let omit: Vec<_> = declarations
                 .iter()
-                .filter_map(|(target, item)| {
-                    let source = item.as_inline_table()?;
-                    let relative = source.get("source")?.as_str()?;
-                    let target_path = target.strip_prefix("~/")?;
-                    (source.len() == 2
-                        && source.get("mode").and_then(Value::as_str) == Some("symlink")
-                        && relative.strip_prefix("dotfiles/") == Some(target_path)
-                        && rejected.contains(Path::new(relative))
-                        && !old.is_some_and(|table| table.contains_key(target)))
-                    .then(|| target.to_owned())
-                })
+                .filter(|(target, _)| !old.is_some_and(|table| table.contains_key(target)))
+                .filter(|(_, item)| names_source(item, self.live.root(), home, rejected))
+                .map(|(target, _)| target.to_owned())
                 .collect();
             if omit.is_empty() {
                 continue;
@@ -362,6 +353,45 @@ impl<'a> Scratch<'a> {
         }
         Ok(findings)
     }
+}
+
+fn names_source(
+    item: &Item,
+    root: &Path,
+    home: Option<&Path>,
+    rejected: &BTreeSet<PathBuf>,
+) -> bool {
+    let matches = |source: &str| {
+        let path = source
+            .strip_prefix("~/")
+            .and_then(|path| home.map(|home| home.join(path)))
+            .unwrap_or_else(|| root.join(source));
+        path.strip_prefix(root)
+            .is_ok_and(|relative| rejected.contains(relative))
+    };
+    let record = |table: &dyn TableLike| {
+        table
+            .get("source")
+            .and_then(Item::as_str)
+            .is_some_and(matches)
+    };
+    let Some(table) = item.as_table_like() else {
+        return item.as_str().is_some_and(matches);
+    };
+    if record(table) {
+        return true;
+    }
+    let Some(variants) = table.get("variants") else {
+        return false;
+    };
+    variants.as_array().is_some_and(|variants| {
+        variants
+            .iter()
+            .filter_map(toml_edit::Value::as_inline_table)
+            .any(|item| record(item))
+    }) || variants
+        .as_array_of_tables()
+        .is_some_and(|variants| variants.iter().any(|item| record(item)))
 }
 
 fn missing_scanner(run: &Run<'_>) -> ScanError {

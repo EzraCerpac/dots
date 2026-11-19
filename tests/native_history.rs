@@ -1094,13 +1094,29 @@ fn history_probe_cancellation_matches_its_report(command: &str, diagnostic: &str
     let fixture = Fixture::new();
     let remote = fixture.world.bare_remote("unused.git");
     let ready = fixture.world.home().join("probe-ready");
-    let probe = fixture.script(
-        "pgrep",
-        "#!/bin/sh\nprintf 'ready\\n' > \"$FIXTURE_READY\"\nexec sleep 30\n",
-    );
-    let mut child = fixture
-        .dots(&[command], &remote)
-        .env("DOTS_MISE_BIN", probe)
+    let mut dots = fixture.dots(&[command], &remote);
+    if command == "backup" {
+        let mise = fixture.script(
+            "history-sync-mode-probe",
+            r#"#!/bin/sh
+case "$*" in
+    "settings get history.sync")
+        printf 'ready\n' > "$FIXTURE_READY"
+        exec sleep 30
+        ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+        );
+        dots.env("DOTS_MISE_BIN", mise)
+            .env("FIXTURE_MISE", &fixture.mise);
+    } else {
+        fixture.script(
+            "pgrep",
+            "#!/bin/sh\nprintf 'ready\\n' > \"$FIXTURE_READY\"\nexec sleep 30\n",
+        );
+    }
+    let mut child = dots
         .env("FIXTURE_READY", &ready)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1945,7 +1961,7 @@ exec "$FIXTURE_MISE" "$@"
             "An earlier restore was interrupted and did not finish.",
             "dots mise dot history --pending",
             "dots mise dot recover UUID",
-            "Otherwise, reconcile the file and run dots restore.",
+            "Otherwise, review your tracked settings and retry with dots restore.",
         ] {
             assert!(diagnostic.contains(text), "{command}: {diagnostic}");
         }

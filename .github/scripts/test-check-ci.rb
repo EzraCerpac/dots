@@ -1,3 +1,4 @@
+require "fileutils"
 require "json"
 require "open3"
 require "tmpdir"
@@ -11,6 +12,28 @@ caller = YAML.load_file(".github/workflows/release.yml").fetch("jobs").fetch("te
 [aggregate, caller].each do |job|
   raise "ci needs Actions read access" unless job.dig("permissions", "actions") == "read"
 end
+
+# Evidence from release binaries should still run when the test jobs fail.
+{ "package" => [], "assets" => ["package"], "install" => ["assets"] }.each do |id, artifacts|
+  job = jobs.fetch(id)
+  prerequisites = ["changes", *artifacts]
+  conditions = ["!cancelled()", "needs.changes.result == 'success'",
+                "needs.changes.outputs.code == 'true'", "needs.changes.outputs.full == 'true'"]
+  conditions.concat(artifacts.map { |input| "needs.#{input}.result == 'success'" })
+  raise "#{id} has unexpected prerequisites" unless Array(job.fetch("needs")) == prerequisites
+  raise "#{id} has an unexpected guard" unless job.fetch("if").split.join(" ") == "${{ #{conditions.join(' && ')} }}"
+end
+install_steps = jobs.fetch("install").fetch("steps")
+candidate = install_steps.find { |entry| entry["id"] == "candidate" }
+raise "candidate must download the release archives" unless candidate&.dig("with", "name") == "release-archives"
+{
+  "Run install.sh in a fresh container with the release archive" => "linux-amd64",
+  "Exercise shipped scaffold examples with native Homebrew" => "darwin-arm64"
+}.each do |name, platform|
+  guard = "${{ !cancelled() && steps.candidate.outcome == 'success' && matrix.platform == '#{platform}' }}"
+  raise "#{name} has an unexpected guard" unless install_steps.find { |entry| entry["name"] == name }&.fetch("if") == guard
+end
+puts "Packaging and install evidence depends on classification and artifacts"
 
 def job_rows(jobs, needs, matrix, prefix, run, attempt)
   needs.flat_map do |id, need|
@@ -41,10 +64,48 @@ end
 
 Dir.mktmpdir do |dir|
   output = File.join(dir, "outputs")
+  classifier = File.expand_path(".github/scripts/classify-changes")
   raise "classifier failed" unless system({ "REF_TYPE" => "tag", "EVENT" => "push", "GITHUB_OUTPUT" => output },
-                                          "bash", ".github/scripts/classify-changes")
+                                          "bash", classifier)
   full_matrix = JSON.parse(File.readlines(output).find { |line| line.start_with?("matrix=") }.split("=", 2).last)
   short_matrix = full_matrix.merge(full_matrix.reject { |key, _| key == "linux" }.transform_values { { "include" => [] } })
+
+  Dir.mktmpdir do |repo|
+    git = lambda do |*args|
+      stdout, stderr, status = Open3.capture3("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                                             "-c", "user.name=CI", "-c", "user.email=ci@example.invalid", *args, chdir: repo)
+      raise stderr unless status.success?
+      stdout.strip
+    end
+    cases = {
+      %w[src/init/README.md] => %w[code=true full=false],
+      %w[skills/dots/SKILL.md] => %w[code=true full=false],
+      %w[docs/contract.md] => %w[code=false full=false],
+      %w[build.rs install.sh] => %w[code=true full=true]
+    }
+    git.call("init", "-q")
+    cases.keys.flatten.each do |path|
+      file = File.join(repo, path)
+      FileUtils.mkdir_p(File.dirname(file))
+      File.write(file, "initial\n")
+    end
+    git.call("add", ".")
+    git.call("commit", "-qm", "base")
+    base = git.call("rev-parse", "HEAD")
+    cases.each do |paths, expected|
+      git.call("reset", "--hard", base)
+      paths.each { |path| File.write(File.join(repo, path), "modified\n") }
+      git.call("add", "--", *paths)
+      git.call("commit", "-qm", "change")
+      File.truncate(output, 0)
+      env = { "REF_TYPE" => "branch", "EVENT" => "pull_request", "BASE" => base,
+              "HEAD_SHA" => git.call("rev-parse", "HEAD"), "GITHUB_OUTPUT" => output }
+      raise "classifier failed for #{paths.join(', ')}" unless system(env, "bash", classifier, chdir: repo)
+      raise "wrong classifier route for #{paths.join(', ')}" unless File.readlines(output, chomp: true).first(2) == expected
+      puts "Classifier: #{paths.join(', ')} → #{expected.join(' ')}"
+    end
+  end
+
   run = 45_123
   attempt = 4
   path = File.join(dir, "gh")
@@ -92,6 +153,15 @@ Dir.mktmpdir do |dir|
     check.call("all selected jobs succeeded", rows, nil)
     check.call("omitted unselected jobs", rows.reject { |row| row["conclusion"] == "skipped" }, nil)
     next unless full && code
+
+    failed_test = prefix + "Rust tests (aarch64-apple-darwin shard 1/2)"
+    failed_rows = rows.map { |row| row["name"] == failed_test ? row.merge("conclusion" => "failure") : row }
+    check.call("failed test with successful packaging and installs", failed_rows,
+               "Required job did not complete successfully on a runner: Rust tests (aarch64-apple-darwin shard 1/2)")
+    needs.fetch("mac-tests")["result"] = "failure"
+    check.call("failed test group with successful packaging and installs", failed_rows,
+               "mac-tests group: expected success, got failure")
+    needs.fetch("mac-tests")["result"] = "success"
 
     leg = prefix + "Package (linux-arm64)"
     without_leg = rows.reject { |row| row["name"] == leg }

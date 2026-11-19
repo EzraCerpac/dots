@@ -210,6 +210,7 @@ fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
 pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display) -> Receipt {
     let ctx = execution.ctx();
     let mut receipt = Receipt::new(Some(ctx.root.path().to_owned()), "not pushed");
+    let mut switched_to_dev = false;
     match loaded {
         Loaded::LocalOnly => local_only(&mut receipt),
         Loaded::Problem(problem) => {
@@ -219,7 +220,8 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
             });
         }
         Loaded::Ready(shared) => {
-            if let Err(Note(reason, fix)) = synchronize(execution, stage, shared, &mut receipt)
+            if let Err(Note(reason, fix)) =
+                synchronize(execution, stage, shared, &mut receipt, &mut switched_to_dev)
                 && !execution.cancelled()
             {
                 receipt.issues.push(Issue {
@@ -239,6 +241,12 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
         receipt.stage_outcome = Outcome::Cancelled;
     } else if !receipt.issues.is_empty() {
         receipt.stage_outcome = Outcome::Deferred;
+    }
+    if switched_to_dev {
+        receipt.outcome = format!(
+            "Switched this checkout from main to dev · {}",
+            receipt.outcome
+        );
     }
 
     if receipt::emit(ctx, &receipt, display).is_err() {
@@ -286,6 +294,34 @@ impl<T, E> Explanation<T> for Result<T, E> {
     fn or_note(self, reason: &'static str, fix: &'static str) -> Result<T, Note> {
         self.map_err(|_| Note::new(reason, fix))
     }
+}
+
+fn validation_note(error: io::Error) -> Note {
+    let fix = "Check the merged mise configuration, selected profile and machine-local ignore rules, then rerun dots sync.";
+    if let Some(location) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<validation::ConfigLocation>())
+    {
+        return Note(
+            format!("Merged configuration failed validation at {location}").into(),
+            fix,
+        );
+    }
+    Note::new(
+        "Merged configuration failed validation; nothing pushed or applied",
+        fix,
+    )
+}
+
+fn check_mise(run: &Run<'_>) -> Result<(), Note> {
+    crate::process::Mise::new_in_run(run)
+        .map(drop)
+        .map_err(|error| {
+            Note(
+                error.to_string().into(),
+                "Correct the mise error, then rerun dots sync.",
+            )
+        })
 }
 
 fn issue(receipt: &mut Receipt, diagnostic: &'static str, action: &'static str) {
@@ -354,6 +390,7 @@ fn synchronize(
     stage: StageId,
     shared: Shared,
     receipt: &mut Receipt,
+    switched_to_dev: &mut bool,
 ) -> Result<(), Note> {
     active(run)?;
     let ctx = run.ctx();
@@ -408,16 +445,42 @@ fn synchronize(
         let selected = source::select_dev(
             |args| {
                 git.output(args)
-                    .map_err(|_| Fail::new(1, "could not run Git"))
+                    .or_note("Could not inspect or switch the source checkout", GIT)
             },
-            || match read_origin(ctx, &git) {
-                Ok(Some(_)) => crate::config::selection::read(&ctx.root, &ctx.env).map(drop),
-                _ => Err(Fail::new(1, "could not verify Git origin")),
+            |main, candidate| {
+                read_origin(ctx, &git)?.ok_or(Note::new("Could not verify Git origin", REMOTE))?;
+                crate::config::selection::read(&ctx.root, &ctx.env).or_note(
+                    "The profile and machine selection could not be read",
+                    CONFIG,
+                )?;
+                check_mise(run)?;
+                let scratch = Scratch::new(&git, &shared.dir)
+                    .or_note("Could not create a private sync workspace", GIT)?;
+                let tree = git
+                    .tree(candidate)
+                    .or_note("Could not read the candidate dev tree", GIT)?;
+                let current = git
+                    .tree(main)
+                    .or_note("Could not read the main tree", GIT)?;
+                let validated = validation::validate(run, &scratch, candidate, &tree, &current)
+                    .map_err(validation_note)?;
+                if !validated
+                    .pre_install_inputs_unchanged(git.root())
+                    .or_note("Could not recheck configuration files", RERUN)?
+                {
+                    return Err(Note::new(
+                        "Configuration files changed during validation",
+                        RERUN,
+                    ));
+                }
+                verify_dirs()?;
+                active(run)
             },
-        )
-        .or_note("Could not switch the clean main checkout to dev", GIT)?;
+            |diagnostic| Note::new(diagnostic, GIT),
+        )?;
+        *switched_to_dev = selected == Outcome::Completed;
         verify_dirs()?;
-        if selected == Outcome::Completed {
+        if *switched_to_dev {
             let after = dev_tip(&git).or_note("Could not verify the selected dev revision", GIT)?;
             if before != after {
                 receipt.adopted_revision = Some((before, after));
@@ -464,10 +527,7 @@ fn synchronize(
         "The profile and machine selection could not be read",
         "Run dots profile --profile PROFILE --machine-id ID to repair the selection.",
     )?;
-    crate::process::Mise::new(ctx).or_note(
-        "mise is missing or this machine's profile could not be read",
-        CONFIG,
-    )?;
+    check_mise(run)?;
     let acquire_index = || {
         checkout::SnapshotIndex::acquire(&git, &shared.dir)
             .or_note("Could not reserve the full Git index for capture", GIT)
@@ -681,32 +741,8 @@ fn synchronize(
             .git
             .tree(&merged)
             .or_note("Could not verify the merged tree", GIT)?;
-        let mut validated = match validation::validate(
-            run,
-            &scratch,
-            &merged,
-            &merged_tree,
-            &local_tree,
-        ) {
-            Ok(validated) => validated,
-            Err(error) => {
-                let fix = "Check the merged mise configuration and machine-local ignore rules, then rerun dots sync.";
-                if let Some(location) = error
-                    .get_ref()
-                    .and_then(|error| error.downcast_ref::<validation::ConfigLocation>())
-                {
-                    let mut issue = Issue::new("Merged configuration failed validation", fix);
-                    issue.diagnostic =
-                        format!("Merged configuration failed validation at {location}");
-                    receipt.issues.push(issue);
-                    return Ok(());
-                }
-                return Err(Note::new(
-                    "Merged configuration failed validation; nothing pushed or applied",
-                    fix,
-                ));
-            }
-        };
+        let mut validated = validation::validate(run, &scratch, &merged, &merged_tree, &local_tree)
+            .map_err(validation_note)?;
 
         if !validated
             .pre_install_inputs_unchanged(git.root())
@@ -986,7 +1022,7 @@ fn scan_candidate(
             return Err(ScanError::Failed);
         }
         candidate = scratch
-            .omit(before, &candidate, &mut rejected)
+            .omit(before, &candidate, &mut rejected, run.ctx().env.home())
             .map_err(|_| ScanError::Failed)?;
     }
 }

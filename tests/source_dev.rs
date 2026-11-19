@@ -2164,7 +2164,7 @@ sync_case!(active unchanged_jj_checkout_stops_cleanly, || {
     wrong_checkout("jj", ".jj", "JJ workspace");
 });
 sync_case!(active unchanged_pre_port_sync_state_stops_cleanly, || {
-    wrong_checkout("legacy", "legacy", "pre-1.0 source state");
+    wrong_checkout("legacy", "legacy", "pre-1.0 source state in .git/dots-dev.json");
 });
 sync_case!(active unchanged_wrong_origin_stops_cleanly, || {
     let f = Repo::new();

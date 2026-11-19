@@ -29,7 +29,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
     }
     if shape.legacy_sync {
         println!(
-            "This checkout has legacy sync state. Convert it to the 1.0 Git layout before running dots sync."
+            "This checkout has legacy sync state in .git/dots-dev.json. See the Checkout shape section of the sync guide before running dots sync."
         );
     }
     for marker in shape.operations {

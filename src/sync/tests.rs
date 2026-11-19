@@ -1394,6 +1394,63 @@ fn completed_and_resumed_checkout_name_the_final_backup_in_live_and_replay_recei
 }
 
 #[test]
+fn cutover_local_only_quotes_the_checkout_in_its_remote_command() {
+    let mut receipt = crate::receipt::Receipt::new(Some("/tmp/config's root".into()), "");
+    super::local_only(&mut receipt);
+    assert!(
+        receipt
+            .outcome
+            .contains("git -C '/tmp/config'\\''s root' remote add origin URL"),
+        "{}",
+        receipt.outcome
+    );
+    assert!(receipt.local_only);
+}
+
+#[test]
+fn cutover_concurrent_staging_before_checkout_reports_not_saved() {
+    let (fixture, ctx) = git_fixture();
+    let world = fixture.path().canonicalize().unwrap();
+    let git = Git::new(&ctx, ctx.root.path());
+    let before = fixture_commit(&git, "before");
+    fs::write(git.root().join("candidate"), b"candidate").unwrap();
+    git.get(["add", "candidate"]).unwrap();
+    let after = fixture_commit(&git, "candidate");
+    git.get(["reset", "--hard", &before]).unwrap();
+    let dir = git.root().join(".git");
+    super::checkout::begin(
+        &git,
+        &dir,
+        &super::checkout::index_snapshot(&dir).unwrap(),
+        &before,
+        &after,
+        false,
+    )
+    .unwrap();
+    fs::write(git.root().join("staged"), b"competing stage").unwrap();
+    git.get(["add", "staged"]).unwrap();
+    let snapshot = super::checkout::index_snapshot(&dir).unwrap();
+    for mode in ["1", "replay"] {
+        let child = isolated(&world, std::env::current_exe().unwrap())
+            .env(RECEIPT_CHILD, mode)
+            .args([
+                "--exact",
+                "sync::tests::receipt_save_failure_child",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        let receipt = String::from_utf8(child.stdout).unwrap();
+        assert!(receipt.contains("Not saved"), "{receipt}");
+        assert!(!receipt.contains("pending checkout"), "{receipt}");
+    }
+    assert_eq!(git.id(["rev-parse", "HEAD"]).unwrap(), before);
+    assert_eq!(super::checkout::index_snapshot(&dir).unwrap(), snapshot);
+    assert!(!super::checkout::has_pending(&dir));
+}
+
+#[test]
 fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
     use std::os::unix::fs::MetadataExt;
 
@@ -1472,7 +1529,24 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
             assert!(child.status.success(), "{child:?}");
             String::from_utf8(child.stdout).unwrap()
         };
-        for receipt in [cli("1"), cli("replay")] {
+        let live = cli("1");
+        let original = if conflict == "staged index" {
+            assert!(live.contains("Guarded checkout parked at"), "{live}");
+            assert!(!pending.exists());
+            let parked = live
+                .lines()
+                .filter_map(|line| line.strip_prefix("Recovery copy at "))
+                .map(Path::new)
+                .find(|path| path.ends_with("old-0"))
+                .expect("parked original");
+            assert!(parked.starts_with(&dir) && !parked.starts_with(&pending));
+            assert!(live.contains(&format!("{:?}", parked.parent().unwrap())));
+            assert!(parked.parent().unwrap().join("started").is_file());
+            parked.to_owned()
+        } else {
+            original
+        };
+        for receipt in [live, cli("replay")] {
             assert!(
                 receipt.contains(&format!("recorded revisions {before} to {after}")),
                 "{receipt}"
@@ -1481,9 +1555,10 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
                 receipt.contains("reconcile the index and checkout"),
                 "{receipt}"
             );
-            assert!(
+            assert_eq!(
                 receipt.contains("A guarded checkout is pending"),
-                "{receipt}"
+                conflict == "late file",
+                "{receipt}",
             );
             assert!(receipt.contains("rerun dots sync"), "{receipt}");
             assert_eq!(
@@ -1509,6 +1584,6 @@ fn started_checkout_conflicts_report_both_revisions_and_preserve_recovery() {
         assert_eq!(fs::read(&early).unwrap(), b"incoming alpha\n");
         assert_eq!(fs::read(&late).unwrap(), b"competing live contents\n");
         assert_eq!(fs::read(original).unwrap(), b"original alpha\n");
-        assert!(pending.join("started").is_file());
+        assert_eq!(pending.join("started").is_file(), conflict == "late file");
     }
 }

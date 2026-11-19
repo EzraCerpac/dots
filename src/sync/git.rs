@@ -126,6 +126,18 @@ impl<'a> Git<'a> {
         }
     }
 
+    pub fn output_with_stdin(
+        &self,
+        args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+        input: Stdio,
+    ) -> io::Result<Output> {
+        let mut command = self.command(args)?;
+        match self.run {
+            Some(run) => run.probe_with_stdin(command, input),
+            None => command.stdin(input).output(),
+        }
+    }
+
     pub fn get(&self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io::Result<Vec<u8>> {
         checked(self.output(args)?)
     }

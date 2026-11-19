@@ -1,8 +1,12 @@
 use std::ffi::OsStr;
-use std::fs;
-use std::io;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+use nix::{libc, unistd::geteuid};
 
 use crate::{Env, Fail};
 
@@ -41,12 +45,9 @@ impl ExecutableOrigin {
             && dir
                 .file_name()
                 .is_some_and(|name| name.as_bytes().starts_with(PIN_PREFIX.as_bytes()))
+            && let Some(origin) = Self::read_from_pin(dir)?
         {
-            match fs::read(dir.join(ORIGIN_FILE)) {
-                Ok(data) => return Self::decode(&data),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-                Err(error) => return Err(error),
-            }
+            return Ok(origin);
         }
         Ok(Self {
             path: executable.to_owned(),
@@ -58,7 +59,60 @@ impl ExecutableOrigin {
         let mut data = self.installer.as_bytes().to_vec();
         data.push(0);
         data.extend_from_slice(self.path.as_os_str().as_bytes());
-        fs::write(directory.join(ORIGIN_FILE), data)
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(ORIGIN_FILE))?
+            .write_all(&data)
+    }
+
+    fn read_from_pin(directory: &Path) -> io::Result<Option<Self>> {
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"installation".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // openat returned a fresh descriptor within the opened pin directory.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let dir = directory.metadata()?;
+        let marker = file.metadata()?;
+        let uid = geteuid().as_raw();
+        if dir.uid() != uid
+            || dir.mode() & 0o022 != 0
+            || marker.uid() != uid
+            || marker.mode() & 0o077 != 0
+            || !marker.is_file()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "untrusted dots pin installation",
+            ));
+        }
+        let mut data = Vec::new();
+        const LIMIT: u64 = 16 * 1024;
+        file.take(LIMIT + 1).read_to_end(&mut data)?;
+        if data.len() as u64 > LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized dots pin installation",
+            ));
+        }
+        Self::decode(&data).map(Some)
     }
 
     fn decode(data: &[u8]) -> io::Result<Self> {
@@ -76,6 +130,9 @@ impl ExecutableOrigin {
             b"other" => "other",
             _ => return Err(invalid()),
         };
+        if path[1..].contains(&0) {
+            return Err(invalid());
+        }
         let path = PathBuf::from(OsStr::from_bytes(&path[1..]));
         if !path.is_absolute() {
             return Err(invalid());

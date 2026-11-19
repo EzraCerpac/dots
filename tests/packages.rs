@@ -203,6 +203,44 @@ fn unchanged_remove_hint_respects_unreadable_app_ownership() {
 }
 
 #[test]
+fn new_exact_github_remove_refuses_unattributed_ownership_errors() {
+    let world = fixture("\n[tools]\n\"github:example/codexbar\" = \"latest\"\n");
+    let markers = world.home().join(".local/state/dots/github-apps");
+    fs::create_dir_all(&markers).unwrap();
+    let broken = markers.join("broken.json");
+    fs::write(&broken, "{").unwrap();
+    fake_mise(&world, "exit 91");
+    let config = world.root().join("config.toml");
+    let before = fs::read(&config).unwrap();
+    let error = failed(
+        dots(&world)
+            .args(["remove", "--base", "github:example/codexbar"])
+            .output()
+            .unwrap(),
+        1,
+    );
+    assert!(error.contains(broken.to_str().unwrap()), "{error}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    success(
+        dots(&world)
+            .args([
+                "remove",
+                "--base",
+                "--keep-installed",
+                "github:example/codexbar",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read(&broken).unwrap(), b"{");
+    assert!(
+        !fs::read_to_string(config)
+            .unwrap()
+            .contains("github:example/codexbar")
+    );
+}
+
+#[test]
 fn unchanged_remove_accepts_alias_from_second_declaration() {
     let world = fixture(
         "\n[bootstrap.packages]\n\"brew:fd\" = \"latest\"\n\"brew:homebrew/core/fd\" = \"latest\"\n",
@@ -1130,6 +1168,10 @@ fn new_native_remove_refuses_dependents_and_restores_a_failed_uninstall() {
         "printf 'fixture:amd64 installed\\n'",
     );
     script(&bin(&world).join("sudo"), "exec \"$@\"");
+    script(
+        &bin(&world).join("dpkg"),
+        "printf '%s\\n' \"$*\" > \"$HOME/apt-remove\"\nexit 3",
+    );
     let config = world.root().join("config.toml");
     let before = fs::read(&config).unwrap();
     for dependents in [true, false] {
@@ -1145,9 +1187,6 @@ fn new_native_remove_refuses_dependents_and_restores_a_failed_uninstall() {
 case "$1" in
     --simulate)
         printf 'Remv fixture [2]\n'{additional};;
-    --yes)
-        printf '%s\n' "$*" > "$HOME/apt-remove"
-        exit 3;;
     *) exit 90;;
 esac"#
             ),
@@ -1164,9 +1203,52 @@ esac"#
         if dependents {
             assert!(log.is_empty());
         } else {
-            assert_eq!(log.trim(), "--yes --no-auto-remove remove fixture:amd64");
+            assert_eq!(
+                log.trim(),
+                "--no-force-depends --no-force-depends-version --remove fixture:amd64"
+            );
         }
     }
+}
+
+#[test]
+fn new_apt_remove_refuses_a_reverse_dependency_added_after_the_preview() {
+    let world = fixture("\n[bootstrap.packages]\n\"apt:fixture\" = \"2\"\n");
+    fake_mise(&world, "exit 91");
+    script(
+        &bin(&world).join("dpkg-query"),
+        "printf 'fixture:amd64 installed\\n'",
+    );
+    script(&bin(&world).join("sudo"), "exec \"$@\"");
+    script(
+        &bin(&world).join("apt-get"),
+        r#"
+case "$1" in
+    --simulate) printf 'Remv fixture [2]\n'; touch "$HOME/new-dependent";;
+    --yes) test -f "$HOME/new-dependent"; touch "$HOME/removed-dependent";;
+    *) exit 90;;
+esac"#,
+    );
+    script(
+        &bin(&world).join("dpkg"),
+        r#"
+test "$*" = "--no-force-depends --no-force-depends-version --remove fixture:amd64"
+test -f "$HOME/new-dependent"
+touch "$HOME/refused-dependent"
+exit 1"#,
+    );
+    let config = world.root().join("config.toml");
+    let before = fs::read(&config).unwrap();
+    failed(
+        dots(&world)
+            .args(["remove", "--base", "apt:fixture"])
+            .output()
+            .unwrap(),
+        1,
+    );
+    assert!(world.home().join("refused-dependent").exists());
+    assert!(!world.home().join("removed-dependent").exists());
+    assert_eq!(fs::read(&config).unwrap(), before);
 }
 
 #[test]
@@ -1238,6 +1320,51 @@ fn new_file_removal_refuses_another_spelling_of_the_same_source() {
     assert!(error.contains("config.host-second.toml"), "{error}");
     assert_eq!(fs::read_link(&target).unwrap(), source);
     assert_eq!(fs::read_to_string(alias).unwrap(), "original");
+}
+
+#[test]
+fn new_file_requests_refuse_unicode_aliases_before_mutating() {
+    let world = fixture("");
+    let first = world.home().join("É.conf");
+    let alias = world.home().join("é.conf");
+    fs::write(&first, "same entry").unwrap();
+    if !alias.exists() {
+        return; // This volume distinguishes the two spellings.
+    }
+    let config = world.root().join("config.toml");
+    let before = fs::read(&config).unwrap();
+    let error = failed(
+        dots(&world)
+            .args(["add", "--base"])
+            .args([&first, &alias])
+            .output()
+            .unwrap(),
+        2,
+    );
+    assert!(error.contains("requested twice"), "{error}");
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(fs::symlink_metadata(first).unwrap().is_file());
+    assert!(!world.root().join("dotfiles/É.conf").exists());
+}
+
+#[test]
+fn new_file_requests_allow_distinct_entries_linked_to_the_same_inode() {
+    let world = fixture("");
+    let first = world.home().join("first");
+    let second = world.home().join("second");
+    fs::write(&first, "same bytes").unwrap();
+    fs::hard_link(&first, &second).unwrap();
+    success(
+        dots(&world)
+            .args(["add", "--base"])
+            .args([&first, &second])
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(
+        fs::read_link(first).unwrap(),
+        fs::read_link(second).unwrap()
+    );
 }
 
 #[test]
@@ -1377,6 +1504,80 @@ fn new_interrupted_file_removal_names_parked_entries_and_the_declaration() {
         assert!(error.contains(path.to_str().unwrap()), "{error}");
     }
     assert_eq!(fs::read_to_string(&target).unwrap(), "contents");
+}
+
+#[test]
+fn new_native_add_records_an_install_after_an_unrelated_config_edit() {
+    let world = fixture("");
+    fake_mise(
+        &world,
+        r#"
+case "$1 $2 $3" in
+    "settings ls --all")
+        echo '{}';;
+    "bootstrap packages status")
+        echo '{"apt":{"available":true,"packages":[{"package":"fixture","state":"installed"}]}}';;
+    "bootstrap packages apply")
+        printf '\n# an edit during installation\n' >> "$DOTS_ROOT/config.toml";;
+    *) exit 91;;
+esac"#,
+    );
+    success(
+        dots(&world)
+            .args(["add", "--base", "apt:fixture"])
+            .output()
+            .unwrap(),
+    );
+    let config = fs::read_to_string(world.root().join("config.toml")).unwrap();
+    assert!(config.contains("# an edit during installation"), "{config}");
+    assert!(config.contains("\"apt:fixture\" = \"latest\""), "{config}");
+}
+
+#[test]
+fn new_native_add_cancels_a_blocked_manager_settings_query() {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let world = fixture("");
+    fake_mise(
+        &world,
+        r#"
+case "$1 $2 $3" in
+    "settings ls --all")
+        touch "$HOME/query-started"
+        while [ ! -e "$HOME/release-query" ]; do sleep 0.025; done
+        echo '{}';;
+    *) exit 91;;
+esac"#,
+    );
+    let mut child = dots(&world)
+        .args(["add", "--base", "apt:fixture"])
+        .spawn()
+        .unwrap();
+    let release = world.home().join("release-query");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !world.home().join("query-started").exists() && Instant::now() < deadline {
+        sleep(Duration::from_millis(25));
+    }
+    let ready = world.home().join("query-started").exists();
+    if ready {
+        assert_eq!(
+            unsafe { nix::libc::kill(child.id() as i32, nix::libc::SIGINT) },
+            0
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status = child.try_wait().unwrap();
+        if status.is_some() || Instant::now() >= deadline || !ready {
+            break status;
+        }
+        sleep(Duration::from_millis(25));
+    };
+    fs::write(release, "").unwrap();
+    child.wait().unwrap();
+    assert!(ready, "manager settings query did not start");
+    assert_eq!(status.and_then(|status| status.code()), Some(130));
 }
 
 #[test]

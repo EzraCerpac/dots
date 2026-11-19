@@ -68,6 +68,24 @@ fn unchanged_rejects_a_github_release_page_as_a_repository() {
 }
 
 #[test]
+fn new_pin_provenance_refuses_a_symlink_sidecar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let world = World::new();
+    let pinned = world.home().join("dots-run-fixture");
+    fs::create_dir(&pinned).unwrap();
+    fs::set_permissions(&pinned, fs::Permissions::from_mode(0o700)).unwrap();
+    let exe = pinned.join("dots");
+    support::stage_executable(world.dots().get_program(), &exe).unwrap();
+    let forged = world.home().join("forged");
+    fs::write(&forged, b"mise\0/forged/installation/bin/dots").unwrap();
+    fs::set_permissions(&forged, fs::Permissions::from_mode(0o600)).unwrap();
+    symlink(&forged, pinned.join("installation")).unwrap();
+    let result = world.command(exe).arg("--version").output().unwrap();
+    assert_eq!(result.status.code(), Some(1), "{result:?}");
+}
+
+#[test]
 fn new_nested_command_keeps_the_original_mise_installation_with_a_different_data_dir() {
     use std::os::unix::fs::PermissionsExt;
 

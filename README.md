@@ -26,34 +26,36 @@ dots remote HOST --profile P           # set up another machine from your config
 ## Install
 
 <!-- TODO: A-07 installer -->
-<!-- The published installer URL is pending; once A-07 publishes install.sh at a project-owned endpoint, show its one-line form here. -->
-
-`dots` 0.5.0 is not released yet.
-**Planned for 0.5.0, not available yet:** the recommended install is the project's `install.sh`.
-Without flags it installs mise when it is missing, then runs `dots init`, asking at most two questions in a terminal.
-With `--from REPO --profile P` it instead clones that repository and bootstraps this machine from it:
 
 ```sh
-sh install.sh --from OWNER/NAME --profile laptop
+curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh
 ```
+
+**Not available yet:** this installer arrives with 0.5.0.
+It installs mise if it is missing, installs `dots`, then runs `dots init`.
+
+<details>
+<summary>Set up from your existing dotfiles repository</summary>
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh -s -- --from OWNER/NAME --profile laptop
+```
+
+With `--from` and `--profile`, the installer clones that repository instead of running `dots init`, and bootstraps this machine from it with that profile.
+
+</details>
 
 <details>
 <summary>Other ways to install</summary>
 
-Until 0.5.0, build the current release candidate from source, with Rust 1.100 or newer and a system linker:
+<!-- TODO (D-01, G-2): Verify these routes against the published 0.5.0 artifacts. -->
+<!-- TODO (C-01): Add a Cargo install route once dots-cli is published. -->
 
-```sh
-cargo install --locked --git https://github.com/EzraCerpac/dots --branch rust dots-cli
-```
-
-<!-- TODO (D-01, C-01, G-2): Verify these alternatives against the published 0.5.0 artifacts. -->
-
-Once 0.5.0 is released, any of these will also work; until then the Homebrew tap installs 0.4.0.
+Once 0.5.0 is released, these will also work; until then the Homebrew tap installs 0.4.0.
 
 ```sh
 mise use -g github:EzraCerpac/dots@0.5.0
 brew install ezracerpac/tap/dots
-cargo install dots-cli --locked
 ```
 
 `dots --version` prints the version and how it was installed.

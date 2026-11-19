@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::{config::RepoSetting, run::Run};
 
-use super::git::{Git, bounded, checked, invalid, oid, records, split};
+use super::git::{Git, checked, invalid, oid, records, split};
 
 const DEV: &str = "refs/heads/dev";
 const MAIN: &str = "refs/heads/main";
@@ -239,7 +239,7 @@ pub(super) fn fetch(git: &Git<'_>, run: &Run<'_>, origin: &Origin) -> io::Result
         ],
         &[REFSPEC],
     )?;
-    checked(bounded(cmd, run, NETWORK_BUDGET)?)?;
+    checked(run.probe_detached(cmd, NETWORK_BUDGET)?)?;
     let mut heads = BTreeMap::new();
     let output = git.get([
         "for-each-ref",
@@ -320,7 +320,9 @@ pub(super) fn push(
         )
         .map_err(|_| PushError::NotAttempted)?;
     cmd.env("LC_ALL", "C");
-    let output = bounded(cmd, run, NETWORK_BUDGET).map_err(|_| PushError::Unconfirmed)?;
+    let output = run
+        .probe_detached(cmd, NETWORK_BUDGET)
+        .map_err(|_| PushError::Unconfirmed)?;
     push_status(&output, &refspec, expected == Some(revision))
 }
 

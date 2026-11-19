@@ -143,7 +143,7 @@ fn apply_pre_hooks(run: &Run<'_>, git: &Git<'_>, plan: &ApplyPlan, receipt: &mut
             receipt,
             "mise pre-dotfiles hook failed",
             "Check the pre-dotfiles hook and rerun dots sync.",
-            invoke(run, git.root(), git.root(), &plan.selectors, hook),
+            invoke(run, git.root(), &plan.selectors, hook),
         ) {
             return false;
         }
@@ -866,7 +866,7 @@ impl Copies {
                     receipt,
                     "mise post-dotfiles hook failed",
                     "Check the post-dotfiles hook and rerun dots sync.",
-                    invoke(run, git.root(), git.root(), selectors, hook),
+                    invoke(run, git.root(), selectors, hook),
                 ) {
                     break;
                 }
@@ -1166,20 +1166,12 @@ impl Copies {
                         };
                         known.matches(&current, base, mode, native)
                     }
-                    (Image::Regular { bytes, .. }, None, _)
-                        if self.deployments.contains_key(&path) =>
-                    {
-                        self.deployments
-                            .get(&path)
-                            .is_some_and(|digest| *digest == copy_digest(bytes))
-                    }
-                    (Image::Regular { .. }, None, _) => matches!(
-                        target.mode.as_str(),
-                        "absent" | "template" | "inline" | "content"
-                    ),
-                    (Image::Link(_), None, _) => {
-                        matches!(target.mode.as_str(), "absent" | "symlink")
-                    }
+                    (Image::Regular { .. }, None, _) => self
+                        .deployments
+                        .get(&path)
+                        .map_or(target.mode == "template", |digest| {
+                            matches_native_copy(&current, digest, None)
+                        }),
                     _ => false,
                 };
                 if !still_observed || !manageable {
@@ -1574,7 +1566,6 @@ fn fs_relative(path: &Path) -> io::Result<&Path> {
     Ok(relative)
 }
 
-#[derive(Default)]
 struct Rules {
     exclude: Vec<String>,
     dot_prefix: bool,
@@ -2181,7 +2172,7 @@ impl ReloadQueue {
                     receipt,
                     "mise dotfile reload failed",
                     "Check the matching history.reload command, then rerun dots sync.",
-                    invoke(run, live, live, selectors, command),
+                    invoke(run, live, selectors, command),
                 );
             }
         }
@@ -2226,20 +2217,14 @@ fn strings(item: &Item) -> Vec<String> {
     }
 }
 
-fn invoke(
-    run: &Run<'_>,
-    overlay: &Path,
-    root: &Path,
-    selectors: &str,
-    expression: &str,
-) -> io::Result<ExitStatus> {
+fn invoke(run: &Run<'_>, root: &Path, selectors: &str, expression: &str) -> io::Result<ExitStatus> {
     if run.cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
     use std::ffi::OsStr;
     let mut command = validation::command(
         run,
-        overlay,
+        root,
         [
             "exec",
             "--",

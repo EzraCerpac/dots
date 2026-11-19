@@ -188,7 +188,6 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
                 diagnostic: problem.diagnostic,
                 next_action: problem.next,
             });
-            receipt.stage_outcome = Outcome::Deferred;
         }
         Loaded::Ready(shared) => {
             if let Err(Note(reason, fix)) = synchronize(execution, stage, shared, &mut receipt)

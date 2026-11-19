@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 
 use crate::config::physical;
@@ -76,27 +77,80 @@ fn remove_if_retired(root: &Path, home: &Path, target: &Path) -> io::Result<bool
         }
         Err(error) => return Err(error),
     };
-    let destination = parent.join(&link);
+    if !missing_inside_root(&parent.join(&link), root)?
+        || !fs::read_link(&target).is_ok_and(|current| current == link)
+    {
+        return Ok(false);
+    }
+    remove_observed_link(&target, &link, root)
+}
+
+fn missing_inside_root(destination: &Path, root: &Path) -> io::Result<bool> {
     match destination.metadata() {
         Ok(_) => return Ok(false),
         Err(error) if missing(&error) => {}
         Err(error) => return Err(error),
     }
+    let mut prefix = destination;
+    loop {
+        match physical(prefix) {
+            Ok(path) => {
+                if prefix != destination && !path.metadata().is_ok_and(|entry| !entry.is_dir()) {
+                    // A dangling alias may hide the actual obstruction.
+                    return Ok(false);
+                }
+                return Ok(path != root && path.starts_with(root));
+            }
+            // A former source directory can now be a file. Resolve the
+            // obstructing prefix, including symlinks, before retiring the link.
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                if !matches!(prefix.components().next_back(), Some(Component::Normal(_))) {
+                    return Ok(false);
+                }
+                let Some(parent) = prefix.parent() else {
+                    return Ok(false);
+                };
+                prefix = parent;
+            }
+            Err(error) if missing(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+}
 
-    let destination = match physical(&destination) {
-        Ok(destination) => destination,
+fn remove_observed_link(target: &Path, observed: &Path, root: &Path) -> io::Result<bool> {
+    let parent = target.parent().expect("retirement target has a parent");
+    let work = tempfile::Builder::new()
+        .prefix(".dots-retire-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    let mut original = tempfile::TempPath::try_from_path(work.path().join("original"))?;
+    original.disable_cleanup(true);
+    match fs::rename(target, &original) {
+        Ok(()) => {}
         Err(error) if missing(&error) => return Ok(false),
         Err(error) => return Err(error),
-    };
-    if destination == root
-        || !destination.starts_with(root)
-        || !fs::read_link(&target).is_ok_and(|current| current == link)
-        || !target.metadata().is_err_and(|error| missing(&error))
-    {
-        return Ok(false);
     }
-    fs::remove_file(target)?;
-    Ok(true)
+    let still_retired = if fs::read_link(&original).is_ok_and(|link| link == observed) {
+        missing_inside_root(&parent.join(observed), root)
+    } else {
+        Ok(false)
+    };
+    if matches!(still_retired, Ok(true)) {
+        fs::remove_file(&original)?;
+        return Ok(true);
+    }
+    // A replacement belongs to its writer. Leave both entries recoverable
+    // if another writer has claimed the target since the displacement.
+    if let Err(error) = original.persist_noclobber(target) {
+        let saved = work.keep().join("original");
+        return Err(io::Error::other(format!(
+            "could not restore changed target, original kept at {}: {}",
+            saved.display(),
+            error.error
+        )));
+    }
+    still_retired
 }
 
 fn missing(error: &io::Error) -> bool {
@@ -112,6 +166,15 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn retains_a_regular_file_at_a_previously_observed_link_path() {
+        let world = tempfile::tempdir().unwrap();
+        let path = world.path().join("target");
+        fs::write(&path, b"saved contents").unwrap();
+        assert!(!remove_observed_link(&path, Path::new("retired"), world.path()).unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"saved contents");
+    }
+
+    #[test]
     fn keeps_links_with_sources_or_outside_destinations_and_never_follows_a_target_parent_out() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("config");
@@ -124,6 +187,15 @@ mod tests {
         symlink(&root, home.join("alias")).unwrap();
         symlink("alias/retired/source", home.join("retired")).unwrap();
         symlink(root.join("existing"), home.join("existing")).unwrap();
+        symlink(root.join("existing/former-leaf"), home.join("blocked-leaf")).unwrap();
+        let outside_file = dir.path().join("outside-file");
+        fs::write(&outside_file, "outside").unwrap();
+        symlink(&outside_file, root.join("file-alias")).unwrap();
+        symlink(
+            root.join("file-alias/former-leaf"),
+            home.join("outside-blocked"),
+        )
+        .unwrap();
         symlink(root.join("missing"), dir.path().join("outside-home")).unwrap();
         symlink(dir.path().join("outside"), root.join("escape")).unwrap();
         symlink(root.join("escape/missing"), home.join("outside-source")).unwrap();
@@ -131,6 +203,9 @@ mod tests {
         fs::write(home.join("regular"), "keep").unwrap();
 
         assert!(remove_if_retired(&root, &home, &home.join("retired")).unwrap());
+        assert!(remove_if_retired(&root, &home, &home.join("blocked-leaf")).unwrap());
+        assert!(!remove_if_retired(&root, &home, &home.join("outside-blocked")).unwrap());
+        assert!(fs::symlink_metadata(home.join("outside-blocked")).is_ok());
         for kept in ["existing", "out/outside-home", "regular", "outside-source"] {
             assert!(!remove_if_retired(&root, &home, &home.join(kept)).unwrap());
             assert!(fs::symlink_metadata(home.join(kept)).is_ok());

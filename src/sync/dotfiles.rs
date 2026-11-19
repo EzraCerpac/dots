@@ -12,7 +12,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::{receipt::Receipt, run::Run};
 
 use super::git::{Entry, Git, Tree, invalid, relative};
-use super::guard::{CStrName, Dir, Image, private_dir, write_private};
+use super::guard::{CStrName, Dir, FileId, Image, private_dir, write_private};
 use super::validation::{self, Retirement, Validated};
 use super::{issue, path_issue};
 
@@ -259,6 +259,8 @@ impl KnownCopy {
 pub(super) struct Copies {
     state: CopyState,
     observed: BTreeMap<PathBuf, Image>,
+    observed_directory_inodes: BTreeMap<PathBuf, FileId>,
+    adopted_directory_leaves: BTreeMap<PathBuf, PathBuf>,
     written: BTreeSet<PathBuf>,
     deployments: BTreeMap<PathBuf, NativeDeployment>,
 }
@@ -514,8 +516,9 @@ impl Copies {
                 }
                 continue;
             };
-            let native = if git.root().join(source).is_dir() {
-                Some(stage_tree(run, git_dir, &git.root().join(source), &rules)?)
+            let source_dir = git.root().join(source);
+            let native = if source_dir.is_dir() {
+                Some(stage_tree(run, git_dir, &source_dir, &rules)?)
             } else {
                 None
             };
@@ -551,9 +554,9 @@ impl Copies {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
                 let common = record.source_image(git, revision)?;
-                let deployed = match filesystem.read_path(fs_relative(&path)?) {
-                    Ok(image @ Image::Regular { .. }) => image,
-                    Ok(Image::Absent) => continue,
+                let (deployed, inode) = match filesystem.read_observed(fs_relative(&path)?) {
+                    Ok((image @ Image::Regular { .. }, Some(inode))) => (image, inode),
+                    Ok((Image::Absent, _)) => continue,
                     _ => {
                         path_issue(
                             receipt,
@@ -565,6 +568,9 @@ impl Copies {
                     }
                 };
                 self.observed.insert(path.clone(), deployed.clone());
+                if path != destination {
+                    self.observed_directory_inodes.insert(path.clone(), inode);
+                }
                 let live = root.read_path(leaf)?;
                 let deployment = if path == destination {
                     self.deployments.get(&path)
@@ -677,6 +683,23 @@ impl Copies {
                     }
                 } else {
                     self.state = Self::load(git_dir)?.state;
+                }
+            }
+            if let Some(leaves) = native {
+                for (relative, expected) in leaves {
+                    let path = destination.join(relative);
+                    // A leaf matching what the declared source would deploy
+                    // counts as deployed, even without a prior Git entry.
+                    if !self.state.known.contains_key(&path)
+                        && let Ok((current, Some(inode))) =
+                            filesystem.read_observed(fs_relative(&path)?)
+                        && current == expected
+                    {
+                        self.adopted_directory_leaves
+                            .insert(path.clone(), source_dir.clone());
+                        self.observed_directory_inodes.insert(path.clone(), inode);
+                        self.observed.insert(path, expected);
+                    }
                 }
             }
         }
@@ -905,7 +928,14 @@ impl Copies {
                 })
                 .collect::<Vec<_>>()
         };
-        let reload = ReloadQueue::new(run, git.root(), git_dir, selectors, &configs.reload)?;
+        let reload = ReloadQueue::new(
+            run,
+            git.root(),
+            git_dir,
+            selectors,
+            &configs.reload,
+            &active_configs.reload,
+        )?;
         let directory_copies = targets
             .iter()
             .filter(|target| target.mode == "copy")
@@ -1259,8 +1289,22 @@ impl Copies {
         let mut clean = true;
         for (path, replacement) in desired {
             let relative_path = fs_relative(&path)?;
-            let current = filesystem.read_path(relative_path)?;
+            let (current, current_inode) = filesystem.read_observed(relative_path)?;
             if rules.create_only && current != Image::Absent {
+                continue;
+            }
+            let observed_inode = self.observed_directory_inodes.get(&path).copied();
+            if let Some(inode) = observed_inode
+                && (Some(inode) != current_inode
+                    || observed.get(&path).is_some_and(|before| *before != current))
+            {
+                path_issue(
+                    receipt,
+                    "Kept a changed or unmanaged dotfile",
+                    &path,
+                    COPY_ACTION,
+                );
+                clean = false;
                 continue;
             }
             let known = self.state.known.get(&path);
@@ -1339,12 +1383,22 @@ impl Copies {
                         (native.is_none() || known.deployed.is_some() || mode.is_some())
                             && known.matches(&current, base, mode, native)
                     }
-                    (Image::Regular { .. }, None, _) => self
-                        .deployments
-                        .get(&path)
-                        .map_or(target.mode == "template", |native| {
-                            matches_native_copy(&current, &native.digest, None)
-                        }),
+                    (Image::Regular { .. }, None, _) => {
+                        (target.mode == "copy"
+                            && path != destination
+                            && self
+                                .adopted_directory_leaves
+                                .get(&path)
+                                .is_some_and(|source| {
+                                    target.effective_source() == Some(source.as_path())
+                                }))
+                            || self
+                                .deployments
+                                .get(&path)
+                                .map_or(target.mode == "template", |native| {
+                                    matches_native_copy(&current, &native.digest, None)
+                                })
+                    }
                     _ => false,
                 };
                 if !still_observed
@@ -1373,6 +1427,7 @@ impl Copies {
                     Some(WriteEffect::Deploy {
                         target: path.clone(),
                         baseline: next_baseline,
+                        observed_inode,
                     }),
                     receipt,
                 )
@@ -1499,6 +1554,8 @@ enum WriteEffect {
     Deploy {
         target: PathBuf,
         baseline: Option<KnownCopy>,
+        #[serde(default)]
+        observed_inode: Option<FileId>,
     },
 }
 
@@ -1616,7 +1673,26 @@ pub(super) fn recover(git_dir: &Path, receipt: &mut Receipt) -> io::Result<()> {
 }
 
 fn complete_write(git_dir: &Path, plan: &WritePlan, receipt: &mut Receipt) -> io::Result<()> {
-    reconcile_write(git_dir, plan, receipt, super::guard::replace_consuming)
+    let expected_inode = match &plan.effect {
+        Some(WriteEffect::Deploy { observed_inode, .. }) => *observed_inode,
+        _ => None,
+    };
+    reconcile_write(
+        git_dir,
+        plan,
+        receipt,
+        |root, path, stage, old, new, before, after| {
+            super::guard::replace_consuming(
+                root,
+                path,
+                stage,
+                old,
+                new,
+                (before, expected_inode),
+                after,
+            )
+        },
+    )
 }
 
 fn reconcile_write(
@@ -1665,7 +1741,9 @@ fn reconcile_write(
             WriteEffect::Capture { deployed, baseline } => {
                 copies.state.captured.insert(deployed.clone(), *baseline);
             }
-            WriteEffect::Deploy { target, baseline } => {
+            WriteEffect::Deploy {
+                target, baseline, ..
+            } => {
                 copies.state.captured.remove(target);
                 if let Some(baseline) = baseline {
                     copies.state.known.insert(target.clone(), baseline.clone());
@@ -1917,6 +1995,13 @@ struct Configs {
     reload: Vec<(String, String)>,
 }
 
+#[derive(Deserialize)]
+struct LoadedConfig {
+    path: PathBuf,
+    #[serde(default, rename = "override")]
+    is_override: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Declaration<'a> {
     name: &'a str,
@@ -1973,13 +2058,11 @@ fn omit_permissions(item: &mut Item) {
 
 impl Configs {
     fn read_at(run: &Run<'_>, root: &Path, preview: bool) -> io::Result<Self> {
-        #[derive(Deserialize)]
-        struct Config {
-            path: PathBuf,
-        }
         let bytes = validation::probe(run, root, validation::MiseProbe::ConfigList, preview)?;
-        let configs: Vec<Config> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let configs: Vec<LoadedConfig> =
+            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         let mut result = Self::default();
+        let mut reload_layers = Vec::new();
         for config in configs {
             if !config.path.starts_with(root) {
                 continue;
@@ -1994,20 +2077,33 @@ impl Configs {
                     result.post.extend(strings(post));
                 }
             }
-            if let Some(reload) = doc
-                .get("history")
-                .and_then(|item| item.get("reload"))
-                .and_then(Item::as_table_like)
+            if !config.is_override
+                && let Some(reload) = doc
+                    .get("history")
+                    .and_then(|item| item.get("reload"))
+                    .and_then(Item::as_table_like)
             {
-                for (path, command) in reload.iter() {
-                    result.reload.extend(
-                        strings(command)
-                            .into_iter()
-                            .map(|command| (path.to_owned(), command)),
-                    );
-                }
+                reload_layers.push(
+                    reload
+                        .iter()
+                        .map(|(glob, command)| (glob.to_owned(), command.clone()))
+                        .collect::<Vec<_>>(),
+                );
             }
             result.docs.push((config.path, doc));
+        }
+        // JSON lists the most local files first. As in native history reload,
+        // merge low to high priority and preserve each glob's original slot.
+        let mut reload = Table::new();
+        for (glob, command) in reload_layers.into_iter().rev().flatten() {
+            reload.insert(&glob, command);
+        }
+        for (glob, command) in reload.iter() {
+            result.reload.extend(
+                strings(command)
+                    .into_iter()
+                    .map(|command| (glob.to_owned(), command)),
+            );
         }
         Ok(result)
     }
@@ -2265,45 +2361,54 @@ impl ReloadQueue {
         git_dir: &Path,
         selectors: &str,
         rules: &[(String, String)],
+        live_rules: &[(String, String)],
     ) -> io::Result<Option<Self>> {
-        if rules.is_empty() {
+        if rules.is_empty() && live_rules.is_empty() {
             return Ok(None);
         }
         let stage = private_dir(git_dir, "copy-reload-")?;
+        // Mise merges history.reload from ordinary profiles. Its special
+        // override files can appear in config ls without replacing these rules.
         let mut config = tempfile::Builder::new()
             .prefix("config.host-")
-            .suffix(".override.toml")
+            .suffix(".local.toml")
             .tempfile_in(live)?;
         let profile = config
             .path()
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .and_then(|name| name.strip_prefix("config."))
-            .and_then(|name| name.strip_suffix(".override.toml"))
+            .and_then(|name| name.strip_suffix(".local.toml"))
             .ok_or_else(|| invalid("invalid mise reload profile"))?;
         let selectors = if selectors.is_empty() {
             profile.to_owned()
         } else {
             format!("{selectors},{profile}")
         };
-        let doc = reload_config(rules, &stage.path().join("matches"), |pattern| {
+        let mut doc = reload_config(rules, &stage.path().join("matches"), |pattern| {
             Ok(pattern.to_owned())
         })?;
+        let reload = doc["history"]["reload"]
+            .as_table_mut()
+            .expect("reload_config creates a reload table");
+        // A validated pre-hook can write a new rule for a future sync.
+        // Keep native apply from executing that unvalidated command now.
+        for (glob, _) in live_rules {
+            if !reload.contains_key(glob) {
+                reload.insert(glob, value(":"));
+            }
+        }
         config.write_all(doc.to_string().as_bytes())?;
         let mut command = validation::command(run, live, ["config", "ls", "--json"], false)?;
         command
             .env("MISE_ENV", &selectors)
             .env("MISE_NO_HOOKS", "1");
         let output = run.probe(command)?;
-        #[derive(Deserialize)]
-        struct LoadedConfig {
-            path: PathBuf,
-        }
         if !output.status.success()
             || !serde_json::from_slice::<Vec<LoadedConfig>>(&output.stdout)
                 .map_err(io::Error::other)?
                 .iter()
-                .any(|loaded| loaded.path == config.path())
+                .any(|loaded| loaded.path == config.path() && !loaded.is_override)
         {
             return Err(invalid("mise did not load the temporary reload profile"));
         }
@@ -2323,6 +2428,9 @@ impl ReloadQueue {
         paths: &BTreeSet<PathBuf>,
         receipt: &mut Receipt,
     ) -> io::Result<()> {
+        if rules.is_empty() {
+            return Ok(());
+        }
         let marker = self.stage.path().join("matches");
         if !paths.is_empty() {
             let root = self.stage.path().join("paths");
@@ -2647,7 +2755,7 @@ mod tests {
             &stage,
             &CStrName::new("previous").unwrap(),
             &CStrName::new("publish").unwrap(),
-            &previous,
+            (&previous, None),
             &replacement,
         )
         .unwrap();

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target=${1:?missing target}
+bundle="$RUNNER_TEMP/dots-cargo-tests"
+workspace=$(pwd -P)
+mkdir -p "$bundle"
+artifacts=$(mktemp)
+files=$(mktemp)
+trap 'rm -f "$artifacts" "$files"' EXIT
+.mise/rust-cargo test --locked --target "$target" --no-run --message-format=json > "$artifacts"
+printf '%s\n' "$workspace" > "$bundle/workspace"
+jq -rs '
+    map(select(.reason == "compiler-artifact" and .profile.test and .executable != null))
+    | sort_by(.target.name)
+    | .[] | [.target.kind[0], .target.name, .executable] | @tsv
+' "$artifacts" > "$bundle/tests.tsv"
+test -s "$bundle/tests.tsv"
+
+while IFS=$'\t' read -r kind name executable; do
+    if [[ "$executable" != "$workspace/"* || ! -x "$executable" ]]; then
+        echo "Missing Cargo artifact for $kind $name at $executable" >&2
+        exit 1
+    fi
+    printf '%s\n' "${executable#"$workspace/"}"
+done < "$bundle/tests.tsv" > "$files"
+printf 'target/%s/debug/dots\n' "$target" >> "$files"
+COPYFILE_DISABLE=1 tar -cf - -T "$files" | gzip -1 > "$bundle/tests.tar.gz"

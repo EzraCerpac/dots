@@ -2,12 +2,11 @@
 set -euo pipefail
 
 trap 'printf "### First-run smoke test\n\nElapsed time: %ss.\n" "$SECONDS" >> "$GITHUB_STEP_SUMMARY"' EXIT
-archive=$1
+binary=$1
 seed="$RUNNER_TEMP/dots-first-run"
 mkdir -p "$seed"
 cp "$(command -v mise)" "$seed/mise"
-tar --zstd -xOf "$archive" target/x86_64-unknown-linux-musl/debug/dots > "$seed/dots"
-chmod +x "$seed/dots"
+install -m 0755 "$binary" "$seed/dots"
 
 docker run --rm -i --mount "type=bind,src=$seed,dst=/seed,readonly" \
   alpine:3.23 sh -eu <<'SH'
@@ -32,6 +31,10 @@ export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$
 mkdir -p "$HOME/.local/bin" "$TMPDIR"
 cp /seed/mise /seed/dots "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:/usr/bin:/bin"
+if command -v python3 || command -v node; then
+    echo 'Fresh-container fixture unexpectedly contains Python or Node' >&2
+    exit 1
+fi
 cd "$HOME"
 dots init </dev/null
 dots up </dev/null

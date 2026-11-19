@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target=${1:?missing native target}
+# The library suite includes terminal and signal fixtures that previously
+# ran in separate nextest processes. Keep those fixtures from overlapping.
+.mise/rust-cargo test --locked --target "$target" --lib -- --test-threads 1
+.mise/rust-cargo test --locked --target "$target" --bins --test '*'
+.mise/rust-cargo test --locked --target "$target" --doc

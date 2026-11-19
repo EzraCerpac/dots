@@ -45,7 +45,7 @@ fn new_first_run_needs_only_mise_and_git_on_path() {
     // A self-update regression must only be able to replace the fixture's copy.
     fs::copy(tool_on_path("mise"), bin.join("mise")).unwrap();
 
-    for tool in ["age", "bash", "gitleaks", "jq", "node", "uv"] {
+    for tool in ["age", "bash", "gitleaks", "jq", "node", "python3", "uv"] {
         let result = world.command(tool).env("PATH", &bin).output();
         assert!(
             matches!(&result, Err(error) if error.kind() == ErrorKind::NotFound),

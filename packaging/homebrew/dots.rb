@@ -9,43 +9,40 @@
 class Dots < Formula
   desc "Keep machines in the state a mise configuration declares"
   homepage "https://github.com/EzraCerpac/dots"
-  version "0.3.0"
+  version "@VERSION@"
   license "MIT"
 
   # The configuration sync needs Git 2.43 or newer, which macOS does not ship.
   # dots also needs mise, which is not a dependency: most users run mise's own
-  # installer, which updates itself (see caveats). Node.js, uv, jq and the
-  # other tools come from the user's mise configuration.
+  # installer, which updates itself (see caveats).
   depends_on "git"
 
   on_macos do
     on_arm do
-      url "https://github.com/EzraCerpac/dots/releases/download/v0.3.0/dots-0.3.0-darwin-arm64.tar.gz"
+      url "https://github.com/EzraCerpac/dots/releases/download/v@VERSION@/dots-@VERSION@-darwin-arm64.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # darwin-arm64
     end
     on_intel do
-      url "https://github.com/EzraCerpac/dots/releases/download/v0.3.0/dots-0.3.0-darwin-amd64.tar.gz"
+      url "https://github.com/EzraCerpac/dots/releases/download/v@VERSION@/dots-@VERSION@-darwin-amd64.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # darwin-amd64
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/EzraCerpac/dots/releases/download/v0.3.0/dots-0.3.0-linux-arm64.tar.gz"
+      url "https://github.com/EzraCerpac/dots/releases/download/v@VERSION@/dots-@VERSION@-linux-arm64.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # linux-arm64
     end
     on_intel do
-      url "https://github.com/EzraCerpac/dots/releases/download/v0.3.0/dots-0.3.0-linux-amd64.tar.gz"
+      url "https://github.com/EzraCerpac/dots/releases/download/v@VERSION@/dots-@VERSION@-linux-amd64.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000" # linux-amd64
     end
   end
 
   def install
-    libexec.install Dir["*"]
-    bin.install_symlink libexec/"bin/dots"
-    fish_completion.install_symlink libexec/"completions/dots.fish"
-    zsh_completion.install_symlink libexec/"completions/_dots"
-    bash_completion.install_symlink libexec/"completions/dots.bash" => "dots"
+    # Homebrew stages the archive from its sole top-level directory, bin/.
+    bin.install "dots"
+    generate_completions_from_executable(bin/"dots", "completions")
   end
 
   def caveats
@@ -61,8 +58,10 @@ class Dots < Formula
   end
 
   test do
-    assert_match "dots #{version} (homebrew)", shell_output("#{bin}/dots --version")
-    assert_predicate libexec/"bin/dots-up", :executable?
-    assert_match "dots-shared-cli/3", shell_output("#{libexec}/bin/dots-up --capabilities")
+    assert_equal "dots #{version} (homebrew)\n", shell_output("#{bin}/dots --version")
+    { bash: bash_completion/"dots", zsh: zsh_completion/"_dots", fish: fish_completion/"dots.fish" }.each do |shell, path|
+      assert_predicate path, :file?
+      assert_equal shell_output("#{bin}/dots completions #{shell}").b, path.binread
+    end
   end
 end

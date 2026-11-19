@@ -189,14 +189,16 @@ impl ReceiptWorld {
         let tools = fixture.join("bin");
         fs::create_dir_all(&tools).unwrap();
         fs::create_dir(fixture.join("tmp")).unwrap();
-        for name in [
-            "bash", "cat", "dirname", "git", "grep", "jq", "node", "python3", "sed", "sleep", "tar",
-        ] {
+        let oracle = oracle();
+        let tools_to_stage = [
+            "bash", "cat", "dirname", "git", "grep", "jq", "sed", "sleep", "tar",
+        ];
+        let oracle_tools = oracle.then_some(["node", "python3"]).into_iter().flatten();
+        for name in tools_to_stage.into_iter().chain(oracle_tools) {
             if let Some(path) = executable_on_path(&world.dots(), name) {
                 symlink(path, tools.join(name)).unwrap();
             }
         }
-        let oracle = oracle();
         if oracle {
             executable(&tools.join("mise"), MISE);
             executable(&tools.join("gitleaks"), SCANNER);

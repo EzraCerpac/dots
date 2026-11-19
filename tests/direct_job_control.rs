@@ -786,6 +786,44 @@ fn new_background_dots_never_takes_shell_terminal_or_starts_observer() {
 }
 
 #[test]
+fn new_intentional_background_stop_resumes_with_bash_bg() {
+    let fixture = Fixture::new();
+    let mut terminal = Terminal::start(&fixture, "background-stop", false);
+    terminal.line(&format!("{JOB} & job=$!"));
+    terminal.expect(SHELL_PROMPT);
+    let stage = terminal.session.identity("stage");
+    let dots = terminal.dots_pid();
+    terminal.verify_original_tty(&stage, false);
+    let bash = terminal.session.pid();
+    assert_eq!(stage.foreground, bash);
+    fs::write(fixture.control.join("stop-stage"), b"").unwrap();
+    wait_for_with(
+        "intentional SIGSTOP to stop the stage and its Bash job",
+        || (stopped(stage.pid) && stopped(dots)).then_some(()),
+        || terminal.session.launch_details(),
+    );
+
+    terminal.line("jobs -sp");
+    terminal.expect(&format!("\r\n{dots}\r\n"));
+    terminal.expect(SHELL_PROMPT);
+    terminal.line("bg; printf '\\nbg-status:%s\\n' \"$?\"");
+    terminal.expect("\r\nbg-status:0\r\n");
+    let resumed = terminal.session.identity("resumed");
+    assert_eq!(resumed.pid, stage.pid);
+    terminal.verify_original_tty(&resumed, false);
+    assert_eq!(resumed.foreground, bash);
+    assert_eq!(foreground(terminal.master.as_raw_fd()), bash);
+    let mut known = vec![bash, dots, stage.pid];
+    known.sort_unstable();
+    assert_eq!(terminal.session.members(), known, "background observer");
+
+    fs::write(fixture.control.join("finish-stage"), b"").unwrap();
+    terminal.line(&format!("wait \"$job\"; {RESULT}"));
+    terminal.result(0);
+    assert!(!fixture.live("stage"));
+}
+
+#[test]
 fn new_background_tty_read_stops_and_bash_fg_resumes_native_input() {
     let fixture = Fixture::new();
     let mut terminal = Terminal::start(&fixture, "background-reader", false);

@@ -215,7 +215,7 @@ fn stage(dir: &Path, case: &str) -> ! {
             set_handler(libc::SIGTSTP, libc::SIG_DFL);
         }
         "background-reader" => set_handler(libc::SIGTTIN, libc::SIG_DFL),
-        "line" | "background" | "sudo" => {}
+        "line" | "background" | "background-stop" | "sudo" => {}
         _ => panic!("unknown fixture case {case}"),
     }
     let _live = register(dir, "stage");
@@ -228,6 +228,17 @@ fn stage(dir: &Path, case: &str) -> ! {
     }
     match case {
         "detached" | "background" => wait_forever(),
+        "background-stop" => {
+            wait_for("permission to stop the background stage", || {
+                dir.join("stop-stage").exists().then_some(())
+            });
+            check(unsafe { libc::raise(libc::SIGSTOP) }).unwrap();
+            let _resumed = register(dir, "resumed");
+            wait_for("permission to exit the continued stage", || {
+                dir.join("finish-stage").exists().then_some(())
+            });
+            process::exit(0);
+        }
         "background-reader" | "cancel-suspend-zero" | "cancel-suspend-23" => {
             let tty = File::open("/dev/tty").unwrap();
             let mut reader = io::BufReader::new(&tty);

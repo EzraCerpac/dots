@@ -770,7 +770,7 @@ fn incomplete_alongside_log_replays_recorded_bytes_without_a_full_log_link() {
 fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
     run_tty_probe_fixture(
         "supervisor::tests::tty_probe_uses_pinned_observer_and_respects_foreground_ownership",
-        false,
+        |path| check_tty_probe(path, false),
     );
 }
 
@@ -778,17 +778,104 @@ fn tty_probe_uses_pinned_observer_and_respects_foreground_ownership() {
 fn tty_probe_resumes_helper_when_launcher_catches_ttin() {
     run_tty_probe_fixture(
         "supervisor::tests::tty_probe_resumes_helper_when_launcher_catches_ttin",
-        true,
+        |path| check_tty_probe(path, true),
     );
 }
 
-fn run_tty_probe_fixture(test: &str, helper: bool) {
+#[test]
+fn parked_probe_retires_pipe_holder_after_reader_and_leader_exit() {
+    run_tty_probe_fixture(
+        "supervisor::tests::parked_probe_retires_pipe_holder_after_reader_and_leader_exit",
+        check_parked_probe_drain,
+    );
+}
+
+fn check_parked_probe_drain(path: &Path) {
+    use std::os::fd::AsRawFd;
+
+    let ctx = fixture_context(path, false);
+    let supervisor = Supervisor::new(&ctx, Mode::Direct);
+    println!("probe prompt");
+    let (tty, caller) = foreground_terminal().unwrap();
+    let other = supervisor
+        .spawn(shell("exec sleep 60", &[]), Placement::Probe, false)
+        .unwrap();
+    let set_foreground = |group| {
+        terminal::without_sigttou(|| {
+            if unsafe { libc::tcsetpgrp(tty.as_raw_fd(), group) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .unwrap();
+    };
+    set_foreground(other.entry.pid);
+
+    let pids = path.join("parked-pids");
+    let holder_ready = path.join("holder-ready");
+    let command = shell(
+        r#"trap ':' TTIN
+        /bin/sh -c 'trap "" TTIN; : > "$1"; exec sleep 60' holder "$2" &
+        holder=$!
+        while [ ! -e "$2" ]; do sleep .02; done
+        dd if=/dev/tty bs=1 count=1 &
+        reader=$!
+        printf '%s %s\n' "$reader" "$holder" > "$1"
+        wait "$reader" || wait "$reader" || :"#,
+        &[&pids, &holder_ready],
+    );
+    let mut probe = supervisor.spawn(command, Placement::Probe, false).unwrap();
+    let pipes = Pipes::take(&mut probe.child).unwrap();
+    let read_pids = || {
+        let contents = fs::read_to_string(&pids).ok()?;
+        let (reader, holder) = contents.trim().split_once(' ')?;
+        Some((
+            reader.parse::<libc::pid_t>().ok()?,
+            holder.parse::<libc::pid_t>().ok()?,
+        ))
+    };
+    let mut children = None;
+    assert!(wait_until(|| {
+        assert!(probe.poll(false, false).unwrap().is_none());
+        children = read_pids();
+        probe.awaiting_foreground && children.is_some()
+    }));
+    let (reader, holder) = children.unwrap();
+    let group = -probe.entry.target;
+    assert_eq!(unsafe { libc::getpgid(reader) }, group);
+    assert_eq!(unsafe { libc::getpgid(holder) }, group);
+    assert_eq!(unsafe { libc::kill(reader, libc::SIGKILL) }, 0);
+    assert!(wait_until(|| matches!(
+        observe(probe.entry.pid, false),
+        Ok(Observed::Exited)
+    )));
+    assert!(!groups::has_stopped_child(group, probe.entry.pid).unwrap());
+    assert!(groups::has_live(group, None).unwrap());
+
+    // Advance the observed idle time without waiting through the 30-second bound.
+    let expired = Instant::now() - OWNED_DRAIN_IDLE;
+    probe.leader_exit = Some(expired);
+    probe.last_output = expired;
+    assert!(probe.poll(false, false).unwrap().is_none());
+    assert!(
+        probe.forced_drain,
+        "parked probe skipped its normal drain deadline"
+    );
+    let error = pipes.collect(&mut probe).unwrap_err();
+    assert!(error.to_string().contains("output stayed open"), "{error}");
+    assert!(probe.reaped && probe.retirement_done && !probe.retirement_unconfirmed);
+    assert!(!supervisor.cancelled());
+    assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, other.entry.pid);
+    set_foreground(caller);
+}
+
+fn run_tty_probe_fixture(test: &str, check: impl FnOnce(&Path)) {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
     const FLAG: &str = "DOTS_SUPERVISOR_TTY_PROBE";
     if let Some(path) = std::env::var_os(FLAG) {
-        check_tty_probe(Path::new(&path), helper);
+        check(Path::new(&path));
         return;
     }
 

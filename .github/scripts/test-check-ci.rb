@@ -13,6 +13,28 @@ caller = YAML.load_file(".github/workflows/release.yml").fetch("jobs").fetch("te
   raise "ci needs Actions read access" unless job.dig("permissions", "actions") == "read"
 end
 
+# Evidence from release binaries should still run when the test jobs fail.
+{ "package" => [], "assets" => ["package"], "install" => ["assets"] }.each do |id, artifacts|
+  job = jobs.fetch(id)
+  prerequisites = ["changes", *artifacts]
+  conditions = ["!cancelled()", "needs.changes.result == 'success'",
+                "needs.changes.outputs.code == 'true'", "needs.changes.outputs.full == 'true'"]
+  conditions.concat(artifacts.map { |input| "needs.#{input}.result == 'success'" })
+  raise "#{id} has unexpected prerequisites" unless Array(job.fetch("needs")) == prerequisites
+  raise "#{id} has an unexpected guard" unless job.fetch("if").split.join(" ") == "${{ #{conditions.join(' && ')} }}"
+end
+install_steps = jobs.fetch("install").fetch("steps")
+candidate = install_steps.find { |entry| entry["id"] == "candidate" }
+raise "candidate must download the release archives" unless candidate&.dig("with", "name") == "release-archives"
+{
+  "Run install.sh in a fresh container with the release archive" => "linux-amd64",
+  "Exercise shipped scaffold examples with native Homebrew" => "darwin-arm64"
+}.each do |name, platform|
+  guard = "${{ !cancelled() && steps.candidate.outcome == 'success' && matrix.platform == '#{platform}' }}"
+  raise "#{name} has an unexpected guard" unless install_steps.find { |entry| entry["name"] == name }&.fetch("if") == guard
+end
+puts "Packaging and install evidence depends on classification and artifacts"
+
 def job_rows(jobs, needs, matrix, prefix, run, attempt)
   needs.flat_map do |id, need|
     job = jobs.fetch(id)
@@ -131,6 +153,15 @@ Dir.mktmpdir do |dir|
     check.call("all selected jobs succeeded", rows, nil)
     check.call("omitted unselected jobs", rows.reject { |row| row["conclusion"] == "skipped" }, nil)
     next unless full && code
+
+    failed_test = prefix + "Rust tests (aarch64-apple-darwin shard 1/2)"
+    failed_rows = rows.map { |row| row["name"] == failed_test ? row.merge("conclusion" => "failure") : row }
+    check.call("failed test with successful packaging and installs", failed_rows,
+               "Required job did not complete successfully on a runner: Rust tests (aarch64-apple-darwin shard 1/2)")
+    needs.fetch("mac-tests")["result"] = "failure"
+    check.call("failed test group with successful packaging and installs", failed_rows,
+               "mac-tests group: expected success, got failure")
+    needs.fetch("mac-tests")["result"] = "success"
 
     leg = prefix + "Package (linux-arm64)"
     without_leg = rows.reject { |row| row["name"] == leg }

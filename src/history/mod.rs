@@ -3,6 +3,7 @@ mod keys;
 mod native;
 mod probe_state;
 mod publication;
+mod recipient_config;
 mod recovery;
 mod tracked;
 mod watcher;

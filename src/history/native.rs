@@ -52,22 +52,23 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         self.selection = Some(selection);
     }
 
+    pub(super) fn selection(&self) -> Result<Selection, Fail> {
+        match &self.selection {
+            Some(selected) => Ok(selected.clone()),
+            None => selection::read(&self.ctx.root, &self.ctx.env),
+        }
+    }
+
     pub fn mise(&self, args: &[&str]) -> Result<Command, Fail> {
-        let selected = match &self.selection {
-            Some(selected) => Selection {
-                profile: selected.profile.clone(),
-                machine_id: selected.machine_id.clone(),
-                selectors: selected.selectors.clone(),
-            },
-            None => selection::read(&self.ctx.root, &self.ctx.env)?,
-        };
+        let selected = self.selection()?;
         let environments = selected.active_environments();
         let mise = Mise::with_selection(self.ctx, selected)?;
         let mut cmd = mise.command(args)?;
         // Backup and restore use the managed layers. Update checkpoints must
         // see the same effective overrides for inventory and native save.
         if !self.checkpoint {
-            cmd.env_remove("MISE_GLOBAL_CONFIG_FILE");
+            cmd.env_remove("MISE_GLOBAL_CONFIG_FILE")
+                .env_remove("MISE_CONFIG_FILE");
         }
         cmd.env_remove("MISE_CD")
             .env_remove("MISE_LOG_FILE")

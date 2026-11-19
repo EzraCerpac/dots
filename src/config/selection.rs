@@ -11,7 +11,7 @@ use crate::{Env, Fail};
 
 const REPAIR: &str = "dots profile --profile PROFILE --machine-id ID";
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Selection {
     pub profile: Option<String>,
     pub machine_id: Option<String>,

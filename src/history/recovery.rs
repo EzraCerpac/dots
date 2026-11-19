@@ -296,27 +296,7 @@ fn verify_capture_policy(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fa
             "plaintext history must be disabled before restore; set history.allow_plaintext_history to false and retry dots restore",
         ));
     }
-    let diagnostic = "no verified history recipient configuration; configure [history.encryption].recipients and retry dots restore";
-    // Native history accepts system and global declarations. The ordinary
-    // config listing also contains project and override files, so read the
-    // managed global local file or ask mise for a specifically scoped file.
-    let mut recipients = LocalSettings::read(native)?.configured_recipients()?;
-    if recipients.is_none() {
-        for scope in ["--global", "--system"] {
-            let mut cmd =
-                native.mise(&["config", "get", scope, "history.encryption.recipients"])?;
-            cmd.env("GIT_ALLOW_PROTOCOL", "");
-            let output = native.probe(cmd, diagnostic)?;
-            if output.status.success() {
-                recipients =
-                    Some(serde_json::from_slice(&output.stdout).map_err(|_| invalid(diagnostic))?);
-                break;
-            }
-        }
-    }
-    recipients
-        .filter(|keys| !keys.is_empty() && keys.iter().all(|key| keys::recipient_shape(key)))
-        .ok_or_else(|| invalid(diagnostic))
+    super::recipient_config::read(native)
 }
 
 struct Recovery<'a, 'run, 'ctx> {

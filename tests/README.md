@@ -39,7 +39,7 @@ cargo test --locked --test contract -- --list
 
 On DriehuisNAS, run each test command through `mise run nas:build --`.
 
-In CI, a pull request into `main` runs the full Linux set and ARM macOS.
+In CI, a pull request into `main` that changes code runs the full Linux set and ARM macOS.
 Intel macOS and the v0.4.0 oracle coverage run only on pushes to `main` and on tags.
 
 Name a case `unchanged_` when v0.4.0 passes it too,

@@ -265,7 +265,7 @@ test('producer keeps a completed share when checkout stops and reports recovery 
   ]);
   assert.deepEqual(retry.issues, [{ summary: 'Dotfile apply failed',
     detail: 'mise bootstrap dotfiles apply (exit 1)\napplying 3 dotfiles\nmise ERROR cannot apply file',
-    action: 'fix the error below, then run dots apply' }]);
+    action: 'fix the error below, then run dots up' }]);
   assert.equal(f.dev(f.a), latest);
 });
 
@@ -647,7 +647,7 @@ test('a failed apply carries the output that explains it', available, t => {
   process.env.DEV_TEST_APPLY_FAIL = 'mise ERROR pre-dotfiles hook failed: github:EzraCerpac/dots@0.3.1 not found\n'
     + 'mise ERROR Version: 2026.11.9 macos-arm64 (2026-11-16)\nmise ERROR Run with --verbose or MISE_VERBOSE=1 for more information';
   const { text } = f.sync(f.a);
-  assert.match(text, /\n {2}APPLY FAILED: mise bootstrap dotfiles apply \(exit 1\); fix the error below, then run dots apply\n {4}applying 3 dotfiles\n {4}mise ERROR pre-dotfiles hook failed: github:EzraCerpac\/dots@0\.3\.1 not found$/);
+  assert.match(text, /\n {2}APPLY FAILED: mise bootstrap dotfiles apply \(exit 1\); fix the error below, then run dots up\n {4}applying 3 dotfiles\n {4}mise ERROR pre-dotfiles hook failed: github:EzraCerpac\/dots@0\.3\.1 not found$/);
 });
 
 test('a failed save carries the output that explains it', available, t => {

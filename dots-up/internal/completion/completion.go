@@ -67,7 +67,7 @@ var commandName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 func publicCommands(reports bool) candidates {
 	result := candidates{}
 	for _, spec := range commands.All() {
-		if !reports || (spec.Name != "reports" && spec.Name != "plan") {
+		if !reports || spec.Name != "reports" {
 			result[spec.Name] = spec.Description
 		}
 	}
@@ -184,7 +184,7 @@ func suggest(words []string, root string) (string, candidates) {
 			pending = option{}
 			continue
 		}
-		if !endOptions && (name == "apply" || name == "remove" || name == "bootstrap") && word == "--" {
+		if !endOptions && (name == "remove" || name == "bootstrap") && word == "--" {
 			endOptions = true
 			continue
 		}

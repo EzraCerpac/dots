@@ -41,7 +41,14 @@ pub(super) struct Validated {
     pub apply: ApplyPlan,
     pub retired: Vec<Retirement>,
     local: BTreeMap<PathBuf, Image>,
+    public_before: BTreeMap<PathBuf, Image>,
     configs: BTreeMap<PathBuf, Image>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum RetirementChange {
+    MachineLocal,
+    Public,
 }
 
 impl Validated {
@@ -49,8 +56,36 @@ impl Validated {
         &self.revision
     }
 
-    pub fn still_current(&self, root: &Path) -> io::Result<bool> {
-        Ok(self.local == local_files(root)?)
+    pub fn pre_install_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
+        Ok(self.local == local_files(root)?
+            && (self.retired.is_empty() || self.public_before == public_root_configs(root)?))
+    }
+
+    pub fn changed_retirement_inputs(&self, root: &Path) -> io::Result<Option<RetirementChange>> {
+        if self.local != local_files(root)? {
+            return Ok(Some(RetirementChange::MachineLocal));
+        }
+        if self.retired.is_empty() {
+            return Ok(None);
+        }
+        let live = Dir::open(root)?;
+        for (path, expected) in &self.configs {
+            if !live.read_path(path)?.git_eq(expected) {
+                return Ok(Some(RetirementChange::Public));
+            }
+        }
+        for entry in fs::read_dir(root)? {
+            let path = PathBuf::from(entry?.file_name());
+            if is_mise_config(&path) && !local(&path) && !self.configs.contains_key(&path) {
+                return Ok(Some(RetirementChange::Public));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    pub fn retirement_inputs_unchanged(&self, root: &Path) -> io::Result<bool> {
+        Ok(self.changed_retirement_inputs(root)?.is_none())
     }
 
     pub fn ready_to_apply(&self, git: &Git<'_>) -> io::Result<()> {
@@ -149,6 +184,11 @@ pub(super) fn validate(
     let retired = retire(&root, &documents, &local, |source| {
         Ok(!current.contains_key(source) && source_exists(scratch.live.root(), source)?)
     })?;
+    let public_before = if retired.is_empty() {
+        BTreeMap::new()
+    } else {
+        public_root_configs(scratch.live.root())?
+    };
     for row in &retired {
         let path = root.join(&row.path);
         fs::remove_file(&path)?;
@@ -212,6 +252,11 @@ pub(super) fn validate(
     probe(run, &root, MiseProbe::DotfilePreview, true)?;
     let private = Dir::open(&root)?;
     let mut configs = BTreeMap::new();
+    if !retired.is_empty() {
+        for path in documents.keys().filter(|path| !local.contains_key(*path)) {
+            configs.insert(path.clone(), private.read_path(path)?);
+        }
+    }
     for file in files {
         let path = file.path.strip_prefix(&root).map_err(io::Error::other)?;
         if !local.contains_key(path) {
@@ -224,8 +269,22 @@ pub(super) fn validate(
         apply,
         retired,
         local,
+        public_before,
         configs,
     })
+}
+
+fn public_root_configs(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
+    let anchored = Dir::open(root)?;
+    let mut files = BTreeMap::new();
+    for entry in fs::read_dir(root)? {
+        let path = PathBuf::from(entry?.file_name());
+        if is_mise_config(&path) && !local(&path) {
+            let image = anchored.read_path(&path)?;
+            files.insert(path, image);
+        }
+    }
+    Ok(files)
 }
 
 fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
@@ -259,12 +318,12 @@ fn materialize(
         if local(path) {
             return Err(invalid("configuration tracks a machine-local file"));
         }
+        let destination = scratch_destination(root, path)?;
         let image = if checkout_config(path) {
             Image::checkout(&scratch.git, revision, path, Some(entry))?
         } else {
             Image::from_git(&scratch.git, Some(entry))?
         };
-        let destination = root.join(path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -277,6 +336,21 @@ fn materialize(
         }
     }
     Ok(documents)
+}
+
+fn scratch_destination(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let path = super::git::relative(path.as_os_str().as_bytes())?;
+    let mut ancestor = root.to_owned();
+    for part in path.iter().take(path.components().count() - 1) {
+        ancestor.push(part);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(invalid("validation path has a non-directory ancestor")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(root.join(path))
 }
 
 fn checkout_config(path: &Path) -> bool {
@@ -304,8 +378,8 @@ fn materialize_sources(
         {
             continue;
         }
+        let destination = scratch_destination(root, path)?;
         let image = Image::checkout(&scratch.git, revision, path, Some(entry))?;
-        let destination = root.join(path);
         fs::remove_file(&destination)?;
         write_private(&destination, &image)?;
     }
@@ -520,7 +594,7 @@ fn protect_future_hosts(root: &Path) -> io::Result<()> {
         while let Some(name) = line.strip_prefix(b"**/") {
             line = name;
         }
-        if !negated && line.contains(&b'/') {
+        if requires_parent_component(line) {
             continue;
         }
 
@@ -548,6 +622,23 @@ fn protect_future_hosts(root: &Path) -> io::Result<()> {
     } else {
         Err(invalid("merged ignore rules expose future host selectors"))
     }
+}
+
+fn requires_parent_component(pattern: &[u8]) -> bool {
+    let mut first_member = None;
+    for (index, &byte) in pattern.iter().enumerate() {
+        match (first_member, byte) {
+            (None, b'[') => {
+                let negated = matches!(pattern.get(index + 1), Some(b'!' | b'^'));
+                first_member = Some(index + 1 + usize::from(negated));
+            }
+            (Some(_), b'[' | b'\\') => return false,
+            (Some(first), b']') if index > first => first_member = None,
+            (None, b'/') => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn is_mise_config(path: &Path) -> bool {
@@ -684,6 +775,9 @@ pub(super) fn source_exists(root: &Path, path: &Path) -> io::Result<bool> {
 }
 
 fn retired_row(row: &str) -> Option<(String, &str)> {
+    if row.contains('\0') {
+        return None;
+    }
     let (path, source) = row.split_once('\t')?;
     let keys = Key::parse(path).ok()?;
     let [section, key] = keys.as_slice() else {
@@ -768,6 +862,18 @@ mod tests {
             fs::write(&ignore, pattern).unwrap();
             assert!(protect_future_hosts(fixture.path()).is_err(), "{pattern}");
         }
+    }
+
+    #[test]
+    fn cutover_scratch_destination_declines_symlink_ancestors_before_materialization() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        fs::create_dir(root.join("inside")).unwrap();
+        std::os::unix::fs::symlink("inside", root.join("alias")).unwrap();
+
+        assert!(scratch_destination(root, Path::new("inside/file")).is_ok());
+        assert!(scratch_destination(root, Path::new("alias/file")).is_err());
+        assert!(!root.join("inside/file").exists());
     }
 
     #[test]
@@ -1008,5 +1114,26 @@ source = "dotfiles/duplicate"
         }
         let exact = "[dotfiles.herdr]\nsource = 'templates/herdr.tera'\n";
         assert_eq!(retirement_fixture(exact, row).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cr59_an_invalid_retirement_row_does_not_skip_its_valid_neighbor() {
+        let local = "[dotfiles.good]\nsource = 'templates/good'\n";
+        let rows = "dotfiles.bad\ttemplates/bad\0name\ndotfiles.good\ttemplates/good\n";
+        assert!(retired_row(rows.lines().next().unwrap()).is_none());
+        assert_eq!(retirement_fixture(local, rows).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cr60_nested_only_negations_preserve_root_host_protection() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ignore = fixture.path().join(".gitignore");
+        for pattern in [
+            "!*/config.host-tomorrow.toml",
+            "!/subdir/**/config.host-tomorrow.toml",
+        ] {
+            fs::write(&ignore, format!("/config.host-*.toml\n{pattern}\n")).unwrap();
+            assert!(protect_future_hosts(fixture.path()).is_ok(), "{pattern}");
+        }
     }
 }

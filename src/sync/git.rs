@@ -126,6 +126,18 @@ impl<'a> Git<'a> {
         }
     }
 
+    pub fn output_with_stdin(
+        &self,
+        args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+        input: Stdio,
+    ) -> io::Result<Output> {
+        let mut command = self.command(args)?;
+        match self.run {
+            Some(run) => run.probe_with_stdin(command, input),
+            None => command.stdin(input).output(),
+        }
+    }
+
     pub fn get(&self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> io::Result<Vec<u8>> {
         checked(self.output(args)?)
     }
@@ -218,10 +230,8 @@ impl<'a> Git<'a> {
         let mut data = tempfile::tempfile()?;
         data.write_all(input)?;
         data.rewind()?;
-        let output = self
-            .command(["update-index", "-z", "--index-info"])?
-            .stdin(Stdio::from(data))
-            .output()?;
+        let output =
+            self.output_with_stdin(["update-index", "-z", "--index-info"], Stdio::from(data))?;
         checked(output).map(drop)
     }
 }

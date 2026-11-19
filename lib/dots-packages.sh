@@ -29,7 +29,7 @@ setup_package_scope_without_mas() {
     printf '%s' "${scope%,}"
 }
 
-# status and plan have no --manager selector. Limit their package queries
+# The native status has no --manager selector. Limit their package queries
 # with the same native allowlist that the package status command honors.
 setup_package_inspect() {
     local inventory settings scope=""

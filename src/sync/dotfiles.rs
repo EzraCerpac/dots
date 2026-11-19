@@ -269,6 +269,8 @@ pub(super) struct Copies {
 struct CopyState {
     known: BTreeMap<PathBuf, KnownCopy>,
     captured: BTreeMap<PathBuf, Captured>,
+    #[serde(default)]
+    recovered_writes: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -1031,6 +1033,8 @@ impl Copies {
             }
         }
         self.persist(git_dir)?;
+        self.written
+            .extend(self.state.recovered_writes.iter().cloned());
 
         if let Some(reload) = reload
             && reload
@@ -1049,6 +1053,10 @@ impl Copies {
                 "Could not match mise dotfile reloads",
                 "Check history.reload and run the matching commands.",
             );
+        }
+        if !run.cancelled() && !self.state.recovered_writes.is_empty() {
+            self.state.recovered_writes.clear();
+            self.persist(git_dir)?;
         }
         if !hooks_disabled(run) {
             for hook in &configs.post {
@@ -1569,6 +1577,7 @@ pub(super) enum CaptureFailure {
 #[cfg(test)]
 thread_local! {
     pub(super) static CAPTURE_FAILURE: std::cell::Cell<Option<CaptureFailure>> = const { std::cell::Cell::new(None) };
+    static FAIL_STAGING_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn install(
@@ -1608,6 +1617,7 @@ fn install(
             git_dir,
             &plan,
             receipt,
+            false,
             |root, path, stage, old, new, before, after| {
                 super::guard::replace_at_boundary(
                     root,
@@ -1623,7 +1633,7 @@ fn install(
             },
         );
     }
-    complete_write(git_dir, &plan, receipt)
+    complete_write(git_dir, &plan, receipt, false)
 }
 
 fn prepare_write(
@@ -1645,6 +1655,11 @@ fn prepare_write(
         )?;
     }
     File::open(private.path())?.sync_all()?;
+    #[cfg(test)]
+    if FAIL_STAGING_PARENT_SYNC.take() {
+        return Err(io::Error::from_raw_os_error(nix::libc::EIO));
+    }
+    File::open(recovery_parent)?.sync_all()?;
     let plan = WritePlan {
         anchor: anchor.into(),
         path: path.into(),
@@ -1669,10 +1684,15 @@ pub(super) fn recover(git_dir: &Path, receipt: &mut Receipt) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     let plan: WritePlan = serde_json::from_reader(stream).map_err(io::Error::other)?;
-    complete_write(git_dir, &plan, receipt)
+    complete_write(git_dir, &plan, receipt, true)
 }
 
-fn complete_write(git_dir: &Path, plan: &WritePlan, receipt: &mut Receipt) -> io::Result<()> {
+fn complete_write(
+    git_dir: &Path,
+    plan: &WritePlan,
+    receipt: &mut Receipt,
+    recovering: bool,
+) -> io::Result<()> {
     let expected_inode = match &plan.effect {
         Some(WriteEffect::Deploy { observed_inode, .. }) => *observed_inode,
         _ => None,
@@ -1681,6 +1701,7 @@ fn complete_write(git_dir: &Path, plan: &WritePlan, receipt: &mut Receipt) -> io
         git_dir,
         plan,
         receipt,
+        recovering,
         |root, path, stage, old, new, before, after| {
             super::guard::replace_consuming(
                 root,
@@ -1699,6 +1720,7 @@ fn reconcile_write(
     git_dir: &Path,
     plan: &WritePlan,
     receipt: &mut Receipt,
+    recovering: bool,
     write: impl FnOnce(&Dir, &Path, &Dir, &CStrName, &CStrName, &Image, &Image) -> io::Result<()>,
 ) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -1745,6 +1767,9 @@ fn reconcile_write(
                 target, baseline, ..
             } => {
                 copies.state.captured.remove(target);
+                if recovering {
+                    copies.state.recovered_writes.insert(target.clone());
+                }
                 if let Some(baseline) = baseline {
                     copies.state.known.insert(target.clone(), baseline.clone());
                 } else {
@@ -2648,6 +2673,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cr8_parent_sync_failure_prevents_recovery_journal_publication() {
+        let fixture = Fixture::new();
+        let stage_parent = fixture._temp.path().join("target-sibling-staging");
+        fs::create_dir(&stage_parent).unwrap();
+        let invoked = std::cell::Cell::new(false);
+        FAIL_STAGING_PARENT_SYNC.set(true);
+        let result = prepare_write(
+            &fixture.root,
+            Path::new("source"),
+            &fixture.git,
+            &stage_parent,
+            (&Image::Absent, &Image::Link(PathBuf::from("fixture"))),
+            None,
+            |_, _| {
+                invoked.set(true);
+                Ok(())
+            },
+        );
+        FAIL_STAGING_PARENT_SYNC.set(false);
+        assert!(
+            !invoked.get(),
+            "published before the staging parent was synced"
+        );
+        assert!(result.is_err());
+        assert!(!has_pending(&fixture.git));
+        assert_eq!(fs::read_dir(stage_parent).unwrap().count(), 0);
+        fixture.original_versions();
+    }
+
+    #[test]
+    fn cr9_recovery_retains_the_reload_for_an_already_installed_copy() {
+        let fixture = Fixture::new();
+        let target = fixture.root.join("source");
+        let (before, observed_inode) = Dir::open(&fixture.root)
+            .unwrap()
+            .read_observed(Path::new("source"))
+            .unwrap();
+        let after = Image::Regular {
+            bytes: b"installed copy".to_vec(),
+            mode: 0o600,
+        };
+        let plan = prepare_write(
+            &fixture.root,
+            Path::new("source"),
+            &fixture.git,
+            &fixture.git,
+            (&before, &after),
+            Some(WriteEffect::Deploy {
+                target: target.clone(),
+                baseline: None,
+                observed_inode,
+            }),
+            |record, path| {
+                record
+                    .persist_noclobber(path)
+                    .map(drop)
+                    .map_err(io::Error::other)
+            },
+        )
+        .unwrap();
+        fs::create_dir(fixture.git.join(STATE)).unwrap();
+        assert!(complete_write(&fixture.git, &plan, &mut fixture.receipt(), false).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"installed copy");
+        assert!(has_pending(&fixture.git));
+        fs::remove_dir(fixture.git.join(STATE)).unwrap();
+        recover(&fixture.git, &mut fixture.receipt()).unwrap();
+        assert!(!has_pending(&fixture.git));
+        let copies = Copies::load(&fixture.git).unwrap();
+        assert_eq!(copies.state.recovered_writes, BTreeSet::from([target]));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn deployed_recovery_keeps_the_editor_inode_with_identical_checkout_backup() {
@@ -2828,6 +2925,7 @@ mod tests {
             &fixture.git,
             &plan,
             &mut receipt,
+            false,
             |root, path, stage, old, new, before, after| {
                 replace_at_boundary(
                     root,
@@ -2859,6 +2957,7 @@ mod tests {
             &fixture.git,
             &plan,
             &mut receipt,
+            false,
             |root, path, stage, old, new, before, after| {
                 replace_at_boundary(
                     root,
@@ -2913,6 +3012,7 @@ mod tests {
             &fixture.git,
             &plan,
             &mut receipt,
+            false,
             |root, path, stage, old, new, before, after| {
                 replace_at_boundary(
                     root,

@@ -300,6 +300,16 @@ fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
     }
+
+    let legacy = root.join(".git/dots-dev.json");
+    fs::write(&legacy, b"{}\n").unwrap();
+    let output = success(init(&world, &root));
+    assert!(
+        output.contains("legacy sync state in .git/dots-dev.json"),
+        "{output}"
+    );
+    assert_eq!(fs::read(legacy).unwrap(), b"{}\n");
+    assert_eq!(git(&world, &root, &["rev-parse", "HEAD"]), id);
 }
 
 #[test]

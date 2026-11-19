@@ -91,6 +91,7 @@ case "${1-}" in
                 printf 'checkpoint local inventory\n' >> calls
                 printf '{"entries":[],"invalid":[]}\n'
                 ;;
+            dotfiles:apply) [ "$*" = 'bootstrap dotfiles apply --yes' ] ;;
             dotfiles:save) printf 'checkpoint save\n' >> calls ;;
             packages:where)
                 [ "${4-}" = brew:mas ] && [ -x fixture-brew-prefix/bin/mas ] || exit 1

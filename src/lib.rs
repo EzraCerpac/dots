@@ -11,7 +11,6 @@ pub mod init;
 pub mod inspect;
 pub mod packages;
 pub mod process;
-pub mod publish;
 pub mod receipt;
 pub mod report;
 pub mod run;
@@ -111,8 +110,8 @@ impl Env {
     pub fn state_dir(&self) -> io::Result<PathBuf> {
         let base = self
             .get("XDG_STATE_HOME")
-            .filter(|path| !path.is_empty())
             .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
             .or_else(|| self.home().map(|home| home.join(".local/state")))
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "set HOME or XDG_STATE_HOME"))?;
         if !base.is_absolute() {

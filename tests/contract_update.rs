@@ -516,6 +516,13 @@ fn unchanged_plain_update_shows_failed_and_deferred_hook_output() {
         "echo 'fixture step one'; echo 'fixture disk full' >&2; exit 7",
     );
     let text = exit(&run(&mut f.up("--plain")), 1);
+    let calls = f.read_home("mise-calls");
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("prune")),
+        "{calls}"
+    );
     mentions(
         &text,
         &[
@@ -597,3 +604,6 @@ fn unchanged_add_refuses_a_held_package_even_with_a_tap_and_version() {
     );
     f.assert_no_package_install();
 }
+
+#[path = "contract_update_fixtures/review.rs"]
+mod review;

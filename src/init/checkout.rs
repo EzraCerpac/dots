@@ -29,7 +29,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
     }
     if shape.legacy_sync {
         println!(
-            "This checkout has legacy sync state. Convert it to the 1.0 Git layout before running dots sync."
+            "This checkout has legacy sync state in .git/dots-dev.json. See the Checkout shape section of the sync guide before running dots sync."
         );
     }
     for marker in shape.operations {
@@ -39,7 +39,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
     }
     match RepoLock::is_held(&shape.common_dir) {
         Ok(true) => println!(
-            "Another sync or publish holds the repository lock. Wait for it to finish before running dots sync."
+            "Another sync holds the repository lock. Wait for it to finish before running dots sync."
         ),
         Ok(false) => {}
         Err(err) => println!(

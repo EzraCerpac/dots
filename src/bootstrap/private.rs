@@ -135,26 +135,28 @@ pub(super) fn open_bundle(
     if !exists && request.bundle.is_none() && request.identity.is_none() && remembered.is_none() {
         return Ok((Outcome::Completed, None));
     }
-    let identity = if let Some(identity) = &request.identity {
-        identity.clone()
-    } else if let Some(identity) = remembered {
-        identity_path(ctx, identity.as_ref())?
-    } else {
-        recovery_identity(ctx, &local.document, request)?
-    };
-    if exists && let Some(identity) = readable_identity(ctx, &identity)? {
-        let bundle = bundle::decrypt(ctx, run, file, &identity)?;
-        if remembered.is_none_or(|value| Path::new(value) != identity) {
-            let identity = identity.to_str().ok_or_else(|| {
-                Fail::usage(
-                    "the bundle identity path must be UTF-8 to save it in config.local.toml",
-                )
-            })?;
-            set(&mut local.document, BUNDLE_IDENTITY, Value::from(identity))?;
-            local.make_private();
-            local.install()?;
+    if exists {
+        let identity = if let Some(identity) = &request.identity {
+            identity.clone()
+        } else if let Some(identity) = remembered {
+            identity_path(ctx, identity.as_ref())?
+        } else {
+            recovery_identity(ctx, &local.document, request)?
+        };
+        if let Some(identity) = readable_identity(ctx, &identity)? {
+            let bundle = bundle::decrypt(ctx, run, file, &identity)?;
+            if remembered.is_none_or(|value| Path::new(value) != identity) {
+                let identity = identity.to_str().ok_or_else(|| {
+                    Fail::usage(
+                        "the bundle identity path must be UTF-8 to save it in config.local.toml",
+                    )
+                })?;
+                set(&mut local.document, BUNDLE_IDENTITY, Value::from(identity))?;
+                local.make_private();
+                local.install()?;
+            }
+            return Ok((Outcome::Completed, Some(bundle)));
         }
-        return Ok((Outcome::Completed, Some(bundle)));
     }
     run.issue(
         stage,
@@ -349,7 +351,6 @@ pub(super) fn enroll(
         ));
     }
     let identity = machine_identity(ctx, run)?;
-    let had_recovery = string(&local(ctx)?.document, RECOVERY_IDENTITY)?.is_some();
     let outcome = history::enroll(
         run,
         stage,
@@ -358,6 +359,7 @@ pub(super) fn enroll(
             machine,
             origin: &resolved.origin,
             identity: &identity,
+            recovery_identity: Some(&resolved.identity),
             recipients: &recipients,
         },
     );
@@ -366,19 +368,6 @@ pub(super) fn enroll(
     }
 
     let mut local = local(ctx)?;
-    // History preparation can fill an absent recovery setting with the machine key.
-    let recorded = string(&local.document, RECOVERY_IDENTITY)?;
-    if recorded.is_none() || (!had_recovery && recorded.map(Path::new) == Some(identity.as_path()))
-    {
-        let recovery = resolved.identity.to_str().ok_or_else(|| {
-            Fail::usage("the recovery identity path must be UTF-8 to save it in config.local.toml")
-        })?;
-        set(
-            &mut local.document,
-            RECOVERY_IDENTITY,
-            Value::from(recovery),
-        )?;
-    }
     let service = &["bootstrap", "services", "mise-history", "builtin"];
     if string(&local.document, service)?.is_some_and(|kind| kind != "history-watch") {
         return Err(Fail::usage(

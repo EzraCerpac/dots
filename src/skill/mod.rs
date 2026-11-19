@@ -95,7 +95,9 @@ fn refresh_in(env: &Env, state: &Path) -> io::Result<()> {
         .filter(|path| !path.exists())
         .filter_map(|path| physical(path).ok())
         .collect();
-    if would_create_agent_root(state, &protected) {
+    if would_create_agent_root(state, &protected)
+        || would_create_agent_root(&state.join("skills/dots"), &protected)
+    {
         return Ok(());
     }
     fs::DirBuilder::new()
@@ -174,29 +176,35 @@ fn refresh_in(env: &Env, state: &Path) -> io::Result<()> {
             continue;
         }
 
-        let new_target = tsv_path(&source)?;
-        if let Some(target) = target {
-            let staged = tempfile::tempdir_in(&parent)?;
-            let staged_link = staged.path().join("dots");
-            symlink(&source, &staged_link)?;
-            if fs::read_link(&path).ok().as_ref() != Some(&target) {
-                continue;
+        let previous = ownership.insert(key.clone(), tsv_path(&source)?);
+        // A failed ownership write must leave the user's working link intact.
+        write_records(&owned_path, &ownership)?;
+        let installed = (|| -> io::Result<bool> {
+            if let Some(target) = target {
+                let staged = tempfile::tempdir_in(&parent)?;
+                let staged_link = staged.path().join("dots");
+                symlink(&source, &staged_link)?;
+                if fs::read_link(&path).ok().as_ref() != Some(&target) {
+                    return Ok(false);
+                }
+                fs::rename(staged_link, &path)?;
+            } else {
+                match symlink(&source, &path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                    Err(error) => return Err(error),
+                }
             }
-            fs::rename(staged_link, &path)?;
-        } else {
-            match symlink(&source, &path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
+            Ok(true)
+        })();
+        if !matches!(installed, Ok(true)) {
+            if let Some(previous) = previous {
+                ownership.insert(key, previous);
+            } else {
+                ownership.remove(&key);
             }
-        }
-        ownership.insert(key, new_target);
-        if let Err(error) = write_records(&owned_path, &ownership) {
-            // Leave a concurrent user replacement untouched.
-            if fs::read_link(&path).ok().as_deref() == Some(source.as_path()) {
-                let _ = fs::remove_file(&path);
-            }
-            return Err(error);
+            write_records(&owned_path, &ownership)?;
+            installed?;
         }
     }
     Ok(())

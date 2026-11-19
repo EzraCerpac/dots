@@ -79,9 +79,9 @@ fn seams_cli_grammar_and_config_boundary() {
     );
     assert_diagnostic(invoke(&world, cwd, &["sync", "--other"]), 2, "dots help");
     assert_diagnostic(
-        invoke(&world, cwd, &["publish", "--bookmark=secret", "--all"]),
+        invoke(&world, cwd, &["publish", "--help"]),
         2,
-        "dots help",
+        "unknown command",
     );
     assert_diagnostic(
         invoke(&world, cwd, &["help", "status"]),

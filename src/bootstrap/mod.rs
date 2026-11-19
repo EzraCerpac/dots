@@ -139,9 +139,6 @@ fn native_args(args: &Args, restore: Option<&str>) -> Vec<OsString> {
     for key in ["config-dir", "only", "skip"] {
         append_strings(&mut native, args, key);
     }
-    if let Some(path) = args.get_one::<OsString>("from-dir") {
-        native.extend(["--from-dir".into(), path.clone()]);
-    }
     match (restore, args.get_many::<String>("env")) {
         (Some(machine), Some(environments)) => {
             for environment in environments.filter(|name| !name.starts_with("host-")) {
@@ -165,6 +162,10 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     let run = Run::begin(ctx, Sink::Report(ReportCommand::Bootstrap));
     let restore = args.get_one::<String>("restore").map(String::as_str);
     let mut native = native_args(args, restore);
+    let from_dir = arg_path(ctx, args, "from-dir");
+    if let Some(path) = &from_dir {
+        native.extend(["--from-dir".into(), path.as_os_str().to_owned()]);
+    }
     let vars = Vars::read(&ctx.root)?;
     let from = args.get_one::<String>("from");
     let adopt = args.get_one::<String>("adopt");
@@ -180,13 +181,7 @@ fn launch(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         })
         .transpose()?;
     if args.get_flag("update") {
-        source::validate_update(
-            ctx,
-            &run,
-            &vars,
-            source.as_ref(),
-            args.get_one::<OsString>("from-dir"),
-        )?;
+        source::validate_update(ctx, &run, &vars, source.as_ref(), from_dir.as_deref())?;
     }
     if let Some((key, source)) = source {
         native.extend([format!("--{key}").into(), source.argument().into()]);

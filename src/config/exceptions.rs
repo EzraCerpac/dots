@@ -14,6 +14,19 @@ pub struct Exception {
     holds: Vec<String>,
 }
 
+impl Exception {
+    pub(crate) fn ensure_executable(&self) -> Result<(), Fail> {
+        if is_executable(&self.path) {
+            Ok(())
+        } else {
+            Err(file_error(
+                &self.path,
+                "installer exception is not executable",
+            ))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Exceptions(Vec<Exception>);
 
@@ -97,7 +110,7 @@ impl Exceptions {
     ) -> Option<&str> {
         let (manager, tail) = identity.split_once(':')?;
         let name = tail.rsplit('/').next()?;
-        for key in [name, name.split('@').next()?] {
+        for key in [tail, tail.split('@').next()?, name, name.split('@').next()?] {
             let key = format!("{manager}:{key}");
             if let Some(row) = self
                 .0
@@ -112,20 +125,18 @@ impl Exceptions {
     }
 
     pub fn selected(&self, profile: &str) -> Result<Vec<&Exception>, Fail> {
+        self.selected_rows(profile)
+            .map(|row| row.ensure_executable().map(|()| row))
+            .collect()
+    }
+
+    pub(crate) fn selected_rows<'a>(
+        &'a self,
+        profile: &str,
+    ) -> impl Iterator<Item = &'a Exception> {
         self.0
             .iter()
-            .filter(|row| row.profile == "base" || row.profile == profile)
-            .map(|row| {
-                if is_executable(&row.path) {
-                    Ok(row)
-                } else {
-                    Err(file_error(
-                        &row.path,
-                        "installer exception is not executable",
-                    ))
-                }
-            })
-            .collect()
+            .filter(move |row| row.profile == "base" || row.profile == profile)
     }
 }
 

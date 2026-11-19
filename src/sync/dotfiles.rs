@@ -425,7 +425,7 @@ impl Copies {
                 {
                     continue;
                 }
-                let path = destination.join(relative);
+                let path = destination.join(&relative);
                 let record = self
                     .state
                     .known
@@ -470,17 +470,21 @@ impl Copies {
                     (Image::Regular { mode, .. }, Some(_)) => {
                         Some(copy_mode(*mode, target.permissions.as_deref())?)
                     }
-                    _ => record.mode,
+                    _ => record
+                        .mode
+                        .or_else(|| match native.as_ref()?.get(&relative)? {
+                            Image::Regular { mode, .. } => Some(*mode),
+                            _ => None,
+                        }),
                 };
                 if record.matches(&deployed, &common, expected_mode, native_digest)
                     || live == deployed
                 {
                     continue;
                 }
-                let unverified_mode = native_digest.is_some()
-                    && matches!(&deployed, Image::Regular { mode, .. } if
-                        expected_mode.is_some_and(|expected| expected != *mode));
-                if unverified_mode || record.matches(&deployed, &common, None, native_digest) {
+                if matches!(&deployed, Image::Regular { mode, .. } if
+                    expected_mode.is_some_and(|expected| expected != *mode))
+                {
                     path_issue(
                         receipt,
                         "Kept a locally changed copy mode",
@@ -1094,7 +1098,7 @@ impl Copies {
         }
 
         let mut clean = true;
-        for (path, mut replacement) in desired {
+        for (path, replacement) in desired {
             let relative_path = fs_relative(&path)?;
             let current = filesystem.read_path(relative_path)?;
             if rules.create_only && current != Image::Absent {
@@ -1105,29 +1109,27 @@ impl Copies {
                 .map(|known| known.source_image(git, validated.revision()))
                 .transpose()?;
             if let (
-                Image::Regular { mode, .. },
+                Image::Regular {
+                    mode: expected_mode,
+                    ..
+                },
                 Some(known),
                 Image::Regular {
                     mode: current_mode, ..
                 },
-            ) = (&mut replacement, known, &current)
+            ) = (&replacement, known, &current)
                 && known.mode.is_none()
                 && path != destination
+                && expected_mode != current_mode
             {
-                if let Some(Image::Regular { mode: old, .. }) = baseline.as_ref()
-                    && (old ^ *mode) & 0o100 != 0
-                    && (current_mode ^ *mode) & 0o100 != 0
-                {
-                    path_issue(
-                        receipt,
-                        "Kept a copy with unverified deployed permissions",
-                        &path,
-                        COPY_ACTION,
-                    );
-                    clean = false;
-                    continue;
-                }
-                *mode = *current_mode;
+                path_issue(
+                    receipt,
+                    "Kept a copy with unverified deployed permissions",
+                    &path,
+                    COPY_ACTION,
+                );
+                clean = false;
+                continue;
             }
             let next_baseline = if let (Some(source), Image::Regular { bytes, mode }) = (
                 target.effective_source().filter(|_| target.mode == "copy"),

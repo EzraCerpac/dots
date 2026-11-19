@@ -782,6 +782,57 @@ fn rendered_variant_preserves_declaring_rules() {
 
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn adopted_directory_copy_keeps_a_locally_changed_leaf_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (fixture, ctx) =
+        shared_mise_fixture("[dotfiles]\n'~/tree' = { mode = 'copy', source = 'source' }\n");
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    fs::create_dir(root.join("source")).unwrap();
+    for leaf in ["clean", "edited"] {
+        let source = root.join("source").join(leaf);
+        fs::write(&source, "initial\n").unwrap();
+        fs::set_permissions(source, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "directory mode preservation fixture");
+    native_dotfile_apply(&ctx);
+    assert!(!root.join(".git/dots-sync-copies.json").exists());
+
+    let target = fixture.path().join("home/tree");
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    for leaf in ["clean", "edited"] {
+        assert_eq!(mode(&target.join(leaf)), 0o600);
+        assert_eq!(fs::read(target.join(leaf)).unwrap(), b"initial\n");
+        fs::write(root.join("source").join(leaf), "source updated\n").unwrap();
+    }
+    fs::set_permissions(target.join("edited"), fs::Permissions::from_mode(0o644)).unwrap();
+    let receipt = shared_mise_sync(&ctx);
+    assert!(
+        receipt.issues.iter().any(|issue| {
+            issue.diagnostic.contains("mode") && issue.diagnostic.contains("tree/edited")
+        }),
+        "{:?}",
+        receipt.issues
+    );
+    assert_eq!(fs::read(target.join("clean")).unwrap(), b"source updated\n");
+    assert_eq!(mode(&target.join("clean")), 0o600);
+    assert_eq!(fs::read(target.join("edited")).unwrap(), b"initial\n");
+    assert_eq!(mode(&target.join("edited")), 0o644);
+    let remote = git.at(&fixture.path().join("bare-origin"));
+    for leaf in ["clean", "edited"] {
+        assert_eq!(
+            remote
+                .get(["show", &format!("refs/heads/dev:source/{leaf}")])
+                .unwrap(),
+            b"source updated\n"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn create_only_sources_and_existing_targets_are_preserved() {
     let (fixture, ctx) = shared_mise_fixture(
         "[dotfiles]\n'~/copy' = { mode = 'copy', source = 'source', create_if_missing = true }\n'~/template' = { mode = 'template', source = 'template.tera', create_if_missing = true }\n'~/missing' = { mode = 'copy', source = 'source', create_if_missing = true }\n",

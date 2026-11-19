@@ -107,7 +107,7 @@ fn run_save(native: &Native<'_, '_>, command: std::process::Command) -> Result<(
 }
 
 pub(super) fn require_no_pending(store: &Path) -> Result<(), Fail> {
-    if (exists(&store.join(MARKER))? && !recovery::is_fetching(store))
+    if (exists(&store.join(MARKER))? && !recovery::is_established_restore(store, true))
         || exists(
             &store
                 .parent()
@@ -115,6 +115,9 @@ pub(super) fn require_no_pending(store: &Path) -> Result<(), Fail> {
                 .join(STAGING),
         )?
     {
+        if recovery::is_established_restore(store, false) {
+            return Err(blocked(recovery::INTERRUPTED_RESTORE));
+        }
         return Err(blocked(
             "a first restore is incomplete; rerun dots restore before saving history",
         ));

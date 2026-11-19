@@ -15,7 +15,7 @@ mod tests;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::config::{CheckoutShape, Vars, checkout_shape};
@@ -35,6 +35,7 @@ const CONFIG: &str = "Check config.toml and the selected profile, then rerun dot
 const REMOTE: &str = "Check origin and dots_source_repo, then rerun dots sync.";
 const GIT: &str = "Check the checkout with git status, then rerun dots sync.";
 const GUIDE: &str = "Use a plain Git dev checkout as described in the dots sync guide.";
+const NOT_GIT: &str = "Git is unavailable or the configuration is not in a Git repository";
 
 pub struct Shared {
     dir: PathBuf,
@@ -85,20 +86,31 @@ fn shape(git: &Git<'_>) -> Result<CheckoutShape, Fail> {
 }
 
 fn shape_problem(shape: &CheckoutShape) -> Option<Note> {
+    shared_shape_problem(shape).or_else(|| protected_shape_problem(shape))
+}
+
+fn shared_shape_problem(shape: &CheckoutShape) -> Option<Note> {
     if shape.git_too_old {
         Some(Note::new(
             "Sync needs Git 2.43 or newer",
             "Upgrade Git and rerun dots sync.",
         ))
-    } else if shape.jj_workspace {
+    } else {
+        (shape.head.as_deref() != Some(OsStr::new("refs/heads/dev"))).then(dev_required)
+    }
+}
+
+fn dev_required() -> Note {
+    Note::new("Sync needs Git HEAD on a dev branch with a commit", GUIDE)
+}
+
+fn protected_shape_problem(shape: &CheckoutShape) -> Option<Note> {
+    if shape.jj_workspace {
         Some(Note::new("Sync stopped in a JJ workspace", GUIDE))
     } else if shape.legacy_sync {
         Some(Note::new("Sync found pre-1.0 source state", GUIDE))
-    } else if shape.head.as_deref() != Some(OsStr::new("refs/heads/dev")) || !shape.has_commit {
-        Some(Note::new(
-            "Sync needs Git HEAD on a dev branch with a commit",
-            GUIDE,
-        ))
+    } else if shape.head.is_none() || !shape.has_commit {
+        Some(dev_required())
     } else if !shape.operations.is_empty() {
         Some(Note::new(
             "Sync skipped while a Git operation is in progress",
@@ -121,27 +133,35 @@ pub fn load(ctx: &Ctx) -> Loaded {
 
 fn load_source(ctx: &Ctx) -> Result<Option<Shared>, Note> {
     let git = Git::new(ctx, ctx.root.path());
-    let checkout = shape(&git).map_err(|_| {
-        Note::new(
-            "Git is unavailable or the configuration is outside a Git repository",
-            GUIDE,
-        )
-    })?;
-    if let Some(problem) = shape_problem(&checkout) {
-        return Err(problem);
+    let (dir, common) = repository_dirs(&git).or_note(NOT_GIT, GUIDE)?;
+    if checkout::has_pending(&dir) || dotfiles::has_pending(&dir) {
+        // Recovery takes precedence over configuration that may be among the
+        // pending writes. The shared path checks its shape under the lock.
+        return Ok(Some(Shared { dir, common }));
     }
-    let (dir, common) =
-        repository_dirs(&git).or_note("Could not resolve Git checkout directories", GUIDE)?;
+    let checkout = shape(&git).or_note(NOT_GIT, GUIDE)?;
     if common != checkout.common_dir {
         return Err(Note::new(
             "The Git common directory changed during preflight",
             GIT,
         ));
     }
-    if checkout::has_pending(&dir) || dotfiles::has_pending(&dir) {
-        return Ok(Some(Shared { dir, common }));
+    if let Some(problem) = protected_shape_problem(&checkout) {
+        return Err(problem);
     }
-    Ok(read_origin(ctx, &git)?.map(|_| Shared { dir, common }))
+    let origin = read_origin(ctx, &git)?;
+    if origin.is_none()
+        && checkout
+            .head
+            .as_deref()
+            .is_some_and(|head| head == "refs/heads/dev" || head == "refs/heads/main")
+    {
+        return Ok(None);
+    }
+    if let Some(problem) = shared_shape_problem(&checkout) {
+        return Err(problem);
+    }
+    Ok(origin.map(|_| Shared { dir, common }))
 }
 
 fn read_origin(ctx: &Ctx, git: &Git<'_>) -> Result<Option<Origin>, Note> {
@@ -213,10 +233,7 @@ pub fn run(execution: &Run<'_>, stage: StageId, loaded: Loaded, display: Display
     }
 
     if receipt::emit(ctx, &receipt, display).is_err() {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "dots sync: could not save the sync receipt for replay"
-        );
+        receipt::warn_save_failure();
     }
     receipt
 }
@@ -906,6 +923,12 @@ fn finish_pending(
                     &path,
                     RERUN,
                 );
+            }
+            if let Some((before, after)) = error.recorded_revisions.as_deref() {
+                return Err(Note(
+                    format!("A guarded checkout is pending; sync kept your files (recorded revisions {before} to {after})").into(),
+                    "Preserve your edits, reconcile the index and checkout with the recorded revisions and any recovery copies, then rerun dots sync.",
+                ));
             }
             Err(Note::new(
                 "A guarded checkout is pending; sync kept your files",

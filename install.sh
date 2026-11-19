@@ -16,6 +16,31 @@ quote() {
     printf "'%s'" "$word"
 }
 
+install_launcher() {
+    user_bin=$HOME/.local/bin
+    launcher=$user_bin/dots
+    mise_data=${MISE_DATA_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/mise"}
+    shim=${MISE_SHIMS_DIR:-"$mise_data/shims"}/dots
+    if [ ! -e "$launcher" ] && [ ! -L "$launcher" ]; then
+        case "$old_dots" in
+            ''|"$shim") mkdir -p "$user_bin"; ln -s "$dots" "$user_bin" ;;
+            *) printf 'Kept existing dots command at %s.\n' "$old_dots"; return ;;
+        esac
+    fi
+    if [ "$launcher" = "$shim" ] || [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
+        printf 'Kept existing path %s. The installed executable is at %s.\n' "$launcher" "$dots"
+    elif [ "$(command -v dots || :)" != "$launcher" ] || ! command -v mise >/dev/null 2>&1; then
+        printf '%s\n' 'Put the dots launcher first on PATH. For sh-compatible shells, run this and add it to your shell startup file:'
+        printf '  export PATH='
+        quote "$user_bin"
+        if [ "${mise%/*}" != "$user_bin" ]; then
+            printf ':'
+            quote "${mise%/*}"
+        fi
+        printf ':"%s"\n' "\$PATH"
+    fi
+}
+
 main() {
     version=${DOTS_VERSION:-latest}
     source=
@@ -66,8 +91,8 @@ main() {
         fi
     fi
     case "$mise" in /*) ;; *) mise=$PWD/$mise ;; esac
-    export PATH="${mise%/*}:$PATH"
 
+    old_dots=$(command -v dots || :)
     tool=github:EzraCerpac/dots@$version
     # Testing only: use an absolute path to a local release-layout .tar.gz.
     # The HTTP backend reads it from disk and has no "latest" version list.
@@ -80,6 +105,7 @@ main() {
     # adopt into that directory. Install without writing a tool declaration.
     "$mise" -C "$HOME" install "$tool"
     dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
+    install_launcher >&2
 
     root=${DOTS_ROOT-${MISE_CONFIG_DIR-"${XDG_CONFIG_HOME:-"$HOME/.config"}/mise"}}
     case "$root" in /*) ;; *) root=$PWD/$root ;; esac

@@ -4,8 +4,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use support::World;
+use std::process::Output;
+use support::{FixtureCommand, World, stage_executable};
 
 // install.tsv counts this Cargo target only. Nine legacy scenarios are tested
 // here, three are covered by two r01_config tests, and eight are in the drop list.
@@ -24,7 +24,7 @@ fn agent_links(world: &World) -> [PathBuf; 2] {
     [CLAUDE_LINK, SHARED_LINK].map(|link| world.home().join(link))
 }
 
-fn with_skill_links(world: &World) -> Command {
+fn with_skill_links(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     command.env_remove("DOTS_SKILL_LINKS");
     command
@@ -213,12 +213,9 @@ fn unchanged_loading_bash_completion_and_completing_a_word_leave_skills_alone() 
     symlink(dots.get_program(), bin.join("dots")).unwrap();
     let path =
         std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
-    let output = Command::new("/bin/bash")
-        .env_clear()
-        .envs(
-            dots.get_envs()
-                .filter_map(|(name, value)| value.map(|value| (name, value))),
-        )
+    let output = world
+        .command("/bin/bash")
+        .env_remove("DOTS_SKILL_LINKS")
         .env("PATH", path)
         .current_dir(world.root())
         .args([
@@ -263,15 +260,11 @@ fn new_private_skill_survives_removal_of_the_installation() {
         let installation = world.root().with_file_name("installation");
         let binary = installation.join(layout);
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        let dots = with_skill_links(&world);
-        fs::copy(dots.get_program(), &binary).unwrap();
+        stage_executable(world.dots().get_program(), &binary).unwrap();
 
-        let output = Command::new(binary)
-            .env_clear()
-            .envs(
-                dots.get_envs()
-                    .filter_map(|(name, value)| value.map(|value| (name, value))),
-            )
+        let output = world
+            .command(binary)
+            .env_remove("DOTS_SKILL_LINKS")
             .current_dir(world.root())
             .arg("--version")
             .output()

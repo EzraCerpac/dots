@@ -6,9 +6,9 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
-use support::World;
+use support::{FixtureCommand, World};
 use toml_edit::DocumentMut;
 
 const BASE: &str = "[vars]\ndots_profiles = \"desktop server\"\n";
@@ -46,7 +46,7 @@ fn bin(world: &World) -> PathBuf {
     bin
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut cmd = world.dots(); // World clears the caller's environment.
     let home = world.home();
     let scratch = world.root().parent().unwrap();
@@ -125,11 +125,10 @@ fn dots(world: &World) -> Command {
     cmd
 }
 
-fn fixture_child(world: &World, program: &Path) -> Command {
+fn fixture_child<'a>(world: &'a World, program: &Path) -> FixtureCommand<'a> {
     let environment = dots(world);
-    let mut child = Command::new(program);
+    let mut child = world.command(program);
     child
-        .env_clear()
         .envs(
             environment
                 .get_envs()
@@ -527,6 +526,7 @@ for directory in "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "
     "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$MISE_CONFIG_DIR" "$MISE_STATE_DIR" "$MISE_CACHE_DIR" \
     "$MISE_DATA_DIR" "$MISE_SYSTEM_CONFIG_DIR" "$MISE_SYSTEM_DATA_DIR" "$MISE_TMP_DIR" \
     "$MISE_DEFAULT_CONFIG_DIR" "$MISE_SYSTEM_DIR" "$MISE_PLUGINS_DIR" "$MISE_SYSTEM_PLUGINS_DIR" \
+    "$MISE_SYSTEM_PLUGINS_DIRS" "$MISE_SYSTEM_SHIMS_DIR" \
     "$MISE_DOWNLOADS_DIR" "$MISE_INSTALLS_DIR" "$MISE_SYSTEM_INSTALLS_DIR" "$MISE_INSTALL_STORE_DIR" \
     "$MISE_SHARED_INSTALL_DIR" "$MISE_SHIMS_DIR" "$MISE_SYSTEM_CONFIG_FILE"; do
     case "$directory" in "$FIXTURE_SANDBOX"|"$FIXTURE_SANDBOX"/*) :;;
@@ -616,7 +616,7 @@ esac"#,
     script(
         &bin(world).join("sudo"),
         r#"
-if [ "$*" = "-n true" ]; then
+if [ "$*" = "-n true" ] || [ "$*" = "-n -v" ]; then
     [ "${FIXTURE_SUDO:-0}" = 1 ]
 elif [ "$1" = "--" ]; then shift; exec "$@"
 else exec "$@"
@@ -629,6 +629,7 @@ fi"#,
         r#"
 printf '%s\n' "$*" >> "$HOME/mas.log"
 case "$*" in
+    "version") echo 'mas 1.0.0';;
     "list --json")
         if [ -e "$HOME/mas-installed" ]; then
             printf '[{"adamID":123,"name":"Fixture App","version":"1"}]\n'
@@ -650,7 +651,7 @@ fn installed(world: &World, key: &str) -> bool {
     world.home().join("installed").join(key).is_file()
 }
 
-fn up(world: &World) -> Command {
+fn up(world: &World) -> FixtureCommand<'_> {
     let mut command = dots(world);
     command
         .args(["--verbose", "up"])
@@ -696,7 +697,6 @@ fn unchanged_native_add_keeps_earlier_success_and_honors_versions() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_empty_host_never_calls_a_package_manager() {
     if !cfg!(target_os = "macos") {
         return;
@@ -711,7 +711,6 @@ fn unchanged_empty_host_never_calls_a_package_manager() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_routine_packages_respect_exception_holds() {
     let world = fixture(
         "\n[bootstrap.packages]\n\"apt:held\" = \"latest\"\n\"apt:regular\" = \"latest\"\n",
@@ -738,7 +737,6 @@ fn unchanged_routine_packages_respect_exception_holds() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_cask_discovery_respects_toml_forms_profiles_and_filters() {
     if !cfg!(target_os = "macos") {
         return;
@@ -779,7 +777,6 @@ fn unchanged_cask_discovery_respects_toml_forms_profiles_and_filters() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_app_store_requires_opt_in_and_authorization() {
     if !cfg!(target_os = "macos") {
         return;
@@ -804,7 +801,6 @@ fn unchanged_app_store_requires_opt_in_and_authorization() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_resolves_bare_packages_and_respects_holds() {
     if !cfg!(target_os = "macos") {
         return;
@@ -833,7 +829,6 @@ fn unchanged_mas_resolves_bare_packages_and_respects_holds() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_tool_formula_keeps_its_normal_brew_pass() {
     if !cfg!(target_os = "macos") {
         return;
@@ -845,7 +840,7 @@ fn unchanged_mas_tool_formula_keeps_its_normal_brew_pass() {
     assert!(!world.home().join("mas.log").exists());
 }
 
-fn no_path_mas(world: &World) -> Command {
+fn no_path_mas(world: &World) -> FixtureCommand<'_> {
     let mut command = up(world);
     let fallback = env::var_os("PATH").unwrap_or_default();
     let mut path = vec![bin(world)];
@@ -871,7 +866,6 @@ fn no_path_mas(world: &World) -> Command {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_defers_when_the_tool_and_brew_are_unavailable() {
     if !cfg!(target_os = "macos") {
         return;
@@ -890,7 +884,6 @@ fn unchanged_mas_defers_when_the_tool_and_brew_are_unavailable() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_mas_can_use_the_brew_tool_outside_path() {
     if !cfg!(target_os = "macos") {
         return;
@@ -924,7 +917,6 @@ fn unchanged_mas_can_use_the_brew_tool_outside_path() {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_status_and_plan_do_not_probe_the_app_store() {
     if !cfg!(target_os = "macos") {
         return;
@@ -960,14 +952,28 @@ fn unchanged_status_and_plan_do_not_probe_the_app_store() {
             .output()
             .unwrap(),
     );
-    for command in ["status", "plan"] {
-        success(dots(&world).arg(command).output().unwrap());
-        assert!(!world.home().join("mas.log").exists(), "{command}");
+    let log = world.home().join("mas.log");
+    for (command, allowed_call) in [("status", Some("version")), ("plan", None)] {
+        success(
+            dots(&world)
+                .arg(command)
+                .env("FIXTURE_NATIVE_MAS", "1")
+                .output()
+                .unwrap(),
+        );
+        if log.exists() {
+            let calls = fs::read_to_string(&log).unwrap();
+            assert!(
+                calls.lines().all(|call| Some(call) == allowed_call),
+                "{command} queried the App Store: {calls}"
+            );
+            fs::remove_file(&log).unwrap();
+        }
     }
 }
 
 #[test]
-#[ignore = "P-04 and P-08"]
+#[ignore = "P-08"]
 fn unchanged_add_sync_up_and_repeat() {
     let remote_config = "dots_source_repo = \"fixture/packages\"\n";
     let a = fixture(remote_config);
@@ -1173,7 +1179,6 @@ esac"#
 }
 
 #[test]
-#[ignore = "P-02"]
 fn new_status_lists_the_adopted_target() {
     let world = fixture("");
     let target = world.home().join("status-fixture");

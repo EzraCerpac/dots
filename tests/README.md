@@ -5,6 +5,11 @@ Place each suite in `tests/<suite>.rs` and import `mod support;`.
 Keep the world alive until its children exit.
 `world.dots()` and `world.git()` return fresh, unstarted commands
 with the fixture root as their working directory.
+Use `world.command(program)` for a shell launcher or a binary at a test install path.
+`FixtureCommand` uses native OS arguments and stdio, and checks the effective
+working directory and application state paths before output, status or spawn.
+Agent directories stay absent until a scenario creates them. To exercise
+skill linking, remove `DOTS_SKILL_LINKS` on the fixture command.
 `world.bare_remote("origin")` creates a local bare Git repository on `main`
 and returns its absolute path.
 
@@ -31,6 +36,14 @@ Use a release or archive of commit `f5c8a0e` for the v0.4.0 oracle.
 mise run test -- --test contract
 DOTS_BIN=/absolute/path/to/v0.4.0/bin/dots mise run test -- unchanged_ -- --include-ignored
 mise run test -- --test contract -- --list
+```
+
+For a manual smoke of a verified, unpacked release, use its absolute executable path.
+The helper makes a fresh private environment for both the CLI and its adjacent
+renderer, including for their informational flags.
+
+```sh
+tests/support/oracle-probe "$DOTS_BIN"
 ```
 
 On DriehuisNAS, wrap each test command with `mise run nas:build --`.

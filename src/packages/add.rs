@@ -56,7 +56,7 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
         }
     }
     for (request, file) in requests.zip(files) {
-        stage(run, "Add request", "dots add", |id| {
+        if !stage(run, "Add request", "dots add", |id| {
             if let Some(file) = file {
                 file.execute(ctx)
             } else {
@@ -70,7 +70,9 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
                     exceptions.as_ref().expect("software request"),
                 )
             }
-        })?;
+        })? {
+            break;
+        }
     }
     Ok(())
 }

@@ -1,12 +1,16 @@
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ChildCommand, ExitStatus, Output, Stdio};
 use std::sync::Mutex;
 
+use crate::Ctx;
 use crate::report::{self, Command, Report, Stage};
 pub use crate::report::{Change, Issue, Outcome, StageId};
-use crate::{Ctx, Fail};
+use crate::supervisor::{Mode, Supervisor};
+use crate::ui::transcript::{write_report, write_stage_end, write_stage_start};
+
+const CANCELLED_STAGE: StageId = StageId(usize::MAX);
 
 pub enum Sink {
     Report(Command),
@@ -23,15 +27,29 @@ pub enum Policy {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     pub stages: Vec<Stage>,
-    /// This is populated when the PTY supervisor owns a foreground stage.
-    pub attachable: Option<StageId>,
 }
 
 pub struct Run<'a> {
     ctx: &'a Ctx,
     sink: Sink,
-    stages: Mutex<Vec<Stage>>,
+    stages: Mutex<Stages>,
     rerun: Option<String>,
+    supervisor: Supervisor<'a>,
+}
+
+#[derive(Default)]
+struct Stages {
+    values: Vec<Stage>,
+    finished_alongside: Vec<StageId>,
+}
+
+impl Stages {
+    fn flush_alongside(&mut self, out: &mut impl Write, supervisor: &Supervisor<'_>) {
+        for id in self.finished_alongside.drain(..) {
+            let _ = supervisor.replay_alongside(id, out);
+            let _ = write_stage_end(out, &self.values[id.0]);
+        }
+    }
 }
 
 impl<'a> Run<'a> {
@@ -40,11 +58,17 @@ impl<'a> Run<'a> {
     }
 
     pub fn begin(ctx: &'a Ctx, sink: Sink) -> Self {
+        let mode = match &sink {
+            Sink::Report(Command::Up) => Mode::up(ctx),
+            Sink::Fragment(_) => Mode::Fragment,
+            _ => Mode::Direct,
+        };
         Self {
             ctx,
             sink,
-            stages: Mutex::new(Vec::new()),
+            stages: Mutex::new(Stages::default()),
             rerun: None,
+            supervisor: Supervisor::new(ctx, mode),
         }
     }
 
@@ -56,96 +80,163 @@ impl<'a> Run<'a> {
     }
 
     pub fn start(&self, label: impl Into<String>) -> StageId {
-        self.add_stage(label.into(), false)
+        self.add_stage(label.into(), false, None)
     }
 
     pub fn start_alongside(&self, label: impl Into<String>) -> StageId {
-        self.add_stage(label.into(), true)
+        self.add_stage(label.into(), true, None)
     }
 
-    fn add_stage(&self, label: String, alongside: bool) -> StageId {
+    /// Record a known skip in one step, with a single result line during up.
+    pub fn skip(&self, label: impl Into<String>) -> StageId {
+        self.add_stage(label.into(), false, Some(Outcome::Skipped))
+    }
+
+    fn add_stage(&self, label: String, alongside: bool, outcome: Option<Outcome>) -> StageId {
         let mut stages = self.stages.lock().expect("stage lock poisoned");
-        let id = StageId(stages.len());
-        stages.push(Stage {
-            id,
-            label,
-            alongside,
-            outcome: None,
-            changes: Vec::new(),
-            issues: Vec::new(),
-        });
-        self.update_fragment(&stages);
+        let Some(id) = self.supervisor.admit_stage(|| {
+            let id = StageId(stages.values.len());
+            stages.values.push(Stage {
+                id,
+                label,
+                alongside,
+                outcome,
+                changes: Vec::new(),
+                issues: Vec::new(),
+            });
+            id
+        }) else {
+            return CANCELLED_STAGE;
+        };
+        self.update_fragment(&stages.values);
+        if self.up() && !alongside {
+            self.supervisor.flush_warnings();
+            let mut output = self.supervisor.stdout();
+            stages.flush_alongside(&mut output, &self.supervisor);
+            let stage = &stages.values[id.0];
+            let _ = if outcome.is_some() {
+                write_stage_end(&mut output, stage)
+            } else {
+                write_stage_start(&mut output, stage)
+            };
+        }
         id
     }
 
-    /// Run one native child in the caller's foreground, with its stdio intact.
+    /// Run a native child with this stage's foreground or alongside policy.
     /// Return the native status separately from spawn or wait errors.
-    pub fn run(
-        &self,
-        id: StageId,
-        mut cmd: ChildCommand,
-        _policy: Policy,
-    ) -> io::Result<ExitStatus> {
-        if !self
-            .stages
-            .lock()
-            .expect("stage lock poisoned")
-            .get(id.0)
-            .is_some_and(|stage| stage.outcome.is_none())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "stage is not active",
-            ));
-        }
-        cmd.stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
+    pub fn run(&self, id: StageId, cmd: ChildCommand, policy: Policy) -> io::Result<ExitStatus> {
+        self.supervisor
+            .run(id, self.stage_alongside(id)?, cmd, policy)
     }
 
-    pub fn probe(&self, mut cmd: ChildCommand) -> io::Result<Output> {
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+    fn stage_alongside(&self, id: StageId) -> io::Result<bool> {
+        if self.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "dots run was cancelled",
+            ));
+        }
+        self.stages
+            .lock()
+            .expect("stage lock poisoned")
+            .values
+            .get(id.0)
+            .filter(|stage| stage.outcome.is_none())
+            .map(|stage| stage.alongside)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stage is not active"))
+    }
+
+    pub fn probe(&self, cmd: ChildCommand) -> io::Result<Output> {
+        self.probe_with_stdin(cmd, Stdio::null())
+    }
+
+    /// Capture a probe, detaching its session when it belongs to an alongside stage.
+    pub fn probe_for(&self, id: StageId, cmd: ChildCommand) -> io::Result<Output> {
+        self.supervisor
+            .probe(cmd, Stdio::null(), self.stage_alongside(id)?)
+    }
+
+    /// Capture a probe's output in memory with an explicit input channel.
+    pub fn probe_with_stdin(&self, cmd: ChildCommand, input: Stdio) -> io::Result<Output> {
+        self.supervisor.probe(cmd, input, false)
+    }
+
+    /// Capture a noninteractive command in an owned session with a result deadline.
+    ///
+    /// The process must keep the default SIGCHLD disposition with automatic
+    /// reaping disabled. This Run exclusively waits on the child until return.
+    /// An in-process caller must not install a SIGCHLD handler or reap it from
+    /// another thread, including through `waitpid(-1, ...)`.
+    /// A pending OS exec handshake and mandatory cleanup can delay the return.
+    pub fn probe_detached(
+        &self,
+        cmd: ChildCommand,
+        budget: std::time::Duration,
+    ) -> io::Result<Output> {
+        self.supervisor.probe_detached(cmd, budget)
     }
 
     pub fn change(&self, id: StageId, change: Change) {
-        self.stages.lock().expect("stage lock poisoned")[id.0]
-            .changes
-            .push(change);
+        if let Some(stage) = self
+            .stages
+            .lock()
+            .expect("stage lock poisoned")
+            .values
+            .get_mut(id.0)
+        {
+            stage.changes.push(change);
+        }
     }
 
     pub fn issue(&self, id: StageId, mut issue: Issue) {
-        // The direct runner retains no raw child output or logs.
-        issue.tail = None;
-        issue.log = None;
-        self.stages.lock().expect("stage lock poisoned")[id.0]
-            .issues
-            .push(issue);
+        self.supervisor.enrich_issue(id, &mut issue);
+        if let Some(stage) = self
+            .stages
+            .lock()
+            .expect("stage lock poisoned")
+            .values
+            .get_mut(id.0)
+        {
+            stage.issues.push(issue);
+        }
     }
 
     pub fn finish(&self, id: StageId, outcome: Outcome) {
         let mut stages = self.stages.lock().expect("stage lock poisoned");
-        stages[id.0].outcome = Some(outcome);
-        self.update_fragment(&stages);
+        if let Some(stage) = stages.values.get_mut(id.0) {
+            stage.outcome = Some(if self.cancelled() {
+                Outcome::Cancelled
+            } else {
+                outcome
+            });
+            if self.up() {
+                if stage.alongside {
+                    stages.finished_alongside.push(id);
+                } else {
+                    self.supervisor.flush_warnings();
+                    let mut output = self.supervisor.stdout();
+                    stages.flush_alongside(&mut output, &self.supervisor);
+                    let _ = write_stage_end(&mut output, &stages.values[id.0]);
+                }
+            }
+            self.update_fragment(&stages.values);
+        }
     }
 
     pub fn cancelled(&self) -> bool {
-        false // Cancellation is owned by P-11.
+        self.supervisor.cancelled()
     }
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
-            stages: self.stages.lock().expect("stage lock poisoned").clone(),
-            attachable: None,
+            stages: self
+                .stages
+                .lock()
+                .expect("stage lock poisoned")
+                .values
+                .clone(),
         }
-    }
-
-    /// Plain mode has no attached view. This call never blocks the runner.
-    pub fn view(&self, _stage: Option<StageId>) -> Result<(), Fail> {
-        Err(Fail::unported("P-11", "opening a stage terminal view"))
     }
 
     /// Import callback metadata after its parent native stage returns.
@@ -153,9 +244,13 @@ impl<'a> Run<'a> {
     pub fn fold(&self, path: &Path) -> io::Result<()> {
         let fragment = report::load_fragment(path)?;
         let mut stages = self.stages.lock().expect("stage lock poisoned");
+        let cancelled = self.cancelled();
         for mut stage in fragment {
-            stage.id = StageId(stages.len());
-            stages.push(stage);
+            stage.id = StageId(stages.values.len());
+            if cancelled && stage.outcome.is_none() {
+                stage.outcome = Some(Outcome::Cancelled);
+            }
+            stages.values.push(stage);
         }
         Ok(())
     }
@@ -164,38 +259,114 @@ impl<'a> Run<'a> {
         if let Sink::Fragment(path) = &self.sink
             && let Err(error) = report::save_fragment(path, stages)
         {
-            eprintln!("dots: could not save stage metadata for dots bootstrap complete: {error}");
+            let _ = writeln!(
+                self.supervisor.stderr(),
+                "dots: could not save stage metadata for dots bootstrap complete: {error}"
+            );
         }
     }
 
+    fn up(&self) -> bool {
+        matches!(self.sink, Sink::Report(Command::Up))
+    }
+
     pub fn end(self, status: u8) -> u8 {
+        let command = match self.sink {
+            Sink::Report(command) => Some(command),
+            _ => None,
+        };
+        let result = self.supervisor.complete(command, status, || {
+            if command == Some(Command::Up) {
+                self.stages
+                    .lock()
+                    .expect("stage lock poisoned")
+                    .flush_alongside(&mut self.supervisor.stdout(), &self.supervisor);
+            }
+            self.supervisor.flush_warnings();
+        });
+        if result.cancelled {
+            let mut stages = self.stages.lock().expect("stage lock poisoned");
+            for stage in &mut stages.values {
+                if stage.outcome.is_none() {
+                    stage.outcome = Some(Outcome::Cancelled);
+                }
+            }
+            self.update_fragment(&stages.values);
+        }
         if let Sink::Report(command) = self.sink {
-            let stages = self.stages.into_inner().expect("stage lock poisoned");
-            let next =
-                (status != 0 || stages.iter().any(|stage| !stage.issues.is_empty())).then(|| {
-                    self.rerun.unwrap_or_else(|| {
-                        format!(
-                            "Rerun your original dots {} invocation with the same arguments.",
-                            command.name()
-                        )
-                    })
-                });
-            let report = Report {
+            let records = self.stages.into_inner().expect("stage lock poisoned");
+            let mut stages = records.values;
+            let rerun = self.rerun.unwrap_or_else(|| {
+                format!(
+                    "Rerun your original dots {} invocation with the same arguments.",
+                    command.name()
+                )
+            });
+            if result.cancelled && command == Command::Remote {
+                let diagnostic = "The remote host's state is unknown after cancellation.";
+                let next = "Inspect the remote host before retrying.";
+                let _ = writeln!(self.supervisor.stderr(), "dots remote: {diagnostic} {next}");
+                let stage = Stage {
+                    id: StageId(stages.len()),
+                    label: "Remote host".into(),
+                    alongside: false,
+                    outcome: Some(Outcome::Cancelled),
+                    changes: Vec::new(),
+                    issues: vec![Issue::new(diagnostic, next)],
+                };
+                stages.push(stage);
+            }
+            if command == Command::Up {
+                for stage in &mut stages {
+                    if stage.outcome == Some(Outcome::Failed) && stage.issues.is_empty() {
+                        let mut issue = Issue::new("The stage failed.", &rerun);
+                        self.supervisor.enrich_issue(stage.id, &mut issue);
+                        stage.issues.push(issue);
+                    }
+                }
+            }
+            let next = (result.status != 0
+                || result.cancelled
+                || stages.iter().any(|stage| !stage.issues.is_empty()))
+            .then_some(rerun);
+            let mut report = Report {
                 command,
                 finished_at_ms: report::timestamp(),
-                status,
-                cancelled: false,
+                status: result.status,
+                cancelled: result.cancelled,
                 next,
                 stages,
             };
-            if let Err(error) = report::save(&self.ctx.env, &report) {
-                eprintln!(
-                    "dots: could not save the report for dots {}: {error}",
-                    command.name()
-                );
+            let log_id = self.supervisor.log_id();
+            let saved = match report::save(&self.ctx.env, &report, log_id.as_deref()) {
+                Ok(()) => {
+                    self.supervisor.keep_logs();
+                    if let Err(error) = report::prune(&self.ctx.env, command) {
+                        let _ = writeln!(
+                            self.supervisor.stderr(),
+                            "dots: could not finish report retention for dots {}: {error}",
+                            command.name()
+                        );
+                    }
+                    true
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        self.supervisor.stderr(),
+                        "dots: could not save the report for dots {}: {error}",
+                        command.name()
+                    );
+                    for issue in report.stages.iter_mut().flat_map(|stage| &mut stage.issues) {
+                        issue.log = None;
+                    }
+                    false
+                }
+            };
+            if command == Command::Up {
+                let _ = write_report(&mut self.supervisor.stdout(), &report, saved);
             }
         }
-        status
+        result.status
     }
 }
 

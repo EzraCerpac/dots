@@ -2,11 +2,11 @@
 mod github_env;
 mod support;
 
-use std::{fs, os::unix::fs::symlink, process::Command};
+use std::{fs, os::unix::fs::symlink};
 
-use support::World;
+use support::{FixtureCommand, World};
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut cmd = world.dots();
     cmd.envs(github_env::private_environment(
         world.home().parent().unwrap(),
@@ -35,11 +35,11 @@ fn unchanged_homebrew_prefix_link_launches_dots_without_dots_on_path() {
     let stable = bin.join("dots");
     symlink("../Cellar/dots/fixture/bin/dots", &stable).unwrap();
 
-    let result = Command::new("/bin/sh")
+    let result = world
+        .command("/bin/sh")
         .args(["-c", "\"$1\" --version", "sh"])
         .arg(stable)
         .current_dir(world.root())
-        .env_clear()
         .envs(
             baseline
                 .get_envs()

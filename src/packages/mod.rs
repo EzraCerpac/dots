@@ -1,9 +1,14 @@
 mod add;
 mod adopt;
 mod edit;
+#[cfg(test)]
+#[path = "../../tests/support/command.rs"]
+pub mod fixture_command;
 pub mod github;
 mod native;
 mod remove;
+#[cfg(test)]
+mod tests;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -42,13 +47,23 @@ fn reported(
     }
 }
 
+/// False stops the request list and leaves the exit status to Run::end.
 fn stage(
     run: &Run<'_>,
     label: &str,
     next: &str,
     operation: impl FnOnce(StageId) -> Result<(), Fail>,
-) -> Result<(), Fail> {
+) -> Result<bool, Fail> {
+    if run.cancelled() {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    tests::before_stage_start();
     let id = run.start(label);
+    // Admission can observe an interrupt after the preceding check.
+    if run.cancelled() {
+        return Ok(false);
+    }
     let result = operation(id);
     if let Err(error) = &result
         && !run.cancelled()
@@ -63,7 +78,11 @@ fn stage(
             Outcome::Failed
         },
     );
-    result
+    if run.cancelled() {
+        Ok(false)
+    } else {
+        result.map(|()| true)
+    }
 }
 
 /// Native children own their output. A nonzero return needs a report issue, but

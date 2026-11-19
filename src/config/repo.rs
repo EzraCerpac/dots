@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -85,6 +86,11 @@ impl RepoSetting {
         })
     }
 
+    /// The OWNER/NAME of a GitHub repository, preserving the configured case.
+    pub fn github(&self) -> Option<&str> {
+        self.github.as_deref()
+    }
+
     pub fn matches(&self, url: &str) -> bool {
         let Ok(other) = Self::parse(url) else {
             return false;
@@ -93,6 +99,14 @@ impl RepoSetting {
             (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
             (None, None) => self.value == other.value,
             _ => false,
+        }
+    }
+
+    pub fn transport_url(&self) -> Cow<'_, str> {
+        if self.value.contains(':') {
+            Cow::Borrowed(&self.value)
+        } else {
+            Cow::Owned(format!("https://github.com/{}", self.value))
         }
     }
 }

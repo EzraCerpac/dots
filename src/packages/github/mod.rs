@@ -3,7 +3,7 @@ mod archive;
 mod release;
 #[cfg(test)]
 #[path = "../../../tests/support/github_env.rs"]
-mod test_env;
+pub(super) mod test_env;
 
 use glob::Pattern;
 use std::{fmt::Write, path::Path};

@@ -81,7 +81,7 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
         }
     }
     for plan in plans {
-        stage(run, "Remove request", "dots remove", |id| match plan {
+        if !stage(run, "Remove request", "dots remove", |id| match plan {
             Plan::File(plan) if dry => {
                 plan.describe();
                 Ok(())
@@ -92,7 +92,9 @@ pub fn run(ctx: &Ctx, args: &Args, run: &Run<'_>) -> Result<(), Fail> {
                 Ok(())
             }
             Plan::Software(plan) => plan.execute(ctx, run, id),
-        })?;
+        })? {
+            break;
+        }
     }
     Ok(())
 }

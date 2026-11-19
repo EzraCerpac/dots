@@ -16,6 +16,7 @@ pub mod receipt;
 pub mod report;
 pub mod run;
 pub mod skill;
+pub mod supervisor;
 pub mod sync;
 pub mod targets;
 pub mod ui;

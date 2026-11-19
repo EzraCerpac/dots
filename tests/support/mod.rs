@@ -2,13 +2,19 @@
 #![allow(dead_code)]
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+mod command;
+pub use command::FixtureCommand;
+use command::PRIVATE_DIRS;
+
 pub struct World {
     _temp: tempfile::TempDir,
+    base: PathBuf,
     home: PathBuf,
     root: PathBuf,
     dots_bin: PathBuf,
@@ -16,9 +22,13 @@ pub struct World {
 
 impl World {
     pub fn new() -> Self {
-        let dots_bin = PathBuf::from(
+        Self::with_dots(
             env::var_os("DOTS_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_dots").into()),
-        );
+        )
+    }
+
+    pub fn with_dots(dots_bin: impl AsRef<OsStr>) -> Self {
+        let dots_bin = Path::new(&dots_bin);
         assert!(dots_bin.is_absolute(), "DOTS_BIN must be an absolute path");
         let dots_bin = dots_bin
             .canonicalize()
@@ -26,11 +36,12 @@ impl World {
 
         let temp = tempfile::Builder::new()
             .prefix("dots-test-")
-            .tempdir()
+            .tempdir_in("/tmp")
             .unwrap();
         let base = temp.path().canonicalize().unwrap();
         let home = base.join("home");
         let root = base.join("config");
+        fs::create_dir(base.join("tmp")).unwrap();
         for directory in [".config", ".cache", ".local/share", ".local/state"] {
             fs::create_dir_all(home.join(directory)).unwrap();
         }
@@ -52,10 +63,15 @@ impl World {
         .unwrap();
         Self {
             _temp: temp,
+            base,
             home,
             root,
             dots_bin,
         }
+    }
+
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 
     pub fn home(&self) -> &Path {
@@ -67,11 +83,11 @@ impl World {
     }
 
     /// Builds an unstarted command. Keep this world alive until the child exits.
-    pub fn dots(&self) -> Command {
+    pub fn dots(&self) -> FixtureCommand<'_> {
         self.command(&self.dots_bin)
     }
 
-    pub fn git(&self) -> Command {
+    pub fn git(&self) -> FixtureCommand<'_> {
         self.command(Path::new("git"))
     }
 
@@ -98,10 +114,10 @@ impl World {
         remote
     }
 
-    fn command(&self, program: &Path) -> Command {
+    pub fn command(&self, program: impl AsRef<OsStr>) -> FixtureCommand<'_> {
         // Even when TMPDIR is inside a checkout, Git must stay inside this world.
-        let git_ceiling = env::join_paths([self.root.parent().unwrap()])
-            .expect("world path must be a valid Git ceiling");
+        let git_ceiling =
+            env::join_paths([&self.base]).expect("world path must be a valid Git ceiling");
         let mut command = Command::new(program);
         command
             .current_dir(&self.root)
@@ -112,6 +128,8 @@ impl World {
             )
             .env("HOME", &self.home)
             .env("DOTS_ROOT", &self.root)
+            .env("MISE_CONFIG_DIR", self.home.join(".config/mise"))
+            .env("MISE_CEILING_PATHS", &self.base)
             .env("DOTS_SKILL_LINKS", "0")
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
@@ -121,13 +139,16 @@ impl World {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CEILING_DIRECTORIES", git_ceiling)
             .env("JJ_CONFIG", self.home.join(".config/jj.toml"));
+        for &(key, relative) in PRIVATE_DIRS {
+            command.env(key, self.base.join(relative));
+        }
         for (key, value) in env::vars_os() {
             let Some(name) = key.to_str() else { continue };
             if matches!(name, "LANG" | "LANGUAGE" | "TERM") || name.starts_with("LC_") {
                 command.env(key, value);
             }
         }
-        command
+        FixtureCommand::new(command, &self.base)
     }
 }
 
@@ -143,5 +164,30 @@ fn copy_fixture(source: &Path, destination: &Path) {
             assert!(kind.is_file(), "unsupported fixture: {:?}", entry.path());
             fs::copy(entry.path(), target).unwrap();
         }
+    }
+}
+
+/// Give an immutable executable another install path. On a different
+/// filesystem, let a separate process own the destination's write descriptor.
+pub fn stage_executable(source: impl AsRef<Path>, target: &Path) -> io::Result<()> {
+    let source = source.as_ref().canonicalize()?;
+    match fs::hard_link(&source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            let status = Command::new("/bin/cp")
+                .env_clear()
+                .arg("-p")
+                .arg(source)
+                .arg(target)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "copying fixture executable failed: {status}"
+                )))
+            }
+        }
+        Err(error) => Err(error),
     }
 }

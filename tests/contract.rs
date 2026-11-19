@@ -4,11 +4,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::{Command, Output};
-use support::World;
+use std::process::Output;
+use support::{FixtureCommand, World};
 use toml_edit::DocumentMut;
 
-fn run(mut command: Command, args: &[impl AsRef<OsStr>]) -> Output {
+fn run(mut command: FixtureCommand<'_>, args: &[impl AsRef<OsStr>]) -> Output {
     command.args(args).output().unwrap()
 }
 
@@ -25,7 +25,7 @@ fn usage_error(output: Output) -> String {
     stderr
 }
 
-fn isolated_mise(world: &World) -> Command {
+fn isolated_mise(world: &World) -> FixtureCommand<'_> {
     let mut dots = world.dots();
     dots.env("MISE_SYSTEM_CONFIG_DIR", world.home().join("mise-system"))
         .env("MISE_CEILING_PATHS", world.root().parent().unwrap())
@@ -85,7 +85,8 @@ fn new_root_respects_configuration_precedence_from_elsewhere() {
     }
 
     let mut dots = world.dots();
-    dots.current_dir(world.home())
+    dots.allow_config_fallback()
+        .current_dir(world.home())
         .arg("root")
         .env("XDG_CONFIG_HOME", xdg)
         .env("MISE_CONFIG_DIR", &mise_root);
@@ -183,7 +184,7 @@ fn new_exceptions_work_without_dots_directory() {
     success(run(isolated_mise(&world), &["exceptions"]));
 }
 
-fn update_mise(world: &World) -> Command {
+fn update_mise(world: &World) -> FixtureCommand<'_> {
     let fake = world.home().join("mock-mise");
     // Keep the disposable update independent of installed tools and package managers.
     // The mise self-update and tool mutations are fixture no-ops.
@@ -254,7 +255,6 @@ fn read_toml(path: &Path) -> DocumentMut {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_creates_layout_and_keeps_edits_on_rerun() {
     let world = World::new();
     let dir = world.root().with_file_name("fresh config");
@@ -319,7 +319,6 @@ fn unchanged_init_creates_layout_and_keeps_edits_on_rerun() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_edits_the_physical_config_referent() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -363,7 +362,6 @@ fn unchanged_init_edits_the_physical_config_referent() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn unchanged_init_keeps_an_existing_quoted_profile_setting() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -374,7 +372,6 @@ fn unchanged_init_keeps_an_existing_quoted_profile_setting() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn new_init_refuses_a_scalar_vars_setting_without_rewriting_it() {
     let world = World::new();
     let config = world.root().join("config.toml");
@@ -388,7 +385,6 @@ fn new_init_refuses_a_scalar_vars_setting_without_rewriting_it() {
 }
 
 #[test]
-#[ignore = "P-03"]
 fn new_init_adds_profiles_to_existing_toml_without_changing_other_bytes() {
     let world = World::new();
     for (directory, original, has_vars) in [

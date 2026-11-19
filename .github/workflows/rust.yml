@@ -91,6 +91,97 @@ jobs:
           age-keygen --version
           mise run test
 
+  legacy-oracle:
+    name: v0.4.0 oracle (${{ matrix.os }})
+    if: github.event_name == 'pull_request' && github.base_ref == 'rust'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+          - os: macos-15
+            platform: darwin-arm64
+    env:
+      MISE_VERSION: v2026.11.9
+      MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends fish jq rsync zsh
+
+      - name: Install Fish on macOS
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: Install the pinned Rust toolchain and oracle tools
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MISE_YES: "1"
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          curl -fsSL https://mise.run | sh
+          mise_bin="$HOME/.local/bin/mise"
+          test "$("$mise_bin" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
+          printf '%s\n' "${mise_bin%/*}" >> "$GITHUB_PATH"
+          cd "$RUNNER_TEMP"
+          "$mise_bin" use --global node@latest python@3.13 uv@latest jj@latest age@latest gitleaks@latest
+          # World replaces HOME and XDG paths. Give it installed binaries instead of shims.
+          "$mise_bin" bin-paths >> "$GITHUB_PATH"
+
+      - name: Verify and unpack the pinned oracle
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          repo=https://github.com/EzraCerpac/dots
+          tag=v0.4.0
+          commit=f5c8a0e83b333dbea6c0b5f19725cc818ffca674
+          test "$(git ls-remote "$repo.git" "refs/tags/$tag" | cut -f1)" = "$commit"
+          archive="dots-${tag#v}-$PLATFORM"
+          oracle="$(mktemp -d "$RUNNER_TEMP/dots-oracle.XXXXXX")"
+          cd "$oracle"
+          for asset in SHA256SUMS "$archive.tar.gz"; do
+            curl -fsSL --retry 3 "$repo/releases/download/$tag/$asset" -o "$asset"
+          done
+          # Pin the published manifest so replaced assets can't change the oracle.
+          printf '%s  SHA256SUMS\n' dc1319f9a2087383ef4fb443b96cd117b3d7c2d18a2fc784dc4e1a3fe864f6c3 | shasum -a 256 -c
+          awk -v asset="$archive.tar.gz" '$2 == asset' SHA256SUMS | shasum -a 256 -c
+          tar -xzf "$archive.tar.gz"
+          test "$(cat "$archive/VERSION")" = "${tag#v}"
+          test -x "$archive/bin/dots"
+          test -x "$archive/bin/dots-up"
+          printf 'DOTS_BIN=%s/%s/bin/dots\n' "$(pwd -P)" "$archive" >> "$GITHUB_ENV"
+
+      - name: Run unchanged black-box scenarios against the archive
+        run: |
+          for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
+            command -v "$tool"
+          done
+          # Discover every integration suite. Libtest's default filter matches substrings.
+          listing="$(mise run test -- --test '*' -- --list --format terse)"
+          scenarios=()
+          while IFS= read -r entry; do
+            case "${entry##*::}" in
+              unchanged_*': test') scenarios+=("${entry%: test}") ;;
+            esac
+          done <<< "$listing"
+          if (( ${#scenarios[@]} == 0 )); then
+            echo 'No unchanged black-box scenarios found' >&2
+            exit 1
+          fi
+          DOTS_TEST_TOOL_PATH="$PATH" mise run test -- --no-fail-fast --test '*' -- --include-ignored --exact "${scenarios[@]}"
+
   rust-distros:
     name: Rust scenarios (${{ matrix.distro }})
     runs-on: ubuntu-24.04
@@ -123,9 +214,9 @@ jobs:
           rust_host=x86_64-unknown-linux-gnu
           case "$DISTRO" in
             Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip age ;;
-            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age ;;
+            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age python ;;
             Alpine)
-              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age python3
               rust_host=x86_64-unknown-linux-musl
               ;;
             *) exit 2 ;;
@@ -187,9 +278,24 @@ jobs:
           adduser -D smoke
           su -l smoke <<'SMOKE'
           set -eu
-          mkdir -p "$HOME/.local/bin"
+          fixture=$(mktemp -d /tmp/dots-first-run.XXXXXXXX)
+          export HOME="$fixture/home" TMPDIR="$fixture/tmp"
+          export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share"
+          export XDG_STATE_HOME="$HOME/.local/state" XDG_CACHE_HOME="$HOME/.cache"
+          export CODEX_HOME="$HOME/.codex" CLAUDE_CONFIG_DIR="$HOME/.claude"
+          export MISE_CONFIG_DIR="$XDG_CONFIG_HOME/mise" MISE_SYSTEM_CONFIG_DIR="$fixture/mise-system/config"
+          export MISE_DATA_DIR="$XDG_DATA_HOME/mise" MISE_CACHE_DIR="$XDG_CACHE_HOME/mise"
+          export MISE_STATE_DIR="$XDG_STATE_HOME/mise" MISE_TMP_DIR="$TMPDIR/mise"
+          export MISE_INSTALLS_DIR="$MISE_DATA_DIR/installs" MISE_INSTALL_STORE_DIR="$MISE_DATA_DIR/store"
+          export MISE_DOWNLOADS_DIR="$MISE_DATA_DIR/downloads" MISE_PLUGINS_DIR="$MISE_DATA_DIR/plugins"
+          export MISE_SHIMS_DIR="$MISE_DATA_DIR/shims" MISE_SYSTEM_DATA_DIR="$fixture/mise-system/data"
+          export MISE_SYSTEM_INSTALLS_DIR="$MISE_SYSTEM_DATA_DIR/installs"
+          export MISE_SYSTEM_PLUGINS_DIRS="$MISE_SYSTEM_DATA_DIR/plugins"
+          export MISE_SYSTEM_SHIMS_DIR="$MISE_SYSTEM_DATA_DIR/shims" MISE_CEILING_PATHS="$fixture"
+          mkdir -p "$HOME/.local/bin" "$TMPDIR"
           cp /seed/mise /seed/dots "$HOME/.local/bin/"
-          export PATH="$HOME/.local/bin:$PATH"
+          export PATH="$HOME/.local/bin:/usr/bin:/bin"
+          cd "$HOME"
           dots init </dev/null
           dots up </dev/null
           SMOKE

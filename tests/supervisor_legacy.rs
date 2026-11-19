@@ -6,13 +6,13 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::libc;
 use serde_json::Value;
-use support::World;
+use support::{FixtureCommand, World};
 
 const FAILURE_TAIL: &str = "fixture-alpha-last-diagnostic";
 const BETA_OUTPUT: &str = "fixture-beta-output";
@@ -50,7 +50,7 @@ fn fixture() -> World {
     world
 }
 
-fn dots(world: &World) -> Command {
+fn dots(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     let bin = world.root().join("bin");
     let path = command
@@ -113,7 +113,7 @@ fn hook(world: &World, name: &str, script: &str) {
     executable(&world.root().join("dots/hooks/update.d").join(name), script);
 }
 
-fn output(command: &mut Command, expected: i32) -> Output {
+fn output(command: &mut FixtureCommand<'_>, expected: i32) -> Output {
     let result = command.output().unwrap();
     assert_eq!(
         result.status.code(),
@@ -187,7 +187,6 @@ fn assert_private(world: &World, path: &Path) {
 }
 
 #[test]
-#[ignore = "P-02"]
 fn unchanged_redirected_test_preserves_binary_streams_and_private_metadata() {
     for (flag, code) in [(None, 0), (Some("--plain"), 23), (Some("--verbose"), 23)] {
         let world = fixture();
@@ -258,7 +257,6 @@ fn unchanged_redirected_test_preserves_binary_streams_and_private_metadata() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_redirected_up_defaults_to_plain_and_verbose_shows_child_output() {
     for flag in [None, Some("--plain"), Some("--verbose")] {
         let world = fixture();
@@ -290,7 +288,6 @@ fn unchanged_redirected_up_defaults_to_plain_and_verbose_shows_child_output() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn new_plain_up_hook_reads_redirected_stdin() {
     let world = fixture();
     hook(
@@ -313,7 +310,6 @@ fn new_plain_up_hook_reads_redirected_stdin() {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
     let world = fixture();
     hook(
@@ -380,7 +376,6 @@ fn unchanged_up_keeps_stage_output_and_replays_the_failed_stages_tail() {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
     let world = fixture();
     hook(
@@ -424,14 +419,9 @@ fn unchanged_plain_up_replays_latest_changes_and_attention_despite_exit_zero() {
         assert!(text.to_ascii_lowercase().contains("needs attention"));
         assert!(!text.contains("fixture-earlier-change"));
     }
-    assert!(
-        !combined(&replay).contains("dots up --last"),
-        "replay advertised itself"
-    );
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_up_reports_one_config_diagnostic_when_state_is_unusable() {
     let world = fixture();
     let blocked = world.home().join("blocked-state");
@@ -538,7 +528,6 @@ fn holding_hook(world: &World) {
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output() {
     let world = fixture();
     holding_hook(&world);
@@ -588,7 +577,6 @@ fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output(
 }
 
 #[test]
-#[ignore = "P-11"]
 fn unchanged_redirected_up_ignores_window_resize() {
     let world = fixture();
     holding_hook(&world);

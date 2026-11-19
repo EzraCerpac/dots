@@ -6,9 +6,9 @@ use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
-use support::World;
+use support::{FixtureCommand, World};
 
 fn fresh(world: &World) -> PathBuf {
     world.root().with_file_name("fresh")
@@ -20,7 +20,7 @@ fn init(world: &World, root: &Path) -> Output {
 
 // World clears the caller's environment. Make the optional agent paths and
 // each mise directory explicit as well, and fail closed before real mise runs.
-fn fixture_dots(world: &World) -> Command {
+fn fixture_dots(world: &World) -> FixtureCommand<'_> {
     let mut command = world.dots();
     let scope = world.home().parent().unwrap();
     for (key, dir) in [
@@ -89,7 +89,7 @@ fn seed_push(output: &str, seed: &str) -> bool {
     })
 }
 
-fn enable_fake_gh(world: &World, cmd: &mut Command) {
+fn enable_fake_gh(world: &World, cmd: &mut FixtureCommand<'_>) {
     let bin = world.home().join("bin");
     fs::create_dir_all(&bin).unwrap();
     write_executable(
@@ -393,7 +393,7 @@ fn new_interactive_enter_declines_and_rerun_does_not_offer() {
     );
 }
 
-fn terminal(cmd: &mut Command, reply: &[u8]) -> Output {
+fn terminal(cmd: &mut FixtureCommand<'_>, reply: &[u8]) -> Output {
     use nix::libc::{EIO, openpty};
     let mut master = -1;
     let mut slave = -1;
@@ -557,15 +557,9 @@ fn new_printed_seed_push_uses_the_commit_object_and_suppresses_tags() {
                 .output()
                 .unwrap(),
         );
-        let environment = world.git();
         success(
-            Command::new("/bin/sh")
-                .env_clear()
-                .envs(
-                    environment
-                        .get_envs()
-                        .filter_map(|(key, value)| Some((key, value?))),
-                )
+            world
+                .command("/bin/sh")
                 .args(["-c", push])
                 .output()
                 .unwrap(),

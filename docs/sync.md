@@ -51,6 +51,7 @@ Sync authenticates the way Git already does on the machine, through SSH keys or 
 Those credentials must succeed without prompting; when authentication fails, follow the action the receipt prints.
 Put an authenticated repository behind `https://` or SSH rather than `http://`.
 Before any network contact, `dots` applies this machine's Git URL rewrites to find the real fetch URL and every push URL, and stops if any of them points somewhere other than the expected repository.
+The installer's `--from` works differently: Git applies your rewrites to its clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
 
 Settings history is kept apart, in the private `dots_state_repo` repository.
 `dots` will not push history to the source repository.
@@ -74,9 +75,13 @@ Commits pushed straight to `origin/dev` from a task worktree are fine: the next 
 
 Sync works on one shape only: a plain Git checkout at the repository root, with `HEAD` on `dev` and at least one commit.
 
-- Sync stops with one line when `HEAD` is detached or on another branch, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
+- Sync stops with one line when `HEAD` is detached or on a branch other than `dev`, apart from the clean `main` case below, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
   The `.jj` check is only a refusal: `dots` neither needs nor runs JJ.
-- `dots bootstrap` switches a fresh clone from `main` to `dev` when it has no edits.
+- The installer's `--from` clones `dev` when the remote has it, and otherwise `main`.
+  A checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, is switched to `dev` by `dots bootstrap`, or by the next shared sync.
+  Before it switches, sync checks that any `dots_source_repo` in the incoming `dev` still matches this checkout's `origin`, and validates that `dev` against this machine's local files.
+  If either check fails, the checkout stays on `main` and the stopped sync still exits 0; after a switch, its receipt begins with one line saying so.
+  When `origin` has no `dev` yet, sync creates `dev` from `main` and pushes it.
   Every other checkout gets a one-time conversion by hand, which keeps its edits and unpushed commits.
 - Sync skips with one line during a merge, rebase, cherry-pick, revert or bisect, and while another sync holds the lock for the same repository.
   It takes over a lock whose owner died on this host.
@@ -109,9 +114,12 @@ Convert the checkout before you run sync again:
    When both sides changed, sync keeps each as it is and reports the clash.
 3. **Candidate.** Builds a candidate commit from every tracked or unignored public edit, leaving machine-local files out, without moving `dev` or the real index.
    Your staging stays as you left it.
+   When Git cannot tell who you are and `user.useConfigOnly` is not set, sync gives its own commit only the missing name or email, as `dots` and `dots@localhost`; it writes no Git configuration, and any configured value wins.
+   With `user.useConfigOnly` set and no identity, there is no fallback: nothing is published, sync still exits 0, and the receipt shows Git's first error line, with any credentials in a URL removed.
    When a path bound for the clean candidate has a staged version that differs from its unstaged one, settle the two before that path can be shared.
 4. **Scan.** Scans the candidate with gitleaks before `dev` or the index advances.
    A flagged file stays on disk and out of the candidate, and the rest is scanned again; only a clean candidate becomes `dev`.
+   When the flagged file is the source of a dotfile you just adopted, its new declaration stays out of the candidate as well, so it is kept on this machine only.
    A rejected candidate never reaches `dev`, the real index or the push, and its edits stay on disk.
    Without a working gitleaks, or when a scan fails, nothing is shared or pushed.
 5. **Fetch.** Fetches `dev` and `main`.

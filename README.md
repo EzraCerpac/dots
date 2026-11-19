@@ -7,7 +7,7 @@
   There is no new language to learn, and if you stop using `dots`, your configuration is still plain mise TOML.
 - **Add software from many sources** with `dots add`: mise tools, Homebrew, apt, dnf, pacman, apk, the Mac App Store and apps from GitHub releases, as each platform supports them.
 - **Share between machines** with `dots sync`, which scans your changes for secrets before pushing configuration changes.
-- **Set up a new machine from your own configuration** with one command, over SSH from a machine you already have.
+- **Set up another machine from your own configuration** with the installer's `--from`, run on that machine; from then on `dots sync` keeps both in step.
 - **Extend it with your own scripts.** Executables in your configuration's `dots/hooks/update.d/` run during `dots up`, those in `dots/hooks/bootstrap.d/` during `dots bootstrap`, and an executable `dots/commands/NAME` becomes `dots NAME`, listed in `dots help`.
   [The `dots/` directory](docs/contract.md#the-dots-directory) has the naming rules.
 - **Works with your coding agent.** `dots` links its built-in agent skill when it finds Claude Code or Codex.
@@ -18,7 +18,6 @@ dots up                                # bring this machine up to date
 dots add ripgrep                       # install a tool and record it
 dots add ~/.config/app/settings.toml   # adopt an existing file that is safe to share
 dots sync                              # scan and share your edits, take the other machines'
-dots remote HOST --profile P           # set up another machine from your configuration's repository
 ```
 
 ## Install
@@ -27,24 +26,51 @@ dots remote HOST --profile P           # set up another machine from your config
 curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh
 ```
 
-**Not available yet:** this installer arrives with 0.5.0.
-It installs mise if it is missing, installs `dots`, then runs `dots init`.
+It installs `dots` through mise, installing mise first when needed, links `~/.local/bin/dots`, and in a terminal runs `dots init`.
 
 <details>
-<summary>Set up from your existing dotfiles repository</summary>
+<summary>Set up this machine from your existing repository</summary>
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh -s -- --from OWNER/NAME --profile laptop
+curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh -s -- --from OWNER/NAME --profile laptop --version X
 ```
 
-With `--from` and `--profile`, the installer clones that repository instead of running `dots init`, and bootstraps this machine from it with that profile.
+Each option is optional.
+
+- `--from` takes `OWNER/NAME`, an `https://` URL or an SSH address, with no credentials in it.
+  Instead of running `dots init`, the installer clones the repository and runs mise's native bootstrap of it.
+  It clones `dev` when the remote has that branch, and otherwise `main`; after a `main`-only clone, the first shared `dots up` switches the checkout to `dev` and publishes it.
+  Your Git `url.*.insteadOf` rewrites apply to the clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
+- If the configuration directory, normally `~/.config/mise`, is already a checkout of that repository, the installer reuses it, so the same command can be rerun after a failure; the rerun runs the native bootstrap again before saving the profile, so work it already did may repeat.
+  It leaves any other Git checkout there alone and stops; anything else is first moved aside to the same path with `.before-dots-` and the UTC time appended.
+- `--profile` must name a profile that the configuration declares, and match the profile this machine has already saved, if any.
+  Without it, the saved profile is used, or else the only declared one; with several, the installer asks in a terminal and refuses without one.
+  A refusal exits with status 2, names the declared profiles and prints the command to rerun with a declared profile.
+- After the bootstrap succeeds, the installer saves the profile and machine ID on this machine, so the configuration needs no hook for that, and prints a `Next:` line with the `dots up` command to run.
+- Without a terminal, it adopts only with `MISE_YES=1` set for the receiving `sh`; otherwise it exits 2 and prints the command to rerun.
+- `--version X` installs release `X` rather than the latest; `DOTS_VERSION=X`, set for the receiving `sh`, does the same, and the flag wins.
+
+</details>
+
+<details>
+<summary>What the installer does</summary>
+
+- It uses the mise named by `DOTS_MISE_BIN`, which must then be new enough, or else `~/.local/bin/mise`, or else the mise on your `PATH`.
+  When there is none, or its version is too old or unreadable, it installs standalone mise at `~/.local/bin/mise` with the official installer, without `sudo`.
+  Native packages that a bootstrap installs, for example with apt, may still ask for your password.
+- It selects `dots` with `mise use -g`, which by default writes to `config.local.toml` in mise's configuration directory.
+- It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path.
+- In a terminal without `--from`, it runs `dots init` and passes its output through unchanged.
+  Without a terminal, it prints the `dots init` command to run in one instead.
+- Each command it prints for you is plain `dots` when that already reaches the new installation.
+  Otherwise it names the launcher or the shim by its absolute path, quoted for the shell, and it sets a quoted `DOTS_ROOT` when the configuration is not in mise's default directory; after `dots init`, the installer then adds its own `Next:` line.
+- As it exits, it prints `PATH` advice on stderr, after the command: the line that puts `~/.local/bin` first, for `fish` or other shells, or, when something else is at `~/.local/bin/dots`, how to run the installed `dots` alongside it.
+  Follow that advice for new shells; the printed command works without it.
 
 </details>
 
 <details>
 <summary>Install with mise instead</summary>
-
-Once 0.5.0 is released, this will also work:
 
 ```sh
 mise use -g github:EzraCerpac/dots@0.5.0
@@ -54,7 +80,7 @@ mise use -g github:EzraCerpac/dots@0.5.0
 
 </details>
 
-`dots` runs on macOS and Linux, including WSL, and needs mise 2026.11.8 or newer and Git.
+`dots` runs on macOS and Linux, including WSL, and needs Git and mise 2026.11.8 or newer; when mise reports an older version, `dots` stops and prints the command that updates it.
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
 A `config.toml` that `dots init` creates declares both in `[tools]`; `init` does not add them to an existing one, so there declare only the ones that are missing and keep any valid declaration already there.
 Once they are declared, `dots up` installs and updates them through mise.
@@ -69,6 +95,7 @@ dots up
 
 `dots init` creates a configuration in mise's configuration directory, normally `~/.config/mise`, and when there is no Git repository, one on branches `main` and `dev`.
 It keeps an existing `config.toml` and only adds what `dots` needs.
+Given another directory, `dots init DIR` ends with `Next: DOTS_ROOT=DIR dots up`, with `DIR` quoted for the shell.
 When it creates the repository in a terminal with `gh` signed in, and `dots_source_repo` is unset or names the proposed one, it offers to create a private GitHub repository; the default is no.
 Otherwise, without `origin`, it prints how to add a remote.
 Until there is a remote, the configuration stays on this machine; see [adding a remote](docs/sync.md#adding-a-remote).
@@ -89,6 +116,7 @@ Machine-local files stay out of the repository, and encrypted settings history l
 - **`dots add`** installs software and records it, or adopts a file.
   It writes to this machine's profile unless you pass `--base` for every machine or `--profile P` for another profile.
   A path starting with `/`, `~/`, `./` or `../` is a file: it moves into the configuration's `dotfiles/` and a link takes its place.
+  It refuses credential files, since dotfiles are shared through Git: `~/.netrc`, `~/.git-credentials`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`, `~/.pgpass` and private keys `~/.ssh/id_*`, in any letter case.
 - **`dots remove`** uninstalls and forgets software, or puts an adopted file back as a regular file.
   `--dry-run` shows what it would do and `--keep-installed` drops only the declaration.
 - **`dots sync`** shares your edits on the `dev` branch after a gitleaks scan and applies what the other machines shared.
@@ -101,12 +129,13 @@ Machine-local files stay out of the repository, and encrypted settings history l
 - [`dots backup`](docs/contract.md#dots-backup) saves this machine's encrypted app settings and publishes them to a private repository.
 - [`dots restore`](docs/contract.md#dots-restore---initialize-history) fetches those settings back onto this machine.
 - [`dots bundle`](docs/contract.md#dots-bundle) encrypts private values that [`dots bootstrap`](docs/contract.md#dots-bootstrap) needs to set up a machine.
-- [`dots remote HOST --profile P`](docs/contract.md#dots-remote) sets up another machine over SSH from your configuration's repository.
+- [`dots remote HOST --profile P`](docs/contract.md#dots-remote) runs mise's remote bootstrap over SSH from your configuration's repository.
+  A real enrollment through it has not been verified; to set up another machine, run the installer with `--from` on that machine.
 
 ## Why dots
 
 - **Plain mise** already bootstraps a machine and manages tools, packages, dotfiles and their history; if that covers you, keep it.
-  `dots` adds one command to update everything, sync between machines that is scanned for secrets, and `dots add` and `dots remove` across package managers.
+  `dots` adds one command to update everything, a one-line setup of another machine from your repository, sync between machines that is scanned for secrets, and `dots add` and `dots remove` across package managers.
 - **chezmoi or GNU Stow** suit you if dotfiles are all you manage. `dots` keeps tools, packages and dotfiles in one mise configuration.
 - **Nix** suits you if you want fully reproducible environments and are happy to learn its language. `dots` stays with mise's TOML and your system's own package managers.
 

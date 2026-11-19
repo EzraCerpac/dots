@@ -3,6 +3,7 @@
 Everything in this directory is how this configuration talks to `dots`.
 None of it is required, so remove whatever you have no use for.
 `dots init` creates this file and its neighbours only where nothing exists yet, and leaves existing files untouched.
+It writes this guide, `exceptions.tsv`, `retired-dotfiles` and `retired-declarations`, and creates `hooks/update.d/`, `hooks/bootstrap.d/`, `commands/` and `exceptions/` empty: every hook, command and recipe in this guide is an example for you to add.
 `dots help` lists the commands, and `dots COMMAND --help` shows how a built-in command is used.
 `dots test` and `dots mise` are the exceptions: they hand `--help` to the program they start.
 
@@ -97,7 +98,8 @@ Update hooks receive three more variables:
 - `DOTS_CHANGES`: the path of a file.
   Every `ITEM<TAB>BEFORE<TAB>AFTER` line the hook appends there shows up as a change in its report; use `not installed` as `BEFORE` for something newly installed.
 
-For example, `hooks/update.d/50-Fonts@laptop`:
+For example, `hooks/update.d/50-Fonts@laptop` counts the installed fonts around a font installer.
+It needs `fc-list` and an executable `$DOTS_ROOT/scripts/install-fonts` that you provide; `dots init` sets up neither:
 
 ```sh
 #!/bin/sh
@@ -171,7 +173,7 @@ base	example-tool	hold=brew:example
 - `dots exceptions` exits 2 on a row with a fourth column, an unknown profile, an invalid name or an unknown flag.
   Under `dots bootstrap`, the same row fails the exceptions stage; later stages still run, and the bootstrap exits 1 when it finishes.
 - `install-only` makes `dots up` pass `--install-only`, so the recipe installs the app only when it is missing; it suits apps that update themselves.
-- `hold=MANAGER:NAME` declares that the recipe pins that package, and `dots add` then refuses the package whatever tap prefix or `@version` the request carries.
+- `hold=MANAGER:NAME` declares that the recipe manages that package, and `dots add` then refuses the package whatever tap prefix or `@version` the request carries.
 - `dots bootstrap` and `dots exceptions` pass `--install-only` every time.
 - Under `dots up`, recipes receive `DOTS_CHANGES` exactly as update hooks do.
 - Recipes use the same exit statuses as the [hook table](#hooks).
@@ -206,12 +208,19 @@ The hold subcommands never install, upgrade or remove anything.
 exec dots brew update-cask --admin example-app 'Example App' "$@"
 ```
 
-`exceptions/example-tool`, which pins a formula:
+Here `example-app` stands for the cask token and `Example App` for the name of the app's running process.
+The recipe needs a Homebrew source that provides that cask, and administrator access when an install or upgrade is due.
+
+`exceptions/example-tool`, which checks a formula's installed version:
 
 ```sh
 #!/bin/sh
 exec dots brew hold-formula example 1.2.3 'example plugin needs 1.2'
 ```
+
+`example` and `1.2.3` are placeholders, and the formula must already be installed at exactly that version.
+`hold-formula` verifies exactly that and installs nothing.
+The row with `hold=brew:example` in `exceptions.tsv`, shown under [Installer exceptions](#installer-exceptions), makes `dots add` refuse the formula; neither that row nor this recipe stops Homebrew from upgrading it.
 
 ## Retired dotfiles and retired declarations
 

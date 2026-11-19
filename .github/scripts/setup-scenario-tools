@@ -48,7 +48,7 @@ for spec in "jj@$jj_version" "gitleaks@$gitleaks_version"; do
   install -m 0755 "$(provision_mise which "$tool" --tool "$spec")" "$prefix/bin/$tool"
 done
 
-# Fixtures use local Git transport. Build the same Git on each OS and libc.
+# Build the same Git on each OS and libc, including HTTP for the loopback fixture.
 archive="git-$git_version.tar.gz"
 curl -fsSL --retry 3 "https://mirrors.edge.kernel.org/pub/software/scm/git/$archive" -o "$archive"
 printf '%s  %s\n' fd0c0495427dc9ac445fdced8e36bb5eb6f233a14da5db3c6dfd8dcfa7f85761 "$archive" > SHA256SUMS
@@ -64,7 +64,7 @@ if [[ ${DISTRO:-} == Alpine ]]; then
   git_options+=(NO_REGEX=NeedsStartEnd)
 fi
 make -s -j4 -C "git-$git_version" prefix="$prefix" CC=cc \
-  NO_CURL=YesPlease NO_GETTEXT=YesPlease NO_OPENSSL=YesPlease \
+  NO_EXPAT=YesPlease NO_GETTEXT=YesPlease NO_OPENSSL=YesPlease \
   NO_PERL=YesPlease NO_TCLTK=YesPlease "${git_options[@]}" install
 
 # Prove fixture PATH still works when HOME and mise state are replaced,
@@ -84,6 +84,7 @@ for tool in mise git age age-keygen jj gitleaks; do
   test "$(command -v "$tool")" = "$1/bin/$tool"
   "$tool" --version
 done
+test -x "$(git --exec-path)/git-remote-http"
 python3 --version
 jq --version
 git init -q --bare --initial-branch=main "$TMPDIR/remote.git"

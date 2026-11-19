@@ -575,7 +575,8 @@ Package, tool and standalone mise changes come from comparing state before and a
 - The original inode stays at a printed private path on the same filesystem, so an editor that still has it open can finish saving.
 - When sync would replace an existing file in a directory copy, it compares the file with the source previously deployed at that path.
 - If both bytes and permissions match, sync treats the file as deployed regardless of who created it and updates it to the new source without reporting it as kept.
-- If the bytes or verified permissions differ, or if the file changes after sync observes it, sync leaves it in place and reports it as kept.
+- If the bytes or verified permissions differ at the target, including a change detected after the initial comparison, sync leaves the file there and reports it as kept.
+- If an editor writes to the original file after sync has moved it aside, the edit survives at the printed private recovery path even when the replacement is already at the target.
 - When the deployed mode cannot be verified, sync updates the file only if its bytes match the previously deployed source and its current mode can stay.
 - Unmatched local files stay in place.
 - Recovery files stay on the same filesystem as the target; when that is impossible, sync reports the path and keeps both versions.

@@ -54,7 +54,7 @@ adopt='
 mise=$1 dots=$2 root=$3 source=$4 profile=$5 retry=$6
 case "$source" in *:*) ;; *) source=https://github.com/$source ;; esac
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CONFIG GIT_INDEX_FILE
-unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES MISE_CD
 if [ ! -e "$root/.git" ]; then
     git clone -- "$source" "$root"
 fi

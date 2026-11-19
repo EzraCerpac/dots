@@ -52,8 +52,9 @@ case "$target:$(uname -s):$(uname -m)" in
     *) echo "Expected a native build runner for $target" >&2; exit 2 ;;
 esac
 
-.mise/rust-cargo build --release --locked --target "$target" --bin dots
-binary="${CARGO_TARGET_DIR:-target}/$target/release/dots"
+target_dir=${CARGO_TARGET_DIR:-target}
+.mise/rust-cargo build --release --locked --target "$target" --target-dir "$target_dir" --bin dots
+binary="$target_dir/$target/release/dots"
 stage=$(mktemp -d "${TMPDIR:-/tmp}/dots-release.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/tree/bin" "$stage/unpacked" "$stage/home" "$stage/tmp"

@@ -11,6 +11,7 @@ pub mod selection;
 
 pub use doc::Doc;
 pub use exceptions::{Exception, Exceptions};
+pub(crate) use repo::unline;
 pub use repo::{CheckoutShape, RepoSetting, checkout_shape};
 pub use vars::Vars;
 

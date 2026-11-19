@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 
 use crate::config::physical;
@@ -95,8 +96,39 @@ fn remove_if_retired(root: &Path, home: &Path, target: &Path) -> io::Result<bool
     {
         return Ok(false);
     }
-    fs::remove_file(target)?;
-    Ok(true)
+    remove_observed_link(&target, &link)
+}
+
+fn remove_observed_link(target: &Path, observed: &Path) -> io::Result<bool> {
+    let parent = target.parent().expect("retirement target has a parent");
+    let work = tempfile::Builder::new()
+        .prefix(".dots-retire-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(parent)?;
+    let mut original = tempfile::TempPath::try_from_path(work.path().join("original"))?;
+    original.disable_cleanup(true);
+    match fs::rename(target, &original) {
+        Ok(()) => {}
+        Err(error) if missing(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    if fs::read_link(&original).is_ok_and(|link| link == observed)
+        && fs::metadata(parent.join(observed)).is_err_and(|error| missing(&error))
+    {
+        fs::remove_file(&original)?;
+        return Ok(true);
+    }
+    // A replacement belongs to its writer. Leave both entries recoverable
+    // if another writer has claimed the target since the displacement.
+    if let Err(error) = original.persist_noclobber(target) {
+        let saved = work.keep().join("original");
+        return Err(io::Error::other(format!(
+            "could not restore changed target, original kept at {}: {}",
+            saved.display(),
+            error.error
+        )));
+    }
+    Ok(false)
 }
 
 fn missing(error: &io::Error) -> bool {
@@ -110,6 +142,15 @@ fn missing(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn retains_a_regular_file_at_a_previously_observed_link_path() {
+        let world = tempfile::tempdir().unwrap();
+        let path = world.path().join("target");
+        fs::write(&path, b"saved contents").unwrap();
+        assert!(!remove_observed_link(&path, Path::new("retired")).unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"saved contents");
+    }
 
     #[test]
     fn keeps_links_with_sources_or_outside_destinations_and_never_follows_a_target_parent_out() {

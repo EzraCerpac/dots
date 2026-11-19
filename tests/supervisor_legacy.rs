@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Output, Stdio};
+use std::process::{Child, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -444,42 +444,59 @@ fn unchanged_up_reports_one_config_diagnostic_when_state_is_unusable() {
     assert!(!text.contains("Log:") && !text.contains("dots up --last"));
 }
 
+enum UpdateInput {
+    Terminal,
+    Headless,
+}
+
 struct HeldUpdate<'a> {
     child: Child,
     world: &'a World,
-    _terminal: File,
+    terminal: Option<File>,
     reaped: bool,
 }
 
 impl<'a> HeldUpdate<'a> {
-    fn start(world: &'a World) -> Self {
+    fn start(world: &'a World, input: UpdateInput) -> Self {
         let mut command = dots(world);
         command
             .arg("up")
             .env("FIXTURE_HOLD", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let terminal = process::foreground_terminal(&mut command);
+        let terminal = match input {
+            UpdateInput::Terminal => Some(process::foreground_terminal(&mut command)),
+            UpdateInput::Headless => {
+                process::headless_session(&mut command);
+                None
+            }
+        };
         let update = Self {
             child: command.spawn().unwrap(),
             world,
-            _terminal: terminal,
+            terminal,
             reaped: false,
         };
+        update.wait_until("the fixture hook", || {
+            world.root().join("held-hook-ready").exists()
+        });
+        assert_legacy_renderer(world, true);
+        update
+    }
+
+    fn wait_until(&self, condition: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !world.root().join("held-hook-ready").exists() {
+        while !ready() {
             assert!(
-                process::exit_success(update.pid()).unwrap().is_none(),
-                "update exited before the fixture hook"
+                process::exit_success(self.pid()).unwrap().is_none(),
+                "update exited before {condition}"
             );
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for the fixture hook"
+                "timed out waiting for {condition}"
             );
             thread::sleep(Duration::from_millis(10));
         }
-        assert_legacy_renderer(world, true);
-        update
     }
 
     fn pid(&self) -> libc::pid_t {
@@ -497,8 +514,13 @@ impl<'a> HeldUpdate<'a> {
             Some(true),
             "released update must exit successfully"
         );
-        self.child.wait().unwrap();
+        self.reap();
+    }
+
+    fn reap(&mut self) -> ExitStatus {
+        let status = self.child.wait().unwrap();
         self.reaped = true;
+        status
     }
 }
 
@@ -510,7 +532,9 @@ impl Drop for HeldUpdate<'_> {
         // Keep World and its release gate alive while the hook unwinds.
         let _ = self.open_gate();
         let pid = self.pid();
-        if process::wait_for_exit(pid, Duration::from_secs(5)) != Some(true) {
+        let clean_exit = process::wait_for_exit(pid, Duration::from_secs(5)) == Some(true);
+        // An early successful exit can still leave the headless writer alive.
+        if !clean_exit || self.terminal.is_none() {
             process::kill_owned_groups(pid);
         }
         if process::wait_for_exit(pid, Duration::from_secs(2)).is_some() {
@@ -543,7 +567,7 @@ fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output(
     };
     complete();
     let oldest = reports(&world, "up").pop().expect("missing first report").0;
-    let active = HeldUpdate::start(&world);
+    let active = HeldUpdate::start(&world, UpdateInput::Terminal);
     for _ in 0..10 {
         complete();
     }
@@ -580,8 +604,117 @@ fn unchanged_report_retention_prunes_old_completed_runs_and_keeps_active_output(
 fn unchanged_redirected_up_ignores_window_resize() {
     let world = fixture();
     holding_hook(&world);
-    let active = HeldUpdate::start(&world);
+    let active = HeldUpdate::start(&world, UpdateInput::Terminal);
     // The ready fixture guarantees the signal reaches the live supervisor.
     assert_eq!(unsafe { libc::kill(active.pid(), libc::SIGWINCH) }, 0);
     active.release();
+}
+
+#[test]
+fn new_headless_up_cancels_during_captured_drain_after_leader_exit() {
+    let world = fixture();
+    let root = world.root();
+    hook(
+        &world,
+        "10-Drain",
+        r#"#!/bin/sh
+set -eu
+if [ -t 0 ] || [ -t 1 ] || [ -t 2 ] || ( : </dev/tty ) 2>/dev/null; then
+    exit 91
+fi
+printf '%s\n' "$$" > "$DOTS_ROOT/drain-leader"
+(
+    trap '' INT TERM
+    i=0
+    while [ "$i" -lt 1200 ] && [ -d "$DOTS_ROOT" ] && [ ! -f "$DOTS_ROOT/release-hook" ]; do
+        if [ -f "$DOTS_ROOT/drain-after-exit" ]; then
+            printf 'fixture-drain-progress\n'
+            printf x >> "$DOTS_ROOT/drain-heartbeat"
+        fi
+        sleep 0.05
+        i=$((i+1))
+    done
+) &
+printf '%s\n' "$!" > "$DOTS_ROOT/drain-writer"
+: > "$DOTS_ROOT/held-hook-ready"
+exit 0
+"#,
+    );
+    hook(
+        &world,
+        "20-Later",
+        "#!/bin/sh\n: > \"$DOTS_ROOT/later-started\"\n",
+    );
+
+    let mut active = HeldUpdate::start(&world, UpdateInput::Headless);
+    let dots_pid = active.pid();
+    assert_eq!(unsafe { libc::getsid(dots_pid) }, dots_pid);
+    assert_ne!(unsafe { libc::getsid(0) }, dots_pid);
+    let read_pid = |name| -> libc::pid_t {
+        fs::read_to_string(root.join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let leader_pid = read_pid("drain-leader");
+    let writer_pid = read_pid("drain-writer");
+    assert!(leader_pid > 1 && writer_pid > 1);
+    assert_ne!(leader_pid, writer_pid);
+
+    let draining = || {
+        let Some(leader) = process::process_state(&world, leader_pid) else {
+            return false;
+        };
+        let Some(writer) = process::process_state(&world, writer_pid) else {
+            return false;
+        };
+        if !leader.zombie() || writer.zombie() {
+            return false;
+        }
+        assert_eq!(
+            leader.parent, dots_pid,
+            "exited hook must be unreaped by dots"
+        );
+        assert_eq!(writer.group, leader.group, "writer left its stage group");
+        assert_ne!(
+            writer.group, dots_pid,
+            "stage lacks a separate process group"
+        );
+        assert_eq!(unsafe { libc::getsid(writer_pid) }, dots_pid);
+        true
+    };
+    active.wait_until("the exited hook and its live writer", draining);
+
+    // The writer can emit this marker only after the kernel confirmed leader exit.
+    fs::write(root.join("drain-after-exit"), "").unwrap();
+    active.wait_until("post-exit heartbeat and captured output", || {
+        fs::metadata(root.join("drain-heartbeat")).is_ok_and(|beat| beat.len() >= 2)
+            && files(&state(&world)).iter().any(|path| {
+                path.extension().is_some_and(|ext| ext == "log")
+                    && fs::read_to_string(path)
+                        .unwrap()
+                        .contains("fixture-drain-progress\n")
+            })
+    });
+    assert!(draining(), "hook was no longer draining before SIGINT");
+    assert!(!root.join("later-started").exists());
+    assert_eq!(unsafe { libc::kill(dots_pid, libc::SIGINT) }, 0);
+
+    assert!(
+        process::wait_for_exit(dots_pid, Duration::from_secs(30)).is_some(),
+        "dots did not exit after SIGINT during captured drain"
+    );
+    // Keep dots unreaped until cleanup is verified so a failed check retains
+    // the guard's ownership of the session.
+    assert!(
+        process::process_state(&world, writer_pid).is_none_or(|writer| writer.zombie()),
+        "the captured-stream writer survived the supervisor's exit"
+    );
+    assert!(!root.join("later-started").exists());
+    let saved = reports(&world, "up");
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].1["status"], 130);
+    assert_eq!(saved[0].1["cancelled"], true);
+    assert_eq!(active.reap().code(), Some(130));
 }

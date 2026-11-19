@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Seek};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -332,7 +333,9 @@ pub(crate) fn validate_selection(
     host: &str,
 ) -> Result<(), Fail> {
     let mise = mise_binary(env)?;
-    let scratch = tempfile::tempdir()
+    let scratch = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
         .map_err(|error| Fail::new(1, format!("could not stage mise validation: {error}")))?;
     let scratch_path = scratch.path().canonicalize().map_err(|error| {
         Fail::new(
@@ -352,7 +355,12 @@ pub(crate) fn validate_selection(
         for (source, target) in [(early, &early_path), (local, &local_path)] {
             let mut source = source.try_clone()?;
             source.rewind()?;
-            std::io::copy(&mut source, &mut File::create(target)?)?;
+            let mut staged = File::options()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(target)?;
+            std::io::copy(&mut source, &mut staged)?;
         }
         Ok(())
     };

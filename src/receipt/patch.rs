@@ -490,12 +490,15 @@ fn snapshot(
             return None;
         }
         if let Some(item) = extend.get_mut("path") {
-            let extension = Path::new(item.as_str()?);
-            if !relative(extension) || private_path(extension) {
-                return None;
+            let extension = item.as_str()?;
+            if !extension.is_empty() {
+                let extension = Path::new(extension);
+                if !relative(extension) || private_path(extension) {
+                    return None;
+                }
+                let copy = snapshot(root, scratch, &root.join(extension), depth + 1, budget)?;
+                *item = value(copy.to_str()?);
             }
-            let copy = snapshot(root, scratch, &root.join(extension), depth + 1, budget)?;
-            *item = value(copy.to_str()?);
         }
     }
     let copy = scratch.join(format!("project-{depth}.toml"));
@@ -510,6 +513,42 @@ fn run(command: &mut Command, budget: &Budget) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_extension_path_keeps_the_default_floor() {
+        let checkout = private_directory().tempdir().unwrap();
+        let root = checkout.path().canonicalize().unwrap();
+        let config = root.join(".gitleaks.toml");
+        let local_rules = "title = 'Local fixture rules'\n";
+        fs::write(root.join("rules.toml"), local_rules).unwrap();
+        let tools = Tools(Vec::new());
+        let budget = Budget::new(Instant::now() + Duration::from_secs(15));
+
+        for (name, settings, extends_local_file) in [
+            ("missing", "useDefault = true\n", false),
+            ("nonempty", "path = 'rules.toml'\n", true),
+            ("empty", "useDefault = true\npath = ''\n", false),
+        ] {
+            fs::write(&config, format!("[extend]\n{settings}")).unwrap();
+            let scratch = private_directory().tempdir().unwrap();
+            let scanner = Scanner::new(&tools, &root, scratch.path(), &budget)
+                .unwrap_or_else(|| panic!("{name} extension path rejected"));
+            assert_eq!(
+                fs::read_to_string(scanner.floor).unwrap(),
+                "[extend]\nuseDefault = true\n"
+            );
+            let project = fs::read_to_string(scanner.project.unwrap()).unwrap();
+            let local_snapshot = scratch.path().join("project-1.toml");
+            if extends_local_file {
+                let doc: DocumentMut = project.parse().unwrap();
+                assert_eq!(doc["extend"]["path"].as_str(), local_snapshot.to_str());
+                assert_eq!(fs::read_to_string(local_snapshot).unwrap(), local_rules);
+            } else {
+                assert_eq!(project, format!("[extend]\n{settings}"));
+                assert!(!local_snapshot.exists());
+            }
+        }
+    }
 
     #[test]
     fn cutoff_returns_screened_text_without_racing_a_staging_write() {

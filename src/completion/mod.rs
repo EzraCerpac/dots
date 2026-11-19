@@ -177,6 +177,9 @@ fn fish_word_quotes(line: &str) -> Vec<Quote> {
             continue;
         }
         if !started {
+            if ch == '\\' && chars.next_if(|&(_, next)| next == '\n').is_some() {
+                continue;
+            }
             started = true;
             words.push(match ch {
                 '"' | '\'' => Quote::Quoted,

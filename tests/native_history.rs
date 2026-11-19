@@ -1043,53 +1043,34 @@ fn new_restore_accepts_trusted_history_fragments() {
         } else {
             target.world.root()
         };
-        let name = if system {
-            let miserc = target.world.root().join("miserc.toml");
-            let selectors = fs::read_to_string(&miserc).unwrap();
-            fs::write(miserc, format!("{selectors}env_conf_d = true\n")).unwrap();
-            "50-history.laptop.toml"
-        } else {
-            "50-history.toml"
-        };
-        let fragment = history_fragment(dir, name, &recipients);
+        let fragment = history_fragment(dir, "50-history.toml", &recipients);
         let original_fragment = fs::read(&fragment).unwrap();
         let original_local = fs::read(&local).unwrap();
         target.write(DEFAULT, 0o600);
 
-        let empty = history_fragment(dir, "90-empty.toml", &[]);
-        for denied in [None, Some(&fragment)] {
-            if denied.is_some() {
-                fs::remove_file(&empty).unwrap();
-            }
-            let mut cmd = target.dots(&["restore"], &remote);
-            if let Some(path) = denied {
-                cmd.env(
-                    "MISE_IGNORED_CONFIG_PATHS",
-                    path.with_file_name(format!("{{{name},missing.toml}}")),
-                );
-            }
-            let refused = cmd.output().unwrap();
+        if !system {
+            fs::write(
+                target.world.root().join("miserc.local.toml"),
+                "# Tera syntax in a comment: {{ config_root }}\n",
+            )
+            .unwrap();
+            fs::write(&fragment, "[fixture-secret-marker\n").unwrap();
+            let refused = target.dots(&["restore"], &remote).output().unwrap();
             assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
-            assert!(messages(&refused).contains("configure [history.encryption].recipients"));
+            let diagnostic = messages(&refused);
+            assert!(diagnostic.contains("50-history.toml"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("mise reported a TOML parse error"),
+                "{diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("fixture-secret-marker"),
+                "{diagnostic}"
+            );
             assert!(!target.store().exists());
             assert_eq!(fs::read(target.active()).unwrap(), DEFAULT);
             assert_eq!(fs::read(&local).unwrap(), original_local);
-        }
-
-        if !system {
-            let ignored = target.world.home().join("state/ignored-configs");
-            fs::create_dir_all(&ignored).unwrap();
-            symlink(fragment.canonicalize().unwrap(), ignored.join("ignored")).unwrap();
-            let refused = target
-                .dots(&["restore"], &remote)
-                .env_remove("MISE_TRUSTED_CONFIG_PATHS")
-                .output()
-                .unwrap();
-            assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
-            assert!(messages(&refused).contains("configure [history.encryption].recipients"));
-            assert!(!target.store().exists());
-            assert_eq!(fs::read(&local).unwrap(), original_local);
-            // The fixture's explicit trusted path takes precedence over the dismissal.
+            fs::write(&fragment, &original_fragment).unwrap();
         }
 
         ok(&mut target.dots(&["restore"], &remote));

@@ -3260,13 +3260,6 @@ copies_case!(
     active unchanged_directory_copy_preserves_edited_restricted_unmanaged_and_excluded_leaves,
     true,
     |f, a, _b, config| {
-        let umask_probe = f.scratch.join("directory-create-mode");
-        fs::create_dir(&umask_probe).unwrap();
-        assert_eq!(
-            mode(&umask_probe),
-            0o755,
-            "directory-copy fixtures must inherit umask 022"
-        );
         let config = format!(
             "{config}\"~/.tree\" = {{ source = \"dir\", mode = \"copy\", exclude = [\"skip\"], dot_prefix = true }}\n"
         );
@@ -3281,6 +3274,7 @@ copies_case!(
         ] {
             a.source(&format!("dir/{name}"), "initial\n");
         }
+        chmod(&a.root.join("dir/restricted"), 0o644);
         f.commit(&f.a, "Declare directory copy");
         f.git(&f.a, &["push", "-q", "origin", "HEAD:dev"]);
         a.deploy();
@@ -3290,7 +3284,9 @@ copies_case!(
         assert_eq!(read(&a.home.join(".tree/.prefixed")), "first sync\n");
         a.target(".tree/dirty", "local edit\n");
         a.target(".tree/unmanaged", "keep unmanaged\n");
-        chmod(&a.home.join(".tree/restricted"), 0o600);
+        let restricted = a.home.join(".tree/restricted");
+        assert_eq!(mode(&restricted), 0o644);
+        chmod(&restricted, 0o600);
         for name in [
             "nested/clean",
             "nested/late",

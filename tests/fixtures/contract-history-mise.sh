@@ -33,7 +33,7 @@ case "$*" in
     'bootstrap packages status --json'|ls|ls\ *) printf '{}\n' ;;
     'settings get history.sync') printf 'manual\n' ;;
     'config get --file '*|'config set '*|'config ls --json'|'--no-config config '*) real_mise "$@" ;;
-    'config ls'|install|upgrade\ *|'self-update --yes') ;;
+    'config ls'|install|upgrade\ *|'self-update --yes'|'self-update --yes --no-plugins') ;;
     exec\ *) shift; [ "$1" != "--" ] || shift; exec "$@" ;;
     which\ *) exit 1 ;;
     --version) printf '2026.11.9\n' ;;

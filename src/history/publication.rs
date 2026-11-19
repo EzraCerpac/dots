@@ -143,14 +143,13 @@ pub(super) fn constrain_http(command: &mut Command, policy: Option<&HttpPolicy>)
 /// bare store and applies git_environment. The origin and branch have already
 /// passed backup's checks, and local is the resulting saved checkpoint.
 pub(super) fn preflight(
-    probe: impl Fn(&[&str], GitAccess<'_>) -> Result<Output, Fail>,
+    run_git: impl Fn(&[&str], GitAccess<'_>) -> Result<Output, Fail>,
     branch: &str,
     origin: &str,
     local: &str,
     ssh_launcher: bool,
 ) -> Result<Option<HttpPolicy>, Fail> {
     let blocked = || refusal("could not verify saved settings history", RECONCILE);
-    let run_git = probe;
     let read = |args: &[&str]| {
         let output = run_git(args, GitAccess::Local)?;
         output

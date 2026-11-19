@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, Permissions};
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink};
-use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nix::libc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -14,7 +13,7 @@ use crate::config::{RepoSetting, Vars, selection};
 
 use super::checkpoint::{MARKER, STAGING, legacy_marker};
 use super::keys::{self, LocalSettings};
-use super::native::{Native, exists, private_dir};
+use super::native::{Native, exists, private_dir, read_native_file};
 use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origin};
 
 const PREVIOUS: &str = "repo.git.pre-restore.";
@@ -1527,17 +1526,7 @@ fn parse_journal(file: &File) -> Result<Journal, Fail> {
 }
 
 fn read_private(path: &Path) -> Result<File, Fail> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .and_then(|file| {
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::other("not a regular marker"));
-            }
-            Ok(file)
-        })
-        .map_err(|_| invalid("could not read local history metadata"))
+    read_native_file(path).map_err(|_| invalid("could not read local history metadata"))
 }
 
 fn match_request(
@@ -1844,9 +1833,6 @@ fn check_envelope(
     oid: &str,
     path: &str,
 ) -> Result<(), Fail> {
-    if !valid_oid(oid) {
-        return Err(unsafe_tree());
-    }
     let mut cmd = local_git(native, store)?;
     cmd.args(["cat-file", "blob", oid]);
     let blob = native.output(cmd, "could not inspect the encrypted checkpoint envelope")?;
@@ -1915,9 +1901,9 @@ fn physical_home(native: &Native<'_, '_>) -> Result<PathBuf, Fail> {
 }
 
 fn home_path(home: &Path, relative: &str) -> Option<PathBuf> {
-    let path = Path::new(relative);
-    (!relative.is_empty()
-        && relative.split('/').all(|part| {
+    relative
+        .split('/')
+        .all(|part| {
             !part.is_empty()
                 && part != "."
                 && part != ".."
@@ -1925,10 +1911,7 @@ fn home_path(home: &Path, relative: &str) -> Option<PathBuf> {
                 && !part.contains(['\\', ':'])
                 && !part.chars().any(char::is_control)
         })
-        && path
-            .components()
-            .all(|part| matches!(part, Component::Normal(_))))
-    .then(|| home.join(path))
+        .then(|| home.join(relative))
 }
 
 fn apply(

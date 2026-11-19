@@ -499,10 +499,6 @@ impl TrackedPaths {
     }
 }
 
-pub(super) fn secure(native: &Native<'_, '_>, paths: &TrackedPaths) -> Result<(), Fail> {
-    paths.secure(native)
-}
-
 fn reopen(
     home: PathBuf,
     source: Option<&Path>,

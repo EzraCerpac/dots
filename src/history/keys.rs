@@ -97,12 +97,8 @@ impl LocalSettings {
     }
 
     pub fn recipients(&self) -> Result<BTreeSet<String>, Fail> {
-        Ok(self.configured_recipients()?.unwrap_or_default())
-    }
-
-    pub fn configured_recipients(&self) -> Result<Option<BTreeSet<String>>, Fail> {
         let Some(item) = nested(&self.document, &["history", "encryption", "recipients"]) else {
-            return Ok(None);
+            return Ok(BTreeSet::new());
         };
         item.as_array()
             .ok_or_else(|| invalid("config.local.toml history recipients must be an array"))?
@@ -115,8 +111,7 @@ impl LocalSettings {
                         invalid("config.local.toml history recipients must be public age1 keys")
                     })
             })
-            .collect::<Result<_, _>>()
-            .map(Some)
+            .collect()
     }
 
     pub fn set_history(

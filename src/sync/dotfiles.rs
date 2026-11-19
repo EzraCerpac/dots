@@ -900,13 +900,32 @@ impl Copies {
         }
         let current = filesystem.read_path(fs_relative(path)?)?;
         let previous_copy = self.state.known.get(path);
+        let absent = target.mode == "absent";
         let copy_is_edited = match previous_copy {
             Some(copy) if current != Image::Absent => {
                 let common = copy.source_image(git, validated.revision())?;
-                !copy.matches(&current, &common, copy.mode, None)
+                let native = if absent {
+                    self.native_baseline(path, copy)
+                } else {
+                    None
+                };
+                !copy.matches(&current, &common, copy.mode, native)
             }
+            None if absent && current != Image::Absent => self
+                .deployments
+                .get(path)
+                .is_some_and(|digest| !matches_native_copy(&current, digest, None)),
             _ => false,
         };
+        if absent && copy_is_edited {
+            path_issue(
+                receipt,
+                "Kept an edited former copy",
+                path,
+                "Move the deployed file somewhere safe, then rerun dots sync.",
+            );
+            return Ok(false);
+        }
         if observed
             .get(path)
             .map_or(current != Image::Absent, |before| *before != current)

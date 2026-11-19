@@ -397,6 +397,74 @@ fn shared_mise_sync(ctx: &Ctx) -> crate::receipt::Receipt {
     super::run(&run, stage, super::load(ctx), Display::Embedded)
 }
 
+fn native_dotfile_apply(ctx: &Ctx) {
+    use crate::run::{Run, Sink};
+
+    let run = Run::begin(ctx, Sink::Unreported);
+    let command = super::validation::command(
+        &run,
+        ctx.root.path(),
+        ["bootstrap", "dotfiles", "apply", "--yes"],
+        false,
+    )
+    .unwrap();
+    let output = run.probe(command).unwrap();
+    assert!(
+        output.status.success(),
+        "native apply returned {}",
+        output.status
+    );
+    let _ = run.end(0);
+}
+
+#[test]
+#[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
+fn absent_keeps_an_edited_copy_known_only_to_mise() {
+    let (fixture, ctx) = shared_mise_fixture(
+        "[dotfiles]\n'~/edited' = { mode = 'copy', source = 'source' }\n'~/clean' = { mode = 'copy', source = 'source' }\n",
+    );
+    let git = Git::new(&ctx, ctx.root.path());
+    let root = git.root();
+    fs::write(root.join("source"), "native copy\n").unwrap();
+    git.get(["add", "."]).unwrap();
+    fixture_commit(&git, "native-only copies fixture");
+    native_dotfile_apply(&ctx);
+
+    let home = fixture.path().join("home");
+    for name in ["edited", "clean"] {
+        assert_eq!(fs::read(home.join(name)).unwrap(), b"native copy\n");
+    }
+    assert!(!root.join(".git/dots-sync-copies.json").exists());
+    fs::write(home.join("edited"), "keep my copy\n").unwrap();
+    let config = root.join("config.toml");
+    let absent = fs::read_to_string(&config)
+        .unwrap()
+        .replace("mode = 'copy', source = 'source'", "mode = 'absent'");
+    fs::write(&config, &absent).unwrap();
+
+    for _ in 0..2 {
+        let receipt = shared_mise_sync(&ctx);
+        assert!(
+            receipt.issues.iter().any(|issue| {
+                issue.diagnostic.contains("edited former copy")
+                    && issue.diagnostic.contains("/edited")
+                    && issue
+                        .next_action
+                        .contains("Move the deployed file somewhere safe")
+            }),
+            "{:?}",
+            receipt.issues
+        );
+        assert_eq!(fs::read(home.join("edited")).unwrap(), b"keep my copy\n");
+        assert!(!home.join("clean").exists());
+    }
+    let remote = git.at(&fixture.path().join("bare-origin"));
+    assert_eq!(
+        remote.get(["show", "refs/heads/dev:config.toml"]).unwrap(),
+        absent.as_bytes()
+    );
+}
+
 #[test]
 #[ignore = "requires real mise, gitleaks and the shared history checkpoint"]
 fn sha256_preview_preserves_ignores_and_manifest_with_sha1_default() {

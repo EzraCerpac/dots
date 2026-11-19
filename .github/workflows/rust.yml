@@ -23,7 +23,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.host[matrix.platform].target }})
     runs-on: ${{ matrix.host[matrix.platform].runner }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.host[matrix.platform].runner == 'macos-15-intel' && 35 || 20 }}
     strategy:
       fail-fast: false
       matrix:

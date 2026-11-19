@@ -34,7 +34,7 @@ if [ -f /seed/install.sh ]; then
     cp /home/smoke/.ssh/fixture.pub /home/smoke/.ssh/authorized_keys
     printf '[127.0.0.1]:2222 %s\n' "$(cut -d ' ' -f 1,2 /tmp/dots-ssh-host.pub)" > /home/smoke/.ssh/known_hosts
     git init --bare --initial-branch=main /srv/dotfiles.git
-    git init --bare --initial-branch=main /srv/template.git
+    git init --bare --initial-branch=master /srv/template.git
     chown -R smoke:smoke /home/smoke/.ssh /srv/dotfiles.git /srv/template.git
     /usr/sbin/sshd -f /dev/null -o ListenAddress=127.0.0.1 -o PasswordAuthentication=no \
         -o KbdInteractiveAuthentication=no -p 2222 -h /tmp/dots-ssh-host
@@ -98,6 +98,33 @@ if [ -f /seed/install.sh ]; then
     test -x "$(mise which age)"
     test -x "$(mise which gitleaks)"
     test -z "$(git -C "$MISE_CONFIG_DIR" status --porcelain)"
+
+    (
+        machine tty
+        export DOTS_MISE_BIN="$fixture/a/.local/bin/mise" PATH="$HOME/bin:/usr/bin:/bin"
+        mkdir "$HOME/bin"
+        cat > "$HOME/bin/gh" <<'GH'
+#!/bin/sh
+case "$*" in
+    'auth status --hostname github.com') exit 0 ;;
+    'api --hostname github.com user --jq .login') printf '%s\n' fixture ;;
+    *) touch "$HOME/unexpected-github-call"; exit 1 ;;
+esac
+GH
+        chmod +x "$HOME/bin/gh"
+        expect <<'EXPECT'
+set timeout 90
+spawn sh -o pipefail -c {curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz}
+expect {
+    -exact {Create a private GitHub repository fixture/dotfiles and push the seed to it? [y/N]} { send -- "n\r" }
+    timeout { exit 1 }
+    eof { exit 1 }
+}
+expect { eof {} timeout { exit 1 } }
+exit [lindex [wait] 3]
+EXPECT
+        test ! -e "$HOME/unexpected-github-call"
+    )
 
     export GIT_SSH_COMMAND='ssh -i /home/smoke/.ssh/fixture -o UserKnownHostsFile=/home/smoke/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes'
     export SMOKE_ORIGIN=ssh://smoke@127.0.0.1:2222/srv/dotfiles.git
@@ -177,6 +204,11 @@ CURL
     expect_status 2 "$fixture/no-consent.log" sh "$fixture/retry"
     grep -Fx 'Adoption needs a terminal or MISE_YES=1.' "$fixture/no-consent.log"
     test ! -e "$HOME/.dots-smoke"
+    (
+        export MISE_YES=1
+        expect_status 2 "$fixture/yes-typo.log" adopt --profile typo
+    )
+    grep -F " | env 'MISE_YES=1' " "$fixture/yes-typo.log"
 
     export SMOKE_RETRY="$fixture/retry"
     if ! expect <<'EXPECT' > "$fixture/interrupted.log"
@@ -229,6 +261,8 @@ EXPECT
     template_origin=${SMOKE_ORIGIN%/*}/template.git
     machine a
     git -C "$MISE_CONFIG_DIR" push "$template_origin" refs/heads/main
+    test "$(git -C /srv/template.git symbolic-ref HEAD)" = refs/heads/master
+    test -z "$(git -C /srv/template.git for-each-ref refs/heads/master)"
     test -z "$(git -C /srv/template.git for-each-ref refs/heads/dev)"
     machine template
     export PATH="$fixture/bin:$PATH"

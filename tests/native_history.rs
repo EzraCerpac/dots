@@ -1980,7 +1980,7 @@ exec "$FIXTURE_GIT" "$@"
     let owner = fs::read(&marker).unwrap();
     let retirement = history.join(".dots-restore-retiring");
     let foreign = staging.join("unrelated");
-    // Stop rmdir after the owner record moves, with no installed journal.
+    // Stop rmdir after the sibling marker becomes the only name, with no installed journal.
     fs::write(&foreign, b"unrelated fixture").unwrap();
     let interrupted = fixture
         .dots(&["restore", "--initialize-history"], &remote)
@@ -2004,6 +2004,36 @@ exec "$FIXTURE_GIT" "$@"
     assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);
     assert!(fs::read(&health).unwrap() == old_health);
     assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+
+    // An independent copy with the same contents cannot prove ownership.
+    let receipt_inode = fs::metadata(&retirement).unwrap().ino();
+    fs::write(&marker, &owner).unwrap();
+    let foreign_inode = fs::metadata(&marker).unwrap().ino();
+    assert_ne!(foreign_inode, receipt_inode);
+    let mismatch = fixture
+        .dots(&["restore", "--initialize-history"], &remote)
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(2), "{}", messages(&mismatch));
+    assert!(messages(&mismatch).contains("the history clone ownership markers do not match"));
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), foreign_inode);
+    assert_eq!(fs::metadata(&retirement).unwrap().ino(), receipt_inode);
+    assert_eq!(fs::read(&marker).unwrap(), owner);
+    assert_eq!(fs::read(&retirement).unwrap(), owner);
+
+    // An interrupted hard link leaves two names for the original inode.
+    fs::remove_file(&marker).unwrap();
+    fs::hard_link(&retirement, &marker).unwrap();
+    assert_eq!(fs::metadata(&marker).unwrap().ino(), receipt_inode);
+    let linked = fixture
+        .dots(&["restore", "--initialize-history"], &remote)
+        .output()
+        .unwrap();
+    assert_eq!(linked.status.code(), Some(1), "{}", messages(&linked));
+    assert!(messages(&linked).contains("could not finish the history install staging directory"));
+    assert!(!marker.exists());
+    assert_eq!(fs::metadata(&retirement).unwrap().ino(), receipt_inode);
+    assert_eq!(fs::read(&foreign).unwrap(), b"unrelated fixture");
     fs::remove_file(foreign).unwrap();
 
     let report_only = fixture.script(

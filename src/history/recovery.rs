@@ -1438,18 +1438,15 @@ fn discard_clone(staging: &Path, clone: &StoreDirectory) -> Result<(), Fail> {
 
 fn finish_staging(staging: &Path, owned_stage: bool) -> Result<(), Fail> {
     if !owned_stage {
-        return fs::remove_dir(staging)
-            .map_err(|_| blocked("could not finish the history install staging directory"));
+        fs::remove_dir(staging)
+            .map_err(|_| blocked("could not finish the history install staging directory"))?;
+        return fsync_dir(parent(staging));
     }
     let retirement = parent(staging).join(RETIRING);
-    if exists(&retirement)? {
-        return Err(blocked("a history clone retirement is already pending"));
-    }
-    // Keep the ownership record outside the directory while rmdir needs it
-    // empty. An interruption can then leave either the stage or its receipt.
-    fs::rename(staging.join(MARKER), &retirement)
-        .map_err(|_| blocked("could not retire the history clone ownership marker"))?;
-    finish_retirement(staging, &retirement)
+    // Keep the original name until the sibling link is durable.
+    fs::hard_link(staging.join(MARKER), &retirement)
+        .map_err(|_| blocked("could not create the history clone retirement marker"))?;
+    finish_retirement(staging, &retirement, &read_private(&retirement)?)
 }
 
 fn resume_staging_retirement(
@@ -1463,7 +1460,8 @@ fn resume_staging_retirement(
     if !exists(&retirement)? {
         return Ok(());
     }
-    let owner = read_journal_at(&retirement)?;
+    let receipt = read_private(&retirement)?;
+    let owner = parse_journal(&receipt)?;
     if !matches!(owner.progress, Progress::Cloning(_)) {
         return Err(invalid(
             "invalid ownership marker for a retired history clone",
@@ -1474,14 +1472,27 @@ fn resume_staging_retirement(
     if let Some(meta) = existing_directory(staging)? {
         match_journal_directory(&owner, &meta)?;
     }
-    finish_retirement(staging, &retirement)
+    finish_retirement(staging, &retirement, &receipt)
 }
 
-fn finish_retirement(staging: &Path, retirement: &Path) -> Result<(), Fail> {
+fn finish_retirement(staging: &Path, retirement: &Path, receipt: &File) -> Result<(), Fail> {
     let base = parent(staging);
     if exists(staging)? {
-        fsync_dir(staging)?;
         fsync_dir(base)?;
+        let original = staging.join(MARKER);
+        if exists(&original)? {
+            let staged = fs::symlink_metadata(&original)
+                .map_err(|_| blocked("could not inspect the history clone ownership marker"))?;
+            let retired = receipt
+                .metadata()
+                .map_err(|_| blocked("could not inspect the history clone retirement marker"))?;
+            if !staged.is_file() || (staged.dev(), staged.ino()) != (retired.dev(), retired.ino()) {
+                return Err(invalid("the history clone ownership markers do not match"));
+            }
+            fs::remove_file(original)
+                .map_err(|_| blocked("could not clear the history clone ownership marker"))?;
+        }
+        fsync_dir(staging)?;
         fs::remove_dir(staging)
             .map_err(|_| blocked("could not finish the history install staging directory"))?;
     }
@@ -1527,11 +1538,11 @@ fn write_journal(store: &Path, record: &Journal) -> Result<(), Fail> {
 }
 
 fn read_journal(store: &Path) -> Result<Journal, Fail> {
-    read_journal_at(&store.join(MARKER))
+    parse_journal(&read_private(&store.join(MARKER))?)
 }
 
-fn read_journal_at(path: &Path) -> Result<Journal, Fail> {
-    serde_json::from_reader(read_private(path)?.take(4 * 1024 * 1024))
+fn parse_journal(file: &File) -> Result<Journal, Fail> {
+    serde_json::from_reader(file.take(4 * 1024 * 1024))
         .map_err(|_| invalid("could not validate the pending history recovery marker"))
 }
 

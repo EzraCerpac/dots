@@ -1266,7 +1266,7 @@ sync_case!(active unchanged_long_native_failure_keeps_receipt_readable, || {
 });
 
 sync_case!(
-    new_native_history_failure_keeps_backend_secret_out_of_live_and_replay,
+    active new_native_history_failure_keeps_backend_secret_out_of_live_and_replay,
     || {
         let f = Repo::new();
         let marker = "SYNTHETIC_HISTORY_PASSWORD_7E341A";
@@ -2044,7 +2044,6 @@ sync_case!(
 );
 
 #[test]
-#[ignore = "P-08 sync and P-11 cancellation"]
 fn new_standalone_sync_cancellation_records_replayable_stopped_receipt() {
     let f = Repo::new();
     let previous = f.tip(&f.a);
@@ -2365,7 +2364,7 @@ const COPY_DECLARATION: &str = r#""~/.copied" = { source = "copy.txt", mode = "c
 const TEMPLATE_DECLARATION: &str =
     r#""~/.rendered" = { source = "template.tera", mode = "template" }"#;
 
-sync_case!(new_shared_sync_saves_encrypted_history_before_push, || {
+sync_case!(active new_shared_sync_saves_encrypted_history_before_push, || {
     let f = Repo::new();
     let machine = Machine::new(&f, &f.a, "machine-a", false);
     let key = machine.home.join("fixture-age-key");
@@ -3536,7 +3535,7 @@ sync_case!(
     }
 );
 
-sync_case!(new_local_only_sync_skips_all_stages, || {
+sync_case!(active new_local_only_sync_skips_all_stages, || {
     let f = Repo::new();
     let before = f.tip(&f.a);
     f.git(&f.a, &["remote", "remove", "origin"]);
@@ -3561,7 +3560,7 @@ sync_case!(new_local_only_sync_skips_all_stages, || {
     assert_eq!(read(&f.a.join("public")), "keep local\n");
 });
 
-sync_case!(new_empty_reachable_origin_creates_only_dev, || {
+sync_case!(active new_empty_reachable_origin_creates_only_dev, || {
     let f = Repo::new();
     f.git(&f.origin, &["update-ref", "-d", "refs/heads/dev"]);
     f.git(&f.origin, &["update-ref", "-d", "refs/heads/main"]);
@@ -3596,13 +3595,13 @@ fn deny_transport(f: &Repo) -> PathBuf {
     attempted
 }
 
-fn rejected_remote(configured: &str, origin: &str) {
+fn rejected_remote(origin: &str) {
     let f = Repo::new();
     let before = f.remote();
     f.write(
         &f.a,
         "config.toml",
-        format!("[vars]\ndots_profiles = \"laptop selected\"\ndots_source_repo = {configured:?}\n"),
+        "[vars]\ndots_profiles = \"laptop selected\"\n",
     );
     f.git(&f.a, &["remote", "set-url", "origin", origin]);
     let attempted = deny_transport(&f);
@@ -3619,20 +3618,20 @@ fn rejected_remote(configured: &str, origin: &str) {
 }
 
 sync_case!(
-    new_credential_bearing_origin_is_refused_before_transport,
+    active new_credential_bearing_origin_is_refused_before_transport,
     || {
         let url = "https://fixture-user:FIXTURE_REMOTE_CREDENTIAL@fixture.invalid/dots";
-        rejected_remote(url, url);
+        rejected_remote(url);
     }
 );
 
-sync_case!(new_remote_helper_origin_is_refused_before_transport, || {
+sync_case!(active new_remote_helper_origin_is_refused_before_transport, || {
     let url = "ext::false";
-    rejected_remote(url, url);
+    rejected_remote(url);
 });
 
 sync_case!(
-    new_effective_push_rewrite_is_refused_before_transport,
+    active new_effective_push_rewrite_is_refused_before_transport,
     || {
         let f = Repo::new();
         let raw = format!("file://{}", f.origin.display());
@@ -3667,7 +3666,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_matching_explicit_file_url_syncs_through_local_origin,
+    active new_matching_explicit_file_url_syncs_through_local_origin,
     || {
         let f = Repo::new();
         let remote = format!("file://{}", f.origin.display());
@@ -3688,7 +3687,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_configured_remote_without_origin_reports_missing_and_keeps_edits,
+    active new_configured_remote_without_origin_reports_missing_and_keeps_edits,
     || {
         let f = Repo::new();
         let before = f.tip(&f.a);
@@ -3704,7 +3703,7 @@ sync_case!(
 );
 
 sync_case!(
-    new_sync_missing_configuration_still_exits_zero_with_receipt,
+    active new_sync_missing_configuration_still_exits_zero_with_receipt,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -3716,7 +3715,7 @@ sync_case!(
     }
 );
 
-sync_case!(new_sync_missing_mise_still_exits_zero_with_receipt, || {
+sync_case!(active new_sync_missing_mise_still_exits_zero_with_receipt, || {
     let f = Repo::new();
     let before = f.remote();
     fs::remove_file(f.tools.join("mise")).unwrap();
@@ -3730,7 +3729,7 @@ sync_case!(new_sync_missing_mise_still_exits_zero_with_receipt, || {
 });
 
 sync_case!(
-    new_sync_invalid_option_exits_two_without_touching_state,
+    active new_sync_invalid_option_exits_two_without_touching_state,
     || {
         let f = Repo::new();
         let before = f.remote();
@@ -4028,7 +4027,6 @@ copies_case!(
 );
 
 #[test]
-#[ignore = "requires real mise and gitleaks in a private World"]
 fn new_file_adoption_below_home_shares_and_preserves_source_guard() {
     let world = IsolatedWorld::new();
     let root = world.home().join(".config/mise");

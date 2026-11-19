@@ -51,12 +51,7 @@ runs:
         printf 'RUSTUP_TOOLCHAIN=%s\nCARGO_INCREMENTAL=0\nCARGO_PROFILE_DEV_DEBUG=0\n' \
           "$RUST_VERSION" >> "$GITHUB_ENV"
         if [[ "$TARGET" == *-linux-musl ]]; then
-          if ! command -v musl-gcc >/dev/null; then
-            sudo apt-get install -y -qq --no-install-recommends musl-tools || {
-              sudo apt-get update -qq
-              sudo apt-get install -y -qq --no-install-recommends musl-tools
-            }
-          fi
+          bash .github/scripts/install-ubuntu-tool musl-gcc
           printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
             "$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
         fi

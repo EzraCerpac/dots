@@ -2084,16 +2084,18 @@ impl ReloadQueue {
             return Ok(None);
         }
         let stage = private_dir(git_dir, "copy-reload-")?;
+        // Mise merges history.reload from ordinary profiles. Its special
+        // override files can appear in config ls without replacing these rules.
         let mut config = tempfile::Builder::new()
             .prefix("config.host-")
-            .suffix(".override.toml")
+            .suffix(".local.toml")
             .tempfile_in(live)?;
         let profile = config
             .path()
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .and_then(|name| name.strip_prefix("config."))
-            .and_then(|name| name.strip_suffix(".override.toml"))
+            .and_then(|name| name.strip_suffix(".local.toml"))
             .ok_or_else(|| invalid("invalid mise reload profile"))?;
         let selectors = if selectors.is_empty() {
             profile.to_owned()
@@ -2112,12 +2114,14 @@ impl ReloadQueue {
         #[derive(Deserialize)]
         struct LoadedConfig {
             path: PathBuf,
+            #[serde(default, rename = "override")]
+            is_override: bool,
         }
         if !output.status.success()
             || !serde_json::from_slice::<Vec<LoadedConfig>>(&output.stdout)
                 .map_err(io::Error::other)?
                 .iter()
-                .any(|loaded| loaded.path == config.path())
+                .any(|loaded| loaded.path == config.path() && !loaded.is_override)
         {
             return Err(invalid("mise did not load the temporary reload profile"));
         }

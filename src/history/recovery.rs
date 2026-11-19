@@ -22,7 +22,7 @@ const CLONE: &str = "clone-";
 const RETIRING: &str = ".dots-restore-retiring";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
-pub(super) const INTERRUPTED_RESTORE: &str = "An earlier restore was interrupted and a tracked settings file changed afterwards. Run mise dot history --pending to see a pending native operation, then mise dot recover UUID for that operation. Otherwise, reconcile the file and run dots restore.";
+pub(super) const INTERRUPTED_RESTORE: &str = "An earlier restore was interrupted and did not finish. Run dots mise dot history --pending to see a pending native operation, then dots mise dot recover UUID for that operation. Otherwise, reconcile the file and run dots restore.";
 
 #[derive(Deserialize, Serialize)]
 struct Journal {
@@ -886,7 +886,7 @@ impl Recovery<'_, '_, '_> {
             return Err(unresolved_restore());
         }
         let command = self.command(&["bootstrap", "dotfiles", "recover", &operation.uuid], true)?;
-        self.native.output(command, "native restore recovery needs attention; use mise dot history --pending to inspect the retained operation")?;
+        self.native.output(command, "native restore recovery needs attention; use dots mise dot history --pending to inspect the retained operation")?;
         self.native.require_no_pending_operations()?;
         if !completed && self.completion(attempt, rollback)?.is_none() {
             let current = tracked::restore_paths(self.native, Some(self.branch))?;
@@ -1136,7 +1136,7 @@ impl NativeAfter {
 
 fn unresolved_restore() -> Fail {
     blocked(
-        "the interrupted restore could not be verified; inspect the retained native operation with mise dot history --pending before retrying",
+        "the interrupted restore could not be verified; inspect the retained native operation with dots mise dot history --pending before retrying",
     )
 }
 

@@ -629,6 +629,11 @@ fn new_allow_plaintext_requires_a_successful_exact_boolean() {
         assert_ne!(error.status, 0);
         assert!(error.diagnostic.contains("history.allow_plaintext_history"));
         assert!(
+            error
+                .diagnostic
+                .contains("dots mise settings get history.allow_plaintext_history")
+        );
+        assert!(
             !error
                 .diagnostic
                 .contains("private configuration diagnostic")

@@ -215,23 +215,16 @@ fn read_early(path: &Path) -> Result<Early, Fail> {
     if !path.is_file() {
         return Ok(Early::default());
     }
-    let early: Early = read_toml(path)?;
-    if early
-        .env
+    let doc = passive::toml(path).map_err(|_| invalid(DIAGNOSTIC))?;
+    // mise renders the entire file before parsing TOML, including comments.
+    let source = doc.to_string();
+    if ["{{", "{%", "{#"]
         .iter()
-        .flatten()
-        .chain(early.env_sets.keys())
-        .chain(early.env_sets.values().flatten())
-        .chain(early.ignored_config_paths.iter().flatten())
-        .any(|value| {
-            ["{{", "{%", "{#"]
-                .iter()
-                .any(|marker| value.contains(marker))
-        })
+        .any(|marker| source.contains(marker))
     {
         return Err(invalid(DIAGNOSTIC));
     }
-    Ok(early)
+    toml_edit::de::from_document(doc).map_err(|_| invalid(DIAGNOSTIC))
 }
 
 // Project miserc can select native environments, but only system/global

@@ -635,12 +635,32 @@ impl Removal {
             Ok(parked) => parked,
             Err(error) => return Err(edit::rollback(error, [replacement.restore()])),
         };
-        if let Err(error) = edit.install() {
+        let written = match edit.install() {
+            Ok(written) => written,
+            Err(error) => {
+                return Err(edit::rollback(
+                    error,
+                    [parked.restore(), replacement.restore()],
+                ));
+            }
+        };
+        if !snapshot(&parked.parked).is_ok_and(|entry| entry.as_ref() == Some(&source)) {
             return Err(edit::rollback(
-                error,
-                [parked.restore(), replacement.restore()],
+                Fail::new(
+                    1,
+                    format!(
+                        "adoption source changed during removal: {}",
+                        paths.source.display()
+                    ),
+                ),
+                [
+                    written.map_or(Ok(()), edit::Written::restore),
+                    parked.restore(),
+                    replacement.restore(),
+                ],
             ));
         }
+        drop(parked);
         println!("Restored {}", paths.target.display());
         Ok(())
     }
@@ -949,7 +969,21 @@ fn retained(work: TempDir, path: &Path, error: io::Error) -> Fail {
 // Trade two directory entries atomically so we can inspect the displaced file,
 // even when a writer changes the target just before the system call.
 pub(super) fn exchange(a: &Path, b: &Path) -> io::Result<()> {
-    rename(a, b, true)
+    rename(a, b, true).map_err(exchange_error)
+}
+
+fn exchange_error(error: io::Error) -> io::Error {
+    if error
+        .raw_os_error()
+        .is_some_and(|errno| [libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&errno))
+    {
+        io::Error::new(
+            error.kind(),
+            format!("{error}. This filesystem or system does not support atomic exchange."),
+        )
+    } else {
+        error
+    }
 }
 
 pub(super) fn rename_noclobber(a: &Path, b: &Path) -> io::Result<()> {
@@ -1011,8 +1045,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn adoption_keeps_the_source_if_a_later_edit_retains_its_declaration() {
+    fn fixture() -> (TempDir, Ctx) {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let base = directory.path().canonicalize().unwrap();
         let home = base.join("home");
@@ -1030,9 +1063,15 @@ mod tests {
             env,
             flags: Flags::default(),
         };
-        let config = root.join("config.toml");
+        (directory, ctx)
+    }
+
+    #[test]
+    fn adoption_keeps_the_source_if_a_later_edit_retains_its_declaration() {
+        let (_directory, ctx) = fixture();
+        let config = ctx.root.path().join("config.toml");
         fs::write(&config, "").unwrap();
-        let target = home.join("settings");
+        let target = ctx.env.home().unwrap().join("settings");
         fs::write(&target, "original").unwrap();
         let paths = paths(&ctx, &target).unwrap();
         let source = paths.source.clone();
@@ -1062,5 +1101,60 @@ mod tests {
             "{text}"
         );
         assert_eq!(fs::read_to_string(source).unwrap(), "original");
+    }
+
+    #[test]
+    fn removal_restores_a_parked_source_edited_during_config_install() {
+        let (_directory, ctx) = fixture();
+        let target = ctx.env.home().unwrap().join("settings");
+        let paths = paths(&ctx, &target).unwrap();
+        let source = paths.source.clone();
+        let config = ctx.root.path().join("config.toml");
+        let declaration =
+            "[dotfiles]\n\"~/settings\" = { source = \"dotfiles/settings\", mode = \"symlink\" }\n";
+        fs::write(&config, declaration).unwrap();
+        fs::create_dir(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"original\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&source, &target).unwrap();
+        let original = fs::metadata(&source).unwrap();
+        let mut writer = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        let removal = prepare_remove(&ctx, paths, None).unwrap();
+        let source_path = source.clone();
+        edit::tests::on_next_exchange(move || {
+            // The first exchange replaces the symlink. The second edits the
+            // configuration while the open source inode is parked.
+            edit::tests::on_next_exchange(move || {
+                assert!(!source_path.exists());
+                writer.write_all(b"late edit\n").unwrap();
+                writer.sync_all().unwrap();
+            });
+        });
+
+        let error = removal.execute(&ctx).unwrap_err();
+        assert_eq!(error.status, 1, "{error}");
+        assert!(error.diagnostic.contains("source changed"), "{error}");
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        let restored = fs::metadata(&source).unwrap();
+        assert_eq!(restored.ino(), original.ino());
+        assert_eq!(restored.mode(), original.mode());
+        assert_eq!(fs::read(&target).unwrap(), b"original\nlate edit\n");
+        assert_eq!(fs::read_to_string(config).unwrap(), declaration);
+    }
+
+    #[test]
+    fn exchange_explains_only_unambiguous_unsupported_errors() {
+        for errno in [libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let error = exchange_error(io::Error::from_raw_os_error(errno));
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support atomic exchange")
+            );
+        }
+        for errno in [libc::EINVAL, libc::ENOENT, libc::EACCES, libc::EXDEV] {
+            let error = exchange_error(io::Error::from_raw_os_error(errno));
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
     }
 }

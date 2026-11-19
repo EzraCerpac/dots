@@ -14,6 +14,7 @@ permissions:
 
 env:
   RUST_VERSION: "1.100.0"
+  MISE_VERSION: v2026.11.9
   CARGO_TEST_FLAGS: >-
     ${{ (github.ref == 'refs/heads/rust' ||
          (github.base_ref == 'main' && github.head_ref == 'rust')) && '--no-fail-fast' || '' }}
@@ -39,18 +40,20 @@ jobs:
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Linux test dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends musl-tools bash zsh fish age
+          sudo apt-get install -y -qq --no-install-recommends musl-tools git bash zsh fish python3 jq
           printf 'CC=musl-gcc\nCARGO_TARGET_%s_LINKER=musl-gcc\n' \
             "$(printf '%s' "$CARGO_BUILD_TARGET" | tr '[:lower:]-' '[:upper:]_')" >> "$GITHUB_ENV"
 
-      - name: Install Fish on macOS
+      - name: Install Fish and Git on macOS
         if: runner.os == 'macOS'
-        run: brew install fish
+        run: brew install fish git
 
       - name: Verify shell executables
         run: |
@@ -63,28 +66,14 @@ jobs:
           test "$(uname -m)" = "$ARCH"
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --target "$CARGO_BUILD_TARGET"
 
-      - name: Install standalone mise
+      - name: Install native scenario tools
         shell: bash
         env:
-          MISE_VERSION: v2026.11.9
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL https://mise.run | sh
-          "$HOME/.local/bin/mise" --version
-          test "$("$HOME/.local/bin/mise" --version | cut -d ' ' -f 1)" = "${MISE_VERSION#v}"
-          printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Install age on macOS
-        if: runner.os == 'macOS'
-        run: |
-          mise install age@1.3.2
-          age_bin="$(mise which age --tool age@1.3.2)"
-          # Keep the fixture tools on PATH when mise activates the project's Rust toolchain.
-          fixture_bin="$RUNNER_TEMP/dots-fixture-bin"
-          mkdir -p "$fixture_bin"
-          for tool in age age-keygen; do
-            install -m 0755 "${age_bin%/*}/$tool" "$fixture_bin/$tool"
-          done
-          printf '%s\n' "$fixture_bin" >> "$GITHUB_PATH"
+          prefix="$RUNNER_TEMP/dots-scenario-tools"
+          bash .github/scripts/setup-scenario-tools "$prefix"
+          printf '%s\n' "$prefix/bin" >> "$GITHUB_PATH"
 
       - name: Check formatting
         run: rustup run "$RUST_VERSION" cargo fmt --all -- --check
@@ -94,8 +83,7 @@ jobs:
 
       - name: Run all tests natively
         run: |
-          age --version
-          age-keygen --version
+          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
           mise run test -- ${{ env.CARGO_TEST_FLAGS }}
 
   legacy-oracle:
@@ -114,7 +102,6 @@ jobs:
       matrix:
         os: ${{ fromJSON(github.base_ref == 'rust' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
     env:
-      MISE_VERSION: v2026.11.9
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -171,6 +158,7 @@ jobs:
 
       - name: Run unchanged black-box scenarios against the archive
         run: |
+          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
           for tool in mise git bash zsh fish node python3 uv jj age age-keygen gitleaks jq gh rsync less; do
             command -v "$tool"
           done
@@ -205,24 +193,27 @@ jobs:
     env:
       DISTRO: ${{ matrix.distro }}
       IMAGE: ${{ matrix.image }}
-      MISE_VERSION: v2026.11.9
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
       - name: Run Rust scenarios in the distribution
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           # Keep Actions' checkout runtime on Ubuntu, including for musl Alpine.
           docker run --rm -i --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/workspace" \
-            --workdir /workspace -e DISTRO -e RUST_VERSION -e MISE_VERSION \
+            --workdir /workspace -e DISTRO -e RUST_VERSION -e MISE_VERSION -e GITHUB_TOKEN \
             -e MISE_TRUSTED_CONFIG_PATHS=/workspace "$IMAGE" sh -eu <<'SH'
+          setup_token=$GITHUB_TOKEN
+          unset GITHUB_TOKEN GH_TOKEN
           rust_host=x86_64-unknown-linux-gnu
           case "$DISTRO" in
-            Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip age ;;
-            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git age python ;;
+            Fedora) dnf install -y bash zsh fish /usr/bin/curl ca-certificates gcc glibc-devel git tar gzip python3 jq ;;
+            Arch) pacman -Syu --noconfirm --needed bash zsh fish curl ca-certificates gcc git python jq ;;
             Alpine)
-              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git age python3
+              apk add --no-cache bash zsh fish curl ca-certificates gcc musl-dev git python3 jq
               rust_host=x86_64-unknown-linux-musl
               ;;
             *) exit 2 ;;
@@ -232,18 +223,10 @@ jobs:
           chmod +x /tmp/rustup-init
           /tmp/rustup-init -y --no-modify-path --default-host "$rust_host" \
             --profile minimal --default-toolchain "$RUST_VERSION"
-          curl -fsSL "https://github.com/jdx/mise/releases/download/$MISE_VERSION/mise-$MISE_VERSION-linux-x64-musl.tar.gz" \
-            -o /tmp/mise.tar.gz
-          tar -xzf /tmp/mise.tar.gz -C /tmp mise/bin/mise
-          mkdir -p "$HOME/.local/bin"
-          install -m 0755 /tmp/mise/bin/mise "$HOME/.local/bin/mise"
-          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-          for tool in mise git bash zsh fish; do
-            command -v "$tool"
-          done
-          mise --version
-          age --version
-          age-keygen --version
+          prefix=/tmp/dots-scenario-tools
+          GITHUB_TOKEN="$setup_token" bash .github/scripts/setup-scenario-tools "$prefix"
+          unset setup_token
+          export PATH="/workspace/.github/scripts/scenario-bin:$prefix/bin:$HOME/.cargo/bin:$PATH"
           mise run test -- ${{ env.CARGO_TEST_FLAGS }}
           SH
 
@@ -252,7 +235,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      MISE_VERSION: v2026.11.9
       MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

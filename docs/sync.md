@@ -176,9 +176,14 @@ Issues, each with its next action, are printed above that line.
 Below it come any recovery copies, then each path group that has entries; live output shows at most five paths per group.
 
 - **Shared on dev**: files that differ between the previously published `dev` and the commit the remote confirmed.
-- **Saved locally**: files this run committed on this machine's `dev`; after a confirmed push they can also appear under **Shared on dev**.
+- **Saved locally**: files this run committed on this machine's `dev`; when this run's own push is confirmed, they all stay listed here and can also appear under **Shared on dev**.
 - **Updated in this checkout**: files that reached the configuration checkout; a later failure to deploy a dotfile is reported separately.
 - **Finished pending checkout**: an interrupted update this run finished.
+
+Another machine can publish this run's saved commit to `origin` before this run pushes it.
+A path then leaves **Saved locally**, and the summary counts it as already shared, only when both that machine's tip and the tip the remote finally confirmed still hold exactly the version this run saved.
+A path the other machine has since reverted stays under **Saved locally**, even though the history contains this run's commit.
+`dots sync --last` replays the receipt with the same accounting.
 
 For example, this receipt followed an edit to `config.toml` next to a new file holding a secret.
 It comes from `dots` 1.0.0-rc.1 at `rust` `9a35df0`, in a disposable home directory with a local bare `origin`:

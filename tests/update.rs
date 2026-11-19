@@ -429,7 +429,6 @@ fn seed_sync_fixture(fixture: &Fixture) -> String {
 }
 
 #[test]
-#[ignore = "local-only source mode (#77)"]
 fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     let fixture = Fixture::new();
     let seed = seed_sync_fixture(&fixture);
@@ -979,7 +978,6 @@ fn saved_sync_receipt(fixture: &Fixture) -> Option<Value> {
 }
 
 #[test]
-#[ignore = "local-only source mode (#77)"]
 fn new_up_embedded_sync_local_only_does_not_emit_or_save_receipt() {
     let fixture = Fixture::new();
     seed_sync_fixture(&fixture);

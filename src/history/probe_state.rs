@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Fail;
 
-use super::native::{Native, exists};
+use super::native::{Native, exists, read_native_file};
 use super::{blocked, invalid};
 
 const STORES: [&str; 2] = ["history", "history-local/history"];
@@ -70,11 +70,17 @@ impl ProbeState {
 
 pub(super) fn check_queued_notices(native: &Native<'_, '_>) -> Result<(), Fail> {
     let live = native.state_dir()?;
+    let unknown = || invalid("could not inspect the mise history notice queue");
     for scope in STORES {
-        if exists(&live.join(scope).join("notices"))? {
-            return Err(blocked(
-                "mise history has queued notices; read them with mise dotfiles paths in the corresponding scope, then retry",
-            ));
+        match read_native_file(&live.join(scope).join("notices")) {
+            Ok(file) if file.metadata().map_err(|_| unknown())?.len() == 0 => (),
+            Ok(_) => {
+                return Err(blocked(
+                    "mise history has queued notices; read them with mise dotfiles paths in the corresponding scope, then retry",
+                ));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => (),
+            Err(_) => return Err(unknown()),
         }
     }
     Ok(())

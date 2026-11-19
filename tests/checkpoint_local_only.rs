@@ -385,7 +385,7 @@ fn new_checkpoint_keeps_the_merged_save_path_for_established_history() {
     f.seam("checkpoint", "blocked");
     assert_eq!(fs::read_to_string(&notice).unwrap(), "queued note\n");
     assert!(!f.world.home().join("history-calls").exists());
-    fs::remove_file(notice).unwrap();
+    fs::write(notice, "").unwrap();
 
     f.seam("checkpoint", "saved");
     let calls = fs::read_to_string(f.world.home().join("history-calls")).unwrap();
@@ -461,7 +461,6 @@ fn new_sync_load_checks_source_and_checkout_before_skipping() {
 }
 
 #[test]
-#[ignore = "P-04"]
 fn unchanged_up_finishes_maintenance_with_empty_history_and_no_origin() {
     let f = Fixture::new();
     f.seed();

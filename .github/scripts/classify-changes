@@ -33,6 +33,9 @@ else
                 full=true
                 break
                 ;;
+            # The binary embeds inputs outside src too (see src/init/files.rs, src/skill/mod.rs).
+            src/*|build.rs|skills/dots/SKILL.md) code=true ;;
+            init/exceptions.tsv|init/gitignore|init/gitleaks.toml|init/retired-declarations|init/retired-dotfiles) code=true ;;
             *.md|docs/*|plan/*|LICENSE) ;;
             *) code=true ;;
         esac

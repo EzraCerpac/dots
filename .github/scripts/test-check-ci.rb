@@ -1,3 +1,4 @@
+require "fileutils"
 require "json"
 require "open3"
 require "tmpdir"
@@ -41,10 +42,48 @@ end
 
 Dir.mktmpdir do |dir|
   output = File.join(dir, "outputs")
+  classifier = File.expand_path(".github/scripts/classify-changes")
   raise "classifier failed" unless system({ "REF_TYPE" => "tag", "EVENT" => "push", "GITHUB_OUTPUT" => output },
-                                          "bash", ".github/scripts/classify-changes")
+                                          "bash", classifier)
   full_matrix = JSON.parse(File.readlines(output).find { |line| line.start_with?("matrix=") }.split("=", 2).last)
   short_matrix = full_matrix.merge(full_matrix.reject { |key, _| key == "linux" }.transform_values { { "include" => [] } })
+
+  Dir.mktmpdir do |repo|
+    git = lambda do |*args|
+      stdout, stderr, status = Open3.capture3("git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                                             "-c", "user.name=CI", "-c", "user.email=ci@example.invalid", *args, chdir: repo)
+      raise stderr unless status.success?
+      stdout.strip
+    end
+    cases = {
+      %w[src/init/README.md] => %w[code=true full=false],
+      %w[skills/dots/SKILL.md] => %w[code=true full=false],
+      %w[docs/contract.md] => %w[code=false full=false],
+      %w[build.rs install.sh] => %w[code=true full=true]
+    }
+    git.call("init", "-q")
+    cases.keys.flatten.each do |path|
+      file = File.join(repo, path)
+      FileUtils.mkdir_p(File.dirname(file))
+      File.write(file, "initial\n")
+    end
+    git.call("add", ".")
+    git.call("commit", "-qm", "base")
+    base = git.call("rev-parse", "HEAD")
+    cases.each do |paths, expected|
+      git.call("reset", "--hard", base)
+      paths.each { |path| File.write(File.join(repo, path), "modified\n") }
+      git.call("add", "--", *paths)
+      git.call("commit", "-qm", "change")
+      File.truncate(output, 0)
+      env = { "REF_TYPE" => "branch", "EVENT" => "pull_request", "BASE" => base,
+              "HEAD_SHA" => git.call("rev-parse", "HEAD"), "GITHUB_OUTPUT" => output }
+      raise "classifier failed for #{paths.join(', ')}" unless system(env, "bash", classifier, chdir: repo)
+      raise "wrong classifier route for #{paths.join(', ')}" unless File.readlines(output, chomp: true).first(2) == expected
+      puts "Classifier: #{paths.join(', ')} → #{expected.join(' ')}"
+    end
+  end
+
   run = 45_123
   attempt = 4
   path = File.join(dir, "gh")

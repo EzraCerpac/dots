@@ -19,6 +19,8 @@ use super::{Restore, blocked, host, invalid, state_repo, tracked, validate_origi
 
 const PREVIOUS: &str = "repo.git.pre-restore.";
 const ATTEMPT: &str = ".dots-restore-attempt.";
+const CLONE: &str = "clone-";
+const RETIRING: &str = ".dots-restore-retiring";
 pub(super) const TRACKING_REF: &str = "refs/remotes/origin/setup";
 pub(super) const MAIN_REF: &str = "refs/heads/main";
 
@@ -35,11 +37,12 @@ struct Journal {
     initial: bool,
     progress: Progress,
     obsolete_scope: Option<String>,
-    previous: Option<Previous>,
+    previous: Option<StoreDirectory>,
 }
 
 #[derive(Deserialize, Serialize)]
 enum Progress {
+    Cloning(StoreDirectory),
     Prepared,
     Fetching(LiveVersions),
     Pulling(Attempt),
@@ -68,12 +71,17 @@ struct FileVersion {
 
 type LiveVersions = BTreeMap<PathBuf, Option<FileVersion>>;
 
-#[derive(Deserialize, Serialize)]
-struct Previous {
+#[derive(Clone, Deserialize, Serialize)]
+struct StoreDirectory {
     directory: String,
     device: u64,
     inode: u64,
-    sync: bool,
+}
+
+impl StoreDirectory {
+    fn matches(&self, meta: &fs::Metadata) -> bool {
+        (meta.dev(), meta.ino()) == (self.device, self.inode)
+    }
 }
 
 pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<(), Fail> {
@@ -118,7 +126,23 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
             "pending history install location is not a real directory",
         ));
     }
+    resume_staging_retirement(native, &staging, &raw, &branch, &paths)?;
     let staged = staging.join("repo.git");
+    let mut owned_stage = exists(&staging.join(MARKER))?;
+    if owned_stage {
+        let owner = read_journal(&staging)?;
+        match_journal_owner(native, &staging, &owner, &raw, &branch)?;
+        paths.check_binding(&owner.paths, false)?;
+        let Progress::Cloning(clone) = &owner.progress else {
+            return Err(invalid(
+                "invalid ownership marker for an unfinished history clone",
+            ));
+        };
+        if !exists(&staged.join(MARKER))? && !exists(&store.join(MARKER))? {
+            discard_clone(&staging, clone)?;
+            owned_stage = false;
+        }
+    }
     let pending = if exists(&staged)? {
         Some(staged.as_path())
     } else if exists(&store.join(MARKER))? {
@@ -146,10 +170,9 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
                 return Err(blocked("the staged history seed checkpoint changed"));
             }
             verify_tree(native, &staged, &record.seed, &branch, &paths)?;
-            install(&staging, &store, record)?;
+            install(&staging, &store, record, owned_stage)?;
         } else if journal.is_some() {
-            fs::remove_dir(&staging)
-                .map_err(|_| blocked("could not finish pending history installation"))?;
+            finish_staging(&staging, owned_stage)?;
         } else {
             return Err(invalid(
                 "incomplete restore staging needs inspection before retrying",
@@ -173,13 +196,15 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
             && prior_origin.is_some_and(|(url, current_branch)| {
                 current_branch == branch && expected.matches(&url)
             })
-            && native
-                .local_origin(&store)?
-                .is_none_or(|url| expected.matches(&url))
-            && read_sync(&store)?.is_none_or(|status| {
-                status.origin_url.is_none_or(|url| expected.matches(&url))
-                    && status.origin_branch.is_none_or(|current| current == branch)
-            });
+            && match native.local_origin(&store)? {
+                // Fetch-only can refresh the plan without replacing the
+                // previous connection label in the native health record.
+                Some(url) => expected.matches(&url),
+                None => read_sync(&store)?.is_none_or(|status| {
+                    status.origin_url.is_none_or(|url| expected.matches(&url))
+                        && status.origin_branch.is_none_or(|current| current == branch)
+                }),
+            };
         if connected {
             None
         } else {
@@ -475,6 +500,9 @@ impl Recovery<'_, '_, '_> {
                 _ => None,
             };
             journal.progress = match &journal.progress {
+                Progress::Cloning(_) => {
+                    return Err(invalid("refusing an unfinished history clone"));
+                }
                 Progress::Prepared => {
                     self.paths.check_binding(&journal.paths, false)?;
                     Progress::Fetching(self.pin_fetch_paths()?)
@@ -1147,19 +1175,122 @@ fn prepare(
 ) -> Result<Journal, Fail> {
     let base = parent(store);
     let temp = tempfile::Builder::new()
-        .prefix(".dots-restore-clone-")
+        .prefix(".dots-restore-reservation-")
+        .permissions(Permissions::from_mode(0o700))
         .tempdir_in(base)
         .map_err(|_| blocked("could not stage a private history clone"))?;
-    let staged = temp.path().join("repo.git");
-    private_dir(&staged).map_err(|_| blocked("could not stage a private history repository"))?;
-    let mut cmd = native.git(Some(&staged))?;
+    let clone = tempfile::Builder::new()
+        .prefix(CLONE)
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(temp.path())
+        .map_err(|_| blocked("could not stage a private history repository"))?;
+    let clone_metadata = existing_directory(clone.path())?
+        .ok_or_else(|| blocked("the staged history repository vanished"))?;
+    let clone = StoreDirectory {
+        directory: clone
+            .keep()
+            .file_name()
+            .expect("clone basename")
+            .to_string_lossy()
+            .into_owned(),
+        device: clone_metadata.dev(),
+        inode: clone_metadata.ino(),
+    };
+    let clone_path = clone_path(&base.join(STAGING), &clone.directory)?;
+    // Register the private slot before Git writes any clone data there.
+    let owner = new_journal(
+        native,
+        temp.path(),
+        raw,
+        branch,
+        paths,
+        String::new(),
+        true,
+        Progress::Cloning(clone.clone()),
+        None,
+    )?;
+    write_journal(temp.path(), &owner)?;
+    let staging = base.join(STAGING);
+    if exists(&staging)? {
+        return Err(blocked(
+            "the pending history install location already exists",
+        ));
+    }
+    fs::rename(temp.path(), &staging)
+        .map_err(|_| blocked("could not reserve the pending history install location"))?;
+    fsync_dir(base)?;
+    // A Git process left behind by a killed restore cannot reuse this name.
+    let seed = match fetch_seed(native, &clone_path, raw, branch, vars, paths) {
+        Ok(seed) => seed,
+        Err(error) => {
+            discard_clone(&staging, &clone)?;
+            return Err(error);
+        }
+    };
+
+    let backup = old
+        .as_ref()
+        .map(|_| tempfile::Builder::new().prefix(PREVIOUS).tempdir_in(base))
+        .transpose()
+        .map_err(|_| blocked("could not reserve a private history backup directory"))?;
+    if let Some(backup) = &backup {
+        fs::set_permissions(backup.path(), Permissions::from_mode(0o700))
+            .map_err(|_| blocked("could not protect the previous history store directory"))?;
+    }
+    let previous = match (old, backup.as_ref()) {
+        (Some(old), Some(backup)) => Some(StoreDirectory {
+            directory: backup
+                .path()
+                .file_name()
+                .expect("backup basename")
+                .to_string_lossy()
+                .into_owned(),
+            device: old.dev(),
+            inode: old.ino(),
+        }),
+        _ => None,
+    };
+    let record = new_journal(
+        native,
+        &clone_path,
+        raw,
+        branch,
+        paths,
+        seed,
+        true,
+        Progress::Prepared,
+        previous,
+    )?;
+    if let Some(backup) = backup {
+        let _ = backup.keep();
+    }
+    write_journal(&clone_path, &record)?;
+    fs::rename(clone_path, staging.join("repo.git"))
+        .map_err(|_| blocked("could not commit the staged history clone for install"))?;
+    fsync_dir(&staging)?;
+    native.require_no_pending_operations()?;
+    paths.recheck(native)?;
+    install(&staging, store, &record, true)?;
+    Ok(record)
+}
+
+fn fetch_seed(
+    native: &Native<'_, '_>,
+    staged: &Path,
+    raw: &str,
+    branch: &str,
+    vars: &Vars,
+    paths: &tracked::TrackedPaths,
+) -> Result<String, Fail> {
+    private_dir(staged).map_err(|_| blocked("could not stage a private history repository"))?;
+    let mut cmd = native.git(Some(staged))?;
     cmd.args(["init", "--bare", "--initial-branch=main"]);
     native.output(cmd, "could not initialize the staged bare history clone")?;
-    let mut cmd = native.git(Some(&staged))?;
+    let mut cmd = native.git(Some(staged))?;
     cmd.args(["config", "--local", "remote.origin.url", raw]);
     native.output(cmd, "could not configure the staged history origin")?;
-    native.destinations(Some(&staged), raw, state_repo(vars)?, vars)?;
-    let mut cmd = native.git(Some(&staged))?;
+    native.destinations(Some(staged), raw, state_repo(vars)?, vars)?;
+    let mut cmd = native.git(Some(staged))?;
     let refspec = format!("refs/heads/{branch}:refs/heads/main");
     cmd.args([
         "fetch",
@@ -1176,58 +1307,12 @@ fn prepare(
         "could not stage the selected remote history branch; the existing store was left unchanged",
     )?;
     require_unchanged(&live, &BTreeSet::new())?;
-    native.bare(&staged)?;
-    let seed = revision(native, &staged, MAIN_REF)?;
-    verify_tree(native, &staged, &seed, branch, paths)?;
-    fs::set_permissions(&staged, Permissions::from_mode(0o700))
+    native.bare(staged)?;
+    let seed = revision(native, staged, MAIN_REF)?;
+    verify_tree(native, staged, &seed, branch, paths)?;
+    fs::set_permissions(staged, Permissions::from_mode(0o700))
         .map_err(|_| blocked("could not protect the staged history store"))?;
-
-    let backup = old
-        .as_ref()
-        .map(|_| tempfile::Builder::new().prefix(PREVIOUS).tempdir_in(base))
-        .transpose()
-        .map_err(|_| blocked("could not reserve a private history backup directory"))?;
-    if let Some(backup) = &backup {
-        fs::set_permissions(backup.path(), Permissions::from_mode(0o700))
-            .map_err(|_| blocked("could not protect the previous history store directory"))?;
-    }
-    let previous = match (old, backup.as_ref()) {
-        (Some(old), Some(backup)) => Some(Previous {
-            directory: backup
-                .path()
-                .file_name()
-                .expect("backup basename")
-                .to_string_lossy()
-                .into_owned(),
-            device: old.dev(),
-            inode: old.ino(),
-            sync: exists(&base.join("sync.json"))?,
-        }),
-        _ => None,
-    };
-    let record = new_journal(
-        native,
-        &staged,
-        raw,
-        branch,
-        paths,
-        seed,
-        true,
-        Progress::Prepared,
-        previous,
-    )?;
-    write_journal(&staged, &record)?;
-    let staging = base.join(STAGING);
-    fs::rename(temp.path(), &staging)
-        .map_err(|_| blocked("could not retain the staged history clone"))?;
-    if let Some(backup) = backup {
-        let _ = backup.keep();
-    }
-    fsync_dir(base)?;
-    native.require_no_pending_operations()?;
-    paths.recheck(native)?;
-    install(&staging, store, &record)?;
-    Ok(record)
+    Ok(seed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1240,7 +1325,7 @@ fn new_journal(
     seed: String,
     initial: bool,
     progress: Progress,
-    previous: Option<Previous>,
+    previous: Option<StoreDirectory>,
 ) -> Result<Journal, Fail> {
     let metadata = existing_directory(store)?.ok_or_else(|| blocked("history store vanished"))?;
     Ok(Journal {
@@ -1259,7 +1344,7 @@ fn new_journal(
     })
 }
 
-fn install(staging: &Path, store: &Path, record: &Journal) -> Result<(), Fail> {
+fn install(staging: &Path, store: &Path, record: &Journal, owned_stage: bool) -> Result<(), Fail> {
     let base = parent(store);
     if let Some(previous) = &record.previous {
         let name = &previous.directory;
@@ -1277,39 +1362,18 @@ fn install(staging: &Path, store: &Path, record: &Journal) -> Result<(), Fail> {
             ));
         }
         let backup = dir.join("repo.git");
-        let matches =
-            |meta: &fs::Metadata| meta.dev() == previous.device && meta.ino() == previous.inode;
         match (existing_directory(store)?, existing_directory(&backup)?) {
-            (Some(old), None) if matches(&old) => {
+            (Some(old), None) if previous.matches(&old) => {
                 fs::rename(store, &backup)
                     .map_err(|_| blocked("could not preserve the previous history store"))?;
                 fsync_dir(&dir)?;
                 fsync_dir(base)?;
             }
-            (None, Some(old)) if matches(&old) => {}
+            (None, Some(old)) if previous.matches(&old) => {}
             _ => {
                 return Err(invalid(
                     "the original history store changed; inspect the pending install before retrying",
                 ));
-            }
-        }
-        if previous.sync {
-            let from = base.join("sync.json");
-            let to = dir.join("sync.json");
-            match (exists(&from)?, exists(&to)?) {
-                (true, false) => {
-                    fs::rename(from, to).map_err(|_| {
-                        blocked("could not preserve previous history sync metadata")
-                    })?;
-                    fsync_dir(&dir)?;
-                    fsync_dir(base)?;
-                }
-                (false, true) => {}
-                _ => {
-                    return Err(invalid(
-                        "previous history sync metadata changed; inspect the pending install",
-                    ));
-                }
             }
         }
         println!(
@@ -1326,8 +1390,96 @@ fn install(staging: &Path, store: &Path, record: &Journal) -> Result<(), Fail> {
         blocked("could not install the staged history clone; the pending install can be retried")
     })?;
     fsync_dir(base)?;
-    fs::remove_dir(staging)
-        .map_err(|_| blocked("could not finish the history install staging directory"))
+    finish_staging(staging, owned_stage)
+}
+
+fn clone_path(staging: &Path, name: &str) -> Result<PathBuf, Fail> {
+    if !name.strip_prefix(CLONE).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    }) {
+        return Err(invalid("invalid history clone name in pending staging"));
+    }
+    Ok(staging.join(name))
+}
+
+fn discard_clone(staging: &Path, clone: &StoreDirectory) -> Result<(), Fail> {
+    let repo = clone_path(staging, &clone.directory)?;
+    if let Some(meta) = existing_directory(&repo)? {
+        if !clone.matches(&meta) {
+            return Err(invalid(
+                "the unfinished history clone changed since it was staged",
+            ));
+        }
+        fs::remove_dir_all(repo)
+            .map_err(|_| blocked("could not discard the unfinished history clone"))?;
+    }
+    finish_staging(staging, true)
+}
+
+fn finish_staging(staging: &Path, owned_stage: bool) -> Result<(), Fail> {
+    if !owned_stage {
+        fs::remove_dir(staging)
+            .map_err(|_| blocked("could not finish the history install staging directory"))?;
+        return fsync_dir(parent(staging));
+    }
+    let retirement = parent(staging).join(RETIRING);
+    // Keep the original name until the sibling link is durable.
+    fs::hard_link(staging.join(MARKER), &retirement)
+        .map_err(|_| blocked("could not create the history clone retirement marker"))?;
+    finish_retirement(staging, &retirement, &read_private(&retirement)?)
+}
+
+fn resume_staging_retirement(
+    native: &Native<'_, '_>,
+    staging: &Path,
+    origin: &str,
+    branch: &str,
+    paths: &tracked::TrackedPaths,
+) -> Result<(), Fail> {
+    let retirement = parent(staging).join(RETIRING);
+    if !exists(&retirement)? {
+        return Ok(());
+    }
+    let receipt = read_private(&retirement)?;
+    let owner = parse_journal(&receipt)?;
+    if !matches!(owner.progress, Progress::Cloning(_)) {
+        return Err(invalid(
+            "invalid ownership marker for a retired history clone",
+        ));
+    }
+    match_journal_context(native, &owner, origin, branch)?;
+    paths.check_binding(&owner.paths, false)?;
+    if let Some(meta) = existing_directory(staging)? {
+        match_journal_directory(&owner, &meta)?;
+    }
+    finish_retirement(staging, &retirement, &receipt)
+}
+
+fn finish_retirement(staging: &Path, retirement: &Path, receipt: &File) -> Result<(), Fail> {
+    let base = parent(staging);
+    if exists(staging)? {
+        fsync_dir(base)?;
+        let original = staging.join(MARKER);
+        if exists(&original)? {
+            let staged = fs::symlink_metadata(&original)
+                .map_err(|_| blocked("could not inspect the history clone ownership marker"))?;
+            let retired = receipt
+                .metadata()
+                .map_err(|_| blocked("could not inspect the history clone retirement marker"))?;
+            if !staged.is_file() || (staged.dev(), staged.ino()) != (retired.dev(), retired.ino()) {
+                return Err(invalid("the history clone ownership markers do not match"));
+            }
+            fs::remove_file(original)
+                .map_err(|_| blocked("could not clear the history clone ownership marker"))?;
+        }
+        fsync_dir(staging)?;
+        fs::remove_dir(staging)
+            .map_err(|_| blocked("could not finish the history install staging directory"))?;
+    }
+    fsync_dir(base)?;
+    fs::remove_file(retirement)
+        .map_err(|_| blocked("could not clear the history clone retirement marker"))?;
+    fsync_dir(base)
 }
 
 fn parent(store: &Path) -> &Path {
@@ -1366,7 +1518,11 @@ fn write_journal(store: &Path, record: &Journal) -> Result<(), Fail> {
 }
 
 fn read_journal(store: &Path) -> Result<Journal, Fail> {
-    serde_json::from_reader(read_private(&store.join(MARKER))?.take(4 * 1024 * 1024))
+    parse_journal(&read_private(&store.join(MARKER))?)
+}
+
+fn parse_journal(file: &File) -> Result<Journal, Fail> {
+    serde_json::from_reader(file.take(4 * 1024 * 1024))
         .map_err(|_| invalid("could not validate the pending history recovery marker"))
 }
 
@@ -1391,6 +1547,35 @@ fn match_request(
     origin: &str,
     branch: &str,
 ) -> Result<(), Fail> {
+    match_journal_owner(native, store, record, origin, branch)?;
+    let head = revision(native, store, MAIN_REF)?;
+    if !ancestor(native, store, &record.seed, &head)? {
+        return Err(invalid(
+            "pending history store no longer contains its seed checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn match_journal_owner(
+    native: &Native<'_, '_>,
+    store: &Path,
+    record: &Journal,
+    origin: &str,
+    branch: &str,
+) -> Result<(), Fail> {
+    match_journal_context(native, record, origin, branch)?;
+    let metadata =
+        existing_directory(store)?.ok_or_else(|| blocked("pending history store vanished"))?;
+    match_journal_directory(record, &metadata)
+}
+
+fn match_journal_context(
+    native: &Native<'_, '_>,
+    record: &Journal,
+    origin: &str,
+    branch: &str,
+) -> Result<(), Fail> {
     let root = native.ctx.root.path();
     if record.root != root
         || record.home != physical_home(native)?
@@ -1401,17 +1586,13 @@ fn match_request(
             "pending history restore belongs to another configuration root, origin or branch",
         ));
     }
-    let metadata =
-        existing_directory(store)?.ok_or_else(|| blocked("pending history store vanished"))?;
+    Ok(())
+}
+
+fn match_journal_directory(record: &Journal, metadata: &fs::Metadata) -> Result<(), Fail> {
     if (record.device, record.inode) != (metadata.dev(), metadata.ino()) {
         return Err(invalid(
             "pending history restore belongs to a different store",
-        ));
-    }
-    let head = revision(native, store, MAIN_REF)?;
-    if !ancestor(native, store, &record.seed, &head)? {
-        return Err(invalid(
-            "pending history store no longer contains its seed checkpoint",
         ));
     }
     Ok(())

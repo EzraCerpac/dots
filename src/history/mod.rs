@@ -134,11 +134,11 @@ fn publish(native: &Native<'_, '_>) -> Result<(), Fail> {
     publication::constrain_http(&mut cmd, http.as_ref());
     native.output(
         cmd,
-        "native history sync failed; the settings checkpoint was kept locally and publication could not be verified. Check the private history remote and use mise dot status",
+        "native history sync failed; the settings checkpoint was kept locally and publication could not be verified. Check the private history remote and use dots mise dot status",
     )?;
     let pending = || {
         blocked(
-            "settings checkpoint saved locally; publication is pending. Run mise dot status to inspect incoming changes or conflicts before retrying dots backup",
+            "settings checkpoint saved locally; publication is pending. Run dots mise dot status to inspect incoming changes or conflicts before retrying dots backup",
         )
     };
     let unconfirmed = || {

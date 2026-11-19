@@ -702,16 +702,18 @@ fn new_native_sync_can_succeed_without_publishing_a_conflicting_checkpoint() {
         .lines()
         .find(|line| line.contains("checkpoint saved locally; publication is pending"))
         .unwrap_or_else(|| panic!("{pending}"));
-    assert!(diagnostic.contains("Run mise dot status"));
+    assert!(diagnostic.contains("Run dots mise dot status"));
     assert!(!messages(&backup).contains("Settings backup published"));
-    let native_status = ok(local.mise(&["dot", "status"]).env("GIT_ALLOW_PROTOCOL", ""));
+    let native_status = ok(local
+        .dots(&["mise", "dot", "status"], &remote)
+        .env("GIT_ALLOW_PROTOCOL", ""));
     let status = messages(&native_status);
     assert!(
         status.contains("both sides changed the same lines"),
         "{status}"
     );
     eprintln!(
-        "dots backup exit 1: {diagnostic}\nmise dot status exit 0: both sides changed the same lines"
+        "dots backup exit 1: {diagnostic}\ndots mise dot status exit 0: both sides changed the same lines"
     );
     assert_eq!(local.tip(&remote, REF), remote_edit);
     assert_eq!(local.tip(&local.store(), "refs/heads/main"), saved);
@@ -1043,6 +1045,7 @@ exec "$FIXTURE_GIT" "$@"
     assert_eq!(output.status.code(), Some(1), "{report}");
     assert!(report.contains("native history sync failed"), "{report}");
     assert!(report.contains("checkpoint was kept locally"), "{report}");
+    assert!(report.contains("use dots mise dot status"), "{report}");
     assert!(
         report.contains("publication could not be verified"),
         "{report}"
@@ -1939,13 +1942,14 @@ exec "$FIXTURE_MISE" "$@"
             "{command}: {diagnostic}"
         );
         for text in [
-            "An earlier restore was interrupted and a tracked settings file changed afterwards.",
-            "mise dot history --pending",
-            "mise dot recover UUID",
+            "An earlier restore was interrupted and did not finish.",
+            "dots mise dot history --pending",
+            "dots mise dot recover UUID",
             "Otherwise, reconcile the file and run dots restore.",
         ] {
             assert!(diagnostic.contains(text), "{command}: {diagnostic}");
         }
+        assert!(!diagnostic.contains("a tracked settings file changed"));
         assert_eq!(fs::read(&marker).unwrap(), original);
         assert_eq!(fs::read(fixture.active()).unwrap(), LOCAL_EDIT);
     }
@@ -2256,7 +2260,7 @@ exec "$FIXTURE_GIT" "$@"
             let retry = fixture.dots(&["restore"], &remote).output().unwrap();
             assert_eq!(retry.status.code(), Some(1), "{}", messages(&retry));
             assert!(
-                messages(&retry).contains("mise dot history --pending"),
+                messages(&retry).contains("dots mise dot history --pending"),
                 "{}",
                 messages(&retry)
             );

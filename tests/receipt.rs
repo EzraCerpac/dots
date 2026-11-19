@@ -204,6 +204,7 @@ impl ReceiptWorld {
             let scanner =
                 executable_on_path(&world.dots(), "gitleaks").expect("receipt needs real gitleaks");
             if controlled {
+                // Keep Git admission real and control the patch scanner's responses.
                 symlink(scanner, tools.join("real-gitleaks")).unwrap();
                 executable(&tools.join("gitleaks"), SCANNER);
             } else {
@@ -463,7 +464,7 @@ fn unchanged_sync_limits_each_group_to_five_paths() {
 
 #[test]
 fn unchanged_latest_receipt_is_checkout_local() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     f.write(
         &f.publisher,
         "initial-receipt-entry",
@@ -567,7 +568,7 @@ fn new_replay_ignores_a_pre_1_0_receipt() {
 
 #[test]
 fn unchanged_inline_patch_uses_committed_inputs() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     f.write(&f.publisher, ".gitattributes", "tracked-text diff=marker\n");
     f.write(
         &f.publisher,
@@ -837,7 +838,7 @@ fn unchanged_replay_omits_unsafe_patch_bodies() {
 
 #[test]
 fn unchanged_replay_caps_retained_patch_bytes() {
-    let f = ReceiptWorld::new();
+    let f = ReceiptWorld::with_scanner(true);
     // Distinct local and incoming paths make independently scoped receipt
     // groups; their combined patch bodies alone exceed the pager limit.
     let large = format!("{}\n", "x".repeat(60_000));

@@ -489,7 +489,7 @@ impl TrackedPaths {
     }
 
     pub(super) fn secure(&self, native: &Native<'_, '_>) -> Result<(), Fail> {
-        protect_modes(self.reopen(native, true)?)
+        protect_modes(self.reopen(native, true)?, self.0.source.is_some())
     }
 
     fn reopen(&self, native: &Native<'_, '_>, open_files: bool) -> Result<Vec<File>, Fail> {
@@ -514,8 +514,17 @@ fn reopen(
     Ok(files)
 }
 
-fn protect_modes(files: Vec<File>) -> Result<(), Fail> {
+fn protect_modes(files: Vec<File>, restoring: bool) -> Result<(), Fail> {
     for file in files {
+        if restoring
+            && file
+                .metadata()
+                .map_err(|_| blocked("could not verify a tracked history file before chmod"))?
+                .nlink()
+                != 1
+        {
+            return Err(linked_restore_target());
+        }
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|_| blocked("could not set tracked history file mode to 0600"))?;
     }
@@ -561,7 +570,7 @@ fn observe(
             .file_name()
             .and_then(|name| c_name(name).ok())
             .ok_or_else(|| invalid("invalid tracked history destination"))?;
-        if !regular_target(&directory, &name, target)? || !open_files {
+        if !regular_target(&directory, &name, target, source.is_some())? || !open_files {
             continue;
         }
         let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
@@ -635,7 +644,12 @@ fn walk_directories(
     Ok(Some(directory))
 }
 
-fn regular_target(directory: &File, name: &CStr, path: &Path) -> Result<bool, Fail> {
+fn regular_target(
+    directory: &File,
+    name: &CStr,
+    path: &Path,
+    restoring: bool,
+) -> Result<bool, Fail> {
     let mut info = MaybeUninit::<libc::stat>::uninit();
     // fstatat borrows the live parent descriptor and writes only to info.
     let result = unsafe {
@@ -653,7 +667,9 @@ fn regular_target(directory: &File, name: &CStr, path: &Path) -> Result<bool, Fa
         };
     }
     // Successful fstatat initialized the result.
-    match unsafe { info.assume_init() }.st_mode & libc::S_IFMT {
+    let info = unsafe { info.assume_init() };
+    match info.st_mode & libc::S_IFMT {
+        libc::S_IFREG if restoring && info.st_nlink != 1 => Err(linked_restore_target()),
         libc::S_IFREG => Ok(true),
         libc::S_IFLNK => Err(invalid(format!(
             "refusing symlink in tracked history path {}",
@@ -664,6 +680,12 @@ fn regular_target(directory: &File, name: &CStr, path: &Path) -> Result<bool, Fa
             path.display()
         ))),
     }
+}
+
+fn linked_restore_target() -> Fail {
+    invalid(
+        "restore refuses a hard-linked tracked file. Replace the link with a private copy and retry",
+    )
 }
 
 fn c_name(name: &OsStr) -> io::Result<CString> {
@@ -793,11 +815,39 @@ mod tests {
 
         let paths = [home.join("missing/data"), path.clone()];
         let validated = observe(home.clone(), None, &paths, false).unwrap().0;
-        protect_modes(reopen(home, None, &validated, true).unwrap()).unwrap();
+        protect_modes(reopen(home, None, &validated, true).unwrap(), false).unwrap();
 
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn restore_rechecks_link_count_on_the_descriptor_before_chmod() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().canonicalize().unwrap();
+        let source = home.join("Source");
+        fs::create_dir(&source).unwrap();
+        let target = home.join("tracked");
+        let alias = source.join("script");
+        fs::write(&target, "fixture").unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o755)).unwrap();
+        let paths = std::slice::from_ref(&target);
+        let (binding, _) = observe(home.clone(), Some(&source), paths, false).unwrap();
+        let files = reopen(home, Some(&source), &binding, true).unwrap();
+
+        fs::hard_link(&target, &alias).unwrap();
+        assert!(
+            protect_modes(files, true)
+                .unwrap_err()
+                .to_string()
+                .contains("hard-linked")
+        );
+        assert_eq!(fs::read(&alias).unwrap(), b"fixture");
+        assert_eq!(
+            fs::metadata(alias).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 }

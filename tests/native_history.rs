@@ -3,7 +3,8 @@ mod support;
 use std::env;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
@@ -1825,6 +1826,213 @@ fn new_restore_refuses_a_more_specific_remote_variant() {
     assert!(messages(&result).contains("unsafe path, stream, object or recorded mode"));
     assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
     assert!(!fixture.store().exists());
+}
+
+#[test]
+fn new_restore_rejects_hard_links_and_protects_ordinary_file_modes() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let fixture = Fixture::new();
+    fixture.configure(&url, &url, &key, &[public]);
+    ok(fixture.git(None).args(["init"]));
+    let source = fixture.world.root().join("source-script");
+    fs::write(&source, b"synthetic executable\n").unwrap();
+    for alias in [&source, &fixture.inactive()] {
+        let bytes = fs::read(alias).unwrap();
+        fs::set_permissions(alias, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::hard_link(alias, fixture.active()).unwrap();
+        let rejected = fixture.dots(&["restore"], &remote).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(2), "{}", messages(&rejected));
+        assert!(messages(&rejected).contains("hard-linked tracked file"));
+        assert!(!fixture.store().exists());
+        for path in [alias.as_path(), &fixture.active()] {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+        fs::remove_file(fixture.active()).unwrap();
+    }
+    fixture.write(DEFAULT, 0o755);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    assert_eq!(
+        fs::metadata(fixture.active()).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"synthetic executable\n");
+    assert_eq!(fs::read(fixture.inactive()).unwrap(), INACTIVE);
+    for alias in [source, fixture.inactive()] {
+        assert_eq!(
+            fs::metadata(alias).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
+fn new_restore_recovers_a_killed_staging_fetch_and_keeps_native_health_in_place() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let previous_remote = seed.world.bare_remote("previous.git");
+    let (key, public) = seed.key("recovery");
+    let url = format!("file://{}", remote.display());
+    let previous_url = format!("file://{}", previous_remote.display());
+    seed.configure(&url, &url, &key, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let fixture = Fixture::new();
+    fixture.configure(
+        &previous_url,
+        &previous_url,
+        &key,
+        std::slice::from_ref(&public),
+    );
+    fixture.seed(&previous_remote, DEFAULT);
+    ok(fixture
+        .git(Some(&fixture.store()))
+        .args(["config", "remote.origin.url", &previous_url]));
+    ok(&mut fixture.mise(&[
+        "--yes",
+        "bootstrap",
+        "dotfiles",
+        "origin",
+        "set",
+        &previous_url,
+        "--branch",
+        BRANCH,
+        "--sync",
+        "fetch-only",
+    ]));
+    let store = fixture.store();
+    let old_tip = fixture.tip(&store, "refs/heads/main");
+    let history = store.parent().unwrap();
+    let health = history.join("sync.json");
+    let old_health = fs::read(&health).unwrap();
+    let health_inode = fs::metadata(&health).unwrap().ino();
+    let old_status: serde_json::Value = serde_json::from_slice(&old_health).unwrap();
+    assert_eq!(old_status["origin_url"], previous_url);
+    assert_ne!(old_status["upstream_commit"], tip);
+
+    let unknown_stage = history.join(".dots-restore-clone-unrelated");
+    fs::create_dir(&unknown_stage).unwrap();
+    fs::write(unknown_stage.join("keep"), b"unrelated fixture").unwrap();
+    fixture.configure(&url, &url, &key, &[public]);
+    let hit = fixture.world.home().join("staging-fetch-hit");
+    fixture.script(
+        "git",
+        r#"#!/bin/sh
+if [ "${FIXTURE_KILL_STAGING_FETCH-}" = 1 ] && [ "${3-}" = fetch ]; then
+    "$FIXTURE_GIT" "$@" || exit "$?"
+    printf '%s\n' "$2" > "$FIXTURE_STAGE_HIT"
+    kill -KILL "$PPID"
+    exit 94
+fi
+exec "$FIXTURE_GIT" "$@"
+"#,
+    );
+    let killed = fixture
+        .dots(&["restore", "--initialize-history"], &remote)
+        .env("FIXTURE_KILL_STAGING_FETCH", "1")
+        .env("FIXTURE_STAGE_HIT", &hit)
+        .output()
+        .unwrap();
+    assert_eq!(killed.status.signal(), Some(9), "{}", messages(&killed));
+    let staging = history.join(".dots-restore-install");
+    let clone = PathBuf::from(
+        fs::read_to_string(hit)
+            .expect("the staged fetch did not run")
+            .trim_end(),
+    );
+    assert_eq!(clone.parent(), Some(staging.as_path()));
+    assert_eq!(fixture.tip(&clone, "refs/heads/main"), tip);
+    assert_eq!(fixture.tip(&store, "refs/heads/main"), old_tip);
+    assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);
+    assert!(fs::read(&health).unwrap() == old_health);
+
+    let report_only = fixture.script(
+        "skip-native-fetch",
+        r#"#!/bin/sh
+case " $* " in
+    *" bootstrap dotfiles sync --fetch-only "*) exit 0 ;;
+esac
+exec "$FIXTURE_MISE" "$@"
+"#,
+    );
+    let skipped = fixture
+        .dots(&["restore", "--initialize-history"], &remote)
+        .env("DOTS_MISE_BIN", report_only)
+        .env("FIXTURE_MISE", &fixture.mise)
+        .output()
+        .unwrap();
+    assert_eq!(skipped.status.code(), Some(1), "{}", messages(&skipped));
+    assert!(
+        messages(&skipped).contains("could not resolve the fetched private history checkpoint")
+    );
+    assert!(store.join("dots-restore-pending").is_file());
+    assert_eq!(fixture.tip(&store, "refs/heads/main"), tip);
+    assert_eq!(fs::metadata(&health).unwrap().ino(), health_inode);
+    assert!(fs::read(&health).unwrap() == old_health);
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    let native_status: serde_json::Value =
+        serde_json::from_slice(&fs::read(&health).unwrap()).unwrap();
+    assert_eq!(native_status["upstream_commit"], tip);
+    assert_eq!(native_status["origin_url"], previous_url);
+    let backup = fs::read_dir(history)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("repo.git.pre-restore.")
+        })
+        .unwrap();
+    assert_eq!(
+        fixture.tip(&backup.join("repo.git"), "refs/heads/main"),
+        old_tip
+    );
+    assert!(!backup.join("sync.json").exists());
+    assert!(!staging.exists());
+    assert!(!store.join("dots-restore-pending").exists());
+    assert_eq!(
+        fs::read(unknown_stage.join("keep")).unwrap(),
+        b"unrelated fixture"
+    );
+    assert_eq!(seed.tip(&remote, REF), tip);
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+
+    let local_file = fixture.world.root().join("config.local.toml");
+    let local = fs::read_to_string(&local_file).unwrap();
+    let head = fixture.tip(&store, "refs/heads/main");
+    let native_health = fs::read(&health).unwrap();
+    for (git_origin, native_branch) in [(&previous_url, BRANCH), (&url, "host-other")] {
+        ok(fixture
+            .git(Some(&store))
+            .args(["config", "remote.origin.url", git_origin]));
+        let mut config: toml_edit::DocumentMut = local.parse().unwrap();
+        config["history"]["origin"]["branch"] = toml_edit::value(native_branch);
+        fs::write(&local_file, config.to_string()).unwrap();
+        let mismatch = fixture.dots(&["restore"], &remote).output().unwrap();
+        assert_eq!(mismatch.status.code(), Some(2), "{}", messages(&mismatch));
+        assert!(messages(&mismatch).contains("local history is connected elsewhere"));
+        assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+        assert_eq!(fixture.tip(&store, "refs/heads/main"), head);
+        assert!(fs::read(&health).unwrap() == native_health);
+    }
 }
 
 #[test]

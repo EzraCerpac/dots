@@ -5,15 +5,17 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::pipe::{nonblocking, ready};
+use super::{Observed, observe as observe_child};
 
 const OBSERVER: &str = "__dots_foreground_signal_observer";
 const OBSERVER_ENV: &str = "DOTS_INTERNAL_SIGNAL_OBSERVER";
 const INTERRUPT: u8 = b'I';
 const READY: u8 = b'R';
 const FENCE: u8 = b'F';
+const FENCE_REPLY_LIMIT: Duration = Duration::from_secs(1);
 
 /// Internal re-exec path. All communication uses private pipes.
 pub fn terminal_observer(mut args: impl Iterator<Item = OsString>) -> Option<u8> {
@@ -75,8 +77,10 @@ pub(super) struct TerminalJob {
     observer: Child,
     group: libc::pid_t,
     handed_off: bool,
-    fence_sent: bool,
+    fence_requested: Option<Instant>,
+    fence_resumed: bool,
     fenced: bool,
+    fence_timed_out: bool,
 }
 
 impl TerminalJob {
@@ -107,8 +111,10 @@ impl TerminalJob {
             observer,
             group,
             handed_off: false,
-            fence_sent: false,
+            fence_requested: None,
+            fence_resumed: false,
             fenced: false,
+            fence_timed_out: false,
         };
         let output = job.observer.stdout.as_mut().unwrap();
         let mut hello = [0];
@@ -128,6 +134,36 @@ impl TerminalJob {
 
     pub(super) fn observer_pid(&self) -> libc::pid_t {
         self.observer.id() as libc::pid_t
+    }
+
+    pub(super) fn prepare_native(&mut self, command: &mut Command) {
+        let fd = self.tty.as_raw_fd();
+        let caller = self.caller;
+        let group = self.group;
+        // The parent must reclaim even when the child fails to exec.
+        self.handed_off = true;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::tcgetpgrp(fd) != caller {
+                    return Ok(());
+                }
+                // After setpgid and before exec, a stop would strand the
+                // parent's spawn handshake. A caught disposition resets at exec.
+                let mut action: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut action) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if action.sa_sigaction != libc::SIG_IGN {
+                    action.sa_sigaction = launch_stop as *const () as libc::sighandler_t;
+                    action.sa_flags = 0;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    if libc::sigaction(libc::SIGTSTP, &action, std::ptr::null_mut()) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                foreground(fd, group)
+            });
+        }
     }
 
     pub(super) fn enter(&mut self) -> io::Result<()> {
@@ -166,17 +202,38 @@ impl TerminalJob {
 
     /// Reclaim before asking the observer to acknowledge its pending signals.
     pub(super) fn fence(&mut self) -> io::Result<bool> {
-        if !self.fence_sent {
+        let requested = if let Some(requested) = self.fence_requested {
+            requested
+        } else {
             self.reclaim()?;
-            self.fence_sent = true;
+            let requested = Instant::now();
+            self.fence_requested = Some(requested);
             if let Err(error) = self.observer.stdin.as_mut().unwrap().write_all(&[FENCE]) {
                 if error.kind() != io::ErrorKind::BrokenPipe {
                     return Err(error);
                 }
                 self.fenced = true;
             }
+            requested
+        };
+        if !self.fenced && requested.elapsed() >= FENCE_REPLY_LIMIT {
+            self.fenced = true;
+            self.fence_timed_out = true;
+        }
+        if !self.fenced && !self.fence_resumed {
+            let pid = self.observer_pid();
+            if matches!(observe_child(pid, true), Ok(Observed::Stopped { .. })) {
+                // The observer no longer owns the terminal. Resume only this
+                // owned child so it can report interrupts before retirement.
+                unsafe { libc::kill(pid, libc::SIGCONT) };
+                self.fence_resumed = true;
+            }
         }
         Ok(self.fenced)
+    }
+
+    pub(super) fn take_fence_timeout(&mut self) -> bool {
+        std::mem::take(&mut self.fence_timed_out)
     }
 
     pub(super) fn suspend(&mut self) -> io::Result<()> {
@@ -224,11 +281,21 @@ impl TerminalJob {
     }
 }
 
+extern "C" fn launch_stop(_: libc::c_int) {}
+
 impl Drop for TerminalJob {
     fn drop(&mut self) {
         let _ = self.reclaim();
-        let _ = self.observer.kill();
-        let _ = self.observer.wait();
+        match observe_child(self.observer_pid(), false) {
+            Ok(Observed::Exited) => {
+                let _ = self.observer.wait();
+            }
+            Ok(_) => {
+                let _ = self.observer.kill();
+                let _ = self.observer.wait();
+            }
+            Err(_) => {}
+        }
     }
 }
 

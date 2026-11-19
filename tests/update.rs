@@ -1,10 +1,13 @@
 mod support;
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
+use nix::libc;
 use serde_json::Value;
 use support::{FixtureCommand, World};
 
@@ -880,23 +883,92 @@ fn new_failed_grouped_status_skips_unconfirmed_bare_only_managers() {
     }));
 }
 
-fn cancel_blocked_update(fixture: &Fixture, args: &[&str], marker: &str, detached: bool) -> Value {
-    use nix::libc;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
+const UPDATE_POLL: Duration = Duration::from_millis(10);
 
-    let mut dots = fixture
-        .command()
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let marker = fixture.world.root().join(marker);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let pids = loop {
-        if let Ok(ready) = fs::read_to_string(&marker)
+struct RunningUpdate {
+    child: Child,
+    release: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl RunningUpdate {
+    fn spawn(fixture: &Fixture, command: &mut FixtureCommand<'_>) -> Self {
+        let home = fixture.world.home();
+        let release = home.join("release-update");
+        let stdout = home.join("update.stdout");
+        let stderr = home.join("update.stderr");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            release,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn streams(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(&self.stdout).unwrap(),
+            fs::read(&self.stderr).unwrap(),
+        )
+    }
+
+    fn diagnostics(&self) -> String {
+        let (stdout, stderr) = self.streams();
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
+    }
+}
+
+impl Drop for RunningUpdate {
+    fn drop(&mut self) {
+        // All blocking fixture workers, including the detached one, observe
+        // this file. Let dots reap them before forcing the direct child down.
+        let _ = fs::write(&self.release, "");
+        if matches!(
+            wait_update_exit(&mut self.child, Duration::from_secs(1)),
+            Ok(None)
+        ) {
+            let _ = self.child.kill();
+            let _ = wait_update_exit(&mut self.child, Duration::from_secs(1));
+        }
+    }
+}
+
+fn wait_update_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let exit = child.try_wait()?;
+        if exit.is_some() || Instant::now() >= deadline {
+            return Ok(exit);
+        }
+        std::thread::sleep(UPDATE_POLL);
+    }
+}
+
+fn interrupt_update_when_ready(
+    child: &mut Child,
+    marker: &Path,
+    timeout: Duration,
+    send: impl FnOnce(u32, &[libc::pid_t]) -> io::Result<()>,
+) -> io::Result<Vec<libc::pid_t>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "update exited before readiness ({status})"
+            )));
+        }
+        if let Ok(ready) = fs::read_to_string(marker)
             && ready.ends_with('\n')
             && let Ok(pids) = ready
                 .split_whitespace()
@@ -905,41 +977,92 @@ fn cancel_blocked_update(fixture: &Fixture, args: &[&str], marker: &str, detache
             && !pids.is_empty()
             && pids.iter().all(|pid| *pid > 1)
         {
-            break pids;
+            // An un-reaped direct child owns this PID even if it exits now.
+            send(child.id(), &pids)?;
+            return Ok(pids);
         }
-        if dots.try_wait().unwrap().is_some() || Instant::now() >= deadline {
-            unsafe { libc::kill(dots.id() as libc::pid_t, libc::SIGINT) };
-            let output = dots.wait_with_output().unwrap();
-            panic!(
-                "fixture did not reach {marker:?}\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "update did not reach readiness",
+            ));
         }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-
-    // The only PIDs signaled or probed belong to this fixture's children.
-    let session = unsafe { libc::getsid(pids[0]) };
-    assert_eq!(
-        unsafe { libc::kill(dots.id() as libc::pid_t, libc::SIGINT) },
-        0
-    );
-    let output = dots.wait_with_output().unwrap();
-    assert_exit(&output, 130);
-    if detached {
-        assert_eq!(session, pids[0], "worker must be its own session leader");
+        std::thread::sleep(UPDATE_POLL);
     }
-    for pid in pids {
+}
+
+fn make_update_workers_releasable(fixture: &Fixture) {
+    fixture.executable(
+        &fixture.bin.join("block-update"),
+        r#"#!/bin/sh
+set -eu
+attempts=0
+while [ -d "$DOTS_ROOT" ] && [ ! -e "$HOME/release-update" ] && [ "$attempts" -lt 600 ]; do
+    attempts=$((attempts + 1))
+    /bin/sleep 0.05
+done
+"#,
+    );
+    let mise = include_str!("fixtures/up/mise");
+    let fallback = "kill -TERM \"$helper\" 2>/dev/null || :; ";
+    assert_eq!(mise.matches("/bin/sleep 30").count(), 3);
+    assert_eq!(mise.matches(fallback).count(), 1);
+    fixture.executable(
+        &fixture.bin.join("mise"),
+        &mise
+            .replace("/bin/sleep 30", "\"$HOME/fixture-bin/block-update\"")
+            .replace(fallback, ""),
+    );
+}
+
+fn cancel_blocked_update(fixture: &Fixture, args: &[&str], marker: &str, detached: bool) -> Value {
+    make_update_workers_releasable(fixture);
+    let mut run = RunningUpdate::spawn(fixture, fixture.command().args(args));
+    let marker = fixture.world.root().join(marker);
+    let mut session = None;
+    let ready = interrupt_update_when_ready(
+        &mut run.child,
+        &marker,
+        Duration::from_secs(20),
+        |pid, helpers| {
+            if detached {
+                session = Some(unsafe { libc::getsid(helpers[0]) });
+            }
+            if unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        },
+    )
+    .unwrap_or_else(|error| panic!("cancel at {marker:?}: {error}\n{}", run.diagnostics()));
+
+    let status = wait_update_exit(&mut run.child, Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| panic!("update did not exit after SIGINT\n{}", run.diagnostics()));
+    let (stdout, stderr) = run.streams();
+    assert_exit(
+        &Output {
+            status,
+            stdout,
+            stderr,
+        },
+        130,
+    );
+    if detached {
         assert_eq!(
-            unsafe { libc::kill(pid, 0) },
+            session,
+            Some(ready[0]),
+            "worker must be its own session leader"
+        );
+    }
+    for pid in ready {
+        assert_eq!(
+            unsafe { libc::getsid(pid) },
             -1,
             "fixture helper {pid} survived"
         );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
     }
 
     let report = fixture.read_report();

@@ -59,6 +59,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
                     "--no-optional-locks",
                     "status",
                     "--porcelain",
+                    "--ignore-submodules=none",
                     "--untracked-files=normal",
                     "-z",
                 ],

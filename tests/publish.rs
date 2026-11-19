@@ -365,6 +365,11 @@ esac
     exec "$PUBLISH_GITLEAKS" "$@"
 fi
 cwd=$(pwd -P)
+if [ "$1" = stdin ]; then
+    case "$cwd" in "$PUBLISH_LOG"/tmp/*) ;; *) exit 88 ;; esac
+    (umask 077; cat > "$PUBLISH_LOG/preview-input")
+    exec < "$PUBLISH_LOG/preview-input"
+else
 for operand do :; done
 case "$operand" in
     /*) source=$operand ;;
@@ -426,18 +431,23 @@ sys.exit(scanned.read_bytes() != approved.read_bytes())
         ;;
     *) exit 88 ;;
 esac
+fi
 status=0
 command=$1
 shift
+case "$command" in
+    stdin) evidence=preview-scan; report=preview-findings.json ;;
+    *) evidence=scan; report=findings.json ;;
+esac
 PATH="$PUBLISH_LOG/scan-bin" "$PUBLISH_GITLEAKS" "$command" \
-    --report-format json --report-path "$PUBLISH_LOG/findings.json" "$@" \
-    2> "$PUBLISH_LOG/scan-stderr" || status=$?
-cat "$PUBLISH_LOG/scan-stderr" >&2
-if [ -f "$PUBLISH_LOG/extra-scan-stderr" ]; then
+    --report-format json --report-path "$PUBLISH_LOG/$report" "$@" \
+    2> "$PUBLISH_LOG/$evidence-stderr" || status=$?
+cat "$PUBLISH_LOG/$evidence-stderr" >&2
+if [ "$command" != stdin ] && [ -f "$PUBLISH_LOG/extra-scan-stderr" ]; then
     cat "$PUBLISH_LOG/extra-scan-stderr" >&2
 fi
-printf '%s\n' "$status" > "$PUBLISH_LOG/scan-status"
-: > "$PUBLISH_LOG/scan-complete"
+printf '%s\n' "$status" > "$PUBLISH_LOG/$evidence-status"
+: > "$PUBLISH_LOG/$evidence-complete"
 exit "$status"
 "#,
         );
@@ -795,6 +805,121 @@ fn assert_no_preview(transcript: &str) {
             "found {marker:?}: {transcript}"
         );
     }
+}
+
+const PREVIEW_MARKER: &str = "P120_PREVIEW_0042";
+
+fn preview_policy(regex: &str) -> String {
+    format!("[[rules]]\nid = 'p120-preview-marker'\nregex = '{regex}'\n")
+}
+
+fn assert_preview_refused(fixture: &Publication, command: FixtureCommand<'_>) {
+    let transcript = refusal(command, true);
+    assert!(
+        transcript.contains("gitleaks found potential secrets in the publication preview"),
+        "{transcript}"
+    );
+    assert_eq!(fixture.read_log("scan-status"), "0\n");
+    assert_eq!(fixture.read_log("preview-scan-status"), "20\n");
+    assert!(!transcript.contains(PREVIEW_MARKER), "{transcript}");
+    assert_no_preview(&transcript);
+    fixture.assert_no_publication();
+}
+
+#[test]
+fn new_publish_120_screens_commit_descriptions_before_display() {
+    let rules = preview_policy(PREVIEW_MARKER);
+    let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", rules.as_bytes())]);
+    fixture.change(0);
+    fixture.jj(&[
+        "describe",
+        "-m",
+        &format!("Describe the change\n\n{PREVIEW_MARKER}"),
+    ]);
+    assert_preview_refused(&fixture, fixture.dots(&["publish"]));
+}
+
+#[test]
+fn new_publish_120_screens_added_preview_bytes() {
+    let rules = preview_policy(r"(?m)^\+P120_PREVIEW_0042$");
+    let fixture = Publication::with_seed(None, false, &[(".gitleaks.toml", rules.as_bytes())]);
+    fixture.change(0);
+    fs::write(
+        fixture.workspace.join("public-0.txt"),
+        format!("{PREVIEW_MARKER}\n"),
+    )
+    .unwrap();
+    assert_preview_refused(&fixture, fixture.dots(&["publish"]));
+}
+
+#[test]
+fn new_publish_120_screens_deleted_preview_bytes_before_merge_consent() {
+    let rules = preview_policy(r"(?m)^-P120_PREVIEW_0042$");
+    let deleted = format!("{PREVIEW_MARKER}\n");
+    let fixture = Publication::with_seed(
+        None,
+        false,
+        &[
+            (".gitleaks.toml", rules.as_bytes()),
+            ("previously-published.txt", deleted.as_bytes()),
+        ],
+    );
+    fixture.change(0);
+    fs::remove_file(fixture.workspace.join("previously-published.txt")).unwrap();
+    fixture.jj(&["describe", "-m", "Remove previous data"]);
+    fixture.change_main("elsewhere.txt", b"Advance main independently\n");
+    let before = (fixture.working_oid(), fixture.local_bookmarks());
+    assert_preview_refused(&fixture, fixture.dots(&["publish", "--all"]));
+    assert_eq!((fixture.working_oid(), fixture.local_bookmarks()), before);
+}
+
+#[test]
+fn new_publish_120_screens_rendered_pr_text_before_display() {
+    let rules = preview_policy(PREVIEW_MARKER);
+    let fixture = Publication::with_seed(
+        Some("Fixture Writer"),
+        false,
+        &[(".gitleaks.toml", rules.as_bytes())],
+    );
+    fixture.change(0);
+    let mut command = fixture.dots(&["publish"]);
+    command.env("DOTS_PUBLISH_MODEL", PREVIEW_MARKER);
+    assert_preview_refused(&fixture, command);
+}
+
+#[test]
+fn new_publish_120_displays_exactly_the_screened_preview() {
+    let fixture = Publication::new(Some("Fixture Writer"), false);
+    fixture.change(0);
+    let mut terminal = Pty::spawn(fixture.dots(&["publish"]));
+    terminal.expect("[y/N]");
+    assert!(fixture.log.join("preview-scan-complete").is_file());
+    terminal.send("n\n");
+    let (status, transcript) = terminal.finish();
+    assert_eq!(status.code(), Some(1));
+    let start = transcript
+        .find("Proposed changes, commit by commit")
+        .unwrap();
+    let end = transcript.find("Publish wip/").unwrap();
+    let screened = fixture.read_log("preview-input");
+    assert_eq!(&transcript[start..end], screened);
+    assert!(screened.contains("Proposed pull request title: Publish fixture change 0"));
+    assert!(screened.contains("is writing on behalf of Fixture Writer"));
+    fixture.assert_no_publication();
+}
+
+#[test]
+fn new_publish_120_checks_dev_before_trimming_the_empty_stack_child() {
+    let fixture = Publication::new(None, false);
+    fixture.change(0);
+    fixture.jj(&["new", "@"]);
+    let working = fixture.jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    fixture.git(&["update-ref", "refs/heads/dev", working.trim()]);
+    let transcript = refusal(fixture.dots(&["publish", "--all"]), true);
+    assert!(transcript.contains("shared dev"), "{transcript}");
+    assert_no_preview(&transcript);
+    assert!(!fixture.log.join("scan-complete").exists());
+    fixture.assert_no_publication();
 }
 
 fn synthetic_token() -> String {

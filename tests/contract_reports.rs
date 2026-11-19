@@ -1,7 +1,3 @@
-//! CLI scenarios ported from v0.4.0's CommandBackendTests plus the saved plan
-//! report. The R-01 completion engine's tests/completion.rs
-//! (new_completion_contract_grammar) covers the "dots reports pl" candidate
-//! and both help flags on "dots completions".
 mod support;
 
 use serde_json::Value;
@@ -11,8 +7,6 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use support::{FixtureCommand, World};
-
-const PLAN_OUTPUT: &str = "fixture plan output: preview editor settings\n";
 
 fn executable(path: &Path, script: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -328,51 +322,27 @@ fn unchanged_status_prints_one_profile_diagnostic_and_saves_it() {
 }
 
 #[test]
-fn unchanged_failed_apply_report_names_the_target_to_rerun() {
+fn new_reports_lists_saved_plan_and_apply_results() {
     let world = World::new();
-    let output = dots(&world)
-        .args(["apply", "missing-target"])
-        .output()
+    let reports = state(&world).join("reports");
+    fs::create_dir_all(&reports).unwrap();
+    fs::set_permissions(&reports, fs::Permissions::from_mode(0o700)).unwrap();
+    for command in ["plan", "apply"] {
+        let report = reports.join(format!("{command}.json"));
+        fs::write(
+            &report,
+            serde_json::json!({
+                "command": command, "finished_at_ms": 1, "status": 0, "next": null, "stages": []
+            })
+            .to_string(),
+        )
         .unwrap();
-    assert_code(&output, 1);
-    assert_eq!(output.stderr, b"no such target\n");
-    let report = saved_report(&world, "apply");
-    assert_report_status(&report, 1);
-    let metadata = report.to_string();
-    assert!(metadata.contains("dots apply missing-target"), "{metadata}");
-    assert!(!metadata.contains("no such target"), "{metadata}");
-}
-
-#[test]
-fn new_plan_prints_the_preview_and_saves_private_stage_metadata() {
-    let world = World::new();
-    let config = world.root().join("config.toml");
-    let before = fs::read(&config).unwrap();
-    let apply_called = world.home().join("apply-called");
-    let output = dots(&world)
-        .arg("plan")
-        .env("EXPECT_PLAN_SELECTOR", "laptop,host-fixture")
-        .env("RECORD_APPLY", &apply_called)
-        .output()
-        .unwrap();
-    assert_code(&output, 0);
-    assert_eq!(output.stdout, PLAN_OUTPUT.as_bytes(), "{output:?}");
-    assert_eq!(fs::read(&config).unwrap(), before);
-    assert!(!world.home().join(".config/example/settings.toml").exists());
-    assert!(
-        !apply_called.exists(),
-        "dots plan invoked mise dotfiles apply"
-    );
-
-    let report = saved_report(&world, "plan");
-    assert_report_status(&report, 0);
-    assert!(
-        report["stages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|stage| stage["outcome"] == "completed"),
-        "{report}"
-    );
-    assert!(!report.to_string().contains(PLAN_OUTPUT.trim()), "{report}");
+        fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = world.dots().args(["reports", command]).output().unwrap();
+        assert_code(&output, 0);
+        assert!(
+            text(&output.stdout).contains(report.to_str().unwrap()),
+            "{output:?}"
+        );
+    }
 }

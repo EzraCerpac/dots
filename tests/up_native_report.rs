@@ -110,6 +110,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(None)) {
+            return;
+        }
         let sid = self.0.id() as unix::Pid;
         for pid in unix::processes() {
             if pid > 1 && unix::session(pid) == sid {
@@ -137,7 +140,7 @@ fn read_terminal(master: &mut File, transcript: &mut Vec<u8>) -> bool {
     }
 }
 
-fn prompted_update(world: &World) -> (ExitStatus, String) {
+fn prompted_update(mut runner: support::FixtureCommand<'_>, label: &str) -> (ExitStatus, String) {
     let (mut master, slave) = open_pty();
     let mut modes = termios(slave.as_raw_fd());
     // Compare live and redirected report bytes with no CRLF processing.
@@ -145,7 +148,6 @@ fn prompted_update(world: &World) -> (ExitStatus, String) {
     modes.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
     set_termios(slave.as_raw_fd(), &modes);
     nonblocking(&master);
-    let mut runner = dots(world);
     runner
         .arg("up")
         .env("FIXTURE_TTY", tty_name(slave.as_raw_fd()).unwrap())
@@ -165,7 +167,7 @@ fn prompted_update(world: &World) -> (ExitStatus, String) {
     let mut job = Session(runner.spawn().unwrap());
     drop(runner);
     let mut transcript = Vec::new();
-    unix::wait_for("the native printer prompt", || {
+    unix::wait_for("the native hook prompt", || {
         let eof = read_terminal(&mut master, &mut transcript);
         let seen = transcript
             .windows(PROMPT.len())
@@ -180,7 +182,9 @@ fn prompted_update(world: &World) -> (ExitStatus, String) {
     let before_prompt = String::from_utf8_lossy(&transcript);
     let before_prompt = before_prompt.split_once(PROMPT).unwrap().0;
     assert!(
-        before_prompt.ends_with(&format!("==> {LABEL}\n")),
+        before_prompt
+            .lines()
+            .any(|line| line == format!("==> {label}")),
         "{before_prompt}"
     );
     writeln!(master, "{REPLY}").unwrap();
@@ -188,6 +192,16 @@ fn prompted_update(world: &World) -> (ExitStatus, String) {
         read_terminal(&mut master, &mut transcript).then_some(())
     });
     (job.wait(), String::from_utf8(transcript).unwrap())
+}
+
+fn saved_report(world: &World) -> Value {
+    let reports: Vec<_> = fs::read_dir(world.home().join(".local/state/dots/reports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|file| file.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    serde_json::from_reader(File::open(&reports[0]).unwrap()).unwrap()
 }
 
 fn check_state(dir: &Path, stage_log: &str) {
@@ -240,7 +254,7 @@ fn redirected_replay(world: &World) -> (ExitStatus, Vec<u8>) {
 fn new_up_replays_native_hook_failure_without_retaining_terminal_output() {
     let world = World::new();
     prepare(&world);
-    let (status, live) = prompted_update(&world);
+    let (status, live) = prompted_update(dots(&world), LABEL);
     assert_eq!(status.code(), Some(1), "{live}");
     assert!(live.contains(HOOK_OUTPUT), "{live}");
     let stage_result = format!("{LABEL}: failed");
@@ -289,13 +303,7 @@ fn new_up_replays_native_hook_failure_without_retaining_terminal_output() {
     }
 
     let state = world.home().join(".local/state/dots");
-    let reports: Vec<_> = fs::read_dir(state.join("reports"))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|file| file.extension().is_some_and(|ext| ext == "json"))
-        .collect();
-    assert_eq!(reports.len(), 1);
-    let report: Value = serde_json::from_reader(File::open(&reports[0]).unwrap()).unwrap();
+    let report = saved_report(&world);
     assert_eq!(report["command"], "up");
     assert_eq!(report["status"], status.code().unwrap());
     assert_eq!(report["cancelled"], false);
@@ -316,4 +324,118 @@ fn new_up_replays_native_hook_failure_without_retaining_terminal_output() {
     let (replay_status, replay) = redirected_replay(&world);
     assert_eq!(replay_status.code(), status.code());
     assert_eq!(replay, final_report.as_bytes());
+}
+
+fn local_apply(world: &World) -> support::FixtureCommand<'_> {
+    prepare(world);
+    let root = world.root();
+    fs::remove_file(root.join("dots/hooks/update.d/30-Printer")).unwrap();
+    fs::write(root.join("config.laptop.toml"), "").unwrap();
+    fs::write(
+        root.join("config.toml"),
+        r#"[vars]
+dots_profiles = "laptop"
+[bootstrap.hooks]
+pre-dotfiles = 'bash "$DOTS_ROOT/prompt-dotfiles"'
+[dotfiles]
+"~/fixture-applied" = { content = "fixture" }
+"#,
+    )
+    .unwrap();
+    executable(
+        &root.join("prompt-dotfiles"),
+        br#"#!/bin/bash
+set -eu
+if [[ -n "${FIXTURE_TTY:-}" ]]; then
+    [[ -t 0 && -t 1 && -t 2 && "$(tty)" == "$FIXTURE_TTY" ]] || exit 97
+fi
+printf '%s' "$FIXTURE_PROMPT"
+IFS= read -r reply
+[[ "$reply" == "$FIXTURE_REPLY" ]] || exit 99
+printf '%s\n' "$FIXTURE_HOOK_OUTPUT"
+exit 23
+"#,
+    );
+    for args in [
+        &["init", "-q", "-b", "dev"][..],
+        &["add", "."],
+        &["commit", "-qm", "Seed local apply fixture"],
+    ] {
+        let output = world.git().args(args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let path = std::env::var_os("PATH").unwrap();
+    let mise = std::env::split_paths(&path)
+        .map(|path| path.join("mise"))
+        .find(|path| path.is_absolute() && path.is_file())
+        .expect("standalone mise on PATH");
+    let mut command = dots(world);
+    command
+        .env("DOTS_MISE_BIN", mise)
+        .env_remove("MISE_GLOBAL_CONFIG_FILE")
+        .env("MISE_OFFLINE", "1");
+    command
+}
+
+fn apply_issue(report: &Value) -> &Value {
+    let stage = report["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["label"] == "Apply dotfiles")
+        .expect("saved dotfile apply stage");
+    assert_eq!(stage["outcome"], "deferred", "{stage}");
+    let issues = stage["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1, "{stage}");
+    assert!(
+        issues[0]["next"]
+            .as_str()
+            .unwrap()
+            .contains("rerun dots up")
+    );
+    &issues[0]
+}
+
+#[test]
+fn new_local_dotfile_hook_prompts_on_the_terminal_and_keeps_plain_capture() {
+    let world = World::new();
+    let (status, live) = prompted_update(local_apply(&world), "Apply dotfiles");
+    assert_eq!(status.code(), Some(0), "{live}");
+    assert!(live.contains(HOOK_OUTPUT), "{live}");
+    assert!(live.contains("Apply dotfiles: deferred"), "{live}");
+    assert!(live.contains("Output was shown on the terminal"), "{live}");
+    let report = saved_report(&world);
+    let issue = apply_issue(&report);
+    assert!(issue["terminal_exit"].as_u64().is_some_and(|code| code > 0));
+    assert!(issue["tail"].is_null() && issue["log"].is_null(), "{issue}");
+    assert!(!report.to_string().contains(HOOK_OUTPUT));
+
+    for flags in [&[][..], &["--plain"][..]] {
+        let world = World::new();
+        let input = world.home().join("reply");
+        fs::write(&input, format!("{REPLY}\n")).unwrap();
+        let output = local_apply(&world)
+            .args(flags)
+            .arg("up")
+            .env("FIXTURE_PROMPT", PROMPT)
+            .env("FIXTURE_REPLY", REPLY)
+            .env("FIXTURE_HOOK_OUTPUT", HOOK_OUTPUT)
+            .stdin(File::open(input).unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = saved_report(&world);
+        let issue = apply_issue(&report);
+        let log = Path::new(issue["log"].as_str().unwrap());
+        assert!(log.starts_with(world.home()), "{log:?}");
+        let captured = fs::read_to_string(log).unwrap();
+        assert!(
+            captured.contains(PROMPT) && captured.contains(HOOK_OUTPUT),
+            "{captured}"
+        );
+        assert!(
+            issue["tail"].as_str().unwrap().contains(HOOK_OUTPUT),
+            "{issue}"
+        );
+    }
 }

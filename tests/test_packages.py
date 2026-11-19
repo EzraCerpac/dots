@@ -500,7 +500,7 @@ chmod +x "$ASDF_INSTALL_PATH/bin/fixture-tool"
                                  FIXTURE_BREW_MAS_PREFIX=str(prefix), **env))
         self.assertIn("upgrade 123", log.read_text().splitlines())
     @unittest.skipUnless(sys.platform == "darwin", "Mac App Store package queries apply on macOS")
-    def test_status_and_plan_do_not_probe_the_app_store(self) -> None:
+    def test_status_does_not_probe_the_app_store(self) -> None:
         config = self.root / "desktop"
         config.mkdir()
         (config / "config.toml").write_text(BASE.lstrip() + '\n[bootstrap.packages]\n"mas:123" = "latest"\n')
@@ -513,7 +513,6 @@ chmod +x "$ASDF_INSTALL_PATH/bin/fixture-tool"
             "plain status": (str(MANAGER / "bin/dots"), "status"),
             "structured status": (sys.executable, str(MANAGER / "lib/dots-command-backend.py"),
                                   str(self.bin / "mise"), str(config), "status"),
-            "plan": (str(MANAGER / "bin/dots"), "plan"),
         }
         for name, command in commands.items():
             with self.subTest(command=name):

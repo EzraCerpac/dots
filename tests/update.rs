@@ -478,6 +478,58 @@ fn new_local_only_update_skips_sync_cleanly_and_checks_history_twice() {
     assert_eq!(sync_fixture_git(&fixture, &["rev-parse", "HEAD"]), seed);
 }
 
+#[test]
+fn new_local_only_update_deploys_a_hand_edited_dotfile() {
+    let fixture = Fixture::new();
+    fixture.write("config.laptop.toml", "");
+    let seed = seed_sync_fixture(&fixture);
+    let declaration = "[vars]\ndots_profiles = 'laptop'\n\
+        [dotfiles]\n'~/.config/local-update.txt' = { content = 'hand-edited deployment' }\n";
+    fixture.write("config.toml", declaration);
+    let destination = fixture.world.home().join(".config/local-update.txt");
+    assert!(!destination.exists());
+    let path = std::env::var_os("PATH").unwrap();
+    let mise = std::env::split_paths(&path)
+        .map(|path| path.join("mise"))
+        .find(|path| path.is_absolute() && path.is_file())
+        .expect("standalone mise on PATH");
+    let output = fixture
+        .command()
+        .env("DOTS_MISE_BIN", &mise)
+        .env("SETUP_MISE_BIN", mise)
+        .env_remove("MISE_GLOBAL_CONFIG_FILE")
+        .env("MISE_OFFLINE", "1")
+        .env("MISE_SELF_UPDATE_AVAILABLE", "false")
+        .args(["--plain", "up"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Sync configuration (no remote configured): skipped"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Apply dotfiles: completed"), "{stdout}");
+    assert!(!stdout.contains("Needs attention"), "{stdout}");
+    let report = fixture.read_report();
+    let stages = report["stages"].as_array().unwrap();
+    let apply = stages
+        .iter()
+        .find(|stage| stage["label"] == "Apply dotfiles")
+        .unwrap();
+    assert_eq!(apply["outcome"], "completed");
+    assert_eq!(
+        fs::read_to_string(destination).unwrap().trim_end(),
+        "hand-edited deployment"
+    );
+    assert_eq!(sync_fixture_git(&fixture, &["rev-parse", "HEAD"]), seed);
+    assert_eq!(
+        fs::read_to_string(fixture.world.root().join("config.toml")).unwrap(),
+        declaration
+    );
+    assert!(saved_sync_receipt(&fixture).is_none());
+}
+
 #[cfg(target_os = "macos")]
 fn store_fixture() -> Fixture {
     let fixture = Fixture::new();

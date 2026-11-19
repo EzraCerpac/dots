@@ -5,15 +5,13 @@ Usage: dots [--plain | --verbose] [COMMAND [ARGS...]]
 
 Inspect:
   status                Show programs, profile and this machine's state
-  plan                  Preview mise's bootstrap plan for this machine
   reports [COMMAND]     List saved reports
   sync --last           Replay the latest sync receipt
   up --last             Print the last update report
 
 Everyday:
-  up [--mas]            Checkpoint settings, sync, then update packages, tools, hooks and mise
+  up [--mas]            Checkpoint settings, apply configuration, then update packages, tools, hooks and mise
   sync                  Share configuration edits and apply others' changes
-  apply [TARGET...]     Apply declared dotfiles and templates
   add REQUEST...        Install software or adopt a dotfile, and record it
   remove TARGET...      Uninstall software or restore an adopted dotfile
   test [ARGS...]        Run the configuration's tests/run

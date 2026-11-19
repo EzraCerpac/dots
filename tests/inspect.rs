@@ -196,7 +196,7 @@ fn new_status_keeps_an_invalid_selected_profile_in_the_startup_report() {
 }
 
 #[test]
-fn unchanged_plan_previews_declared_resources_without_writing_them() {
+fn new_mise_plan_previews_declared_resources_without_writing_them() {
     let world = World::new();
     let directory = world.home().join("planned-output.txt");
     minimal(
@@ -206,38 +206,14 @@ fn unchanged_plan_previews_declared_resources_without_writing_them() {
             directory.display()
         ),
     );
-    let plan = output(with_mise(&world).arg("plan"), 0);
+    let plan = output(with_mise(&world).args(["mise", "bootstrap", "plan"]), 0);
     let stdout = String::from_utf8_lossy(&plan.stdout);
     assert!(stdout.contains("planned-output.txt"), "{plan:?}");
     assert!(!directory.exists());
 }
 
 #[test]
-fn new_plan_saves_a_private_metadata_only_report() {
-    let world = World::new();
-    minimal(&world, "");
-    let fake = world.home().join("fixture-mise");
-    script(
-        &fake,
-        r#"
-case "$*" in
-  'bootstrap packages status --json') printf '{}\n' ;;
-  'bootstrap plan') printf 'synthetic native plan output\n' ;;
-  *) exit 12 ;;
-esac
-"#,
-    );
-    let plan = output(world.dots().env("DOTS_MISE_BIN", fake).arg("plan"), 0);
-    assert_eq!(plan.stdout, b"synthetic native plan output\n");
-    let report = read_report(&world);
-    assert_eq!(report["command"], "plan");
-    assert_eq!(report["status"], 0);
-    assert_eq!(report["stages"][0]["outcome"], "completed");
-    assert!(!report.to_string().contains("synthetic native plan output"));
-}
-
-#[test]
-fn unchanged_apply_selected_target_through_mise() {
+fn new_mise_applies_only_the_selected_dotfile() {
     let world = World::new();
     minimal(
         &world,
@@ -247,7 +223,10 @@ fn unchanged_apply_selected_target_through_mise() {
 "~/other file" = { content = "two" }
 "#,
     );
-    output(with_mise(&world).args(["apply", "~/first file"]), 0);
+    output(
+        with_mise(&world).args(["mise", "bootstrap", "dotfiles", "apply", "~/first file"]),
+        0,
+    );
     assert_eq!(
         fs::read_to_string(world.home().join("first file"))
             .unwrap()
@@ -336,45 +315,30 @@ fn new_retire_dotfiles_removes_only_dead_links_into_the_config() {
 
 #[test]
 fn new_missing_configuration_saves_one_startup_issue_without_a_child() {
-    for command in ["plan", "apply", "test"] {
-        let world = World::new();
-        fs::remove_file(world.root().join("config.toml")).unwrap();
-        let mise = world.home().join("unwanted-mise");
-        script(&mise, r#": > "$HOME/mise-ran"; exit 99"#);
-        let mut invocation = world.dots();
-        invocation.env("DOTS_MISE_BIN", mise).arg(command);
-        if command == "apply" {
-            invocation.args(["--dry-run", "shell"]);
-        }
-        let result = output(&mut invocation, 2);
-        assert!(result.stdout.is_empty(), "{result:?}");
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        assert_eq!(stderr.lines().count(), 1);
-        assert!(stderr.contains("config.toml"));
-        assert!(!world.home().join("mise-ran").exists());
-        let report = read_report(&world);
-        assert_eq!(report["command"], command);
-        assert_eq!(report["status"], 2);
-        let stages = report["stages"].as_array().unwrap();
-        assert_eq!(stages.len(), 1);
-        let issues = stages[0]["issues"].as_array().unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0]["diagnostic"], stderr.trim_end());
-        if command == "apply" {
-            assert!(
-                issues[0]["next"]
-                    .as_str()
-                    .unwrap()
-                    .contains("same arguments"),
-                "unsafe startup recovery advice: {}",
-                issues[0]["next"]
-            );
-        }
-    }
+    let world = World::new();
+    fs::remove_file(world.root().join("config.toml")).unwrap();
+    let mise = world.home().join("unwanted-mise");
+    script(&mise, r#": > "$HOME/mise-ran"; exit 99"#);
+    let mut invocation = world.dots();
+    invocation.env("DOTS_MISE_BIN", mise).arg("test");
+    let result = output(&mut invocation, 2);
+    assert!(result.stdout.is_empty(), "{result:?}");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(stderr.lines().count(), 1);
+    assert!(stderr.contains("config.toml"));
+    assert!(!world.home().join("mise-ran").exists());
+    let report = read_report(&world);
+    assert_eq!(report["command"], "test");
+    assert_eq!(report["status"], 2);
+    let stages = report["stages"].as_array().unwrap();
+    assert_eq!(stages.len(), 1);
+    let issues = stages[0]["issues"].as_array().unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["diagnostic"], stderr.trim_end());
 }
 
 #[test]
-fn new_inspection_uses_all_persisted_selectors_and_lists_uninstalled_tools() {
+fn new_status_uses_all_persisted_selectors_and_lists_uninstalled_tools() {
     let world = World::new();
     minimal(&world, "");
     fs::write(
@@ -396,8 +360,6 @@ case "$*" in
   'bootstrap packages status --json') printf '{}\n' ;;
   'ls --current --json') printf '%s\n' '{"fixture-tool":[{"active":false,"installed":false,"requested_version":"2.0"}]}' ;;
   'bootstrap dotfiles status --json') printf '{}\n' ;;
-  'bootstrap plan') printf 'planned\n' ;;
-  'bootstrap dotfiles apply') printf 'applied\n' ;;
   *) exit 92 ;;
 esac
 "#,
@@ -413,8 +375,6 @@ esac
         stdout.contains("fixture-tool@2.0") && stdout.contains("Install the selected tools"),
         "{stdout}"
     );
-    assert_eq!(output(dots().arg("plan"), 0).stdout, b"planned\n");
-    assert_eq!(output(dots().arg("apply"), 0).stdout, b"applied\n");
     assert_eq!(
         output(dots().args(["mise", "cli-selector"]), 0).stdout,
         b"laptop,host-fixture\n"

@@ -200,3 +200,104 @@ fn passive_mise_discovers_active_in_root_paths_without_running_env_or_hooks() {
         assert!(!path.exists(), "probe wrote to {}", path.display());
     }
 }
+
+#[test]
+fn private_edits_stage_in_the_existing_machine_local_namespace() {
+    let (_temp, _env, root) = fixture();
+    let path = root.path().join("config.local.toml");
+    fs::write(&path, "# private fixture\n").unwrap();
+    let mut document = Doc::open(&path).unwrap();
+    document.make_private();
+    let staged = document.stage().unwrap();
+    assert!(
+        staged
+            .file
+            .path()
+            .starts_with(root.path().join(".setup-state"))
+    );
+}
+
+#[test]
+fn missing_tail_does_not_step_through_a_non_directory() {
+    let (_temp, _env, root) = fixture();
+    let pipe = root.path().join("pipe");
+    assert!(
+        Command::new("/usr/bin/mkfifo")
+            .arg(pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let path = root.path().join("missing/../pipe/../config.toml");
+    assert_eq!(
+        super::physical(&path).unwrap_err().kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+}
+
+#[test]
+fn holds_match_the_full_tap_and_the_short_formula_name() {
+    let (_temp, _env, root) = fixture();
+    fs::write(
+        root.path().join("config.toml"),
+        "[vars]\ndots_profiles = 'laptop'\n",
+    )
+    .unwrap();
+    fs::create_dir(root.path().join("dots")).unwrap();
+    fs::write(
+        root.path().join("dots/exceptions.tsv"),
+        "base\twidetap\thold=brew:owner/tap/widget\nlaptop\tshort\thold=brew:gadget\n",
+    )
+    .unwrap();
+    let exceptions = Exceptions::read(&root).unwrap();
+    assert_eq!(exceptions.held_by("brew:owner/tap/widget"), Some("widetap"));
+    assert_eq!(
+        exceptions.held_by_for("brew:owner/tap/widget@2", "laptop"),
+        Some("widetap")
+    );
+    assert_eq!(exceptions.held_by("brew:other/tap/widget"), None);
+    assert_eq!(exceptions.held_by("brew:owner/tap/gadget@2"), Some("short"));
+}
+
+#[test]
+fn a_relative_xdg_state_home_falls_back_to_the_absolute_home() {
+    let (_temp, mut env, _root) = fixture();
+    let home = env.cwd.join("home");
+    env.vars
+        .insert("HOME".into(), home.clone().into_os_string());
+    env.vars
+        .insert("XDG_STATE_HOME".into(), "relative-state".into());
+    assert_eq!(env.state_dir().unwrap(), home.join(".local/state/dots"));
+}
+
+#[test]
+fn repository_origins_accept_standard_urls_and_reject_query_parameters() {
+    use super::RepoSetting;
+
+    for value in [
+        "https://example.invalid/repo.git",
+        "ssh://git@example.invalid/repo.git",
+    ] {
+        assert_eq!(RepoSetting::parse(value).unwrap().transport_url(), value);
+    }
+    let error = RepoSetting::parse("https://example.invalid/repo.git?auth=fixture").unwrap_err();
+    assert!(error.diagnostic.contains("without query parameters"));
+    assert!(!error.diagnostic.contains("fixture"));
+}
+
+#[test]
+fn selection_install_checks_again_after_the_other_file_was_committed() {
+    let (_temp, _env, root) = fixture();
+    let early = root.path().join("miserc.toml");
+    let local = root.path().join("config.local.toml");
+    fs::write(&early, "# previous config\n").unwrap();
+    let mut early_edit = Doc::open(&early).unwrap();
+    early_edit.document["env"] = toml_edit::value("candidate");
+    let early_edit = early_edit.stage().unwrap();
+    let local_edit = Doc::open(&local).unwrap().stage().unwrap();
+    early_edit.check_destination().unwrap();
+    local_edit.install().unwrap();
+    fs::write(&early, "# later editor save\n").unwrap();
+    assert!(early_edit.install().is_err());
+    assert_eq!(fs::read_to_string(early).unwrap(), "# later editor save\n");
+}

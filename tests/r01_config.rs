@@ -856,3 +856,156 @@ exec "$@"
         "pinned path: {pinned:?}"
     );
 }
+
+#[test]
+fn new_bootstrap_missing_file_operand_preserves_dry_run_flag() {
+    for option in ["--identity", "--bundle", "--from-dir"] {
+        let result = dots_cli::cli::tree().try_get_matches_from([
+            "dots",
+            "bootstrap",
+            option,
+            "--dry-run",
+            "--yes",
+        ]);
+        assert!(result.is_err(), "{option} consumed --dry-run");
+    }
+    let parsed = dots_cli::cli::tree()
+        .try_get_matches_from(["dots", "bootstrap", "--identity=--literal", "--dry-run"])
+        .unwrap();
+    let (_, bootstrap) = parsed.subcommand().unwrap();
+    assert!(bootstrap.get_flag("dry-run"));
+    assert_eq!(
+        bootstrap.get_one::<OsString>("identity").unwrap(),
+        "--literal"
+    );
+}
+
+#[test]
+fn new_profile_machine_change_updates_the_existing_history_branch() {
+    let f = Fixture::new();
+    successful(f.select(&["--origin", ORIGIN]));
+    let before = fs::read_to_string(f.config.join("config.local.toml")).unwrap();
+    successful(
+        f.dots()
+            .args([
+                "profile",
+                "--profile",
+                "server",
+                "--machine-id",
+                "demo-machine",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(f.config.join("config.local.toml")).unwrap(),
+        before.replace("SETUP_PROFILE = \"laptop\"", "SETUP_PROFILE = \"server\"")
+    );
+    successful(
+        f.dots()
+            .args([
+                "profile",
+                "--profile",
+                "server",
+                "--machine-id",
+                "replacement",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(f.config.join("config.local.toml")).unwrap(),
+        before
+            .replace("SETUP_PROFILE = \"laptop\"", "SETUP_PROFILE = \"server\"")
+            .replace("demo-machine", "replacement")
+    );
+}
+
+#[test]
+fn new_skill_refresh_does_not_create_a_missing_agent_root_inside_state() {
+    for subdir in ["skills", "skills/dots"] {
+        let f = Fixture::new();
+        let agent = f.skill_state().join(subdir);
+        successful(
+            f.dots()
+                .env("CODEX_HOME", &agent)
+                .env_remove("DOTS_SKILL_LINKS")
+                .arg("--version")
+                .output()
+                .unwrap(),
+        );
+        assert!(!agent.exists(), "{subdir} was created");
+    }
+}
+
+#[test]
+fn new_skill_refresh_keeps_the_old_link_if_ownership_cannot_be_saved() {
+    if nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let link = f.home.join(".claude/skills/dots");
+    let old = f.base.join("old-install");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    fs::create_dir(&old).unwrap();
+    fs::write(old.join("SKILL.md"), b"old working skill").unwrap();
+    symlink(&old, &link).unwrap();
+    fs::create_dir_all(f.skill_state().join("skills/dots")).unwrap();
+    fs::write(
+        f.skill_state().join("skill-links"),
+        format!("{}\t{}\n", link.display(), old.display()),
+    )
+    .unwrap();
+    let state = f.skill_state();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    let output = f.refresh_skill();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not update the dots agent skill")
+    );
+    assert_eq!(fs::read_link(link).unwrap(), old);
+}
+
+#[test]
+fn new_unwritable_stderr_preserves_a_usage_error_status() {
+    let f = Fixture::new();
+    let mut command = f.dots();
+    // Setting the child-only limit makes its next write fail with EFBIG.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = nix::libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            nix::libc::signal(nix::libc::SIGXFSZ, nix::libc::SIG_IGN);
+            if nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let diagnostic = fs::File::create(f.base.join("unwritable-stderr")).unwrap();
+    let output = command
+        .arg("--bogus")
+        .stderr(std::process::Stdio::from(diagnostic))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn new_missing_exception_recipe_does_not_skip_the_remaining_rows() {
+    let f = Fixture::new();
+    let ran = f.config.join("ran-recipe");
+    fs::create_dir(f.config.join("dots")).unwrap();
+    f.write("dots/exceptions.tsv", "base\tmissing\nbase\tworking\n");
+    f.script(
+        "config/dots/exceptions/working",
+        "test \"$1\" = --install-only && touch \"$DOTS_ROOT/ran-recipe\"",
+    );
+    let output = f.dots().arg("exceptions").output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing"));
+    assert!(ran.is_file());
+}

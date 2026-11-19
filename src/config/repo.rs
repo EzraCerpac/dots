@@ -34,22 +34,15 @@ impl RepoSetting {
             if !matches!(scheme, "https" | "http" | "ssh" | "git" | "file") {
                 return Err(invalid());
             }
+            if rest.contains('?') {
+                return Err(Fail::usage(
+                    "use a Git URL without query parameters; configure authentication in Git",
+                ));
+            }
             let (authority, path) = rest.split_once('/').ok_or_else(invalid)?;
             if let Some((user, _)) = authority.rsplit_once('@')
                 && (scheme != "ssh" || user.contains([':', '%', '@']))
             {
-                return Err(credential());
-            }
-            if path.split_once('?').is_some_and(|(_, query)| {
-                query.split('&').any(|entry| {
-                    let key = entry
-                        .split('=')
-                        .next()
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    key.contains("token") || key.contains("password") || key == "key"
-                })
-            }) {
                 return Err(credential());
             }
             if path.is_empty()

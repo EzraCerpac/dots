@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -7,7 +8,7 @@ fn main() -> ExitCode {
     match dots_cli::cli::run(std::env::args_os().collect()) {
         Ok(status) => status.into(),
         Err(error) => {
-            eprintln!("dots: {error}");
+            let _ = writeln!(io::stderr().lock(), "dots: {error}");
             error.status.into()
         }
     }

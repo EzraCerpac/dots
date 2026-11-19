@@ -19,11 +19,16 @@ fn resolve(path: &Path, links: u8) -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::NotFound, "missing path"));
     };
     let mut resolved = resolve(parent, links)?;
-    if resolved.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotADirectory,
-            "not a directory",
-        ));
+    match fs::metadata(&resolved) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     if name.as_os_str() == ".." {
         resolved.pop();

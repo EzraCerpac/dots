@@ -1,6 +1,6 @@
 use std::fs::{self, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -16,6 +16,7 @@ pub struct Doc {
     original: Option<String>,
     original_mode: Option<u32>,
     mode: u32,
+    private: bool,
 }
 
 impl Doc {
@@ -47,13 +48,12 @@ impl Doc {
             original,
             original_mode,
             mode,
+            private: false,
         })
     }
 
     pub fn install(self) -> Result<(), Fail> {
-        let staged = self.stage()?;
-        staged.check_destination()?;
-        staged.install()
+        self.stage()?.install()
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -62,16 +62,18 @@ impl Doc {
 
     pub(crate) fn make_private(&mut self) {
         self.mode = 0o600;
+        self.private = true;
     }
 
     pub(super) fn stage(self) -> Result<Staged, Fail> {
         let source = self.document.to_string();
         let changed =
             self.original.as_deref() != Some(&source) || self.original_mode != Some(self.mode);
+        let directory = self.staging_dir().map_err(|e| file_error(&self.path, e))?;
         let file = tempfile::Builder::new()
             .prefix(".dots-edit-")
             .suffix(".toml")
-            .tempfile_in(self.path.parent().expect("absolute file path"))
+            .tempfile_in(directory)
             .and_then(|mut file| {
                 file.write_all(source.as_bytes())?;
                 file.as_file()
@@ -85,6 +87,31 @@ impl Doc {
             file,
             changed,
         })
+    }
+
+    fn staging_dir(&self) -> io::Result<PathBuf> {
+        let referent_parent = self.path.parent().expect("absolute file path");
+        if !self.private {
+            return Ok(referent_parent.to_owned());
+        }
+        // Sync already keeps the root's .setup-state out of its snapshot.
+        let state = self
+            .requested
+            .parent()
+            .expect("absolute file path")
+            .join(".setup-state");
+        match fs::DirBuilder::new().mode(0o700).create(&state) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let metadata = fs::symlink_metadata(&state)?;
+        if !metadata.is_dir() || metadata.dev() != fs::metadata(referent_parent)?.dev() {
+            return Err(io::Error::other(
+                ".setup-state must be a real directory on the same filesystem as the private file",
+            ));
+        }
+        Ok(state)
     }
 }
 
@@ -122,11 +149,15 @@ impl Staged {
     }
 
     pub(super) fn install(self) -> Result<(), Fail> {
+        self.check_destination()?;
         if self.changed {
             let target = &self.document.path;
-            self.file
-                .persist(target)
-                .map_err(|e| file_error(target, e.error))?;
+            if self.document.original.is_some() {
+                self.file.persist(target)
+            } else {
+                self.file.persist_noclobber(target)
+            }
+            .map_err(|e| file_error(target, e.error))?;
         }
         Ok(())
     }

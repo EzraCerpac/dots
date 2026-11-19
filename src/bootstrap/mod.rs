@@ -47,6 +47,15 @@ pub fn bootstrap(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
     }
 }
 
+pub(crate) fn check_profile(root: &Root, requested: &OsStr) -> Result<u8, Fail> {
+    if selection::configured_profile(root)?.is_some_and(|saved| OsStr::new(&saved) != requested) {
+        return Err(Fail::usage(
+            "requested bootstrap profile differs from the saved profile; use dots profile --profile PROFILE --machine-id ID to change it",
+        ));
+    }
+    Ok(0)
+}
+
 fn arg_path(ctx: &Ctx, args: &Args, name: &str) -> Option<PathBuf> {
     args.get_one::<OsString>(name)
         .map(|path| ctx.env.cwd().join(path))

@@ -241,14 +241,24 @@ pub(crate) fn tool_path(
     install: bool,
     mut mise: impl FnMut(&[&str]) -> Option<Vec<u8>>,
 ) -> PathBuf {
-    if let Some(path) = env
+    let on_path = env
         .get("PATH")
         .into_iter()
         .flat_map(std::env::split_paths)
         .map(|dir| env.cwd().join(dir).join(name))
-        .find(|path| is_executable(path))
-    {
-        return path;
+        .find(|path| is_executable(path));
+    if let Some(path) = &on_path {
+        // A native shim would select a tool in the caller's directory.
+        let mise_shim = path.is_symlink()
+            && path.canonicalize().ok().is_some_and(|target| {
+                mise_binary(env)
+                    .ok()
+                    .and_then(|mise| mise.canonicalize().ok())
+                    == Some(target)
+            });
+        if !mise_shim {
+            return path.clone();
+        }
     }
     let which = |bytes: Vec<u8>| {
         let path = PathBuf::from(OsStr::from_bytes(
@@ -269,7 +279,7 @@ pub(crate) fn tool_path(
     {
         return path;
     }
-    PathBuf::from(name)
+    on_path.unwrap_or_else(|| PathBuf::from(name))
 }
 
 pub(crate) fn mise_binary(env: &Env) -> Result<PathBuf, Fail> {

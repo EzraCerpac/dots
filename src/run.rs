@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ChildCommand, ExitStatus, Output, Stdio};
 use std::sync::Mutex;
 
-use crate::Ctx;
 use crate::report::{self, Command, Report, Stage};
 pub use crate::report::{Change, Issue, Outcome, StageId};
 use crate::supervisor::{Mode, Supervisor};
 use crate::ui::transcript::{write_report, write_stage_end, write_stage_start};
+use crate::{Ctx, Fail};
 
 const CANCELLED_STAGE: StageId = StageId(usize::MAX);
 
@@ -164,11 +164,18 @@ impl<'a> Run<'a> {
     }
 
     pub(crate) fn tool(&self, name: &str) -> std::path::PathBuf {
+        self.tool_with(name, |args| {
+            crate::process::Mise::new(self.ctx())?.command_active(args)
+        })
+    }
+
+    pub(crate) fn tool_with(
+        &self,
+        name: &str,
+        mut command: impl FnMut(&[&str]) -> Result<ChildCommand, Fail>,
+    ) -> std::path::PathBuf {
         crate::process::tool_path(&self.ctx().env, name, self.up(), |args| {
-            let mut cmd = crate::process::Mise::new(self.ctx())
-                .ok()?
-                .command_active(args)
-                .ok()?;
+            let mut cmd = command(args).ok()?;
             cmd.env("MISE_NO_HOOKS", "1").env("MISE_NO_ENV", "1");
             if args[0] != "install" {
                 cmd.env("MISE_OFFLINE", "1").env("MISE_SAFE", "1");

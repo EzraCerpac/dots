@@ -93,6 +93,10 @@ impl<'a, 'ctx> Native<'a, 'ctx> {
         Ok(cmd)
     }
 
+    pub fn tool(&self, name: &str) -> PathBuf {
+        self.run.tool_with(name, |args| self.mise(args))
+    }
+
     pub fn probe(&self, cmd: Command, diagnostic: &str) -> Result<Output, Fail> {
         if self.run.cancelled() {
             return Err(blocked("history operation was cancelled"));

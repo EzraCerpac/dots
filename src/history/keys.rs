@@ -30,7 +30,7 @@ pub(super) fn read_identity(
     if !fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
         return Err(invalid("age identity must be a readable regular file"));
     }
-    let mut cmd = native.command(native.run.tool("age-keygen"))?;
+    let mut cmd = native.command(native.tool("age-keygen"))?;
     cmd.arg("-y").arg(&path);
     let output = native.text(
         cmd,
@@ -215,7 +215,7 @@ pub(super) fn check_recipients(
     native: &Native<'_, '_>,
     recipients: &BTreeSet<String>,
 ) -> Result<(), Fail> {
-    let mut cmd = native.command(native.run.tool("age"))?;
+    let mut cmd = native.command(native.tool("age"))?;
     for key in recipients {
         if !recipient_shape(key) {
             return Err(invalid("history recipient must be a public age1 key"));

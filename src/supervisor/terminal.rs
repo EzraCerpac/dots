@@ -80,7 +80,7 @@ pub(super) struct TerminalJob {
 }
 
 impl TerminalJob {
-    pub(super) fn start(join: Option<libc::pid_t>) -> io::Result<Option<Self>> {
+    pub(super) fn start(ctx: &crate::Ctx, join: Option<libc::pid_t>) -> io::Result<Option<Self>> {
         let Some((tty, caller)) = foreground_terminal() else {
             return Ok(None);
         };
@@ -88,7 +88,9 @@ impl TerminalJob {
         if unsafe { libc::tcgetattr(tty.as_raw_fd(), modes.as_mut_ptr()) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        let observer = Command::new(std::env::current_exe()?)
+        let observer = Command::new(ctx.pinned_executable()?)
+            .env_clear()
+            .envs(&ctx.env.vars)
             .arg(OBSERVER)
             .env(OBSERVER_ENV, "1")
             .process_group(join.unwrap_or(0))
@@ -206,11 +208,18 @@ impl TerminalJob {
         let fd = self.tty.as_raw_fd();
         if unsafe { libc::tcgetpgrp(fd) } == self.group() {
             foreground(fd, self.caller)?;
+        }
+        let current = unsafe { libc::tcgetpgrp(fd) };
+        if current == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if current == self.caller {
+            // A child can return foreground itself and still leave changed modes.
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.modes) } == -1 {
                 return Err(io::Error::last_os_error());
             }
+            self.handed_off = false;
         }
-        self.handed_off = false;
         Ok(())
     }
 }

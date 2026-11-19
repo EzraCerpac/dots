@@ -67,13 +67,13 @@ fn write_ready(fd: RawFd, tty: bool, bytes: &[u8]) -> io::Result<Option<usize>> 
 /// The foreground runner owns these writes. A blocked reader never prevents
 /// processing cancellation or finishing the report.
 pub(crate) struct Console<'a> {
-    supervisor: &'a Supervisor,
+    supervisor: &'a Supervisor<'a>,
     fd: RawFd,
     tty: bool,
 }
 
 impl<'a> Console<'a> {
-    pub(super) fn new(supervisor: &'a Supervisor, fd: RawFd) -> Self {
+    pub(super) fn new(supervisor: &'a Supervisor<'a>, fd: RawFd) -> Self {
         Self {
             supervisor,
             fd,
@@ -180,6 +180,10 @@ impl Stream {
 }
 
 impl Pipes {
+    pub(super) fn drained(&self) -> bool {
+        self.streams.iter().all(|stream| stream.input.is_none())
+    }
+
     pub(super) fn take(child: &mut Child) -> io::Result<Self> {
         Ok(Self {
             streams: [
@@ -227,7 +231,7 @@ impl Pipes {
         let mut bytes = [0; 8192];
         let mut capture_error = None;
         loop {
-            let eof = self.streams.iter().all(|stream| stream.input.is_none());
+            let eof = self.drained();
             let pending_output = self.streams.iter().any(|stream| !stream.pending.is_empty());
             match running.poll(eof, pending_output) {
                 Ok(Some(status)) => return capture_error.map_or(Ok(status), Err),

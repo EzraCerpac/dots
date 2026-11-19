@@ -98,12 +98,12 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     let vars = Vars::read(&native.ctx.root)?;
     let expected = state_repo(&vars)?;
     validate_origin(native, &vars, origin)?;
-    let mut recipients = verify_capture_policy(native)?;
+    let configured = verify_capture_policy(native)?;
     let (identity, recovered_keys) = keys::read_identity(native, identity)?;
     let mut local = LocalSettings::read(native)?;
-    let refresh_recipients = recovered_keys.iter().any(|key| !recipients.contains(key));
-    recipients.extend(local.recipients()?);
-    recipients.extend(recovered_keys);
+    let refresh_recipients = recovered_keys.iter().any(|key| !configured.contains(key));
+    let mut recipients = local.recipients()?;
+    recipients.extend(recovered_keys.iter().cloned());
     keys::check_recipients(native, &recipients)?;
     let paths = tracked::restore_paths(native, Some(&branch))?;
     let store = native.store()?;
@@ -219,6 +219,8 @@ pub(super) fn restore(native: &Native<'_, '_>, settings: Restore<'_>) -> Result<
     }
 
     let mut local = LocalSettings::read(native)?;
+    let mut recipients = local.recipients()?;
+    recipients.extend(recovered_keys);
     local.set_history(&branch, &RepoSetting::parse(&raw)?, &identity, &recipients)?;
     local.install(native)?;
     fs::remove_file(store.join(MARKER))
@@ -258,10 +260,6 @@ fn read_sync(store: &Path) -> Result<Option<SyncState>, Fail> {
 }
 
 fn verify_capture_policy(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fail> {
-    #[derive(Deserialize)]
-    struct ConfigFile {
-        path: PathBuf,
-    }
     let mut cmd = native.mise(&["settings", "get", "history.allow_plaintext_history"])?;
     cmd.env("GIT_ALLOW_PROTOCOL", "");
     if native
@@ -274,59 +272,26 @@ fn verify_capture_policy(native: &Native<'_, '_>) -> Result<BTreeSet<String>, Fa
         ));
     }
     let diagnostic = "no verified history recipient configuration; configure [history.encryption].recipients and retry dots restore";
-    let mut cmd = native.mise(&["config", "ls", "--json"])?;
-    cmd.env("GIT_ALLOW_PROTOCOL", "");
-    let files: Vec<ConfigFile> = serde_json::from_slice(&native.output(cmd, diagnostic)?)
-        .map_err(|_| invalid(diagnostic))?;
-    let managed = native.ctx.root.path();
-    // Inspect the native config inventory. This only proves that recipient
-    // configuration exists. Native mise reconciles its own saved policy.
-    for file in files {
-        if file
-            .path
-            .extension()
-            .is_none_or(|extension| extension != "toml")
-            || !file.path.starts_with(managed)
-        {
-            continue;
-        }
-        let source = fs::read_to_string(&file.path).map_err(|_| invalid(diagnostic))?;
-        let config = source
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|_| invalid(diagnostic))?;
-        let mut item = config.as_item();
-        let keys = ["history", "encryption", "recipients"]
-            .into_iter()
-            .all(|name| {
-                if let Some(next) = item.as_table_like().and_then(|table| table.get(name)) {
-                    item = next;
-                    true
-                } else {
-                    false
-                }
-            });
-        if keys {
-            let observed = item
-                .as_array()
-                .ok_or_else(|| invalid(diagnostic))?
-                .iter()
-                .map(|key| {
-                    key.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| invalid(diagnostic))
-                })
-                .collect::<Result<BTreeSet<_>, _>>()?;
-            if observed.is_empty()
-                || observed
-                    .iter()
-                    .any(|recipient| !keys::recipient_shape(recipient))
-            {
-                return Err(invalid(diagnostic));
+    // Native history accepts system and global declarations. The ordinary
+    // config listing also contains project and override files, so read the
+    // managed global local file or ask mise for a specifically scoped file.
+    let mut recipients = LocalSettings::read(native)?.configured_recipients()?;
+    if recipients.is_none() {
+        for scope in ["--global", "--system"] {
+            let mut cmd =
+                native.mise(&["config", "get", scope, "history.encryption.recipients"])?;
+            cmd.env("GIT_ALLOW_PROTOCOL", "");
+            let output = native.probe(cmd, diagnostic)?;
+            if output.status.success() {
+                recipients =
+                    Some(serde_json::from_slice(&output.stdout).map_err(|_| invalid(diagnostic))?);
+                break;
             }
-            return Ok(observed);
         }
     }
-    Err(invalid(diagnostic))
+    recipients
+        .filter(|keys| !keys.is_empty() && keys.iter().all(|key| keys::recipient_shape(key)))
+        .ok_or_else(|| invalid(diagnostic))
 }
 
 struct Recovery<'a, 'run, 'ctx> {

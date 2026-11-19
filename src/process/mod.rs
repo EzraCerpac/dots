@@ -54,13 +54,8 @@ impl Ctx {
         )
     }
 
-    pub(crate) fn command_with_profile(
-        &self,
-        program: impl AsRef<OsStr>,
-        cwd: Cwd<'_>,
-        profile: &OsStr,
-    ) -> Result<Command, Fail> {
-        let bin = self
+    pub(crate) fn pinned_executable(&self) -> io::Result<std::path::PathBuf> {
+        Ok(self
             .root
             .child_bin
             .get_or_init(|| {
@@ -83,12 +78,29 @@ impl Ctx {
             })
             .as_ref()
             .map_err(|error| {
-                Fail::new(
-                    1,
-                    format!("could not keep dots on its children's PATH: {error}"),
+                error.raw_os_error().map_or_else(
+                    || io::Error::new(error.kind(), error.to_string()),
+                    io::Error::from_raw_os_error,
                 )
-            })?;
-        let path = prepend_to_path(bin.path(), self.env.get("PATH"))?;
+            })?
+            .path()
+            .join("dots"))
+    }
+
+    pub(crate) fn command_with_profile(
+        &self,
+        program: impl AsRef<OsStr>,
+        cwd: Cwd<'_>,
+        profile: &OsStr,
+    ) -> Result<Command, Fail> {
+        let pinned = self.pinned_executable().map_err(|error| {
+            Fail::new(
+                1,
+                format!("could not keep dots on its children's PATH: {error}"),
+            )
+        })?;
+        let bin = pinned.parent().expect("pinned dots directory");
+        let path = prepend_to_path(bin, self.env.get("PATH"))?;
         let cwd = match cwd {
             Cwd::Root => self.root.path(),
             Cwd::Caller => self.env.cwd(),

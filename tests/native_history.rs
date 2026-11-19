@@ -976,6 +976,99 @@ fn new_established_restore_can_undo_after_the_configured_recipient_changes() {
 }
 
 #[test]
+fn new_restore_does_not_promote_a_project_only_recipient() {
+    let seed = Fixture::new();
+    let remote = seed.world.bare_remote("private.git");
+    let (selected, public) = seed.key("selected");
+    let url = format!("file://{}", remote.display());
+    seed.configure(&url, &url, &selected, std::slice::from_ref(&public));
+    seed.seed(&remote, FIRST);
+    let tip = seed.tip(&remote, REF);
+
+    let fixture = Fixture::new();
+    let (project_key, project_public) = fixture.key("project");
+    fixture.configure(&url, &url, &selected, std::slice::from_ref(&public));
+    let root = fixture.world.root();
+    let override_file = root.join("config.override.toml");
+    let override_text = format!("[history.encryption]\nrecipients = [{project_public:?}]\n");
+    fs::write(&override_file, &override_text).unwrap();
+    fixture.write(DEFAULT, 0o600);
+    let local_file = root.join("config.local.toml");
+    let original = fs::read_to_string(&local_file).unwrap();
+    let mut without_recipients: toml_edit::DocumentMut = original.parse().unwrap();
+    without_recipients["history"]
+        .as_table_mut()
+        .unwrap()
+        .remove("encryption");
+    fs::write(&local_file, without_recipients.to_string()).unwrap();
+    let refused = fixture.dots(&["restore"], &remote).output().unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{}", messages(&refused));
+    assert!(messages(&refused).contains("configure [history.encryption].recipients"));
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+    assert!(!fixture.store().exists());
+    fs::write(&local_file, original).unwrap();
+
+    ok(&mut fixture.dots(&["restore"], &remote));
+    assert_eq!(fs::read(fixture.active()).unwrap(), FIRST);
+    assert!(
+        fs::read(override_file).unwrap() == override_text.as_bytes(),
+        "restore modified the project override"
+    );
+    let local = fs::read(local_file).unwrap();
+    assert!(
+        contains(&local, public.as_bytes()),
+        "restore lost the selected recipient"
+    );
+    assert!(
+        !contains(&local, project_public.as_bytes()),
+        "restore persisted a recipient from the project override"
+    );
+
+    let store = fixture.store();
+    let commits = text(ok(fixture.git(Some(&store)).args([
+        "rev-list",
+        "refs/heads/main",
+        "--not",
+        &tip,
+    ])));
+    let mut checked = 0;
+    for commit in commits.lines() {
+        let manifest = ok(fixture
+            .git(Some(&store))
+            .args(["show", &format!("{commit}:.mise-history/manifest.json")]))
+        .stdout;
+        assert!(
+            !contains(&manifest, project_public.as_bytes()),
+            "a new checkpoint recorded the project recipient"
+        );
+        let payload = fixture
+            .git(Some(&store))
+            .args(["show", &format!("{commit}:home@host-fixture/app/selected")])
+            .output()
+            .unwrap();
+        if payload.status.success() {
+            assert!(payload.stdout.starts_with(b"mise-encrypted-file-v1\n"));
+            assert!(
+                fixture.can_decrypt(&payload.stdout, &selected),
+                "selected identity could not decrypt a new checkpoint"
+            );
+            assert!(
+                !fixture.can_decrypt(&payload.stdout, &project_key),
+                "project identity decrypted a new checkpoint"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no new encrypted payloads were checked");
+    ok(fixture
+        .mise(&["bootstrap", "dotfiles", "undo", "--yes"])
+        .env("MISE_AGE_IDENTITY_FILES", &selected)
+        .env("GIT_ALLOW_PROTOCOL", ""));
+    assert_eq!(fs::read(fixture.active()).unwrap(), DEFAULT);
+    assert_eq!(seed.tip(&remote, REF), tip);
+}
+
+#[test]
 fn new_first_restore_keeps_an_edit_made_during_native_fetch() {
     let seed = Fixture::new();
     let remote = seed.world.bare_remote("private.git");

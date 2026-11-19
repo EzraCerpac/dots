@@ -1,0 +1,47 @@
+legacy_case	reason
+launcher/menu_test.go.TestFormsBuildLiteralArgsAndValidate	The old menu form fields and validation flow are pending Ezra's design. The CLI keeps literal argument handling.
+launcher/menu_test.go.TestMenuRequiresExplicitRunAndRestoresSelection	The old group-to-form selection and restore flow are pending Ezra's design.
+launcher/menu_test.go.TestEditDoesNotTreatQAsQuit	The old field editor's q key behavior is pending Ezra's design.
+launcher/menu_test.go.TestGuidedTargetsAreSeparateTokens	The old guided multi-value field and backspace handling are pending Ezra's design.
+launcher/menu_test.go.TestProfilesComeFromTheConfiguration	The old profile selector ordering and typed fallback are pending Ezra's design.
+launcher/menu_test.go.TestConfigurationCommandsFollowTheBuiltins	The old final Configuration group and its advanced form are pending Ezra's design. The public command list and dispatch belong to R-01.
+launcher/menu_test.go.TestDiscoverAsksTheManager	The old menu asked the Bash manager for internal profiles and commands. Rust has no separate renderer discovery subprocess.
+ui/commands_test.go.TestStatusInventoryKeepsSelectedAreaAndFooterVisible	The old status dashboard area viewport and footer are retired. Public status prints directly.
+ui/commands_test.go.TestRepeatedOperationReplacesItsRunningRow	The row replacement rule belongs to the old item_upsert-driven UI.
+ui/issue_test.go.TestIssueDetailsShowTheErrorTheLogAndTheNextStep	The old issue details view is pending Ezra's design. The non-interactive up replay test retains the diagnostic, next action and log link.
+ui/issue_test.go.TestNeedsAttentionListShowsTheErrorAndTheNextCommand	The old attention list layout is pending Ezra's design. The non-interactive summary retains the guidance.
+ui/issue_test.go.TestNarrowDashboardWrapsTheErrorInsteadOfCuttingIt	The old narrow issue layout and wrapping are pending Ezra's design.
+ui/issue_test.go.TestAgentHandOffWaitsForTheRunAndNeedsACommand	The retired A shortcut waited for completion and required DOTS_AGENT_COMMAND before handing off.
+ui/issue_test.go.TestAgentGetsTheIssueAsItsLastArgument	The old UI handoff payload fixture is retired with that view. Future interactive handoff requirements belong to P-12 acceptance.
+ui/issue_test.go.TestAgentMessageShowsFromTheIssueListAndTheLog	The old handoff message placement in two views is pending Ezra's design.
+ui/issue_test.go.TestAnItemWithoutOutputDoesNotBorrowAnotherProblemsLog	The old issue list's log lookup is retired. P-11 non-interactive stage attribution verifies that diagnostics stay with their stage.
+ui/model_test.go.TestStageLifecycleAndSelection	The event-driven dashboard model and stage selection are retired. Stage outcomes still appear in public reports.
+ui/model_test.go.TestHoldUntilExitAndNoWait	The held dashboard exit and its --no-wait bypass were removed with that flow.
+ui/model_test.go.TestLogPathStaysWithinRunState	The old model accepted log paths from its event stream. The renderer and input protocol are retired.
+ui/model_test.go.TestCancelIsSentOnce	The old dashboard cancellation key dispatch is pending Ezra's design. P-11 core owns process cancellation.
+ui/model_test.go.TestSearchReadsFullLogAndStripsTerminalControls	The old raw log search model and terminal filtering are pending Ezra's design.
+ui/model_test.go.TestSmallTerminalUsesActualSize	The old view's dimensions and small-terminal layout are pending Ezra's design.
+ui/model_test.go.TestOverviewAndTerminalViews	The old overview and terminal page arrangement is pending Ezra's design.
+ui/model_test.go.TestManualTerminalRequestAndReturn	The old dashboard's stage-terminal request and return actions are pending Ezra's design.
+ui/model_test.go.TestAutomaticHandoffPreventsManualRequests	The old dashboard model's automatic/manual handoff gating is pending Ezra's design.
+ui/model_test.go.TestConcurrentAppStoreDoesNotReplaceMainStage	The old dashboard's concurrent App Store row placement is pending Ezra's design.
+ui/model_test.go.TestAreaOpensChangesBeforeDiagnostics	The old area expansion priority is pending Ezra's design.
+ui/model_test.go.TestSpaceCollapseFromDetailsRestoresAreaOverview	The old Space shortcut and overview selection restore are pending Ezra's design.
+ui/model_test.go.TestLargeExpandedAreaKeepsSelectedChildAndFooterVisible	The old area viewport selection and footer placement are pending Ezra's design.
+ui/model_test.go.TestMiddleChildDetailsReserveHeadingRowInLongArea	The old viewport reserves a heading row for selected detail. Layout is pending Ezra's design.
+ui/model_test.go.TestOverviewShowsSixChangesBeforeTwentyFailures	The old overview's priority and row budget are pending Ezra's design.
+ui/model_test.go.TestNoticeAndStageAttentionDeduplication	The old model deduplicated Go event notices against stage events. The event protocol is retired.
+ui/model_test.go.TestNoticeOnlyMarksSuccessfulRunForAttention	The old dashboard attention model is retired. The plain up suite retains exit-zero attention and replay.
+ui/model_test.go.TestSyncIssuesPreserveDistinctDetails	The old view assembled separate issue details from event notices. Public sync receipt details belong to P-09.
+ui/model_test.go.TestBackKeysReturnOneLevelWithoutCancelling	The old hierarchy and back-key behavior are pending Ezra's design.
+ui/model_test.go.TestAttentionNavigationIncludesNoticesAndKeepsLiveSelection	The old live attention list selection and notice navigation are pending Ezra's design.
+ui/model_test.go.TestCompactAttentionIssuesRemainAccessible	The old compact issue list navigation is pending Ezra's design.
+ui/model_test.go.TestAttentionViewportAndFooterFitTerminal	The old attention viewport and footer geometry are pending Ezra's design.
+ui/model_test.go.TestFinishedRawLogKeepsBackFooterVisible	The old raw log viewer's back-navigation footer is pending Ezra's design.
+ui/outcomes_test.go.TestActionFormattingIncludesChangesWithoutVersions	The old view's action-line formatting is pending Ezra's design. P-04 owns the producer's change classification.
+ui/outcomes_test.go.TestEveryOutcomeRemainsReachableInLongReports	The old report detail navigation through long lists is pending Ezra's design.
+ui/outcomes_test.go.TestAttentionRowFollowsLastArea	The old report browser's attention row order is pending Ezra's design.
+ui/outcomes_test.go.TestOutcomeRefreshKeepsSelectedGroupVisible	The old report selection and refresh policy are pending Ezra's design.
+ui/outcomes_test.go.TestFinishedReportDoesNotClaimUnfinishedStepIsRunning	The old view inferred finished stage states from Go events. The Rust report records outcomes with typed metadata.
+ui/outcomes_test.go.TestExpandedAreaWrapsCompleteRevisionTransitions	The old report area's revision wrapping is pending Ezra's design.
+ui/outcomes_test.go.TestUpOverviewShowsCurrentWorkAndConcreteOutcomes	The old dashboard overview's current-work and outcome rows are pending Ezra's design.

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+version=1.100.0
+bin=$(dirname "$(rustup which --toolchain "$version" rustc)")
+# rustup runs the requested Cargo, but Cargo resolves its compiler and subcommands on PATH.
+export PATH="$bin:$PATH"
+exec rustup run "$version" cargo "$@"

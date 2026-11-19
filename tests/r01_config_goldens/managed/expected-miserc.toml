@@ -1,0 +1,6 @@
+# Early environment selectors
+# Preserve extras
+"env" = ["laptop", "host-demo-machine", "local-extra", "second-extra"]
+
+["env_sets"]
+env = ["other"] # Unrelated selector array

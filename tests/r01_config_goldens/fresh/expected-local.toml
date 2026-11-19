@@ -1,0 +1,11 @@
+[env]
+SETUP_PROFILE = "laptop"
+SETUP_MACHINE_ID = "demo-machine"
+SETUP_HISTORY_ORIGIN = "ssh://git@example.com/dots/history.git"
+
+[settings.history]
+sync = "manual"
+
+[history.origin]
+url = "ssh://git@example.com/dots/history.git"
+branch = "host-demo-machine"

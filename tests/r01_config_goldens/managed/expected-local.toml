@@ -1,0 +1,16 @@
+# Machine-local settings
+["env"] # Environment
+KEEP_FIRST = "first"
+# Selected profile
+SETUP_PROFILE = "laptop"
+# Host identity
+SETUP_MACHINE_ID = "demo-machine"
+KEEP_LAST = "last" # Unrelated value
+SETUP_HISTORY_ORIGIN = "ssh://git@example.com/dots/history.git"
+
+[settings.history]
+sync = "manual" # Keep history sync explicit
+
+[history.origin]
+url = "ssh://git@example.com/dots/history.git"
+branch = "host-demo-machine"

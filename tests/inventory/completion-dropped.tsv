@@ -1,0 +1,3 @@
+legacy_case	reason
+completion.topLevel/menu	The built-in menu was retired. A configuration can use that name.
+completion.frontendOptions/--no-wait	Scrollback no longer waits for a dashboard to close.

@@ -1,0 +1,34 @@
+[package]
+name = "dots-cli"
+version = "1.0.0-rc.1"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+description = "A dotfiles and machine setup manager for mise"
+repository = "https://github.com/EzraCerpac/dots"
+
+[[bin]]
+name = "dots"
+path = "src/main.rs"
+
+[dependencies]
+bzip2 = "0.6.1"
+caseless = "0.2.2"
+clap = "4.6.8"
+flate2 = "1.1.11"
+glob = "0.3.4"
+lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
+nix = { version = "0.32.0", features = ["user"] }
+plist = { version = "1.10.4", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = { version = "0.4.46", default-features = false }
+tempfile = "3.27.0"
+toml_edit = "0.25.19"
+unicode-general-category = "1.1.0"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+zip = { version = "9.7.0", default-features = false, features = ["deflate-flate2"] }
+
+[profile.release]
+panic = "unwind"

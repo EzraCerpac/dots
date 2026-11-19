@@ -1,0 +1,9 @@
+# Machine-local settings
+["env"] # Environment
+KEEP_FIRST = "first"
+"SETUP_PROFILE" = "server" # Selected profile
+"SETUP_MACHINE_ID" = "old-machine" # Host identity
+KEEP_LAST = "last" # Unrelated value
+
+[settings.history]
+sync = "manual" # Keep history sync explicit

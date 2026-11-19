@@ -31,6 +31,7 @@ const OPTIONAL_PATHS: &[&str] = &[
     "DOTS_HOME",
     "DOTS_STAGES",
     "DOTS_CHANGES",
+    "DOTS_UP_STATE_DIR",
     "SETUP_CONFIG_ROOT",
     "XDG_RUNTIME_DIR",
     "GIT_CONFIG_GLOBAL",
@@ -219,6 +220,9 @@ impl<'a> FixtureCommand<'a> {
         }
         for &name in OPTIONAL_PATHS {
             if let Some(path) = value(name).filter(|path| !path.is_empty()) {
+                if name == "DOTS_UP_STATE_DIR" && !Path::new(path).is_absolute() {
+                    return Err(outside(name));
+                }
                 self.check_path(name, &cwd.join(path))?;
             }
         }

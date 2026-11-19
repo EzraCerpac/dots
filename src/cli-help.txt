@@ -21,7 +21,7 @@ Everyday:
 New machines and private settings:
   init [DIR]            Create a configuration and its Git repository
   bootstrap             Set up this machine from the configuration
-  remote HOST           Set up another machine over SSH
+  remote HOST --profile PROFILE  Set up another machine over SSH
   bundle create|check   Encrypt or check private bootstrap inputs
   backup                Save and publish encrypted app settings
   restore               Fetch and restore encrypted app settings

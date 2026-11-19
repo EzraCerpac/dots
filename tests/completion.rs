@@ -850,7 +850,10 @@ impl Session {
     }
 
     fn wait_for(&mut self, marker: &[u8]) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        self.wait_for_until(marker, Instant::now() + Duration::from_secs(10))
+    }
+
+    fn wait_for_until(&mut self, marker: &[u8], deadline: Instant) -> Vec<u8> {
         loop {
             if let Some(start) = self
                 .buffered
@@ -859,7 +862,11 @@ impl Session {
             {
                 return self.buffered.drain(..start + marker.len()).collect();
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
             let tty = self.tty.as_mut().unwrap();
             let mut ready = libc::pollfd {
                 fd: tty.as_raw_fd(),
@@ -878,13 +885,14 @@ impl Session {
                 self.buffered.extend_from_slice(&bytes[..n]);
                 continue;
             }
-            panic!(
-                "{} did not print {:?}\n{}",
-                self.shell,
-                String::from_utf8_lossy(marker),
-                String::from_utf8_lossy(&self.buffered),
-            );
+            break;
         }
+        panic!(
+            "{} did not print {:?}\n{}",
+            self.shell,
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&self.buffered),
+        );
     }
 
     fn expect(&mut self, keys: &[u8], expected: &[&str]) {
@@ -908,6 +916,27 @@ impl Session {
             String::from_utf8_lossy(keys)
         );
     }
+}
+
+#[test]
+fn new_completion_wait_stops_at_the_deadline_with_readable_output() {
+    let world = World::new();
+    let mut command = world.command("/bin/sh");
+    command.args(["-c", "printf fixture-marker; read -r line"]);
+    let mut session = Session::start(command, "deadline fixture");
+    let mut ready = libc::pollfd {
+        fd: session.tty.as_ref().unwrap().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    assert_eq!(unsafe { libc::poll(&mut ready, 1, 10_000) }, 1);
+    assert_ne!(ready.revents & libc::POLLIN, 0);
+    let expired = Instant::now() - Duration::from_secs(1);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.wait_for_until(b"fixture-marker", expired)
+    }));
+    assert!(result.is_err(), "read the marker after the deadline");
+    assert!(session.buffered.is_empty());
 }
 
 fn terminal() -> io::Result<(File, File)> {

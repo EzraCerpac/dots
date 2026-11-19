@@ -232,7 +232,10 @@ mod macos {
     use nix::libc;
     use serde_json::json;
 
-    use crate::targets::{AppInstallation, github_repo, marker_filename};
+    use crate::{
+        packages::{adopt, edit},
+        targets::{AppInstallation, github_repo, marker_filename},
+    };
 
     use super::*;
 
@@ -338,6 +341,7 @@ mod macos {
                 ));
             }
         };
+        let previous_marker = previous.map(|app| adopt::needed(&app.marker)).transpose()?;
         let previous_node = if let Some(app) = previous {
             validate_ownership(ctx, applications, state, app)?;
             metadata(&app.path)?.as_ref().map(node)
@@ -416,7 +420,7 @@ mod macos {
         let backup = directory.path().join(".previous-app");
         let mut backed_up = None;
         let mut installed = false;
-        let mut new_marker = false;
+        let mut retired_marker = None;
         let result = (|| {
             if let Some(app) = previous {
                 validate_ownership(ctx, applications, state, app)?;
@@ -440,31 +444,36 @@ mod macos {
             }
             rename(&stage, &target, libc::RENAME_EXCL).map_err(|err| path_error(&target, err))?;
             installed = true;
-            if same_marker {
-                pending
-                    .persist(&marker)
-                    .map_err(|err| path_error(&marker, err.error))?;
-            } else {
-                pending
-                    .persist_noclobber(&marker)
-                    .map_err(|err| path_error(&marker, err.error))?;
-                new_marker = true;
-                if let Some(app) = previous {
-                    fs::remove_file(&app.marker).map_err(|err| path_error(&app.marker, err))?;
+            #[cfg(test)]
+            tests::before_marker_commit();
+            if let Some((app, expected)) = previous.zip(previous_marker) {
+                if same_marker {
+                    let mut replacement = adopt::Replacement::new(&marker, expected)?;
+                    pending
+                        .persist_noclobber(&replacement.parked)
+                        .map_err(|err| path_error(&marker, err.error))?;
+                    return replacement.install();
                 }
+                retired_marker = Some(adopt::Stashed::new(&app.marker, &expected)?);
             }
+            pending
+                .persist_noclobber(&marker)
+                .map_err(|err| path_error(&marker, err.error))?;
             Ok(())
         })();
 
         if let Err(issue) = result {
-            let marker_restored = !new_marker || fs::remove_file(&marker).is_ok();
+            let issue = edit::rollback(
+                issue,
+                retired_marker.into_iter().map(adopt::Stashed::restore),
+            );
             let stage_restored = !installed
                 || (metadata(&target)
                     .is_ok_and(|meta| meta.as_ref().map(node) == Some(staged_node))
                     && rename(&target, &stage, libc::RENAME_EXCL).is_ok());
             let previous_restored =
                 backed_up.is_none_or(|path| rename(&backup, path, libc::RENAME_EXCL).is_ok());
-            if marker_restored && stage_restored && previous_restored {
+            if stage_restored && previous_restored {
                 return Err(issue);
             }
             let recovery = directory.keep();
@@ -499,6 +508,17 @@ mod macos {
         use super::*;
         use crate::{Env, Flags, config::Root};
         use std::os::unix::fs::symlink;
+
+        thread_local! {
+            static BEFORE_MARKER_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        pub(super) fn before_marker_commit() {
+            if let Some(change) = BEFORE_MARKER_COMMIT.take() {
+                change();
+            }
+        }
 
         fn ctx(config: &Path) -> Ctx {
             let env = Env {
@@ -651,6 +671,43 @@ mod macos {
                     b"upgrade"
                 );
                 assert_eq!(children(&state).unwrap().collect::<Vec<_>>(), [new_marker]);
+            }
+        }
+
+        #[test]
+        fn an_app_upgrade_preserves_a_marker_changed_during_the_swap() {
+            for replacement in ["Tool.app", "Renamed.app"] {
+                let fixture = tempfile::tempdir().unwrap();
+                let applications = fixture.path().join("Applications");
+                let state = fixture.path().join("markers");
+                let old = applications.join("Tool.app");
+                let marker = state.join(marker_filename("Tool.app"));
+                fs::create_dir_all(&state).unwrap();
+                bundle(&old, "example.tool", b"original");
+                let data = json!({"repo": "owner/tool", "path": old, "bundle_id": "example.tool"});
+                fs::write(&marker, data.to_string()).unwrap();
+                let changed = serde_json::to_vec_pretty(&data).unwrap();
+                let (path, bytes) = (marker.clone(), changed.clone());
+                BEFORE_MARKER_COMMIT.set(Some(Box::new(move || fs::write(path, bytes).unwrap())));
+                let source = fixture.path().join("release").join(replacement);
+                bundle(&source, "example.tool", b"upgrade");
+
+                let error = publish(
+                    &ctx(fixture.path()),
+                    &source,
+                    "owner/tool",
+                    &applications,
+                    &state,
+                )
+                .unwrap_err();
+                assert!(error.diagnostic.contains("changed"), "{error}");
+                assert_eq!(fs::read(&marker).unwrap(), changed);
+                assert_eq!(
+                    fs::read(old.join("Contents/MacOS/fixture")).unwrap(),
+                    b"original"
+                );
+                assert_eq!(children(&applications).unwrap().collect::<Vec<_>>(), [old]);
+                assert_eq!(children(&state).unwrap().collect::<Vec<_>>(), [marker]);
             }
         }
 

@@ -1157,6 +1157,8 @@ fn http_requests(tip: &str, exercise: impl FnOnce(String)) -> Vec<String> {
                 }
                 Err(err) => panic!("fixture HTTP accept failed: {err}"),
             };
+            // An accepted socket can inherit the listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();

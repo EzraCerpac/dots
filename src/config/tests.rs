@@ -133,10 +133,8 @@ fn base_vars_keep_raw_strings_and_atomic_doc_edits_keep_the_referent_mode() {
 #[test]
 fn passive_mise_discovers_active_in_root_paths_without_running_env_or_hooks() {
     let (_temp, mut env, root) = fixture();
-    let mut ambient = Env::current().unwrap();
     // Locate the tested installation once, then give the child isolated paths.
-    ambient.vars.remove(std::ffi::OsStr::new("DOTS_MISE_BIN"));
-    let binary = crate::process::mise_binary(&ambient).unwrap();
+    let binary = crate::process::mise_binary(&Env::current().unwrap()).unwrap();
     env.vars
         .insert("DOTS_MISE_BIN".into(), binary.into_os_string());
     env.vars.insert("PATH".into(), "/usr/bin:/bin".into());

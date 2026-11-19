@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod admission_test;
 mod bundle;
 pub(crate) mod bundle_pipe;
 mod private;
@@ -477,10 +479,9 @@ fn stage<T>(
     label: &str,
     action: impl FnOnce(StageId) -> Result<(Outcome, T), Fail>,
 ) -> Option<(Outcome, T)> {
-    if run.cancelled() {
-        return None;
-    }
-    let id = run.start(label);
+    #[cfg(test)]
+    admission_test::at_admission();
+    let id = run.try_start(label)?;
     match action(id) {
         Ok(result) => {
             run.finish(id, result.0);

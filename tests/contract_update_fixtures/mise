@@ -13,6 +13,7 @@ done
 printf '%s\n' "$*" >> "$HOME/mise-calls"
 
 case "$#:$*" in
+    '4:bootstrap dotfiles apply --yes') exit 0 ;;
     '4:bootstrap dotfiles paths --json'|'5:bootstrap dotfiles --local paths --json')
         printf '{"entries":[],"invalid":[]}\n'
         exit 0

@@ -23,7 +23,7 @@ else
 fi
 export DOTS_HOME
 # Built-in commands always win over configuration commands of the same name.
-builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall completions help internal init "
+builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status test bootstrap remote bundle backup restore add remove uninstall completions help internal init "
 
 # The configuration: DOTS_ROOT, else mise's config directory. lib/setup-common.sh
 # applies the same rule; it is repeated here so a bare bin/dots, or one whose
@@ -63,12 +63,10 @@ Your machine setup, from any directory.
   dots atuin-bundle [ARGS...]       Securely prepare the Atuin-only bundle
   dots atuin-login [--browser]     Finish Atuin login, including two-factor/Hub steps
   dots status                     Inspect files, tools and backup health
-  dots plan                       Preview the declared machine setup
   dots test [SUITE...]            Run this repository's tests (python node)
   dots bootstrap [ARGS...]        Install/apply the full declared machine setup
   dots remote HOST --profile ROLE  Bootstrap a machine over existing SSH
   dots bundle create [ARGS...]     Encrypt private bootstrap inputs
-  dots apply [TARGET...]          Apply dotfiles and templates
   dots backup                     Publish encrypted settings snapshots
   dots restore [ARGS...]          Restore private settings
   dots init [DIR]                 Create a minimal dots configuration (never overwrites)
@@ -297,10 +295,10 @@ if (($#)); then shift; fi
 case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 case "$command_name" in
     sync) [[ $# -eq 0 ]] || { echo 'dots: usage: dots sync [--last]' >&2; exit 2; } ;;
-    status|backup|plan) [[ $# -eq 0 ]] || { echo "dots: $command_name takes no arguments" >&2; exit 2; } ;;
+    status|backup) [[ $# -eq 0 ]] || { echo "dots: $command_name takes no arguments" >&2; exit 2; } ;;
 esac
 # Shared flags belong to the frontend, never to the maintenance backend.
-if [[ "$backend_mode" -eq 0 && "$command_name" != up && "$command_name" != update && "$command_name" != plan ]]; then
+if [[ "$backend_mode" -eq 0 && "$command_name" != up && "$command_name" != update ]]; then
     if resolve_renderer; then
         case "$command_name" in
             sync|add) [[ " $frontend_flags " == *' --no-wait '* ]] || frontend_args+=(--no-wait) ;;
@@ -442,18 +440,11 @@ case "$command_name" in
         done
         exec "$mise_bin" -C "$root" exec -- uv run --no-project python "$DOTS_HOME/bootstrap/atuin.py" "${login_args[@]}"
         ;;
-    plan)
-        source "$DOTS_HOME/lib/dots-packages.sh"
-        setup_mise() { MISE_AUTO_INSTALL=0 MISE_EXEC_AUTO_INSTALL=0 run_mise "$@"; }
-        setup_package_inspect plan
-        exit $?
-        ;;
     status|backup|restore) exec_in_setup bash "$DOTS_HOME/tasks/$command_name" "$@" ;;
     test) exec_in_setup bash "$root/tests/run" "$@" ;;
     bootstrap) exec bash "$DOTS_HOME/bootstrap/launch" "$mise_bin" "$root" "$@" ;;
     remote) exec bash "$DOTS_HOME/bootstrap/remote" "$mise_bin" "$root" "$@" ;;
     bundle) exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/bootstrap/bundle.mjs" "$@" ;;
-    apply) exec "$mise_bin" -C "$root" bootstrap dotfiles apply "$@" ;;
     remove|uninstall)
         remove_args=()
         while (($#)); do

@@ -81,7 +81,8 @@ fn update(run: &Run<'_>, mas: bool) {
         return;
     }
     let source = sync::load(ctx);
-    if matches!(source, sync::Loaded::LocalOnly) {
+    let local_only = matches!(source, sync::Loaded::LocalOnly);
+    if local_only {
         run.skip("Sync configuration (no remote configured)");
     } else {
         step(run, "Sync configuration", |id| {
@@ -99,6 +100,19 @@ fn update(run: &Run<'_>, mas: bool) {
     let Some((config, mise, files)) = loaded else {
         return;
     };
+
+    if local_only {
+        step(run, "Apply dotfiles", |id| {
+            let command = mise_command(run, &mise, ["bootstrap", "dotfiles", "apply", "--yes"]);
+            match child(run, id, command, Policy::Ordinary) {
+                Ok(()) => Ok(Outcome::Completed),
+                Err(error) => {
+                    run.issue(id, error);
+                    Ok(Outcome::Deferred)
+                }
+            }
+        });
+    }
 
     let manager = tools::manager_source(ctx, run, &mise, &files);
     let manager_before = manager

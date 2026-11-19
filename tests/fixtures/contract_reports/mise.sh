@@ -14,25 +14,8 @@ case "${1-} ${2-} ${3-}" in
         esac
         ;;
     'bootstrap dotfiles apply')
-        if [ "${RECORD_APPLY+x}" ]; then
-            : > "$RECORD_APPLY" || exit 91
-        fi
         shift 3
-        case " $* " in
-            *' --dry-run '*|' --yes ') exit 0 ;;
-            ' missing-target '|' -- missing-target ')
-                printf 'no such target\n' >&2
-                exit 1
-                ;;
-            *) exit 91 ;;
-        esac
-        ;;
-    'bootstrap plan ')
-        if [ "${EXPECT_PLAN_SELECTOR+x}" ]; then
-            [ "${MISE_CONFIG_DIR-}" = "$DOTS_ROOT" ] &&
-                [ "${MISE_ENV-}" = "$EXPECT_PLAN_SELECTOR" ] || exit 91
-        fi
-        printf 'fixture plan output: preview editor settings\n'
+        case " $* " in *' --dry-run '*|' --yes ') exit 0 ;; *) exit 91 ;; esac
         ;;
     'bootstrap packages status'|'ls --current --json'|'settings ls --all')
         printf '{}\n'

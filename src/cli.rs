@@ -161,22 +161,13 @@ pub fn tree() -> Command {
                 }
             })))))
         .subcommand(sub("status", "Show programs, profile and this machine's state"))
-        .subcommand(sub("plan", "Preview mise's bootstrap plan for this machine"))
-        .subcommand(globals(sub("up", "Checkpoint settings, sync, and update packages, tools, hooks and mise"))
+        .subcommand(globals(sub("up", "Checkpoint settings, apply configuration, and update packages, tools, hooks and mise"))
             .visible_alias("update")
             .arg(flag("mas", "Include Mac App Store updates (macOS)").conflicts_with("last"))
             .arg(flag("last", "Print the last update report")))
         .subcommand(sub("sync", "Share configuration edits and apply others' changes")
             .arg(flag("last", "Replay the latest receipt without the network"))
             .after_help("A sync with valid arguments always exits 0."))
-        .subcommand(sub("apply", "Apply declared dotfiles and templates")
-            .arg(flag("force", "Overwrite conflicting files").short('f'))
-            .arg(flag("dry-run", "Show what would change").short('n'))
-            .arg(flag("yes", "Skip confirmation").short('y'))
-            .arg(flag("prune", "Remove stale dotfiles"))
-            .arg(flag("prompt-secrets", "Prompt for missing template secrets"))
-            .arg(positionals("TARGET"))
-            .after_help("Options are passed to mise."))
         .subcommand(pass_through("test", "Run the configuration's tests/run"))
         .subcommand(scopes(sub("add", "Install software or adopt a dotfile, and record it"),
             "Record in config.toml, for every profile", "Record in config.PROFILE.toml", "Record in FILE")
@@ -691,15 +682,7 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
     };
     if !matches!(
         name,
-        "init"
-            | "bundle"
-            | "brew"
-            | "install-release-app"
-            | "status"
-            | "sync"
-            | "plan"
-            | "apply"
-            | "test"
+        "init" | "bundle" | "brew" | "install-release-app" | "status" | "sync" | "test"
     ) {
         require_config(&ctx.root)?;
     }
@@ -711,8 +694,6 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         "up" if args.get_flag("last") => ui::last(&ctx, args),
         "up" => update::up(&ctx, args),
         "status" => inspect::status(&ctx, args),
-        "plan" => inspect::plan(&ctx, args),
-        "apply" => inspect::apply(&ctx, args),
         "test" => inspect::test(&ctx, tail),
         "retire-dotfiles" => inspect::retire_dotfiles(&ctx, args),
         "exceptions" => exceptions::install(&ctx, args),

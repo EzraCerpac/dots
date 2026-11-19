@@ -291,7 +291,7 @@ fn new_completion_contract_grammar() {
         ("dots ro", &["root"][..]),
         ("dots atuin", &[]),
         ("dots profile --profile se", &["server"]),
-        ("dots reports pl", &["plan"]),
+        ("dots reports pl", &[]),
         ("dots reports rep", &[]),
         ("dots brew admin", &["admin-available"]),
         ("dots --plain --ver", &[]),
@@ -302,9 +302,8 @@ fn new_completion_contract_grammar() {
             &["--skip", "--skip-dirty"],
         ),
         ("dots bootstrap --only=tools comp", &[]),
-        ("dots apply -n --dry", &[]),
-        ("dots apply -ny --yes", &[]),
-        ("dots apply -- --", &[]),
+        ("dots ap", &[]),
+        ("dots pl", &[]),
         ("dots bundle create --from-live", &[]),
         ("dots mise --h", &[]),
         ("dots add --asset glob ", &["https://github.com/"]),
@@ -351,7 +350,7 @@ fn new_completion_uses_the_released_menu_name() {
     world.expect("dots men", &["menu"]);
     world.expect("dots menu --", &[]);
     world.expect("dots --plain men", &[]);
-    world.expect("dots reports pl", &["plan"]);
+    world.expect("dots reports pl", &[]);
     assert!(!world.home.join("config-command-ran").exists());
     assert!(!world.cwd().join("mise-called").exists());
 }

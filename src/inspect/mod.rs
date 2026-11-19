@@ -1,12 +1,10 @@
-use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use serde::de::DeserializeOwned;
 
-use crate::process::Mise;
 use crate::report::Command as Report;
 use crate::run::{Issue, Outcome, Policy, Run, Sink, StageId, exit_code};
-use crate::{Args, Ctx, Fail};
+use crate::{Ctx, Fail};
 
 pub mod packages;
 mod retirement;
@@ -16,87 +14,6 @@ mod test_command;
 pub use retirement::retire_dotfiles;
 pub use status::status;
 pub use test_command::test;
-
-pub fn plan(ctx: &Ctx, _args: &Args) -> Result<u8, Fail> {
-    Ok(with_report(ctx, Report::Plan, |run| {
-        let result = stage(&run, "Bootstrap plan", "dots plan", |stage| {
-            let mise = Mise::new(ctx)?;
-            let scope = packages::Scope::read(&run, &mise)?;
-            let command = scope.scoped(mise.command_active(["bootstrap", "plan"])?, false);
-            run_command(&run, stage, command, "mise bootstrap plan")
-        });
-        run.end(result)
-    }))
-}
-
-pub fn apply(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
-    let mut arguments = Vec::new();
-    for flag in ["force", "dry-run", "yes", "prune", "prompt-secrets"] {
-        if args.get_flag(flag) {
-            arguments.push(format!("--{flag}").into());
-        }
-    }
-    let target_offset = arguments.len();
-    if let Some(targets) = args.get_many::<OsString>("TARGET") {
-        arguments.push("--".into());
-        arguments.extend(targets.cloned());
-    }
-    let rerun = apply_rerun(&arguments, target_offset);
-    Ok(with_report(ctx, Report::Apply, |run| {
-        let run = run.with_rerun(if rerun.starts_with("dots apply") {
-            rerun.clone()
-        } else {
-            "Rerun your original dots apply command with the same arguments.".into()
-        });
-        let result = stage(&run, "Apply dotfiles", &rerun, |stage| {
-            let mise = Mise::new(ctx)?;
-            let native = ["bootstrap", "dotfiles", "apply"]
-                .map(OsString::from)
-                .into_iter()
-                .chain(arguments);
-            run_command(
-                &run,
-                stage,
-                mise.command_active(native)?,
-                "mise bootstrap dotfiles apply",
-            )
-        });
-        run.end(result)
-    }))
-}
-
-fn apply_rerun(arguments: &[OsString], target_offset: usize) -> String {
-    let targets = arguments.get(target_offset + 1..).unwrap_or_default();
-    let marker_needed = targets
-        .iter()
-        .any(|arg| arg.as_encoded_bytes().starts_with(b"-"));
-    let operands = arguments
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != target_offset || marker_needed)
-        .map(|(_, arg)| shell_operand(arg))
-        .collect::<Option<Vec<_>>>();
-    match operands.as_deref() {
-        Some([]) => "dots apply".into(),
-        Some(operands) => format!("dots apply {}", operands.join(" ")),
-        None => "your original dots apply command".into(),
-    }
-}
-
-fn shell_operand(arg: &OsStr) -> Option<String> {
-    let arg = arg
-        .to_str()
-        .filter(|text| !text.chars().any(char::is_control))?;
-    if !arg.is_empty()
-        && arg
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))
-    {
-        Some(arg.to_owned())
-    } else {
-        Some(format!("'{}'", arg.replace('\'', "'\\''")))
-    }
-}
 
 fn with_report(ctx: &Ctx, command: Report, action: impl FnOnce(Run<'_>) -> u8) -> u8 {
     let run = Run::begin(ctx, Sink::Report(command));

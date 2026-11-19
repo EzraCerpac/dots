@@ -29,13 +29,6 @@ var commandOptions = map[string][]option{
 		{name: "--mas", description: "Include Mac App Store updates", group: "update"},
 	},
 	"sync": {{name: "--last", description: "Inspect the previous sync"}},
-	"apply": {
-		{name: "--force", short: "-f", description: "Overwrite conflicting files"},
-		{name: "--dry-run", short: "-n", description: "Preview dotfile changes"},
-		{name: "--yes", short: "-y", description: "Skip confirmation"},
-		{name: "--prune", description: "Remove stale dotfiles deployed by groups"},
-		{name: "--prompt-secrets", description: "Prompt for missing template secrets"},
-	},
 	"publish": {
 		{name: "--all", description: "Publish the unpublished setup stack", group: "publish"},
 		{name: "--bookmark", description: "Publish a private bookmark", group: "publish", value: "text"},

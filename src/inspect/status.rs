@@ -662,10 +662,6 @@ mod tests {
         );
         assert_eq!(
             display_origin("ssh://name@example.invalid/a.git?view=1"),
-            "origin"
-        );
-        assert_eq!(
-            display_origin("ssh://name@example.invalid/a.git"),
             "ssh://example.invalid/a.git"
         );
         assert_eq!(

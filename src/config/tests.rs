@@ -271,17 +271,18 @@ fn a_relative_xdg_state_home_falls_back_to_the_absolute_home() {
 }
 
 #[test]
-fn repository_origins_accept_standard_urls_and_reject_query_parameters() {
+fn repository_origins_preserve_benign_queries_and_redact_errors() {
     use super::RepoSetting;
 
     for value in [
         "https://example.invalid/repo.git",
         "ssh://git@example.invalid/repo.git",
+        "file:///fixture/repo.git?view=full&compression=off",
     ] {
         assert_eq!(RepoSetting::parse(value).unwrap().transport_url(), value);
     }
-    let error = RepoSetting::parse("https://example.invalid/repo.git?auth=fixture").unwrap_err();
-    assert!(error.diagnostic.contains("without query parameters"));
+    let error = RepoSetting::parse("https://example.invalid/repo.git?token=fixture").unwrap_err();
+    assert!(error.diagnostic.contains("carries a password or token"));
     assert!(!error.diagnostic.contains("fixture"));
 }
 

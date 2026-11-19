@@ -10,7 +10,7 @@ Amended 2026-11-19 to cover what source sync writes and publishes, native recove
 Amended 2026-11-19 to cover how directory copies are matched and protected, the groups in a live sync receipt, how far an installer-exception failure reaches, and the recipient check before restore.
 Amended 2026-11-19 to remove `dots publish` and the need for JJ.
 Amended 2026-11-19 to remove `dots plan` and `dots apply`, and to have local-only `dots up` apply the declared dotfiles.
-Amended 2026-11-19 to cover adoption through the installer's `--from`, and sync selecting `dev` in a clean checkout still on `main`.
+Amended 2026-11-19 to cover adoption through the installer's `--from` and its machine ID, sync selecting `dev` in a clean checkout still on `main`, the credential files that `dots add` refuses, and the scope of the remote destination check.
 
 This contract defines `dots` 0.5 as the outside world sees it: its commands, files, settings, environment, output and exit codes.
 Each statement is about 0.5.
@@ -254,7 +254,8 @@ A repository setting is one of a GitHub `OWNER/NAME`, a GitHub URL or another Gi
   `dots` adds no protection to Git's own transport, so a repository that needs authentication belongs on `https://` or SSH, never `http://`.
 
 `dots` hands a URL to Git as a single argument, never through a shell.
-Before any fetch, clone, adoption or push, `dots` resolves the effective fetch URL and every effective push URL after this machine's Git URL rewrites, and does not contact the remote unless each of them matches the expected repository.
+Before `dots` itself fetches, clones, adopts or pushes, it resolves the effective fetch URL and every effective push URL after this machine's Git URL rewrites, and does not contact the remote unless each of them matches the expected repository.
+The installer's `--from` adoption is not `dots` and does not make that check: Git applies the user's `url.*.insteadOf` rewrites to its clone, and afterwards the installer verifies that the checkout's stored local `remote.origin.url` is exactly the requested repository, with `OWNER/NAME` expanded to `https://github.com/OWNER/NAME`.
 For the source repository, the expected one is `dots_source_repo` when set, and otherwise the `origin` URL as configured; for history, it is `dots_state_repo`.
 No URL that `dots` prints, logs or stores contains credentials.
 The source and state repositories are separate and must not resolve to the same repository; `dots` refuses any history push whose destination is the source repository.
@@ -317,7 +318,7 @@ A read-only command never installs a tool.
 | `dots remove`, `dots uninstall` `[SELECTOR] [--dry-run] [--keep-installed] TARGET...` | M, C, report | `--dry-run`: R/O; `--keep-installed`: C only |
 | `dots init [DIR]` | C, (R: an accepted offer creates a GitHub repository and pushes the seed) | [`dots init`](#dots-init-dir) |
 | `dots bootstrap [OPTIONS] [MISE-ARGS...]` | M, C, (D: mise hooks, bootstrap hooks, recipes), report | [`dots bootstrap`](#dots-bootstrap) |
-| `dots bootstrap persist-selected` | C | Called back from a `pre-dotfiles` hook |
+| `dots bootstrap persist-selected` | C | Called by the installer's `--from` adoption, or back from a `pre-dotfiles` hook |
 | `dots bootstrap complete` | M, C, D | Called back from the final `bootstrap` task |
 | `dots remote HOST --profile P [OPTIONS]` | H, report | `--dry-run`: R/O |
 | `dots bundle create OPTIONS` | M, (C when the output is inside the configuration), report | Writes a single encrypted file |
@@ -517,7 +518,9 @@ Changes to packages, tools and the standalone mise come from comparing the state
 
 - The checkout is a plain Git checkout at the root of the repository, with `HEAD` on `dev` and at least one commit.
 - Sync stops with a single line on a detached `HEAD`, on a branch other than `dev` apart from the case below, with a `.jj` directory, or with state left by a pre-0.5 sync layout.
-- `dots bootstrap`, and a shared sync before anything else, move a checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, to `dev`; sync then reports the change of configuration revision, if any.
+- `dots bootstrap`, and a shared sync before anything else, move a checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, to `dev`.
+  Sync first validates the tree of that `dev` against this machine's local files and leaves `main` unchanged when validation fails; after a switch, its receipt opens with one line saying so, and it reports the change of configuration revision, if any.
+  When `origin` has no `dev`, the new `dev` starts at `main` and the run pushes it as described under [Remotes](#remotes).
   Any other shape has to be converted by hand.
 - Sync skips with a single line while a merge, rebase, cherry-pick, revert or bisect is under way, or while another sync of the same repository is running.
 - A lock that a dead process on this host left behind is reclaimed.
@@ -659,13 +662,14 @@ Otherwise it refuses the following, with exit status 2 and no change:
 - a source path with a symlink or a non-directory among its parent directories below `ROOT`, or one that the configuration's Git ignore rules would exclude;
 - a source path that already exists, or that some configuration file in `ROOT` already uses, for whatever profile;
 - a target that some configuration file in `ROOT` already declares;
-- two requests in the same invocation that resolve to one target.
+- two requests in the same invocation that resolve to one target;
+- a credential file, compared without regard to letter case: `~/.netrc`, `~/.git-credentials`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`, `~/.pgpass`, or a file `~/.ssh/id_*` directly in `~/.ssh` whose name does not end in `.pub`.
 
 It then copies the target's bytes and mode to the source, adds the declaration while keeping every other byte, comment and the order of the file, and replaces the target with a symlink to the source.
 If the target changes meanwhile, or any step fails, `dots add` restores the original target, removes the source and declaration it added, never overwrites a file it did not create, and exits 1.
 After an interruption, a rerun either completes the adoption or reports exactly what remains to reconcile.
 The target is then a link, and `dots status` lists it.
-The next sync, which scans the new source first, carries it to other machines.
+The next sync, which scans the new source first, carries it to other machines; if the scan flags the new source, its new declaration stays out of the shared commit as well.
 
 ### `dots remove TARGET...`
 
@@ -765,11 +769,14 @@ When `--restore ID` is in effect, the machine ID is `ID`, and a different persis
 It records `SETUP_HISTORY_ORIGIN` as the history origin when that is set, and keeps any recorded history origin that conflicts with it.
 A full bootstrap is never run from it.
 
-**New in 0.5:** a fresh machine adopts a configuration through the installer's `--from`, in a terminal.
+**New in 0.5:** a fresh machine adopts a configuration through the installer's `--from`.
 The installer clones the repository, its `dev` branch when the remote has one, and checks the profile against `dots_profiles` in the cloned configuration.
 A profile requested with `--profile` must be declared there, and must match a profile the machine has already saved.
-Without one, the saved profile is used, or else the only declared profile; with several, the installer asks.
-A refusal exits with status 2, lists the declared profiles and leaves the cloned checkout in place.
+Without one, the saved profile is used, or else the only declared profile; with several, the installer asks when stdin is a terminal and refuses otherwise.
+A refusal exits with status 2, lists the declared profiles and prints the installer command to run again; the clone stays in place.
+Without a terminal, adoption proceeds only when `MISE_YES=1` is set, and otherwise exits 2 with the same command.
+When the configuration root is already the top of a checkout whose stored `origin` is the requested repository, the installer reuses it, so the same command continues after a failure; any other Git checkout there stops it unchanged, and a root that is not a Git checkout is first moved to `ROOT.before-dots-` followed by a UTC timestamp.
+When the remote has no `dev`, the clone stays on its default branch, and the first shared sync switches it as described under [Checkout shape](#checkout-shape).
 After mise's native bootstrap succeeds, the installer checks the profile again and runs `dots bootstrap persist-selected`, so the profile and machine ID are saved even when the configuration has no hook for that; only then does it select `dots`.
 
 `dots bootstrap complete` runs the following stages, printing a result line for each and a final count:
@@ -1193,7 +1200,7 @@ Publication to the state repository happens only through native `mise bootstrap 
 If native sync exits nonzero after the local save, backup exits 1, reports that the checkpoint was saved locally and that publication is unconfirmed, keeps native stderr private and skips the readback.
 Version 0.4.0 printed `Settings backup published.` whenever native sync exited 0, even with conflicts still waiting to be reconciled.
 **New in 0.5:** after a successful native sync, backup reads the validated remote host branch back once, and reports publication only when the saved checkpoint is that branch's tip or one of its ancestors.
-If reconciliation is pending and the checkpoint is absent, backup exits 1, says that the checkpoint was kept locally and points the user to `mise dot status`.
+If reconciliation is pending and the checkpoint is absent, backup exits 1, says that the checkpoint was kept locally and points the user to `dots mise dot status`.
 If the readback cannot verify publication, backup exits 1, says that the checkpoint was saved locally and points the user to the private history remote to check it.
 The outcome of publication is then left unconfirmed.
 Backup runs native sync once, with no publication retry and no force push.

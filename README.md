@@ -26,8 +26,8 @@ dots sync                              # scan and share your edits, take the oth
 curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | sh
 ```
 
-**Not ready yet:** the installer installs the latest `dots` release, and it needs 0.5.0, which has not been released.
-In a terminal, it finds or installs mise, installs `dots` through mise, links `~/.local/bin/dots` and runs `dots init`.
+**Not ready yet:** the installer installs the latest `dots` release and needs 0.5.0, which has not been released.
+It installs `dots` through mise, installing mise first when needed, links `~/.local/bin/dots`, and in a terminal runs `dots init`.
 
 <details>
 <summary>Set up this machine from your existing repository</summary>
@@ -39,12 +39,16 @@ curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | s
 Each option is optional.
 
 - `--from` takes `OWNER/NAME`, an `https://` URL or an SSH address, with no credentials in it.
-  Instead of running `dots init`, the installer clones the repository, its `dev` branch when there is one, and runs mise's native bootstrap of it.
-  It stops if the configuration directory, normally `~/.config/mise`, is already a Git checkout; anything else there is first moved aside, to `~/.config/mise.before-dots-` followed by the UTC time for the default directory.
+  Instead of running `dots init`, the installer clones the repository and runs mise's native bootstrap of it.
+  It clones `dev` when the remote has that branch, and otherwise the default branch, normally `main`; the first `dots up` then switches the checkout to `dev` and publishes it.
+  Your Git `url.*.insteadOf` rewrites apply to the clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
+- If the configuration directory, normally `~/.config/mise`, is already a checkout of that repository, the installer continues with it, so rerunning the same command after a failure picks up where it stopped.
+  It leaves any other Git checkout there alone and stops; anything else is first moved aside to the same path with `.before-dots-` and the UTC time appended.
 - `--profile` must name a profile that the configuration declares, and match the profile this machine has already saved, if any.
-  Without it, the saved profile is used, or else the only declared one; with several, the installer asks.
-  A refusal exits with status 2, names the declared profiles and leaves the clone in place.
+  Without it, the saved profile is used, or else the only declared one; with several, the installer asks in a terminal and refuses without one.
+  A refusal exits with status 2, names the declared profiles and prints the command to rerun with a declared profile.
 - After the bootstrap succeeds, the installer saves the profile and machine ID on this machine, so the configuration needs no hook for that, and prints `Next: dots up`.
+- Without a terminal, it adopts only with `MISE_YES=1` set for the receiving `sh`; otherwise it exits 2 and prints the command to rerun.
 - `--version X` installs release `X` rather than the latest; `DOTS_VERSION=X`, set for the receiving `sh`, does the same, and the flag wins.
 
 </details>
@@ -52,12 +56,13 @@ Each option is optional.
 <details>
 <summary>What the installer does</summary>
 
-- It uses the mise named by `DOTS_MISE_BIN`, else the one on your `PATH`, in Homebrew's directories or at `~/.local/bin/mise`.
-  When there is none, or it is older than `dots` needs, it installs standalone mise at `~/.local/bin/mise` with the official installer, without `sudo`.
+- It uses the mise named by `DOTS_MISE_BIN`, which must then be new enough, or else `~/.local/bin/mise`, or else the mise on your `PATH`.
+  When there is none, or its version is too old or unreadable, it installs standalone mise at `~/.local/bin/mise` with the official installer, without `sudo`.
   Native packages that a bootstrap installs, for example with apt, may still ask for your password.
 - It selects `dots` with `mise use -g`, which by default writes to `config.local.toml` in mise's configuration directory.
-- It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path, and says what to put on your `PATH` when the launcher would not run first.
-- Without a terminal, it installs and selects `dots` and prints the command to run next in one: `dots init`, or with `--from` the whole installer command again, since it clones and bootstraps only in a terminal.
+- It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path.
+  When the launcher would not run first, it prints the line that puts `~/.local/bin` first on your `PATH`, for `fish` or for other shells.
+- Without a terminal and without `--from`, it installs and selects `dots` and prints `dots init` to run next in a terminal.
 
 </details>
 
@@ -74,7 +79,7 @@ mise use -g github:EzraCerpac/dots@0.5.0
 
 </details>
 
-`dots` runs on macOS and Linux, including WSL, and needs Git and mise 2026.11.8 or newer; with an older mise, it stops and prints the command that updates it.
+`dots` runs on macOS and Linux, including WSL, and needs Git and mise 2026.11.8 or newer; when mise reports an older version, `dots` stops and prints the command that updates it.
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
 A `config.toml` that `dots init` creates declares both in `[tools]`; `init` does not add them to an existing one, so there declare only the ones that are missing and keep any valid declaration already there.
 Once they are declared, `dots up` installs and updates them through mise.
@@ -89,6 +94,7 @@ dots up
 
 `dots init` creates a configuration in mise's configuration directory, normally `~/.config/mise`, and when there is no Git repository, one on branches `main` and `dev`.
 It keeps an existing `config.toml` and only adds what `dots` needs.
+Given another directory, `dots init DIR` ends with `Next: DOTS_ROOT=DIR dots up`, with `DIR` quoted for the shell.
 When it creates the repository in a terminal with `gh` signed in, and `dots_source_repo` is unset or names the proposed one, it offers to create a private GitHub repository; the default is no.
 Otherwise, without `origin`, it prints how to add a remote.
 Until there is a remote, the configuration stays on this machine; see [adding a remote](docs/sync.md#adding-a-remote).
@@ -109,7 +115,7 @@ Machine-local files stay out of the repository, and encrypted settings history l
 - **`dots add`** installs software and records it, or adopts a file.
   It writes to this machine's profile unless you pass `--base` for every machine or `--profile P` for another profile.
   A path starting with `/`, `~/`, `./` or `../` is a file: it moves into the configuration's `dotfiles/` and a link takes its place.
-  It refuses well-known credential files, `~/.netrc`, `~/.git-credentials`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`, `~/.pgpass` and private keys `~/.ssh/id_*`; keep those in an encrypted [bootstrap bundle](docs/contract.md#dots-bundle) instead.
+  It refuses credential files, since dotfiles are shared through Git: `~/.netrc`, `~/.git-credentials`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`, `~/.pgpass` and private keys `~/.ssh/id_*`, in any letter case.
 - **`dots remove`** uninstalls and forgets software, or puts an adopted file back as a regular file.
   `--dry-run` shows what it would do and `--keep-installed` drops only the declaration.
 - **`dots sync`** shares your edits on the `dev` branch after a gitleaks scan and applies what the other machines shared.

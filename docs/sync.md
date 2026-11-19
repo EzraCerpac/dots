@@ -51,6 +51,7 @@ Sync authenticates the way Git already does on the machine, through SSH keys or 
 Those credentials must succeed without prompting; when authentication fails, follow the action the receipt prints.
 Put an authenticated repository behind `https://` or SSH rather than `http://`.
 Before any network contact, `dots` applies this machine's Git URL rewrites to find the real fetch URL and every push URL, and stops if any of them points somewhere other than the expected repository.
+The installer's `--from` works differently: Git applies your rewrites to its clone, and the installer then checks that the checkout's saved `origin` is the repository you named.
 
 Settings history is kept apart, in the private `dots_state_repo` repository.
 `dots` will not push history to the source repository.
@@ -76,8 +77,10 @@ Sync works on one shape only: a plain Git checkout at the repository root, with 
 
 - Sync stops with one line when `HEAD` is detached or on a branch other than `dev`, apart from the clean `main` case below, when the root holds a `.jj` directory, and when Git's directory still holds the legacy `dots-dev.json` record described below.
   The `.jj` check is only a refusal: `dots` neither needs nor runs JJ.
-- The installer's `--from` clones `dev` when the remote has it.
-  A checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, is switched to `dev` by `dots bootstrap`, or by the next shared sync, whose report then lists the change of configuration revision, if any.
+- The installer's `--from` clones `dev` when the remote has it, and otherwise the default branch.
+  A checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, is switched to `dev` by `dots bootstrap`, or by the next shared sync.
+  Before it switches, sync validates the `dev` it would check out against this machine's local files and leaves `main` untouched if that fails; after a switch, its receipt begins with one line saying so.
+  When `origin` has no `dev` yet, sync creates `dev` from `main` and pushes it.
   Every other checkout gets a one-time conversion by hand, which keeps its edits and unpushed commits.
 - Sync skips with one line during a merge, rebase, cherry-pick, revert or bisect, and while another sync holds the lock for the same repository.
   It takes over a lock whose owner died on this host.

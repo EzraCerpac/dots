@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
   workflow_call:
+    outputs:
+      tested-commit:
+        value: ${{ jobs.changes.outputs.tested-commit }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.sha, github.run_id) }}
@@ -29,6 +32,7 @@ jobs:
       code: ${{ steps.classify.outputs.code }}
       full: ${{ steps.classify.outputs.full }}
       matrix: ${{ steps.classify.outputs.matrix }}
+      tested-commit: ${{ steps.tested.outputs.commit }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -41,6 +45,11 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: bash .github/scripts/classify-changes
+      - id: tested
+        if: github.ref_type == 'tag'
+        run: |
+          commit=$(git rev-parse --verify 'HEAD^{commit}')
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   lint:
     name: Rust lint
@@ -103,10 +112,30 @@ jobs:
           compression-level: 0
           retention-days: 2
 
+  mac-pr:
+    name: Rust tests (aarch64-apple-darwin)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'false'
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          target: aarch64-apple-darwin
+      - uses: ./.github/actions/scenario-tools
+      - name: Test
+        run: |
+          export PATH="$GITHUB_WORKSPACE/.github/scripts/scenario-bin:$PATH"
+          for tool in bash zsh fish git jq age age-keygen mise gitleaks; do command -v "$tool"; done
+          bash .github/scripts/run-native-tests aarch64-apple-darwin
+
   mac-build:
     name: Build Cargo tests (${{ matrix.target }})
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
@@ -134,6 +163,7 @@ jobs:
   mac-tests:
     name: Rust tests (${{ matrix.target }} shard ${{ matrix.shard }}/2)
     needs: [changes, mac-build]
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.full == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     strategy:
@@ -225,12 +255,14 @@ jobs:
 
   package:
     name: Package (${{ matrix.platform }})
-    needs: [changes, lint, native, mac-tests, distros, oracle, secrets]
+    needs: [changes, lint, native, mac-pr, mac-build, mac-tests, distros, oracle, secrets]
     if: >-
-      ${{ !cancelled() && needs.lint.result == 'success' && needs.native.result == 'success'
-          && needs.mac-tests.result == 'success' && needs.distros.result == 'success'
-          && needs.secrets.result == 'success'
-          && (needs.changes.outputs.full == 'false' || needs.oracle.result == 'success') }}
+      ${{ !cancelled() && needs.changes.result == 'success'
+          && needs.lint.result == 'success' && needs.native.result == 'success'
+          && needs.distros.result == 'success' && needs.secrets.result == 'success'
+          && ((needs.changes.outputs.full == 'false' && needs.mac-pr.result == 'success')
+              || (needs.changes.outputs.full == 'true' && needs.mac-build.result == 'success'
+                  && needs.mac-tests.result == 'success' && needs.oracle.result == 'success')) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -306,7 +338,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [changes, lint, native, mac-build, mac-tests, distros, oracle, secrets, package, assets, install]
+    needs: [changes, lint, native, mac-pr, mac-build, mac-tests, distros, oracle, secrets, package, assets, install]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
@@ -318,7 +350,11 @@ jobs:
         run: |
           jq -r 'to_entries[] | "- \(.key): \(.value.result)"' <<< "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
           jq -e --arg code "$CODE" --arg full "$FULL" '
+            def expected($selected): if $selected then "success" else "skipped" end;
             .changes.result == "success" and .secrets.result == "success" and
-            .oracle.result == (if $code == "true" and $full == "true" then "success" else "skipped" end) and
-            (del(.changes, .secrets, .oracle) | all(.[]; .result == (if $code == "true" then "success" else "skipped" end)))
+            ."mac-pr".result == expected($code == "true" and $full == "false") and
+            ([."mac-build", ."mac-tests", .oracle] |
+              all(.[]; .result == expected($code == "true" and $full == "true"))) and
+            (del(.changes, .secrets, ."mac-pr", ."mac-build", ."mac-tests", .oracle) |
+              all(.[]; .result == expected($code == "true")))
           ' <<< "$RESULTS"

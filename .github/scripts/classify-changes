@@ -15,7 +15,7 @@ matrix=$(jq -cn --argjson full "$full" '
         {runner:"macos-26", target:"aarch64-apple-darwin", platform:"darwin-arm64"},
         {runner:"macos-15-intel", target:"x86_64-apple-darwin", platform:"darwin-amd64"}
     ] as $mac_all |
-    (if $full then $mac_all else $mac_all[:1] end) as $mac |
+    (if $full then $mac_all else [] end) as $mac |
     {
         linux: {include:$linux},
         mac: {include:$mac},

@@ -23,7 +23,7 @@ else
 fi
 export DOTS_HOME
 # Built-in commands always win over configuration commands of the same name.
-builtin_commands=" menu reports up update sync publish atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall completions help internal init "
+builtin_commands=" menu reports up update sync atuin-bundle atuin-login status plan test bootstrap remote bundle apply backup restore add remove uninstall completions help internal init "
 
 # The configuration: DOTS_ROOT, else mise's config directory. lib/setup-common.sh
 # applies the same rule; it is repeated here so a bare bin/dots, or one whose
@@ -59,7 +59,6 @@ Your machine setup, from any directory.
                                    Sync configuration, then update tools and plugins
   dots sync                       Share configuration and show changed files
   dots sync --last                Inspect the previous sync and its diff (read-only)
-  dots publish [--all | --bookmark NAME]   Open/update a PR from the JJ workspace you are in
   dots atuin-bundle [ARGS...]       Securely prepare the Atuin-only bundle
   dots atuin-login [--browser]     Finish Atuin login, including two-factor/Hub steps
   dots status                     Inspect files, tools and backup health
@@ -96,7 +95,7 @@ progress, --verbose shows full subprocess output, and --last reopens the saved r
 Bare tool names use mise's preferred backend and latest version.
 brew: names prefer formulas and resolve to casks when no formula exists.
 New requests are recorded after installation; failures ask before recording.
-Sync shares public source through dev; publish reviews main-based JJ tasks.
+Sync shares public source through dev.
 Backup publishes only private settings.
 HELP
     local root names name
@@ -418,7 +417,6 @@ case "$command_name" in
         if [[ " $frontend_flags " == *' --verbose '* || "${DOTS_UP_VERBOSE:-0}" == 1 ]]; then sync_args+=(--verbose); fi
         exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/lib/source-repo.mjs" sync "$root" ${sync_args[@]+"${sync_args[@]}"}
         ;;
-    publish) exec "$mise_bin" -C "$root" exec -- node "$DOTS_HOME/tasks/publish.mjs" "$root" "$PWD" "$@" ;;
     atuin-bundle) exec "$mise_bin" -C "$root" exec -- bash "$DOTS_HOME/bootstrap/atuin-bundle" "$@" ;;
     atuin-login)
         login_args=(enroll --root "$root")

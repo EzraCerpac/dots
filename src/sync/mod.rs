@@ -336,7 +336,7 @@ fn synchronize(
     let _lock = RepoLock::try_acquire(&shared.common)
         .or_note("Could not open the source operation lock", GIT)?
         .ok_or(Note::new(
-            "Sync skipped while another sync or publish is running",
+            "Sync skipped while another sync is running",
             "Wait for it to finish, then rerun dots sync.",
         ))?;
     let checked_shape = shape(&git).or_note("Could not recheck the Git checkout", GIT)?;

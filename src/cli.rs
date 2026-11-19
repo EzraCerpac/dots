@@ -10,7 +10,7 @@ use crate::completion::Shell;
 use crate::config::Root;
 use crate::config_commands::Invocation;
 use crate::{Ctx, Env, Fail, Flags, bootstrap, brew, completion, config_commands, exceptions};
-use crate::{history, init, inspect, packages, publish, receipt, skill, sync, ui, update};
+use crate::{history, init, inspect, packages, receipt, skill, sync, ui, update};
 
 const HELP: &str = include_str!("cli-help.txt");
 
@@ -222,10 +222,6 @@ pub fn tree() -> Command {
         .subcommand(sub("backup", "Save and publish encrypted app settings"))
         .subcommand(sub("restore", "Fetch and restore encrypted app settings")
             .arg(flag("initialize-history", "Replace a history store connected elsewhere and keep the old one")))
-        .subcommand(sub("publish", "Open a pull request from a JJ workspace")
-            .arg(flag("all", "Publish the whole current stack").conflicts_with("bookmark"))
-            .arg(value("bookmark", "NAME", "Publish this wip/... bookmark"))
-            .after_help("Without options, publish the one change above main@origin."))
         .subcommand(sub("root", "Print the physical configuration root"))
         .subcommand(sub("profile", "Print or select this machine's profile")
             .arg(profile().requires("machine-id"))
@@ -729,7 +725,6 @@ pub fn run(argv: Vec<OsString>) -> Result<u8, Fail> {
         "backup" => history::backup(&ctx, args),
         "restore" => history::restore_command(&ctx, args),
         "enroll-history" => history::enroll_command(&ctx, args),
-        "publish" => publish::publish(&ctx, args),
         _ => unreachable!("covered by command grammar"),
     }
 }

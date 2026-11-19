@@ -39,7 +39,7 @@ pub(super) fn advise(git: &Git<'_>) -> Result<(), Fail> {
     }
     match RepoLock::is_held(&shape.common_dir) {
         Ok(true) => println!(
-            "Another sync or publish holds the repository lock. Wait for it to finish before running dots sync."
+            "Another sync holds the repository lock. Wait for it to finish before running dots sync."
         ),
         Ok(false) => {}
         Err(err) => println!(

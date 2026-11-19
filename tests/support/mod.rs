@@ -56,11 +56,6 @@ impl World {
             "[user]\nname = Dots Tests\nemail = dots-tests@example.invalid\n",
         )
         .unwrap();
-        fs::write(
-            home.join(".config/jj.toml"),
-            "[user]\nname = 'Dots Tests'\nemail = 'dots-tests@example.invalid'\n",
-        )
-        .unwrap();
         Self {
             _temp: temp,
             base,
@@ -170,8 +165,7 @@ impl World {
             .env("XDG_STATE_HOME", self.home.join(".local/state"))
             .env("GIT_CONFIG_GLOBAL", self.home.join(".gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CEILING_DIRECTORIES", git_ceiling)
-            .env("JJ_CONFIG", self.home.join(".config/jj.toml"));
+            .env("GIT_CEILING_DIRECTORIES", git_ceiling);
         for &(key, relative) in PRIVATE_DIRS {
             command.env(key, self.base.join(relative));
         }

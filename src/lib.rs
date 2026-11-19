@@ -11,7 +11,6 @@ pub mod init;
 pub mod inspect;
 pub mod packages;
 pub mod process;
-pub mod publish;
 pub mod receipt;
 pub mod report;
 pub mod run;

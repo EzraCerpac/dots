@@ -290,6 +290,7 @@ fn new_completion_contract_grammar() {
     for (line, values) in [
         ("dots ro", &["root"][..]),
         ("dots atuin", &[]),
+        ("dots publi", &[]),
         ("dots profile --profile se", &["server"]),
         ("dots reports pl", &["plan"]),
         ("dots reports rep", &[]),

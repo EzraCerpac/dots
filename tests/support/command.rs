@@ -35,7 +35,6 @@ const OPTIONAL_PATHS: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
-    "JJ_CONFIG",
     "CARGO_HOME",
     "MISE_SYSTEM_DIR",
     "MISE_CONFIG_FILE",

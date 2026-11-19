@@ -11,7 +11,6 @@ pub struct Vars {
     pub source_repo: Option<RepoSetting>,
     pub state_repo: Option<RepoSetting>,
     pub self_updating_casks: Vec<String>,
-    pub publish_on_behalf_of: Option<String>,
 }
 
 impl Vars {
@@ -48,7 +47,6 @@ impl Vars {
                 .split_whitespace()
                 .map(str::to_owned)
                 .collect(),
-            publish_on_behalf_of: read("dots_publish_on_behalf_of")?.map(str::to_owned),
         })
     }
 }

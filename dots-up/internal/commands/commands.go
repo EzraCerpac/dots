@@ -22,7 +22,6 @@ var specs = []Spec{
 	{"remote", "Bootstrap remote host", "Setup", "Bootstrap a machine over existing SSH", "scrollback", true, true},
 	{"bundle", "Private bundle", "Setup", "Create or check encrypted bootstrap inputs", "scrollback", true, true},
 	{"test", "Run tests", "Development", "Run repository test suites", "scrollback", false, false},
-	{"publish", "Publish source", "Development", "Review changes and open or update a PR", "scrollback", false, true},
 	{"plan", "Native setup plan", "Advanced", "Print the existing native mise plan", "concise", false, false},
 }
 

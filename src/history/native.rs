@@ -700,7 +700,6 @@ pub(super) mod tests {
             ("GIT_TRACE2_EVENT", world.join("trace-event").into()),
             ("GIT_TRACE_FSMONITOR", world.join("trace-fsmonitor").into()),
             ("GIT_CURL_VERBOSE", "1".into()),
-            ("JJ_CONFIG", home.join("jj.toml").into()),
             ("RUSTUP_HOME", home.join("rustup").into()),
             ("CARGO_HOME", home.join("cargo").into()),
             ("MISE_SYSTEM_CONFIG_DIR", home.join("mise-system").into()),

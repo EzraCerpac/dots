@@ -64,9 +64,9 @@ pub(super) fn recipient(value: &str) -> bool {
     })
 }
 
-fn age(ctx: &Ctx) -> Result<Command, Fail> {
+fn age(ctx: &Ctx, run: &Run<'_>) -> Result<Command, Fail> {
     // Bundle check and create work without a configuration or mise.
-    ctx.command_with_profile("age", Cwd::Caller, "".as_ref())
+    ctx.command_with_profile(run.tool("age"), Cwd::Caller, "".as_ref())
 }
 
 pub(super) fn decrypt(
@@ -75,7 +75,7 @@ pub(super) fn decrypt(
     file: &Path,
     identity: &Path,
 ) -> Result<Bundle, Fail> {
-    let mut command = age(ctx)?;
+    let mut command = age(ctx, run)?;
     command
         .arg("--decrypt")
         .arg("--identity")
@@ -115,7 +115,7 @@ fn create(
     let plaintext = serde_json::to_vec(&document)
         .map_err(|_| Fail::new(1, "could not prepare the private bootstrap JSON input"))?;
     let pipe = BundlePipe::new(&plaintext)?;
-    let mut command = age(ctx)?;
+    let mut command = age(ctx, run)?;
     for key in recipients {
         command.args(["--recipient", key]);
     }

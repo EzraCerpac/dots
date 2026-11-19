@@ -56,14 +56,15 @@ if [ -f /seed/install.sh ]; then
     fi
     MISE_VERSION=$(cat /seed/mise-version)
     DOTS_VERSION=$(cat /seed/dots-version)
-    export MISE_VERSION DOTS_VERSION DOTS_INSTALL_ARCHIVE=/seed/dots.tar.gz
-    curl -fsSL file:///seed/install.sh | sh > "$fixture/installer.log"
+    export MISE_VERSION DOTS_VERSION
+    curl -fsSL file:///seed/install.sh | sh -s -- --archive /seed/dots.tar.gz > "$fixture/installer.log"
     cat "$fixture/installer.log"
-    test ! -e "$MISE_CONFIG_DIR"
+    test ! -e "$MISE_CONFIG_DIR/config.toml"
+    test ! -e "$MISE_CONFIG_DIR/.git"
     test -x "$HOME/.local/bin/mise"
-    test -L "$HOME/.local/bin/dots"
-    tar -xOzf "$DOTS_INSTALL_ARCHIVE" bin/dots > "$fixture/expected-dots"
-    cmp "$fixture/expected-dots" "$HOME/.local/bin/dots"
+    test "$(readlink "$HOME/.local/bin/dots")" = "$MISE_SHIMS_DIR/dots"
+    tar -xOzf /seed/dots.tar.gz bin/dots > "$fixture/expected-dots"
+    cmp "$fixture/expected-dots" "$(mise which dots)"
     test "$(sh -c 'command -v dots')" = "$HOME/.local/bin/dots"
     test "$(sh -c 'dots --version')" = "dots $DOTS_VERSION (mise)"
 

@@ -10,6 +10,9 @@ permissions:
 jobs:
   test:
     uses: ./.github/workflows/rust.yml
+    permissions:
+      actions: read
+      contents: read
 
   release:
     needs: test

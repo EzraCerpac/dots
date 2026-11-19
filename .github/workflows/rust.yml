@@ -354,22 +354,20 @@ jobs:
     name: ci
     if: always()
     needs: [changes, lint, native, mac-pr, mac-build, mac-tests, distros, oracle, secrets, package, assets, install]
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     env:
-      CODE: ${{ needs.changes.outputs.code }}
-      FULL: ${{ needs.changes.outputs.full }}
       RESULTS: ${{ toJSON(needs) }}
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Summarize and check results
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          jq -r 'to_entries[] | "- \(.key): \(.value.result)"' <<< "$RESULTS" >> "$GITHUB_STEP_SUMMARY"
-          jq -e --arg code "$CODE" --arg full "$FULL" '
-            def expected($selected): if $selected then "success" else "skipped" end;
-            .changes.result == "success" and .secrets.result == "success" and
-            ."mac-pr".result == expected($code == "true" and $full == "false") and
-            ([."mac-build", ."mac-tests", .oracle, .package, .assets, .install] |
-              all(.[]; .result == expected($code == "true" and $full == "true"))) and
-            (del(.changes, .secrets, ."mac-pr", ."mac-build", ."mac-tests", .oracle, .package, .assets, .install) |
-              all(.[]; .result == expected($code == "true")))
-          ' <<< "$RESULTS"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" |
+            jq -er -f .github/scripts/check-ci.jq | tee -a "$GITHUB_STEP_SUMMARY"

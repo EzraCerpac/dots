@@ -16,3 +16,8 @@ path = "junit.xml"
 [[profile.ci.overrides]]
 filter = "binary(direct_job_control)"
 test-group = "pty"
+
+# This scenario intentionally waits a minute. Overlap it with other tests.
+[[profile.ci.overrides]]
+filter = "binary(source_dev) & test(=unchanged_hanging_push_times_out)"
+priority = 100

@@ -4,7 +4,7 @@ set -euo pipefail
 case "${RUNNER_OS:-}" in
   Linux)
     packages=()
-    for tool in fish zsh jq rsync; do
+    for tool in zsh jq rsync; do
       if ! command -v "$tool" >/dev/null; then
         packages+=("$tool")
       fi

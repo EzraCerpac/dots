@@ -84,6 +84,12 @@ jobs:
         env:
           PLATFORM: ${{ runner.os == 'macOS' && 'darwin-arm64' || 'linux-amd64' }}
         run: bash .github/scripts/setup-oracle
+      - name: Install the legacy oracle's uv runtime
+        if: matrix.suite == 'oracle'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.9'
+          enable-cache: false
       - name: Run distribution scenarios from the musl archive
         if: contains(fromJSON('["Fedora","Arch","Alpine"]'), matrix.suite)
         run: bash .github/scripts/run-distro

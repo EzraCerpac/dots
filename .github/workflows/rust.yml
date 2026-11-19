@@ -79,7 +79,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             suites: '["native"]'
-          - runner: macos-15
+          - runner: macos-26
             target: aarch64-apple-darwin
             suites: '["1/2","2/2","oracle"]'
           - runner: macos-15-intel

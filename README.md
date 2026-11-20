@@ -73,7 +73,7 @@ Each option is optional.
 <summary>Install with mise instead</summary>
 
 ```sh
-mise use -g github:EzraCerpac/dots@0.5.0
+mise use -g github:EzraCerpac/dots@0.5.1
 ```
 
 `dots --version` prints the version and how it was installed.

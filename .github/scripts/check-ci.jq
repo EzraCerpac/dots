@@ -15,7 +15,6 @@ def group($id; $selected; $names; $placeholder):
     group("mac-pr"; $code and ($full | not); ["Rust tests (aarch64-apple-darwin)"]; null),
     group("mac-build"; $extended; [$matrix.mac.include[] | "Build Cargo tests (\(.target))"]; "Build Cargo tests (${{ matrix.target }})"),
     group("mac-tests"; $extended; [$matrix.shards.include[] | "Rust tests (\(.target) shard \(.shard)/2)"]; "Rust tests (${{ matrix.target }} shard ${{ matrix.shard }}/2)"),
-    group("oracle"; $extended; [$matrix.oracle.include[] | "v0.4.0 oracle (\(.platform))"]; "v0.4.0 oracle (${{ matrix.platform }})"),
     group("package"; $extended; [$matrix.packages.include[] | "Package (\(.platform))"]; "Package (${{ matrix.platform }})"),
     group("assets"; $extended; ["Assemble release assets"]; null),
     group("install"; $extended; [$matrix.packages.include[] | "Test installs (\(.platform))"]; "Test installs (${{ matrix.platform }})")

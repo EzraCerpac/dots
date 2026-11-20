@@ -183,11 +183,13 @@ impl<'a> Git<'a> {
         let mut output = self.output_command(command()?)?;
         if !output.status.success()
             && identity_unknown(&first_stderr(&output))
-            && self
-                .output(["config", "--get", "user.useConfigOnly"])?
-                .status
-                .code()
-                == Some(1)
+            && self.text([
+                "config",
+                "--type=bool",
+                "--default=false",
+                "--get",
+                "user.useConfigOnly",
+            ])? == "false"
         {
             let mut cmd = command()?;
             crate::process::fill_commit_identity(&mut cmd, |ident, defaults| {

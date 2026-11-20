@@ -60,14 +60,34 @@ where
         return Ok(Outcome::Skipped);
     }
     validate(&head, candidate)?;
-    if !clean(&mut git)?
-        || !on_branch(&mut git, b"refs/heads/main\n")?
-        || reference(&mut git, "HEAD")?.as_ref() != Some(&head)
-        || reference(&mut git, "refs/remotes/origin/main")?.as_ref() != Some(&head)
-        || reference(&mut git, "refs/heads/dev")? != local
-        || reference(&mut git, "refs/remotes/origin/dev")? != remote
-    {
-        return Err(failure("Source checkout changed before switching to dev"));
+    let recheck = |git: &mut G| {
+        if !clean(git)?
+            || !on_branch(git, b"refs/heads/main\n")?
+            || reference(git, "HEAD")?.as_ref() != Some(&head)
+            || reference(git, "refs/remotes/origin/main")?.as_ref() != Some(&head)
+            || reference(git, "refs/heads/dev")? != local
+            || reference(git, "refs/remotes/origin/dev")? != remote
+        {
+            return Err(failure("Source checkout changed before switching to dev"));
+        }
+        Ok(())
+    };
+    recheck(&mut git)?;
+    if local.is_none() && remote.is_some() {
+        // Record the upstream before creating dev, without resolving the
+        // cached ref. A failed config write leaves this checkout on main.
+        for (key, value) in [
+            ("branch.dev.remote", "origin"),
+            ("branch.dev.merge", "refs/heads/dev"),
+        ] {
+            if !git(&["config", "--local", "--replace-all", key, value])?
+                .status
+                .success()
+            {
+                return Err(failure("could not set origin/dev as the upstream for dev"));
+            }
+        }
+        recheck(&mut git)?;
     }
     let mut args = vec!["switch", "--quiet", "--no-guess", "--no-overwrite-ignore"];
     args.extend_from_slice(dev);
@@ -78,14 +98,6 @@ where
         || reference(&mut git, "HEAD")?.as_deref() != Some(candidate)
     {
         return Err(failure("dev does not match the verified source revision"));
-    }
-    if local.is_none()
-        && remote.is_some()
-        && !git(&["branch", "--set-upstream-to=refs/remotes/origin/dev", "dev"])?
-            .status
-            .success()
-    {
-        return Err(failure("could not set origin/dev as the upstream for dev"));
     }
     Ok(Outcome::Completed)
 }

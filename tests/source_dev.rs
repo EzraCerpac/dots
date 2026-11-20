@@ -2253,48 +2253,118 @@ fn new_sync_selects_dev_from_a_clean_main_clone() {
     f.clean(&clone);
     f.git(&clone, &["update-ref", tracking, &dev, &main]);
 
+    let private = "keep-local";
+    f.write(&clone, ".git/info/exclude", format!("/{private}\n"));
+    f.write(&clone, private, "ignored local bytes\n");
     let shim = f.tools.join("git");
     let real = sh(&fs::read_link(&shim).unwrap());
     fs::remove_file(&shim).unwrap();
-    let raced = f.scratch.join("tracking-ref-moved-at-switch");
+    let selected = f.scratch.join("selected-dev");
+    let pruned = f.scratch.join("tracking-ref-pruned-at-switch");
     script(
         &shim,
         &format!(
             r#"
 case " $* " in
   *" switch --quiet --no-guess --no-overwrite-ignore "*)
-    {real} update-ref {tracking} {main} {dev}
+    case "${{FIXTURE_DEV_RACE:-}}" in
+      move) {real} update-ref {tracking} {main} {dev} ;;
+      prune) {real} update-ref -d {tracking} {dev}; touch {} ;;
+    esac
     {real} "$@"
     exec {real} rev-parse HEAD > {}
+    ;;
+  *" fetch "*)
+    if [ "${{FIXTURE_DEV_RACE:-}}" = prune ]; then
+      exit 1
+    fi
     ;;
 esac
 exec {real} "$@"
 "#,
-            sh(&raced)
+            sh(&pruned),
+            sh(&selected)
         ),
     );
-    let receipt = f.sync(&clone);
-    assert_eq!(read(&raced), format!("{dev}\n"), "{receipt}");
-    assert_eq!(
+    let upstream = || {
         f.git(
             &clone,
-            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
-        ),
-        tracking
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"],
+        )
+    };
+    let saved_revision = || {
+        let directory = f.world.home().join(".local/state/dots/receipts");
+        let saved = fs::read_dir(directory).unwrap().next().unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&read(&saved.path())).unwrap();
+        stored["receipt"]["adopted_revision"].clone()
+    };
+    for race in ["", "move"] {
+        let receipt = f.sync_env(&clone, &[("FIXTURE_DEV_RACE", race)]);
+        assert_eq!(read(&selected), format!("{dev}\n"), "{receipt}");
+        assert_eq!(upstream(), tracking);
+        has(&receipt, "dev up to date");
+        has(&receipt, "Switched this checkout from main to dev");
+        f.git(&clone, &["switch", "main"]);
+        f.git(&clone, &["branch", "-d", "dev"]);
+    }
+
+    let git_dir = f.git_dir(&clone);
+    let config = fs::read(git_dir.join("config")).unwrap();
+    let lock = git_dir.join("config.lock");
+    put(&lock, "concurrent config writer\n");
+    let refused = f.sync(&clone);
+    has(&refused, "could not set origin/dev as the upstream for dev");
+    absent(&refused, "Switched this checkout from main to dev");
+    assert_eq!(saved_revision(), serde_json::Value::Null);
+    assert_eq!(
+        f.git(&clone, &["branch", "--show-current"]),
+        "main",
+        "{refused}"
     );
-    has(&receipt, "dev up to date");
+    assert_eq!(f.dev_or_head(&clone), main);
+    assert!(f.git(&clone, &["branch", "--list", "dev"]).is_empty());
+    assert!(!clone.join("from-dev").exists());
+    assert_eq!(read(&lock), "concurrent config writer\n");
+    assert_eq!(fs::read(git_dir.join("config")).unwrap(), config);
+    f.clean(&clone);
+    fs::remove_file(&lock).unwrap();
+
+    let retried = f.sync(&clone);
+    has(&retried, "Switched this checkout from main to dev");
+    has(&retried, "dev up to date");
+    assert_eq!(f.tip(&clone), dev);
+    assert_eq!(upstream(), tracking);
+    f.git(&clone, &["switch", "main"]);
+    f.git(&clone, &["branch", "-d", "dev"]);
+
+    let receipt = f.sync_env(&clone, &[("FIXTURE_DEV_RACE", "prune")]);
+    assert!(pruned.exists(), "{receipt}");
+    assert_eq!(read(&selected), format!("{dev}\n"), "{receipt}");
+    assert!(f.git(&clone, &["for-each-ref", tracking]).is_empty());
+    assert_eq!(f.tip(&clone), dev);
+    assert_eq!(f.git(&clone, &["config", "branch.dev.remote"]), "origin");
+    assert_eq!(
+        f.git(&clone, &["config", "branch.dev.merge"]),
+        "refs/heads/dev"
+    );
+    f.git(&clone, &["update-ref", tracking, &dev]);
+    assert_eq!(upstream(), tracking);
     assert_eq!(
         receipt
             .matches("Switched this checkout from main to dev")
             .count(),
         1
     );
+    assert_eq!(saved_revision(), serde_json::json!([main, dev]));
     has(&f.replay(&clone), "Switched this checkout from main to dev");
-    absent(&f.sync(&clone), "Switched this checkout from main to dev");
+    let retry = f.sync(&clone);
+    has(&retry, "dev up to date");
+    absent(&retry, "Switched this checkout from main to dev");
     assert_eq!(f.git(&clone, &["branch", "--show-current"]), "dev");
     assert_eq!(f.tip(&clone), dev);
     assert_eq!(f.git(&clone, &["rev-parse", "main"]), main);
     assert_eq!(read(&clone.join("from-dev")), "published on dev\n");
+    assert_eq!(read(&clone.join(private)), "ignored local bytes\n");
     f.clean(&clone);
 }
 

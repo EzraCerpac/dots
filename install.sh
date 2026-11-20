@@ -122,14 +122,13 @@ while [ "$#" -gt 0 ]; do
             shift 2 ;;
         -h|--help)
             printf '%s\n' 'Usage: sh -s -- [--version VERSION] [--from REPO [--profile PROFILE]] [--archive PATH]' \
-                'Version defaults to DOTS_VERSION or latest. Requires Git and curl.' \
+                    'Version defaults to DOTS_VERSION or the latest GitHub release. Requires Git and curl.' \
                 '--archive PATH is for testing only and takes an absolute local .tar.gz path.'
             exit 0 ;;
         *) fail 'unknown option (see --help).' ;;
     esac
 done
 [ -n "$source" ] || [ -z "$profile" ] || fail '--profile requires --from.'
-case "$version" in *[!a-zA-Z0-9._+-]*) fail 'invalid version.' ;; esac
 case "$(uname -s):$(uname -m)" in
     Darwin:x86_64|Darwin:amd64|Darwin:arm64|Darwin:aarch64|\
     Linux:x86_64|Linux:amd64|Linux:arm64|Linux:aarch64) ;;
@@ -153,19 +152,35 @@ if [ -n "$source" ]; then
         reuse=true
     fi
 fi
+version_hint='Rerun the installer with sh -s -- --version X.Y.Z.'
+if [ "$version" = latest ]; then
+    releases=https://github.com/EzraCerpac/dots/releases
+    redirect=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$releases/latest" 2>/dev/null) ||
+        fail "could not look up the latest GitHub release. $version_hint"
+    version=${redirect#"$releases/tag/"}
+    [ "$version" != "$redirect" ] || fail "GitHub did not redirect to a dots release tag. $version_hint"
+fi
+version=${version#v}
+number='(0|[1-9][0-9]*)'
+identifier="($number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+case "$version" in *[!a-zA-Z0-9.+-]*) fail "expected a dots release version. $version_hint" ;; esac
+printf '%s\n' "$version" | LC_ALL=C grep -Eq \
+    "^$number\\.$number\\.$number(-$identifier(\\.$identifier)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$" ||
+    fail "expected a dots release version. $version_hint"
 tool=github:EzraCerpac/dots@$version
 if [ -n "$archive" ]; then
     case "$archive" in /*.tar.gz) ;; *) fail 'expected an absolute .tar.gz path.' ;; esac
-    [ "$version" != latest ] || version=0.0.0
     tool="http:dots[url=file://$archive]@$version"
 fi
 find_mise
 export DOTS_MISE_BIN="$mise" DOTS_ROOT="$root" PATH="${mise%/*}:$PATH"
+"$mise" -q -C "$HOME" install "$tool"
+dots=$("$mise" -C "$HOME" which --tool "$tool" dots) || fail "mise could not find dots $version."
+reported=$(DOTS_SKILL_LINKS=0 "$dots" --version 2>/dev/null) || fail "could not verify dots $version."
+case "$reported" in "dots $version"|"dots $version ("*")") ;; *) fail "the installed dots did not report version $version." ;; esac
 terminal=false
 if ( : </dev/tty ) 2>/dev/null; then exec </dev/tty; terminal=true; fi
 if [ -n "$source" ]; then
-    "$mise" -q -C "$HOME" install "$tool"
-    dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
     export PATH="${dots%/*}:$PATH"
     (adopt)
 fi
@@ -199,7 +214,6 @@ fi
 if [ -n "$source" ]; then
     printf 'Next: %s up\n' "$display"
 elif "$terminal"; then
-    dots=$("$mise" -C "$HOME" which --tool "$tool" dots)
     "$dots" init
     if [ "$display" != dots ]; then printf 'Next: %s up\n' "$display"; fi
 else

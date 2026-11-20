@@ -44,7 +44,7 @@ where
         (Some(local), Some(remote)) if local == remote => &["dev"][..],
         (Some(local), None) if local == &head => &["dev"],
         (Some(_), _) => return Ok(Outcome::Skipped),
-        (None, Some(_)) => &["--track", "-c", "dev", "refs/remotes/origin/dev"],
+        (None, Some(_)) => &["--no-track", "-c", "dev", &start],
         (None, None) => &["-c", "dev", &start],
     };
     let clean = |git: &mut G| {
@@ -78,6 +78,14 @@ where
         || reference(&mut git, "HEAD")?.as_deref() != Some(candidate)
     {
         return Err(failure("dev does not match the verified source revision"));
+    }
+    if local.is_none()
+        && remote.is_some()
+        && !git(&["branch", "--set-upstream-to=refs/remotes/origin/dev", "dev"])?
+            .status
+            .success()
+    {
+        return Err(failure("could not set origin/dev as the upstream for dev"));
     }
     Ok(Outcome::Completed)
 }

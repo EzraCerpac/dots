@@ -5,6 +5,7 @@ require "tmpdir"
 require "yaml"
 
 jobs = YAML.load_file(".github/workflows/rust.yml").fetch("jobs")
+raise "CI still schedules the frozen oracle" if jobs.key?("oracle")
 aggregate = jobs.fetch("ci")
 raise "ci must depend on every other CI job" unless aggregate.fetch("needs").sort == (jobs.keys - ["ci"]).sort
 step = aggregate.fetch("steps").find { |entry| entry["name"] == "Summarize and check results" }
@@ -68,6 +69,7 @@ Dir.mktmpdir do |dir|
   raise "classifier failed" unless system({ "REF_TYPE" => "tag", "EVENT" => "push", "GITHUB_OUTPUT" => output },
                                           "bash", classifier)
   full_matrix = JSON.parse(File.readlines(output).find { |line| line.start_with?("matrix=") }.split("=", 2).last)
+  raise "full CI still routes to the frozen oracle" if full_matrix.key?("oracle")
   short_matrix = full_matrix.merge(full_matrix.reject { |key, _| key == "linux" }.transform_values { { "include" => [] } })
 
   Dir.mktmpdir do |repo|
@@ -81,6 +83,7 @@ Dir.mktmpdir do |dir|
       %w[src/init/README.md] => %w[code=true full=false],
       %w[skills/dots/SKILL.md] => %w[code=true full=false],
       %w[docs/contract.md] => %w[code=false full=false],
+      %w[Cargo.toml Cargo.lock] => %w[code=true full=true],
       %w[build.rs install.sh] => %w[code=true full=true]
     }
     git.call("init", "-q")
@@ -126,13 +129,13 @@ Dir.mktmpdir do |dir|
     ["ordinary PR", true, false, "CI", 9],
     ["Markdown PR", false, false, "CI", 2],
     ["Markdown main push", false, true, "CI", 2],
-    ["full CI", true, true, "CI", 25],
-    ["reusable Release", true, true, "Release", 25]
+    ["full CI", true, true, "CI", 23],
+    ["reusable Release", true, true, "Release", 23]
   ].each do |label, code, full, workflow, count|
     matrix = full ? full_matrix : short_matrix
     selected = %w[changes secrets]
     selected += %w[lint native distros] if code
-    selected += full ? %w[mac-build mac-tests oracle package assets install] : %w[mac-pr] if code
+    selected += full ? %w[mac-build mac-tests package assets install] : %w[mac-pr] if code
     needs = aggregate.fetch("needs").to_h { |id| [id, { "result" => selected.include?(id) ? "success" : "skipped" }] }
     needs.fetch("changes")["outputs"] = { "code" => code.to_s, "full" => full.to_s, "matrix" => JSON.generate(matrix) }
     prefix = workflow == "Release" ? "test / " : ""
@@ -153,6 +156,10 @@ Dir.mktmpdir do |dir|
     check.call("all selected jobs succeeded", rows, nil)
     check.call("omitted unselected jobs", rows.reject { |row| row["conclusion"] == "skipped" }, nil)
     next unless full && code
+
+    oracle = "v0.4.0 oracle (linux-amd64)"
+    check.call("unexpected frozen oracle", rows + [rows.first.merge("name" => prefix + oracle)],
+               "Unexpected job: #{oracle}")
 
     failed_test = prefix + "Rust tests (aarch64-apple-darwin shard 1/2)"
     failed_rows = rows.map { |row| row["name"] == failed_test ? row.merge("conclusion" => "failure") : row }

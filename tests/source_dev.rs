@@ -2240,7 +2240,48 @@ fn new_sync_selects_dev_from_a_clean_main_clone() {
     assert_eq!(f.dev_or_head(&clone), main);
     assert_eq!(f.tip(&clone), main);
     f.git(&clone, &["branch", "-d", "dev"]);
+
+    let tracking = "refs/remotes/origin/dev";
+    let changed = f.validation_hook(&format!(
+        "git -C {} update-ref {tracking} {main}",
+        sh(&clone)
+    ));
+    let refused = f.sync_env(&clone, &[("FIXTURE_VALIDATE", changed.to_str().unwrap())]);
+    has(&refused, "Source checkout changed before switching to dev");
+    assert_eq!(f.git(&clone, &["branch", "--show-current"]), "main");
+    assert!(f.git(&clone, &["branch", "--list", "dev"]).is_empty());
+    f.clean(&clone);
+    f.git(&clone, &["update-ref", tracking, &dev, &main]);
+
+    let shim = f.tools.join("git");
+    let real = sh(&fs::read_link(&shim).unwrap());
+    fs::remove_file(&shim).unwrap();
+    let raced = f.scratch.join("tracking-ref-moved-at-switch");
+    script(
+        &shim,
+        &format!(
+            r#"
+case " $* " in
+  *" switch --quiet --no-guess --no-overwrite-ignore "*)
+    {real} update-ref {tracking} {main} {dev}
+    {real} "$@"
+    exec {real} rev-parse HEAD > {}
+    ;;
+esac
+exec {real} "$@"
+"#,
+            sh(&raced)
+        ),
+    );
     let receipt = f.sync(&clone);
+    assert_eq!(read(&raced), format!("{dev}\n"), "{receipt}");
+    assert_eq!(
+        f.git(
+            &clone,
+            &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+        ),
+        tracking
+    );
     has(&receipt, "dev up to date");
     assert_eq!(
         receipt
@@ -2493,16 +2534,25 @@ exec {} "$@"
     assert_eq!(f.remote(), before);
     assert_eq!(f.tip(&f.a), before);
 
-    for (content, setting, email, expected) in [
-        ("no identity", None, None, "dots <dots@localhost>"),
+    for (content, config_only, setting, email, expected) in [
+        ("no identity", None, None, None, "dots <dots@localhost>"),
+        (
+            "config only false",
+            Some("false"),
+            None,
+            None,
+            "dots <dots@localhost>",
+        ),
         (
             "name only",
+            Some("off"),
             Some(("user.name", "Fixture Name")),
             None,
             "Fixture Name <dots@localhost>",
         ),
         (
             "configured email",
+            Some("0"),
             Some(("user.email", "config@example.invalid")),
             None,
             "dots <config@example.invalid>",
@@ -2510,10 +2560,14 @@ exec {} "$@"
         (
             "EMAIL only",
             None,
+            None,
             Some("env@example.invalid"),
             "dots <env@example.invalid>",
         ),
     ] {
+        if let Some(value) = config_only {
+            f.git(&f.a, &["config", "user.useConfigOnly", value]);
+        }
         if let Some((key, value)) = setting {
             f.git(&f.a, &["config", key, value]);
         }
@@ -2550,7 +2604,24 @@ exec {} "$@"
         if let Some((key, _)) = setting {
             f.git(&f.a, &["config", "--unset", key]);
         }
+        if config_only.is_some() {
+            f.git(&f.a, &["config", "--unset", "user.useConfigOnly"]);
+        }
     }
+
+    f.git(&f.a, &["config", "user.useConfigOnly", "yes"]);
+    f.seed_identity(&f.a);
+    f.write(&f.a, "text", "configured identity with config only\n");
+    let config = fs::read(f.a.join(".git/config")).unwrap();
+    has(&sync("0", "1", "1", None), "pushed dev");
+    assert_eq!(fs::read(f.a.join(".git/config")).unwrap(), config);
+    assert_eq!(
+        f.git(
+            &f.origin,
+            &["log", "-1", "--format=%an <%ae>%n%cn <%ce>", "dev"]
+        ),
+        "Dots fixture <fixture@example.invalid>\nDots fixture <fixture@example.invalid>"
+    );
 }
 
 struct RunningSync {

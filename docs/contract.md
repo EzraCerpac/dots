@@ -11,6 +11,7 @@ Amended 2026-11-19 to cover how directory copies are matched and protected, the 
 Amended 2026-11-19 to remove `dots publish` and the need for JJ.
 Amended 2026-11-19 to remove `dots plan` and `dots apply`, and to have local-only `dots up` apply the declared dotfiles.
 Amended 2026-11-19 to cover adoption through the installer's `--from` and its machine ID, sync selecting `dev` in a clean checkout still on `main`, the credential files that `dots add` refuses, and the scope of the remote destination check.
+Amended 2026-11-20 to start the `dev` that sync selects at the validated `origin/dev`.
 
 This contract defines `dots` 0.5 as the outside world sees it: its commands, files, settings, environment, output and exit codes.
 Each statement is about 0.5.
@@ -520,6 +521,7 @@ Changes to packages, tools and the standalone mise come from comparing the state
 - Sync stops with a single line on a detached `HEAD`, on a branch other than `dev` apart from the case below, with a `.jj` directory, or with state left by a pre-0.5 sync layout.
 - `dots bootstrap`, and a shared sync before anything else, move a checkout that is still on `main`, exactly at `origin/main`, with no edits and no local `dev` that disagrees, to `dev`.
   Sync first checks that any `dots_source_repo` in the incoming `dev` still matches this checkout's `origin`, and validates the tree of that `dev` against this machine's local files; when either check fails, the checkout stays on `main` and the stopped sync exits 0 like any other.
+  The new `dev` starts at exactly the `origin/dev` commit that passed both checks.
   After a switch, its receipt opens with one line saying so, and it reports the change of configuration revision, if any.
   When `origin` has no `dev`, the new `dev` starts at `main` and the run pushes it as described under [Remotes](#remotes).
   Any other shape has to be converted by hand.

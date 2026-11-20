@@ -81,11 +81,11 @@ mise runs as a child rooted in the configuration, with `MISE_CONFIG_DIR` set to 
 | `miserc.toml` | The selector of this machine's mise environment, mode 0600 | no |
 | `config.local.toml` | The profile, machine ID, history settings and identity settings of this machine, mode 0600 | no |
 | `mise.lock`, `mise.*.lock`, `locks/`, `.setup-state/` | Per-machine files written by mise and by older setups | no |
-| `conf.d/00-dots-manager.toml` | The installer's fallback declaration of `dots`, written only when no configuration file declares it: `latest`, or the exact version requested with `--version` or `DOTS_VERSION`; mise gives `config.toml` precedence over it | no |
+| `conf.d/00-dots-manager.toml` | The fallback declaration of `dots`, written by `dots init` or, after `--from` adoption, by the installer, only when no configuration file declares it: `latest`, or the exact version requested with `--version` or `DOTS_VERSION`; mise gives `config.toml` precedence over it | no |
 
 `dots sync` never shares a machine-local file, and it refuses a merged configuration whose ignore rules would expose one.
 Root `mise.lock` and `mise.*.lock` files are never shared.
-Neither is `conf.d/00-dots-manager.toml`, which is reserved for the installer.
+Neither is `conf.d/00-dots-manager.toml`, which only `dots init` and the installer write.
 Among lockfiles, incoming ignore rules only have to protect those present at the root.
 They must still protect `config.host-*.toml` selectors that do not exist yet.
 
@@ -159,6 +159,9 @@ Every line of output names one item and says whether `init` created, added or ke
 A second run of `init` leaves everything it made before unchanged.
 In every command `init` prints, `DIR` is quoted for the shell.
 If `DIR` is not the root `dots` would select, `init` says so and prints every later `dots` command with `DOTS_ROOT` set, as in `DOTS_ROOT='/path/to/dotfiles' dots up`.
+When the running `dots` was installed through mise, `init` instead ends with
+`Next: env DOTS_ROOT=DIR MISE_CONFIG_DIR=DIR DOTS_MISE_BIN=MISE MISE_EXEC_AUTO_INSTALL=0 MISE -C DIR exec -- dots up`, with `MISE` the mise it used,
+so the configuration in `DIR` selects the `dots` version.
 
 The Git shape is checked first.
 Before writing anything, `init` looks at the repository around `DIR`:
@@ -184,6 +187,9 @@ The steps then run in this order:
    In an existing repository, it commits and stages nothing, keeps every branch and all history, and reports, with its fix, each problem that sync would stop on (see [Checkout shape](#checkout-shape)).
    If `HEAD` is on `main` with commits and no uncommitted changes, and there is neither a local `dev` nor an `origin/dev`, the fix printed is `git -C DIR switch -c dev`; in every other case no branch command is printed.
 7. **Remote.** Described below.
+8. **Manager.** If no configuration file declares `dots` and mise finds no `dots` for `DIR`, `init` writes `conf.d/00-dots-manager.toml` declaring `"github:EzraCerpac/dots"` at `latest`,
+   or at the exact version that `DOTS_VERSION` names, as the installer sets it from `--version`.
+   It refuses when Git tracks that path, adds it to the checkout's Git exclusions unless Git already ignores it, and leaves `config.toml` and every other shared file unchanged.
 
 `init` exits 0 when every step it attempted succeeded, leaving aside the optional remote step.
 

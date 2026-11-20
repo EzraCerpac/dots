@@ -40,24 +40,25 @@ pub(super) fn direct(run: &Run<'_>, mise: &Mise<'_>, files: &[u8]) -> Option<Dir
         tools: Vec<String>,
     }
     let files: Vec<ConfigFile> = serde_json::from_slice(files).ok()?;
-    let names: std::collections::BTreeSet<_> = files
+    let mut names = files
         .iter()
         .flat_map(|file| file.tools.iter().map(String::as_str))
         .filter(|name| crate::config::manager_tool(name))
-        .collect();
-    let mut requests = names.into_iter().filter_map(|name| {
-        // This field comes from mise's effective requests, even when no
-        // version can be resolved. A policy probe must not fetch versions.
-        let cmd =
-            mise_command(run, mise, ["tool", name, "--requested", "--json"]).map(|mut cmd| {
-                cmd.env("MISE_OFFLINE", "1");
-                cmd
-            });
-        let requested: Option<Vec<String>> = json(run, cmd).ok()?;
-        Some((name, requested?))
-    });
-    let (tool, requested) = requests.next()?;
-    if !tool.eq_ignore_ascii_case(TOOL) || requested != ["latest"] || requests.next().is_some() {
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter();
+    let tool = names.next()?;
+    if !tool.eq_ignore_ascii_case(TOOL) || names.next().is_some() {
+        return None;
+    }
+    // This field comes from mise's effective requests, even when no
+    // version can be resolved. A policy probe must not fetch versions.
+    let command =
+        mise_command(run, mise, ["tool", tool, "--requested", "--json"]).map(|mut cmd| {
+            cmd.env("MISE_OFFLINE", "1");
+            cmd
+        });
+    let requested: Option<Vec<String>> = json(run, command).ok()?;
+    if requested?.as_slice() != ["latest"] {
         return None;
     }
 

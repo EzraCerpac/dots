@@ -103,9 +103,13 @@ pub(super) fn update(
         });
         let result = run_and_record(run, id, mise, before, cmd);
         if shims.is_some() {
-            let _ = probe(run, mise_command(run, mise, ["reshim"]));
+            let refresh = probe(run, mise_command(run, mise, ["reshim"]));
+            let outcome = result?;
+            refresh.map_err(|_| issue("mise could not refresh the live tool shims."))?;
+            Ok(outcome)
+        } else {
+            result
         }
-        result
     }) == Some(Outcome::Completed);
 
     let upgraded = installed

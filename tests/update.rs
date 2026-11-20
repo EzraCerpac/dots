@@ -762,6 +762,44 @@ fn new_offline_latest_manager_is_excluded_from_native_install_and_upgrade_unless
 }
 
 #[test]
+fn new_manager_alternate_declaration_keeps_native_handling() {
+    let fixture = Fixture::new();
+    fixture.write("manager-policy", "");
+    fixture.write("alternate-manager", "");
+    fixture.run(0);
+    let calls = fixture.calls();
+    assert!(
+        calls.lines().any(|line| line == "disabled tools "),
+        "{calls}"
+    );
+    assert!(
+        calls.lines().any(|line| line == "upgrade --no-prune"),
+        "{calls}"
+    );
+    assert!(!calls.contains("refresh unfiltered shims"), "{calls}");
+}
+
+#[test]
+fn new_manager_filtered_install_reports_failed_shim_refresh() {
+    let fixture = Fixture::new();
+    fixture.write("manager-policy", "");
+    fixture.write("fail-reshim", "");
+    let report = fixture.run(1);
+    let install = report["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["label"] == "Install declared mise tools")
+        .unwrap();
+    assert_eq!(install["outcome"], "failed");
+    assert_eq!(
+        install["issues"][0]["diagnostic"],
+        "mise could not refresh the live tool shims."
+    );
+    assert!(!fixture.calls().contains("upgrade --no-prune"));
+}
+
+#[test]
 fn new_cancel_reaps_the_configuration_probe_and_its_child() {
     let fixture = Fixture::new();
     fixture.write("block-config-lookup", "");

@@ -29,7 +29,9 @@ case "${1-}" in
                     printf '%s %s\n' "$$" "$helper" > config-ready
                     wait "$helper"
                 fi
-                if [ -f manager-policy ]; then
+                if [ -f alternate-manager ]; then
+                    printf '[{"path":"%s/config.toml","tools":["github:EzraCerpac/dots","http:dots"]}]\n' "$PWD"
+                elif [ -f manager-policy ]; then
                     printf '[{"path":"%s/config.toml","tools":["github:EzraCerpac/dots"]}]\n' "$PWD"
                 else
                     printf '[{"path":"%s/config.toml"}]\n' "$PWD"
@@ -89,7 +91,10 @@ case "${1-}" in
         : > installed
         ;;
     upgrade) printf '%s\n' "$*" >> calls ;;
-    reshim) printf 'refresh unfiltered shims\n' >> calls ;;
+    reshim)
+        printf 'refresh unfiltered shims\n' >> calls
+        [ ! -f fail-reshim ] || exit 74
+        ;;
     settings)
         if [ -f manager-policy ] && [ "$2" = get ]; then
             case "$3" in

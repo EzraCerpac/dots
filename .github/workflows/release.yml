@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    outputs:
+      published-commit: ${{ steps.publish.outputs.commit }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -28,6 +30,7 @@ jobs:
           path: dist
 
       - name: Publish verified assets
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -66,3 +69,105 @@ jobs:
             exit 1
           fi
           gh release create "$TAG" "${assets[@]}" SHA256SUMS dots.rb --verify-tag --title "$TAG" --generate-notes
+          printf 'commit=%s\n' "$TESTED_COMMIT" >> "$GITHUB_OUTPUT"
+
+  crates-io:
+    needs: release
+    if: >-
+      ${{ github.repository == 'EzraCerpac/dots' && github.event_name == 'push'
+          && github.ref_type == 'tag' && needs.release.result == 'success'
+          && needs.release.outputs.published-commit != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check whether crates.io publication is configured
+        id: token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo 'Skipping crates.io publication because CARGO_REGISTRY_TOKEN is unset.' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        if: steps.token.outputs.available == 'true'
+        with:
+          ref: ${{ needs.release.outputs.published-commit }}
+          persist-credentials: false
+      - uses: ./.github/actions/rust-toolchain
+        if: steps.token.outputs.available == 'true'
+        with:
+          target: x86_64-unknown-linux-gnu
+      - name: Publish dots-cli to crates.io
+        if: steps.token.outputs.available == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required}"
+          .mise/rust-cargo publish --locked --registry crates-io
+
+  homebrew-tap:
+    needs: release
+    if: >-
+      ${{ github.repository == 'EzraCerpac/dots' && github.event_name == 'push'
+          && github.ref_type == 'tag' && needs.release.result == 'success'
+          && needs.release.outputs.published-commit != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check whether Homebrew tap publication is configured
+        id: deploy-key
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]]; then
+            echo 'Skipping Homebrew tap publication because HOMEBREW_TAP_DEPLOY_KEY is unset.' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.deploy-key.outputs.available == 'true'
+        with:
+          name: release-archives
+          path: dist
+      - name: Prepare the tap update from the published formula
+        id: formula
+        if: steps.deploy-key.outputs.available == 'true'
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          tap="$RUNNER_TEMP/homebrew-tap"
+          git clone --branch main --single-branch https://github.com/EzraCerpac/homebrew-tap.git "$tap"
+          cp dist/dots.rb "$tap/Formula/dots.rb"
+          git -C "$tap" add -- Formula/dots.rb
+          if git -C "$tap" diff --cached --quiet; then
+            exit 0
+          fi
+          git -C "$tap" -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "Update dots to $TAG"
+          printf 'changed=true\n' >> "$GITHUB_OUTPUT"
+      - name: Push the formula to the tap
+        if: steps.formula.outputs.changed == 'true'
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        shell: bash
+        run: |
+          : "${HOMEBREW_TAP_DEPLOY_KEY:?HOMEBREW_TAP_DEPLOY_KEY is required}"
+          umask 077
+          key=$(mktemp "$RUNNER_TEMP/dots-tap-key.XXXXXX")
+          trap 'rm -f -- "$key"' EXIT
+          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$key"
+          unset HOMEBREW_TAP_DEPLOY_KEY
+
+          # https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+          known_hosts="$RUNNER_TEMP/dots-tap-known-hosts"
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$known_hosts"
+          printf -v GIT_SSH_COMMAND 'ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile=%q -o GlobalKnownHostsFile=/dev/null -i %q' "$known_hosts" "$key"
+          export GIT_SSH_COMMAND
+          git -C "$RUNNER_TEMP/homebrew-tap" push git@github.com:EzraCerpac/homebrew-tap.git HEAD:refs/heads/main

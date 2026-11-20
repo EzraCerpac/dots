@@ -3,8 +3,8 @@
 
 # Reviewed source of the tap's Formula/dots.rb. For each release,
 # packaging/build-release renders this file with the release's version and
-# checksums into the dots.rb release asset. Nothing pushes it to the tap: copy
-# that asset by hand to Formula/dots.rb in EzraCerpac/homebrew-tap. Keep the
+# checksums into the dots.rb release asset. The release workflow copies that
+# asset to Formula/dots.rb in EzraCerpac/homebrew-tap after publication. Keep the
 # platform comment at the end of each sha256 line: the renderer matches on it.
 class Dots < Formula
   desc "Keep machines in the state a mise configuration declares"

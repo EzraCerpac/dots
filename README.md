@@ -87,6 +87,23 @@ mise use -g github:EzraCerpac/dots@0.5.1
 
 </details>
 
+<details>
+<summary>Install with Cargo or Homebrew instead</summary>
+
+```sh
+cargo install dots-cli --locked
+cargo binstall dots-cli
+brew install EzraCerpac/tap/dots
+```
+
+The crate is named `dots-cli` and installs the `dots` command.
+`cargo install` builds it from source and needs Rust 1.100 or newer;
+`cargo binstall`, if you already have that plugin, downloads the release archive instead.
+The Homebrew formula installs Git but not mise, so install mise as well.
+`dots --version` then prints the installed version.
+
+</details>
+
 `dots` runs on macOS and Linux, including WSL, and needs Git and mise 2026.11.8 or newer; when mise reports an older version, `dots` stops and prints the command that updates it.
 Sharing changes needs [gitleaks](https://github.com/gitleaks/gitleaks), and encrypted settings need [age](https://age-encryption.org).
 A `config.toml` that `dots init` creates declares both in `[tools]`; `init` does not add them to an existing one, so there declare only the ones that are missing and keep any valid declaration already there.

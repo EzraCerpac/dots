@@ -6,10 +6,28 @@ rust-version = "1.100"
 license = "MIT"
 description = "A dotfiles and machine setup manager for mise"
 repository = "https://github.com/EzraCerpac/dots"
+publish = ["crates-io"]
 
 [[bin]]
 name = "dots"
 path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "bin/{ bin }"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/dots-{ version }-darwin-amd64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/dots-{ version }-darwin-arm64.tar.gz"
+
+# The Linux release archives are static musl builds, including for GNU hosts.
+[package.metadata.binstall.overrides.'cfg(all(target_os = "linux", target_arch = "x86_64", any(target_env = "gnu", target_env = "musl")))']
+pkg-url = "{ repo }/releases/download/v{ version }/dots-{ version }-linux-amd64.tar.gz"
+
+[package.metadata.binstall.overrides.'cfg(all(target_os = "linux", target_arch = "aarch64", any(target_env = "gnu", target_env = "musl")))']
+pkg-url = "{ repo }/releases/download/v{ version }/dots-{ version }-linux-arm64.tar.gz"
 
 [dependencies]
 bzip2 = "0.6.1"

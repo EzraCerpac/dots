@@ -138,7 +138,11 @@ fn ensure_profiles(path: &Path) -> Result<bool, Fail> {
     Ok(true)
 }
 
-fn candidate(path: &Path, contents: &[u8], mode: u32) -> io::Result<tempfile::NamedTempFile> {
+pub(super) fn candidate(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> io::Result<tempfile::NamedTempFile> {
     let mut temp = tempfile::NamedTempFile::new_in(path.parent().expect("absolute file path"))?;
     temp.write_all(contents)?;
     temp.as_file()

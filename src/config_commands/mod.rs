@@ -1,7 +1,7 @@
 mod version;
 
 pub use version::version;
-pub(crate) use version::{ExecutableOrigin, PIN_PREFIX};
+pub(crate) use version::{ExecutableOrigin, PIN_PREFIX, mise_installs};
 
 use std::ffi::OsString;
 use std::fs;

@@ -58,12 +58,19 @@ Each option is optional.
 - It uses the mise named by `DOTS_MISE_BIN`, which must then be new enough, or else `~/.local/bin/mise`, or else the mise on your `PATH`.
   When there is none, or its version is too old or unreadable, it installs standalone mise at `~/.local/bin/mise` with the official installer, without `sudo`.
   Native packages that a bootstrap installs, for example with apt, may still ask for your password.
-- It selects `dots` with `mise use -g`, which by default writes to `config.local.toml` in mise's configuration directory.
+- It installs the newest release, or the one `--version` or `DOTS_VERSION` names, as an exact version and verifies the executable.
+- After `dots init` or `--from` adoption succeeds, if no configuration file declares `dots`, `dots init` or the installer records one fallback declaration in `conf.d/00-dots-manager.toml` in the configuration directory: `latest`, or the exact version you requested.
+  That file stays on this machine, and a declaration in `config.toml` takes precedence over it.
+  A configuration that already declares `dots` gets nothing written.
 - It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path.
 - In a terminal without `--from`, it runs `dots init` and passes its output through unchanged.
-  Without a terminal, it prints the `dots init` command to run in one instead.
+  Without a terminal, it never runs `dots init`; it prints the command to run in a terminal instead,
+  which names the verified executable by its absolute path and sets `DOTS_ROOT`, `DOTS_MISE_BIN` and `DOTS_VERSION`, quoted for the shell.
 - Each command it prints for you is plain `dots` when that already reaches the new installation.
-  Otherwise it names the launcher or the shim by its absolute path, quoted for the shell, and it sets a quoted `DOTS_ROOT` when the configuration is not in mise's default directory; after `dots init`, the installer then adds its own `Next:` line.
+  Otherwise it names `~/.local/bin/dots` or the shim by its absolute path, quoted for the shell.
+  When the configuration is not in mise's default directory, it sets both `DOTS_ROOT` and `MISE_CONFIG_DIR` and runs the shim through `mise -C` in that directory, all quoted,
+  so the shim loads that configuration and the project you run it from cannot select a different `dots` version.
+  After `dots init`, the installer then adds its own `Next:` line.
 - As it exits, it prints `PATH` advice on stderr, after the command: the line that puts `~/.local/bin` first, for `fish` or other shells, or, when something else is at `~/.local/bin/dots`, how to run the installed `dots` alongside it.
   Follow that advice for new shells; the printed command works without it.
 
@@ -95,7 +102,8 @@ dots up
 
 `dots init` creates a configuration in mise's configuration directory, normally `~/.config/mise`, and when there is no Git repository, one on branches `main` and `dev`.
 It keeps an existing `config.toml` and only adds what `dots` needs.
-Given another directory, `dots init DIR` ends with `Next: DOTS_ROOT=DIR dots up`, with `DIR` quoted for the shell.
+Given another directory, `dots init DIR` ends with `Next: DOTS_ROOT=DIR dots up`, with `DIR` quoted for the shell;
+a `dots` installed through mise instead ends with a `Next:` line that runs `dots up` through `mise -C DIR`, so that configuration selects the `dots` version.
 When it creates the repository in a terminal with `gh` signed in, and `dots_source_repo` is unset or names the proposed one, it offers to create a private GitHub repository; the default is no.
 Otherwise, without `origin`, it prints how to add a remote.
 Until there is a remote, the configuration stays on this machine; see [adding a remote](docs/sync.md#adding-a-remote).

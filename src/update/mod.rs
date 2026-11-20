@@ -1,4 +1,5 @@
 mod app_store;
+mod manager;
 mod packages;
 mod tools;
 
@@ -145,10 +146,11 @@ fn update(run: &Run<'_>, mas: bool) {
             }
         }
 
-        let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise);
+        let direct = manager::direct(run, &mise, &files);
+        let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise, direct.as_ref());
 
         if !validate_configuration(ctx, run) {
-            return false;
+            return None;
         }
         if !run.cancelled()
             && let Err(error) = exceptions::run(run, &config.exceptions, exceptions::Mode::Update)
@@ -157,7 +159,7 @@ fn update(run: &Run<'_>, mas: bool) {
         }
 
         if !validate_configuration(ctx, run) {
-            return false;
+            return None;
         }
         if !run.cancelled() {
             match hooks::list(&ctx.root, hooks::Dir::Update, &config.vars, &config.profile) {
@@ -175,7 +177,7 @@ fn update(run: &Run<'_>, mas: bool) {
                             },
                         );
                         if !validate_configuration(ctx, run) {
-                            return false;
+                            return None;
                         }
                     }
                 }
@@ -184,15 +186,19 @@ fn update(run: &Run<'_>, mas: bool) {
                 }
             }
         }
-        true
+        Some(direct)
     });
 
-    if !valid {
+    let Some(direct) = valid else {
         return;
-    }
+    };
 
     tools::update_mise(ctx, run, &mise);
-    tools::report_manager(ctx, run, &mise, manager, manager_before);
+    if let Some(direct) = direct {
+        manager::update(ctx, run, direct);
+    } else {
+        tools::report_manager(ctx, run, &mise, manager, manager_before);
+    }
     step(run, "Post-update settings checkpoint", |id| {
         checkpoint(ctx, run, id)
     });

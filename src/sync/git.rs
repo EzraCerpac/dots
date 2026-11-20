@@ -284,7 +284,8 @@ pub(super) fn relative(path: &[u8]) -> io::Result<PathBuf> {
 }
 
 pub(super) fn local(path: &Path) -> bool {
-    let Some(Component::Normal(first)) = path.components().next() else {
+    let mut parts = path.components();
+    let Some(Component::Normal(first)) = parts.next() else {
         return false;
     };
     // These root names can select the same on-disk file on macOS.
@@ -294,6 +295,9 @@ pub(super) fn local(path: &Path) -> bool {
         b"miserc.toml" | b"config.local.toml" | b"mise.lock" | b"locks" | b".setup-state"
     ) || (first.starts_with(b"config.host-") && first.ends_with(b".toml"))
         || (first.starts_with(b"mise.") && first.ends_with(b".lock"))
+        || (first == b"conf.d"
+            && matches!(parts.next(), Some(Component::Normal(name))
+                if name.as_bytes().eq_ignore_ascii_case(b"00-dots-manager.toml")))
 }
 
 pub(super) fn oid(raw: &[u8]) -> io::Result<String> {

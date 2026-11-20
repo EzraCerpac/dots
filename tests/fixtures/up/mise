@@ -29,7 +29,13 @@ case "${1-}" in
                     printf '%s %s\n' "$$" "$helper" > config-ready
                     wait "$helper"
                 fi
-                printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                if [ -f alternate-manager ]; then
+                    printf '[{"path":"%s/config.toml","tools":["github:EzraCerpac/dots","http:dots"]}]\n' "$PWD"
+                elif [ -f manager-policy ]; then
+                    printf '[{"path":"%s/config.toml","tools":["github:EzraCerpac/dots"]}]\n' "$PWD"
+                else
+                    printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                fi
                 ;;
             get)
                 for last; do :; done
@@ -58,8 +64,21 @@ case "${1-}" in
         if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
         if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
         ;;
+    tool)
+        [ "$*" = 'tool github:EzraCerpac/dots --requested --json' ]
+        [ "${MISE_OFFLINE:-}" = 1 ]
+        printf '["latest"]\n'
+        ;;
+    --locked)
+        [ "$*" = '--locked ls --current --json github:EzraCerpac/dots' ]
+        if [ -f manager-locked ]; then cat manager-locked; else printf '[]\n'; fi
+        ;;
     install)
         printf 'install tools\n' >> calls
+        if [ -f manager-policy ]; then
+            printf 'disabled tools %s\n' "${MISE_DISABLE_TOOLS:-}" >> calls
+            printf 'install shims %s\n' "${MISE_SHIMS_DIR:-}" >> calls
+        fi
         if [ -f expect-store-overlap ]; then
             attempts=0
             until [ -f store-started ]; do
@@ -72,7 +91,20 @@ case "${1-}" in
         : > installed
         ;;
     upgrade) printf '%s\n' "$*" >> calls ;;
+    reshim)
+        printf 'refresh unfiltered shims\n' >> calls
+        [ ! -f fail-reshim ] || exit 74
+        ;;
     settings)
+        if [ -f manager-policy ] && [ "$2" = get ]; then
+            case "$3" in
+                locked) printf 'false\n' ;;
+                disable_tools) printf '["unrelated"]\n' ;;
+                offline) printf 'true\n' ;;
+                *) exit 1 ;;
+            esac
+            exit 0
+        fi
         if [ -f package-settings.json ]; then
             cat package-settings.json
         else

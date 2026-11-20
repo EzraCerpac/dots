@@ -149,23 +149,8 @@ fn installer(exe: &Path, env: &Env) -> &'static str {
         return "homebrew";
     }
 
-    let mise_data = env
-        .get("MISE_DATA_DIR")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            env.get("XDG_DATA_HOME")
-                .filter(|path| !path.is_empty())
-                .map(|path| Path::new(path).join("mise"))
-        })
-        .or_else(|| env.home().map(|home| home.join(".local/share/mise")));
-    let mise_installs = env
-        .get("MISE_INSTALLS_DIR")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| mise_data.map(|dir| dir.join("installs")));
-    let in_mise_data = mise_installs
-        .and_then(|dir| env.cwd().join(dir).canonicalize().ok())
+    let in_mise_data = mise_installs(env)
+        .and_then(|dir| dir.canonicalize().ok())
         .is_some_and(|dir| exe.starts_with(dir));
     let in_mise_layout = components
         .windows(2)
@@ -196,4 +181,22 @@ fn installer(exe: &Path, env: &Env) -> &'static str {
         }
     }
     "other"
+}
+
+pub(crate) fn mise_installs(env: &Env) -> Option<PathBuf> {
+    let mise_data = env
+        .get("MISE_DATA_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env.get("XDG_DATA_HOME")
+                .filter(|path| !path.is_empty())
+                .map(|path| Path::new(path).join("mise"))
+        })
+        .or_else(|| env.home().map(|home| home.join(".local/share/mise")));
+    env.get("MISE_INSTALLS_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| mise_data.map(|dir| dir.join("installs")))
+        .map(|dir| env.cwd().join(dir))
 }

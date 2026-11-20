@@ -326,6 +326,31 @@ fn new_init_uses_git_identity_under_the_seed_commit_policy() {
 }
 
 #[test]
+fn new_init_ignores_the_machine_local_manager_fallback_and_preserves_existing_config() {
+    let world = World::new();
+    let root = fresh(&world);
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join(".gitignore"),
+        "/config.local.toml\n/miserc.toml\n",
+    )
+    .unwrap();
+    let config = b"# existing configuration\n[vars]\ndots_profiles = 'default'\n";
+    fs::write(root.join("config.toml"), config).unwrap();
+
+    let fragment = "conf.d/00-dots-manager.toml";
+    success(init(&world, &root));
+    assert_eq!(fs::read(root.join("config.toml")).unwrap(), config);
+    assert!(
+        fs::read_to_string(root.join(fragment))
+            .unwrap()
+            .contains("\"github:EzraCerpac/dots\" = \"latest\"")
+    );
+    git(&world, &root, &["check-ignore", "-q", fragment]);
+    assert!(!git(&world, &root, &["add", "--dry-run", "--all"]).contains(fragment));
+}
+
+#[test]
 fn new_noninteractive_init_seeds_both_branches_locally_and_never_calls_gh() {
     let world = World::new();
     let root = fresh(&world);

@@ -2,6 +2,7 @@
 /miserc.toml
 /config.local.toml
 /config.host-*.toml
+/conf.d/00-dots-manager.toml
 /mise.lock
 /mise.*.lock
 /locks/

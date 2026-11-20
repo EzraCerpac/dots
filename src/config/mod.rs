@@ -24,6 +24,18 @@ use tempfile::TempDir;
 use crate::{Env, Fail};
 pub(crate) use path::physical;
 
+pub(crate) const MANAGER_FALLBACK: &str = "conf.d/00-dots-manager.toml";
+
+pub(crate) fn manager_tool(name: &str) -> bool {
+    matches!(name, "dots" | "http:dots" | "cargo:dots-cli")
+        || name
+            .strip_prefix("https://github.com/")
+            .or_else(|| name.split_once(':').map(|(_, repository)| repository))
+            .and_then(crate::targets::github_repo)
+            .as_deref()
+            == Some("ezracerpac/dots")
+}
+
 #[derive(Debug)]
 pub struct Root {
     path: PathBuf,

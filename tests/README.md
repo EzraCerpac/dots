@@ -39,7 +39,6 @@ So put each tool's real executable in a directory on `PATH` before running Cargo
 CI does this with `.github/scripts/setup-scenario-tools`, which installs pinned `mise`, `age`, `age-keygen`, `gitleaks` and `fish` under one prefix and puts its `bin` directories on `PATH`.
 
 These are test needs only: what the `dots` executable needs at run time is listed in [Platforms and programs](../docs/contract.md#platforms-and-programs).
-The archived v0.4.0 oracle jobs also need `node`, `python3` and `uv`; ordinary runs do not.
 
 ## Run and count cases
 
@@ -59,8 +58,7 @@ On DriehuisNAS, run each test command through `mise run nas:build --`.
 
 In CI, a pull request into `main` that changes code runs the Linux tests and one ARM macOS test job, and skips packaging.
 A pull request that touches `packaging/**`, `.github/workflows/**`, `.github/scripts/**`, `.github/actions/**`, `Cargo.toml` or `Cargo.lock`, and every code push to `main` and every tag, takes the full route instead.
-The full route adds sharded ARM and Intel macOS tests, the archived v0.4.0 oracle jobs on x86_64 Linux and ARM macOS, all four package jobs and real install checks.
-Only the oracle jobs install the legacy prerequisites.
+The full route adds sharded ARM and Intel macOS tests, all four package jobs and real install checks.
 
 Name a case `unchanged_` when v0.4.0 passes it too,
 and `new_` when it covers behaviour that v0.4.0 lacks.

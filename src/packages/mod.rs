@@ -21,6 +21,7 @@ use crate::run::{Issue, Outcome, Policy, Run, Sink, StageId};
 use crate::targets::Scope;
 use crate::{Args, Ctx, Fail};
 
+pub(crate) use adopt::rename_noclobber;
 pub use github::install_release_app;
 
 pub fn add(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {

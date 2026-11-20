@@ -58,8 +58,16 @@ case "${1-}" in
         if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
         if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
         ;;
+    --locked)
+        [ "$*" = '--locked ls --current --json github:EzraCerpac/dots' ]
+        if [ -f manager-locked ]; then cat manager-locked; else printf '[]\n'; fi
+        ;;
     install)
         printf 'install tools\n' >> calls
+        if [ -f manager-policy ]; then
+            printf 'disabled tools %s\n' "${MISE_DISABLE_TOOLS:-}" >> calls
+            printf 'install shims %s\n' "${MISE_SHIMS_DIR:-}" >> calls
+        fi
         if [ -f expect-store-overlap ]; then
             attempts=0
             until [ -f store-started ]; do
@@ -72,7 +80,17 @@ case "${1-}" in
         : > installed
         ;;
     upgrade) printf '%s\n' "$*" >> calls ;;
+    reshim) printf 'refresh unfiltered shims\n' >> calls ;;
     settings)
+        if [ -f manager-policy ] && [ "$2" = get ]; then
+            case "$3" in
+                locked) printf 'false\n' ;;
+                disable_tools) printf '["unrelated"]\n' ;;
+                offline) printf 'true\n' ;;
+                *) exit 1 ;;
+            esac
+            exit 0
+        fi
         if [ -f package-settings.json ]; then
             cat package-settings.json
         else

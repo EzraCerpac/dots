@@ -861,6 +861,7 @@ exec "$DOTS_TEST_SNAPSHOT_GIT" "$@"
             "MiSe.LoCk",
             "LOCKS/fixture",
             ".Setup-State/fixture",
+            "conf.d/00-dots-manager.toml",
         ];
         for path in private_paths {
             let file = git.root().join(path);

@@ -39,10 +39,6 @@ case "$1" in
     which)
         test "$2 $3 $4" = "--tool $tool dots"
         printf '%s\n' "${0%/*}/candidate" ;;
-    use)
-        test "$2 $3 $5 $6" = "-g --path --fuzzy $tool"
-        mkdir -p "${4%/*}"
-        : > "$4" ;;
     reshim)
         mkdir -p "$MISE_SHIMS_DIR"
         ln -s "${0%/*}/candidate" "$MISE_SHIMS_DIR/dots" ;;
@@ -106,7 +102,7 @@ fn assert_refusal(output: &Output, reason: &str) {
 }
 
 #[test]
-fn new_installer_pins_github_latest_before_activation() {
+fn headless_installer_installs_the_exact_release_and_prints_init_without_writing_config() {
     for requested_latest in [false, true] {
         let world = fixture();
         let mut command = installer(&world, "0.5.0");
@@ -119,11 +115,19 @@ fn new_installer_pins_github_latest_before_activation() {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             trace(&world),
-            "curl\ninstall\nwhich\ndots --version\nuse\nreshim\nsettings\n"
+            "curl\ninstall\nwhich\ndots --version\nreshim\nsettings\n"
         );
         assert_eq!(
             fs::read_link(world.home().join(".local/bin/dots")).unwrap(),
             world.base().join("mise/data/shims/dots")
+        );
+        assert!(!world.root().join("conf.d/00-dots-manager.toml").exists());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&format!(
+                "'{}' init",
+                world.base().join("bin/candidate").display()
+            )),
+            "{output:?}"
         );
     }
 }
@@ -144,7 +148,7 @@ fn new_installer_prefers_cli_version_over_environment_without_lookup() {
         assert!(output.status.success(), "{output:?}");
         assert_eq!(
             trace(&world),
-            "install\nwhich\ndots --version\nuse\nreshim\nsettings\n"
+            "install\nwhich\ndots --version\nreshim\nsettings\n"
         );
     }
 }

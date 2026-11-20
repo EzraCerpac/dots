@@ -735,6 +735,33 @@ fn new_manager_discovery_reuses_the_supervised_configuration_listing() {
 }
 
 #[test]
+fn new_offline_latest_manager_is_excluded_from_native_install_and_upgrade_unless_locked() {
+    const ROW: &str =
+        r#"{"version":"0.5.0","requested_version":"latest","active":true,"installed":true}"#;
+    for locked in [false, true] {
+        let fixture = Fixture::new();
+        fixture.write("manager-policy", "");
+        let tools = format!(r#"{{"github:EzraCerpac/dots":[{ROW}]}}"#);
+        fixture.write("tools-before.json", &tools);
+        fixture.write("tools-after.json", &tools);
+        if locked {
+            fixture.write("manager-locked", &format!("[{ROW}]"));
+        }
+        assert!(changes(&fixture.run(0)).iter().all(|row| row.0 != "dots"));
+        let calls = fixture.calls();
+        assert_eq!(
+            calls.contains("disabled tools unrelated,github:EzraCerpac/dots"),
+            !locked
+        );
+        assert_eq!(
+            calls.contains("upgrade --no-prune --exclude github:EzraCerpac/dots"),
+            !locked
+        );
+        assert_eq!(calls.contains("refresh unfiltered shims"), !locked);
+    }
+}
+
+#[test]
 fn new_cancel_reaps_the_configuration_probe_and_its_child() {
     let fixture = Fixture::new();
     fixture.write("block-config-lookup", "");

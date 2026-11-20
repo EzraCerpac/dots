@@ -169,8 +169,15 @@ pub(super) fn validate(
             };
             documents.insert(path.clone(), parse_at(path, bytes)?);
         }
-        write_private(&root.join(path), image)?;
-        ignored.push(path.clone());
+        let destination = scratch_destination(&root, path)?;
+        if path == Path::new(super::git::MANAGER_FALLBACK) {
+            // This reserved path is omitted by Git sync even for an adopted
+            // checkout whose shared .gitignore predates the installer.
+            fs::create_dir_all(destination.parent().expect("fragment parent"))?;
+        } else {
+            ignored.push(path.clone());
+        }
+        write_private(&destination, image)?;
     }
     protect_future_hosts(&root)?;
     let preview_git = scratch.live.at(&root);
@@ -305,6 +312,22 @@ fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
             }
             files.insert(path, image);
         }
+    }
+    let fragment = Path::new(super::git::MANAGER_FALLBACK);
+    match fs::symlink_metadata(root.join(fragment)) {
+        Ok(_) => {
+            let image = anchored.read_path(fragment)?;
+            if !matches!(image, Image::Regular { .. }) {
+                return Err(invalid("machine-local config is not a regular file"));
+            }
+            files.insert(fragment.into(), image);
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) => {}
+        Err(error) => return Err(error),
     }
     Ok(files)
 }

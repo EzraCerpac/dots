@@ -11,22 +11,26 @@ use crate::process::{Cwd, Mise};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId};
 use crate::targets::github_repo;
 
-use super::{Step, Versions, child, json, mise_command, probe, record_changes, step};
+use super::{
+    Step, Versions, child, issue, json, manager, mise_command, probe, record_changes, step,
+};
 
-type ToolList = BTreeMap<String, Vec<Tool>>;
+pub(super) type ToolList = BTreeMap<String, Vec<Tool>>;
 
 #[derive(Deserialize)]
-struct Tool {
+pub(super) struct Tool {
     #[serde(default)]
-    requested_version: String,
+    pub(super) requested_version: String,
     version: String,
     #[serde(default)]
     active: bool,
     #[serde(default)]
-    installed: Option<bool>,
+    pub(super) installed: Option<bool>,
+    #[serde(default)]
+    pub(super) install_path: PathBuf,
 }
 
-fn list(run: &Run<'_>, mise: &Mise<'_>) -> Result<ToolList, Issue> {
+pub(super) fn list(run: &Run<'_>, mise: &Mise<'_>) -> Result<ToolList, Issue> {
     json(run, mise_command(run, mise, ["ls", "--current", "--json"]))
 }
 
@@ -66,7 +70,12 @@ fn run_and_record(
     result.map(|()| Outcome::Completed)
 }
 
-pub(super) fn update(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> (bool, bool) {
+pub(super) fn update(
+    ctx: &Ctx,
+    run: &Run<'_>,
+    mise: &Mise<'_>,
+    direct: Option<&manager::Direct>,
+) -> (bool, bool) {
     let installed = step(run, "Install declared mise tools", |id| {
         let before = list(run, mise).ok();
         let mut hints = ctx
@@ -78,17 +87,34 @@ pub(super) fn update(ctx: &Ctx, run: &Run<'_>, mise: &Mise<'_>) -> (bool, bool) 
             hints.push(",");
         }
         hints.push("system_packages_missing");
+        // A filtered mise install may remove the excluded tool's shim.
+        // Keep the live shims intact and refresh them with the full toolset.
+        let shims = direct
+            .map(|_| tempfile::tempdir())
+            .transpose()
+            .map_err(issue)?;
         let cmd = mise_command(run, mise, ["install"]).map(|mut cmd| {
             cmd.env("MISE_DISABLE_HINTS", hints);
+            if let (Some(direct), Some(shims)) = (direct, &shims) {
+                direct.exclude_from_install(&mut cmd);
+                cmd.env("MISE_SHIMS_DIR", shims.path());
+            }
             cmd
         });
-        run_and_record(run, id, mise, before, cmd)
+        let result = run_and_record(run, id, mise, before, cmd);
+        if shims.is_some() {
+            let _ = probe(run, mise_command(run, mise, ["reshim"]));
+        }
+        result
     }) == Some(Outcome::Completed);
 
     let upgraded = installed
         && step(run, "Upgrade declared mise tools", |id| {
             let before = list(run, mise)?;
-            let args = upgrade_args(&before);
+            let mut args = upgrade_args(&before);
+            if let Some(direct) = direct {
+                args.extend(["--exclude".to_owned(), direct.tool.clone()]);
+            }
             run_and_record(run, id, mise, Some(before), mise_command(run, mise, &args))
         }) == Some(Outcome::Completed);
     (installed, upgraded)
@@ -105,7 +131,10 @@ fn upgrade_args(tools: &ToolList) -> Vec<String> {
     args
 }
 
-fn text(run: &Run<'_>, cmd: Result<std::process::Command, crate::Fail>) -> Option<String> {
+pub(super) fn text(
+    run: &Run<'_>,
+    cmd: Result<std::process::Command, crate::Fail>,
+) -> Option<String> {
     let result = probe(run, cmd).ok()?;
     let value = String::from_utf8(result).ok()?.trim().to_owned();
     (!value.is_empty()).then_some(value)
@@ -188,7 +217,7 @@ pub(super) enum ManagerBaseline {
     Installed(String),
 }
 
-fn manager_tool(name: &str) -> bool {
+pub(super) fn manager_tool(name: &str) -> bool {
     name == "dots"
         || name
             .strip_prefix("https://github.com/")
@@ -281,7 +310,7 @@ pub(super) fn manager_baseline(
 
 fn manager_version(ctx: &Ctx, run: &Run<'_>, executable: PathBuf) -> Option<String> {
     let cmd = ctx.command(executable, Cwd::Root).map(|mut cmd| {
-        cmd.arg("--version");
+        cmd.env("DOTS_SKILL_LINKS", "0").arg("--version");
         cmd
     });
     let output = text(run, cmd)?;

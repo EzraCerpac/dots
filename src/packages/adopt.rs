@@ -1017,7 +1017,7 @@ fn exchange_error(error: io::Error) -> io::Error {
     }
 }
 
-pub(super) fn rename_noclobber(a: &Path, b: &Path) -> io::Result<()> {
+pub(crate) fn rename_noclobber(a: &Path, b: &Path) -> io::Result<()> {
     rename(a, b, false)
 }
 

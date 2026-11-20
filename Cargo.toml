@@ -1,6 +1,6 @@
 [package]
 name = "dots-cli"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -38,6 +38,7 @@ glob = "0.3.4"
 lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
 nix = { version = "0.32.0", features = ["user"] }
 plist = { version = "1.10.4", default-features = false }
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"

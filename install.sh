@@ -89,6 +89,7 @@ adopt() {
     cd -P "$root"
     export DOTS_ROOT="$PWD" DOTS_BOOTSTRAP_ADOPT=1 MISE_CONFIG_DIR="$PWD"
     export MISE_GLOBAL_CONFIG_FILE='' MISE_CONFIG_FILE='' MISE_HISTORY_ENABLED=0
+    if [ -z "$archive" ]; then reject_tracked_fragment; fi
     profile=$("$dots" __check-bootstrap-profile "$profile") || {
         status=$?
         if [ "$status" -eq 2 ]; then printf '%s\n' 'Rerun with a declared profile:' >&2; fi
@@ -106,6 +107,36 @@ adopt() {
     "$mise" bootstrap --skip-dirty --env "$profile"
     "$dots" __check-bootstrap-profile "$profile" >/dev/null
     "$dots" bootstrap persist-selected
+}
+
+manager_config() (
+    unset MISE_ENV MISE_ENVIRONMENT
+    MISE_CONFIG_DIR="$root" "$mise" -C "$root" config ls --json
+)
+
+declares_manager() {
+    printf '%s\n' "$1" | LC_ALL=C grep -Eiq '^[[:space:]]*"github:EzraCerpac/dots",?[[:space:]]*$'
+}
+
+reject_tracked_fragment() {
+    if git -C "$root" ls-files --error-unmatch -- ':(icase,literal)conf.d/00-dots-manager.toml' >/dev/null 2>&1 ||
+       git -C "$root" ls-tree -r --name-only HEAD 2>/dev/null |
+           LC_ALL=C grep -Eiq '^conf\.d/00-dots-manager\.toml(/|$)'; then
+        fail "the machine-local configuration path is tracked by Git at $root/conf.d/00-dots-manager.toml."
+    fi
+}
+
+record_manager_if_missing() {
+    reject_tracked_fragment
+    configs=$(manager_config) || fail 'could not inspect the active mise configuration.'
+    if declares_manager "$configs"; then return; fi
+    fragment=$root/conf.d/00-dots-manager.toml
+    [ ! -L "$root/conf.d" ] || fail "expected a real directory at $root/conf.d."
+    mkdir -p "$root/conf.d"
+    (umask 077; set -C; printf '[tools]\n"github:EzraCerpac/dots" = "%s"\n' "$request" > "$fragment") ||
+        fail "could not create the machine-local configuration at $fragment."
+    configs=$(manager_config) && declares_manager "$configs" ||
+        fail "mise did not load the machine-local configuration at $fragment."
 }
 
 version=${DOTS_VERSION:-latest} source='' profile='' archive=''
@@ -153,6 +184,7 @@ if [ -n "$source" ]; then
     fi
 fi
 version_hint='Rerun the installer with sh -s -- --version X.Y.Z.'
+request=$version
 if [ "$version" = latest ]; then
     releases=https://github.com/EzraCerpac/dots/releases
     redirect=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$releases/latest" 2>/dev/null) ||
@@ -167,6 +199,7 @@ case "$version" in *[!a-zA-Z0-9.+-]*) fail "expected a dots release version. $ve
 printf '%s\n' "$version" | LC_ALL=C grep -Eq \
     "^$number\\.$number\\.$number(-$identifier(\\.$identifier)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$" ||
     fail "expected a dots release version. $version_hint"
+[ "$request" = latest ] || request=$version
 tool=github:EzraCerpac/dots@$version
 if [ -n "$archive" ]; then
     case "$archive" in /*.tar.gz) ;; *) fail 'expected an absolute .tar.gz path.' ;; esac
@@ -176,6 +209,7 @@ find_mise
 export DOTS_MISE_BIN="$mise" DOTS_ROOT="$root" PATH="${mise%/*}:$PATH"
 "$mise" -q -C "$HOME" install "$tool"
 dots=$("$mise" -C "$HOME" which --tool "$tool" dots) || fail "mise could not find dots $version."
+case "$dots" in /*) ;; *) fail "mise did not return an absolute path for dots $version." ;; esac
 reported=$(DOTS_SKILL_LINKS=0 "$dots" --version 2>/dev/null) || fail "could not verify dots $version."
 case "$reported" in "dots $version"|"dots $version ("*")") ;; *) fail "the installed dots did not report version $version." ;; esac
 terminal=false
@@ -184,9 +218,18 @@ if [ -n "$source" ]; then
     export PATH="${dots%/*}:$PATH"
     (adopt)
 fi
-config=${MISE_GLOBAL_CONFIG_FILE:-"${MISE_CONFIG_FILE:-"$global/config.local.toml"}"}
-case "$config" in /*) ;; *) config=$PWD/$config ;; esac
-"$mise" -q -C "$HOME" use -g --path "$config" --fuzzy "$tool"
+if [ -n "$archive" ]; then
+    # Keep the explicit testing backend selected for archive fixtures.
+    config=${MISE_GLOBAL_CONFIG_FILE:-"${MISE_CONFIG_FILE:-"$global/config.local.toml"}"}
+    case "$config" in /*) ;; *) config=$PWD/$config ;; esac
+    "$mise" -q -C "$HOME" use -g --path "$config" --fuzzy "$tool"
+elif [ -z "$source" ] && "$terminal"; then
+    reject_tracked_fragment
+    "$dots" init
+fi
+if [ -z "$archive" ] && { [ -n "$source" ] || "$terminal"; }; then
+    record_manager_if_missing
+fi
 "$mise" -C "$HOME" reshim
 data=${MISE_DATA_DIR:-"${XDG_DATA_HOME:-"$HOME/.local/share"}/mise"}
 shims=$("$mise" -C "$HOME" settings get shims_dir 2>/dev/null) || shims=
@@ -209,13 +252,19 @@ elif [ "$launcher" != "$(PATH=$original_path command -v dots || :)" ]; then
         *) trap 'printf "export PATH=\"\$HOME/.local/bin:\$PATH\"\n" >&2' 0 ;;
     esac
 fi
-[ "$root" = "$global" ] || display="env DOTS_ROOT=$(shell_word "$root") $display"
+if [ "$root" != "$global" ]; then
+    if [ -z "$archive" ]; then display="MISE_CONFIG_DIR=$(shell_word "$root") $display"; fi
+    display="env DOTS_ROOT=$(shell_word "$root") $display"
+fi
 
 if [ -n "$source" ]; then
     printf 'Next: %s up\n' "$display"
 elif "$terminal"; then
-    "$dots" init
+    if [ -n "$archive" ]; then "$dots" init; fi
     if [ "$display" != dots ]; then printf 'Next: %s up\n' "$display"; fi
+elif [ -z "$archive" ]; then
+    printf 'env DOTS_ROOT=%s DOTS_MISE_BIN=%s %s init\n' \
+        "$(shell_word "$root")" "$(shell_word "$mise")" "$(shell_word "$dots")"
 else
     printf '%s init\n' "$display"
 fi

@@ -64,10 +64,12 @@ Each option is optional.
   A configuration that already declares `dots` gets nothing written.
 - It links `~/.local/bin/dots` to mise's `dots` shim unless something is already at that path.
 - In a terminal without `--from`, it runs `dots init` and passes its output through unchanged.
-  Without a terminal, it never runs `dots init`; it prints the command to run in a terminal instead.
+  Without a terminal, it never runs `dots init`; it prints the command to run in a terminal instead,
+  which names the verified executable by its absolute path and sets `DOTS_ROOT` and `DOTS_MISE_BIN`, quoted for the shell.
 - Each command it prints for you is plain `dots` when that already reaches the new installation.
-  Otherwise it names the verified executable or the shim by its absolute path, quoted for the shell.
-  When the configuration is not in mise's default directory, it sets both `DOTS_ROOT` and `MISE_CONFIG_DIR`, quoted, so the shim loads that configuration.
+  Otherwise it names `~/.local/bin/dots` or the shim by its absolute path, quoted for the shell.
+  When the configuration is not in mise's default directory, it sets both `DOTS_ROOT` and `MISE_CONFIG_DIR` and runs the shim through `mise -C` in that directory, all quoted,
+  so the shim loads that configuration and the project you run it from cannot select a different `dots` version.
   After `dots init`, the installer then adds its own `Next:` line.
 - As it exits, it prints `PATH` advice on stderr, after the command: the line that puts `~/.local/bin` first, for `fish` or other shells, or, when something else is at `~/.local/bin/dots`, how to run the installed `dots` alongside it.
   Follow that advice for new shells; the printed command works without it.

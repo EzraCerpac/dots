@@ -92,7 +92,13 @@ mise use -g github:EzraCerpac/dots@0.5.1
 
 ```sh
 cargo install dots-cli --locked
+```
+
+```sh
 cargo binstall dots-cli
+```
+
+```sh
 brew install EzraCerpac/tap/dots
 ```
 

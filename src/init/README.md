@@ -260,7 +260,7 @@ pre-dotfiles = 'SETUP_PROFILE=laptop "$(command -v mise || echo "$HOME/.local/bi
 
 # config.toml
 [tools]
-"github:EzraCerpac/dots" = "0.5.0"
+"github:EzraCerpac/dots" = "latest"
 
 [tasks.bootstrap]
 description = "Finish the dots bootstrap"
@@ -268,5 +268,5 @@ run = 'dots bootstrap complete'
 raw = true
 ```
 
-Because the `pre-dotfiles` hook may run before `mise` is on `PATH`, it finds mise on its own and runs the `dots` version pinned in `[tools]`.
+Because the `pre-dotfiles` hook may run before `mise` is on `PATH`, it finds mise on its own and runs the `dots` version declared in `[tools]`.
 `dots bootstrap complete` then reads the private inputs, switches a fresh clone to `dev`, restores settings history if asked, installs installer exceptions, runs `hooks/bootstrap.d/`, and prepares encrypted history when a state repository is configured.

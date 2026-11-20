@@ -81,9 +81,11 @@ mise runs as a child rooted in the configuration, with `MISE_CONFIG_DIR` set to 
 | `miserc.toml` | The selector of this machine's mise environment, mode 0600 | no |
 | `config.local.toml` | The profile, machine ID, history settings and identity settings of this machine, mode 0600 | no |
 | `mise.lock`, `mise.*.lock`, `locks/`, `.setup-state/` | Per-machine files written by mise and by older setups | no |
+| `conf.d/00-dots-manager.toml` | The installer's fallback declaration of `dots`, written only when no configuration file declares it: `latest`, or the exact version requested with `--version` or `DOTS_VERSION`; mise gives `config.toml` precedence over it | no |
 
 `dots sync` never shares a machine-local file, and it refuses a merged configuration whose ignore rules would expose one.
 Root `mise.lock` and `mise.*.lock` files are never shared.
+Neither is `conf.d/00-dots-manager.toml`, which is reserved for the installer.
 Among lockfiles, incoming ignore rules only have to protect those present at the root.
 They must still protect `config.host-*.toml` selectors that do not exist yet.
 
@@ -167,8 +169,9 @@ Before writing anything, `init` looks at the repository around `DIR`:
 
 The steps then run in this order:
 
-1. **Files.** If there is no `config.toml`, `init` writes one containing `gitleaks = "latest"` and `age = "latest"` in `[tools]`, `[vars] dots_profiles = "default"` and commented hints for the optional settings.
+1. **Files.** If there is no `config.toml`, `init` writes one containing `gitleaks = "latest"`, `age = "latest"` and `"github:EzraCerpac/dots" = "latest"` in `[tools]`, `[vars] dots_profiles = "default"` and commented hints for the optional settings.
    If `config.toml` exists without `dots_profiles`, `init` adds `dots_profiles = "default"` and leaves every other byte alone.
+   An existing `config.toml` keeps its tool declarations, including any declaration of `dots` or the lack of one.
    It creates `dots/` with `hooks/update.d/`, `hooks/bootstrap.d/`, `commands/` and `exceptions/`, and writes `dots/README.md`, `dots/exceptions.tsv`, `dots/retired-dotfiles`, `dots/retired-declarations`, `.gitleaks.toml` and `.gitignore`, each one only if it is absent.
 2. **Profile.** A valid persisted profile stays.
    If there is none, `init` selects `default` when `dots_profiles` lists it, and the first listed profile otherwise.
@@ -490,10 +493,15 @@ The stages run in this order:
    An eligible cask declared present is installed when it is missing.
    An eligible installed cask declared present is upgraded, unless its metadata marks it as auto-updating or `dots_self_updating_casks` lists it.
 6. **Tools.** Installs newly declared mise tools, then upgrades the declared tools; a tool pinned to a revision stays at that revision, and versions that are replaced stay installed.
+   When the effective declaration of `dots` is the official `github:EzraCerpac/dots` at `latest` and no lockfile fixes its version, this stage leaves `dots` to stage 10.
 7. **Installer exceptions.** Every selected recipe; with `install-only`, the recipe receives `--install-only`.
 8. **Update hooks**, in name order.
 9. **Standalone mise.** Updates mise itself, unless a package manager installed it.
-10. **Manager.** If the configuration declares `dots` and a stage installed a different version, it reports `dots X -> Y, used from the next run`.
+10. **Manager.** When stage 6 left `dots` to it, this stage looks up the official latest release, with a bounded wait.
+    If that release is newer than the version in use, it installs that exact version and verifies the executable; the earlier version stays installed.
+    It reports `dots X -> Y, used from the next run` only once the new executable is verified and selected.
+    Being offline, or a failed lookup, installation or activation, defers the update quietly: the previous executable stays in use, and the exit status of `dots up` is unaffected.
+    Any other declaration of `dots`, such as a fixed version, a locked version or another source, stays with mise's native handling; this stage then reports `dots X -> Y, used from the next run` if a stage installed a different version.
 11. **Post-update checkpoint.** As stage 1.
 
 **Changed from 0.3.5:** the pre-update checkpoint is the first stage, where 0.3.5 ran it after sync and reload.
@@ -750,7 +758,7 @@ pre-dotfiles = 'SETUP_PROFILE=laptop "$(command -v mise || echo "$HOME/.local/bi
 
 # config.toml
 [tools]
-"github:EzraCerpac/dots" = "0.5.0"
+"github:EzraCerpac/dots" = "latest"
 
 [tasks.bootstrap]
 description = "Finish the dots bootstrap"
@@ -759,7 +767,7 @@ raw = true
 ```
 
 On mise 2026.11.9, with nothing but `/usr/bin:/bin` on `PATH`, a native bootstrap ran the `pre-dotfiles` hook before applying dotfiles and without `mise` on `PATH`, then applied dotfiles, ran the `post-dotfiles` hook and the tools step, and ran the `bootstrap` task last.
-That is why the `pre-dotfiles` hook finds the standalone mise for itself and runs `dots` through `mise x github:EzraCerpac/dots`, which uses the version pinned by `[tools]` in `config.toml`, 0.5.0 in this example.
+That is why the `pre-dotfiles` hook finds the standalone mise for itself and runs `dots` through `mise x github:EzraCerpac/dots`, which uses the version that `[tools]` in `config.toml` declares.
 On mise 2026.11.9 on macOS, with an empty temporary `HOME` and empty data, state and cache directories, and `"github:EzraCerpac/dots" = "0.3.5"` in `[tools]`, a `pre-dotfiles` hook that ran `mise x github:EzraCerpac/dots -- dots --version` through the standalone mise fetched and installed the pinned 0.3.5 before it existed and printed its version; dotfiles were then applied, the tools step found `dots` installed already, and the bootstrap exited 0.
 This verifies resolving the pin and launching it from the hook, not the 0.5 callback itself.
 
@@ -781,6 +789,7 @@ Without a terminal, adoption proceeds only when `MISE_YES=1` is set, and otherwi
 When the configuration root is already the top of a checkout whose stored `origin` is the requested repository, the installer reuses it, so the same command continues after a failure; any other Git checkout there stops it unchanged, and a root that is not a Git checkout is first moved to `ROOT.before-dots-` followed by a UTC timestamp.
 After a `main`-only clone, the first shared sync switches the checkout to `dev` and publishes it, as described under [Checkout shape](#checkout-shape).
 After mise's native bootstrap succeeds, the installer checks the profile again and runs `dots bootstrap persist-selected`, so the profile and machine ID are saved even when the configuration has no hook for that; only then does it select `dots`.
+If the adopted configuration declares `dots`, the installer records nothing; otherwise it records the fallback declaration in `conf.d/00-dots-manager.toml`.
 
 `dots bootstrap complete` runs the following stages, printing a result line for each and a final count:
 

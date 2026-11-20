@@ -73,7 +73,7 @@ shell_word() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 retry() {
     printf 'curl -fsSL https://raw.githubusercontent.com/EzraCerpac/dots/main/install.sh | env '
-    set -- "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --version "$version"
+    set -- "DOTS_ROOT=$root" "DOTS_MISE_BIN=$mise" sh -s -- --version "$request"
     if [ "${MISE_YES:-}" = 1 ]; then set -- MISE_YES=1 "$@"; fi
     if [ -n "$archive" ]; then set -- "$@" --archive "$archive"; fi
     if [ -n "$profile" ]; then set -- "$@" --profile "$profile"; fi

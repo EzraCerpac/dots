@@ -24,6 +24,10 @@ printf '%s' "$REDIRECT""#,
         (
             "git",
             r#"printf 'git\n' >> "$TRACE"
+case "${3-}" in
+    rev-parse) pwd -P; exit 0 ;;
+    config) printf '%s\n' https://github.com/example/dotfiles; exit 0 ;;
+esac
 exit 71"#,
         ),
         (
@@ -49,6 +53,7 @@ esac"#,
         (
             "candidate",
             r#"printf 'dots %s\n' "$*" >> "$TRACE"
+if [ "$1" = __check-bootstrap-profile ]; then exit 2; fi
 test "$*" = --version
 test "$DOTS_SKILL_LINKS" = 0
 printf 'dots %s (mise)\n' "$ACTUAL""#,
@@ -149,6 +154,28 @@ fn new_installer_prefers_cli_version_over_environment_without_lookup() {
         assert_eq!(
             trace(&world),
             "install\nwhich\ndots --version\nreshim\nsettings\n"
+        );
+    }
+}
+
+#[test]
+fn adoption_retry_preserves_the_requested_release_policy() {
+    for (request, expected) in [("latest", "latest"), ("v0.5.0", "0.5.0")] {
+        let world = fixture();
+        fs::create_dir(world.root().join(".git")).unwrap();
+        let output = installer(&world, "0.5.0")
+            .args(["--from", "example/dotfiles", "--version", request])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        let retry = stderr
+            .lines()
+            .find(|line| line.starts_with("curl -fsSL "))
+            .expect("missing adoption retry command");
+        assert!(
+            retry.contains(&format!("'--version' '{expected}'")),
+            "{retry}"
         );
     }
 }

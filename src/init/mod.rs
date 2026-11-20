@@ -1,6 +1,7 @@
 mod checkout;
 mod files;
 mod git;
+mod manager;
 mod remote;
 
 pub use files::TEMPLATES;
@@ -17,7 +18,7 @@ use crate::{Args, Ctx, Env, Fail};
 use git::{Git, Shape};
 
 pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
-    crate::process::require_mise(&ctx.env)?;
+    let mise = crate::process::require_mise(&ctx.env)?;
     let root = ctx.root.path();
     let ancestor = existing_directory(root)?;
     let probe = Git {
@@ -111,7 +112,12 @@ pub fn init(ctx: &Ctx, args: &Args) -> Result<u8, Fail> {
         checkout::advise(&git)?;
     }
     remote::configure(&git, vars.source_repo.as_ref(), created_seed)?;
-    if outside_active_root {
+    manager::ensure(ctx, &git)?;
+    if crate::config_commands::ExecutableOrigin::current(&ctx.env)
+        .is_ok_and(|origin| origin.installer == "mise")
+    {
+        mise_next(root, &mise)?;
+    } else if outside_active_root {
         command_line("Next: DOTS_ROOT=", root, " dots up")?;
     } else {
         println!("Next: dots up");
@@ -184,22 +190,44 @@ fn command_line(before: &str, root: &Path, after: &str) -> Result<(), Fail> {
     let mut stdout = io::stdout().lock();
     let mut write = || -> io::Result<()> {
         stdout.write_all(before.as_bytes())?;
-        stdout.write_all(b"'")?;
-        for (index, chunk) in root
-            .as_os_str()
-            .as_bytes()
-            .split(|byte| *byte == b'\'')
-            .enumerate()
-        {
-            if index > 0 {
-                stdout.write_all(b"'\\''")?;
-            }
-            stdout.write_all(chunk)?;
-        }
-        stdout.write_all(b"'")?;
+        shell_path(&mut stdout, root)?;
         writeln!(stdout, "{after}")
     };
     write().map_err(|err| Fail::new(1, format!("could not print init guidance: {err}")))
+}
+
+fn mise_next(root: &Path, mise: &Path) -> Result<(), Fail> {
+    let mut stdout = io::stdout().lock();
+    let mut write = || -> io::Result<()> {
+        stdout.write_all(b"Next: env DOTS_ROOT=")?;
+        shell_path(&mut stdout, root)?;
+        stdout.write_all(b" MISE_CONFIG_DIR=")?;
+        shell_path(&mut stdout, root)?;
+        stdout.write_all(b" DOTS_MISE_BIN=")?;
+        shell_path(&mut stdout, mise)?;
+        stdout.write_all(b" MISE_EXEC_AUTO_INSTALL=0 ")?;
+        shell_path(&mut stdout, mise)?;
+        stdout.write_all(b" -C ")?;
+        shell_path(&mut stdout, root)?;
+        writeln!(stdout, " exec -- dots up")
+    };
+    write().map_err(|err| Fail::new(1, format!("could not print init guidance: {err}")))
+}
+
+fn shell_path(out: &mut impl Write, path: &Path) -> io::Result<()> {
+    out.write_all(b"'")?;
+    for (index, chunk) in path
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'\'')
+        .enumerate()
+    {
+        if index > 0 {
+            out.write_all(b"'\\''")?;
+        }
+        out.write_all(chunk)?;
+    }
+    out.write_all(b"'")
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ pub(super) fn direct(run: &Run<'_>, mise: &Mise<'_>, files: &[u8]) -> Option<Dir
     let names: std::collections::BTreeSet<_> = files
         .iter()
         .flat_map(|file| file.tools.iter().map(String::as_str))
-        .filter(|name| tools::manager_tool(name))
+        .filter(|name| crate::config::manager_tool(name))
         .collect();
     let mut requests = names.into_iter().filter_map(|name| {
         // This field comes from mise's effective requests, even when no

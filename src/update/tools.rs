@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::Ctx;
+use crate::config::manager_tool;
 use crate::config::passive;
 use crate::process::{Cwd, Mise};
 use crate::run::{Change, Issue, Outcome, Policy, Run, StageId};
-use crate::targets::github_repo;
 
 use super::{
     Step, Versions, child, issue, json, manager, mise_command, probe, record_changes, step,
@@ -215,16 +215,6 @@ pub(super) enum ManagerSource {
 pub(super) enum ManagerBaseline {
     Missing,
     Installed(String),
-}
-
-pub(super) fn manager_tool(name: &str) -> bool {
-    matches!(name, "dots" | "http:dots" | "cargo:dots-cli")
-        || name
-            .strip_prefix("https://github.com/")
-            .or_else(|| name.split_once(':').map(|(_, repository)| repository))
-            .and_then(github_repo)
-            .as_deref()
-            == Some("ezracerpac/dots")
 }
 
 pub(super) fn probe_path(run: &Run<'_>, mise: &Mise<'_>, args: &[&str]) -> Option<PathBuf> {

@@ -246,7 +246,7 @@ if [ -n "$archive" ]; then
     "$mise" -q -C "$HOME" use -g --path "$config" --fuzzy "$tool"
 elif [ -z "$source" ] && "$terminal"; then
     reject_tracked_fragment
-    "$dots" init
+    DOTS_VERSION="$request" "$dots" init
 fi
 if [ -z "$archive" ] && { [ -n "$source" ] || "$terminal"; }; then
     record_manager_if_missing
@@ -285,8 +285,8 @@ elif "$terminal"; then
     if [ -n "$archive" ]; then "$dots" init; fi
     if [ "$display" != dots ]; then printf 'Next: %s up\n' "$display"; fi
 elif [ -z "$archive" ]; then
-    printf 'env DOTS_ROOT=%s DOTS_MISE_BIN=%s %s init\n' \
-        "$(shell_word "$root")" "$(shell_word "$mise")" "$(shell_word "$dots")"
+    printf 'env DOTS_ROOT=%s DOTS_MISE_BIN=%s DOTS_VERSION=%s %s init\n' \
+        "$(shell_word "$root")" "$(shell_word "$mise")" "$(shell_word "$request")" "$(shell_word "$dots")"
 else
     printf '%s init\n' "$display"
 fi

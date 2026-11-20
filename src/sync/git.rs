@@ -283,8 +283,6 @@ pub(super) fn relative(path: &[u8]) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-pub(super) const MANAGER_FALLBACK: &str = "conf.d/00-dots-manager.toml";
-
 pub(super) fn local(path: &Path) -> bool {
     let mut parts = path.components();
     let Some(Component::Normal(first)) = parts.next() else {

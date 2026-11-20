@@ -170,7 +170,7 @@ pub(super) fn validate(
             documents.insert(path.clone(), parse_at(path, bytes)?);
         }
         let destination = scratch_destination(&root, path)?;
-        if path == Path::new(super::git::MANAGER_FALLBACK) {
+        if path == Path::new(crate::config::MANAGER_FALLBACK) {
             // This reserved path is omitted by Git sync even for an adopted
             // checkout whose shared .gitignore predates the installer.
             fs::create_dir_all(destination.parent().expect("fragment parent"))?;
@@ -313,7 +313,7 @@ fn local_files(root: &Path) -> io::Result<BTreeMap<PathBuf, Image>> {
             files.insert(path, image);
         }
     }
-    let fragment = Path::new(super::git::MANAGER_FALLBACK);
+    let fragment = Path::new(crate::config::MANAGER_FALLBACK);
     match fs::symlink_metadata(root.join(fragment)) {
         Ok(_) => {
             let image = anchored.read_path(fragment)?;

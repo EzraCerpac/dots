@@ -253,6 +253,10 @@ fn install(
     if let (Some(selected), Ok(target)) = (selected, target.canonicalize())
         && selected.starts_with(target)
         && reports_version(ctx, run, &selected, &version)
+        && mise_command(run, mise, ["reshim"])
+            .ok()
+            .and_then(|command| bounded_text(run, command))
+            .is_some()
     {
         return Some(());
     }

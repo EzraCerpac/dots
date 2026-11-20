@@ -146,7 +146,7 @@ fn update(run: &Run<'_>, mas: bool) {
             }
         }
 
-        let direct = manager::direct(run, &mise);
+        let direct = manager::direct(run, &mise, &files);
         let (tools_ok, tools_upgraded) = tools::update(ctx, run, &mise, direct.as_ref());
 
         if !validate_configuration(ctx, run) {

@@ -218,7 +218,7 @@ pub(super) enum ManagerBaseline {
 }
 
 pub(super) fn manager_tool(name: &str) -> bool {
-    name == "dots"
+    matches!(name, "dots" | "http:dots" | "cargo:dots-cli")
         || name
             .strip_prefix("https://github.com/")
             .or_else(|| name.split_once(':').map(|(_, repository)| repository))

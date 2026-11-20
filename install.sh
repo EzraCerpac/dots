@@ -109,13 +109,14 @@ adopt() {
     "$dots" bootstrap persist-selected
 }
 
-manager_config() (
+root_mise() (
     unset MISE_ENV MISE_ENVIRONMENT
-    MISE_CONFIG_DIR="$root" "$mise" -C "$root" config ls --json
+    MISE_CONFIG_DIR="$root" "$mise" -C "$root" "$@"
 )
 
 declares_manager() {
-    printf '%s\n' "$1" | LC_ALL=C grep -Eiq '^[[:space:]]*"github:EzraCerpac/dots",?[[:space:]]*$'
+    printf '%s\n' "$1" | LC_ALL=C grep -Eiq \
+        '^[[:space:]]*"(dots|http:dots|cargo:dots-cli|[^"]+:EzraCerpac/dots|https://github\.com/EzraCerpac/dots)",?[[:space:]]*$'
 }
 
 reject_tracked_fragment() {
@@ -126,16 +127,36 @@ reject_tracked_fragment() {
     fi
 }
 
+exclude_fragment() {
+    if git -C "$root" check-ignore -q -- "$fragment_path"; then
+        return
+    else
+        [ "$?" -eq 1 ] || fail 'could not check the machine-local Git exclusion.'
+    fi
+    exclude=$(git -C "$root" rev-parse --path-format=absolute --git-path info/exclude) ||
+        fail 'could not locate the checkout-local Git exclusions.'
+    [ ! -L "${exclude%/*}" ] && [ ! -L "$exclude" ] &&
+        { [ ! -e "$exclude" ] || [ -f "$exclude" ]; } ||
+        fail "expected a regular Git exclusion file at $exclude."
+    mkdir -p "${exclude%/*}"
+    printf '\n/%s\n' "$fragment_path" >> "$exclude" ||
+        fail "could not append the machine-local Git exclusion to $exclude."
+    git -C "$root" check-ignore -q -- "$fragment_path" ||
+        fail "Git does not ignore $fragment_path in $root."
+}
+
 record_manager_if_missing() {
     reject_tracked_fragment
-    configs=$(manager_config) || fail 'could not inspect the active mise configuration.'
-    if declares_manager "$configs"; then return; fi
-    fragment=$root/conf.d/00-dots-manager.toml
+    configs=$(root_mise config ls --json) || fail 'could not inspect the active mise configuration.'
+    if declares_manager "$configs" || MISE_OFFLINE=1 root_mise which dots >/dev/null 2>&1; then return; fi
+    fragment_path=conf.d/00-dots-manager.toml
+    fragment=$root/$fragment_path
     [ ! -L "$root/conf.d" ] || fail "expected a real directory at $root/conf.d."
+    exclude_fragment
     mkdir -p "$root/conf.d"
     (umask 077; set -C; printf '[tools]\n"github:EzraCerpac/dots" = "%s"\n' "$request" > "$fragment") ||
         fail "could not create the machine-local configuration at $fragment."
-    configs=$(manager_config) && declares_manager "$configs" ||
+    configs=$(root_mise config ls --json) && declares_manager "$configs" ||
         fail "mise did not load the machine-local configuration at $fragment."
 }
 
@@ -253,6 +274,7 @@ elif [ "$launcher" != "$(PATH=$original_path command -v dots || :)" ]; then
     esac
 fi
 if [ "$root" != "$global" ]; then
+    display="DOTS_MISE_BIN=$(shell_word "$mise") MISE_EXEC_AUTO_INSTALL=0 $(shell_word "$mise") -C $(shell_word "$root") exec -- $(shell_word "$shim")"
     if [ -z "$archive" ]; then display="MISE_CONFIG_DIR=$(shell_word "$root") $display"; fi
     display="env DOTS_ROOT=$(shell_word "$root") $display"
 fi

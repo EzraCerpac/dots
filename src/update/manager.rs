@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -25,7 +25,6 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) struct Direct {
     pub tool: String,
     install_filter: (&'static str, String),
-    install_path: PathBuf,
 }
 
 impl Direct {
@@ -34,17 +33,31 @@ impl Direct {
     }
 }
 
-pub(super) fn direct(run: &Run<'_>, mise: &Mise<'_>) -> Option<Direct> {
-    let tools = tools::list(run, mise).ok()?;
-    let mut managers = tools.iter().filter(|(name, _)| tools::manager_tool(name));
-    let (tool, rows) = managers.next()?;
-    let [row] = rows.as_slice() else {
-        return None;
-    };
-    if !tool.eq_ignore_ascii_case(TOOL)
-        || row.requested_version != "latest"
-        || managers.next().is_some()
-    {
+pub(super) fn direct(run: &Run<'_>, mise: &Mise<'_>, files: &[u8]) -> Option<Direct> {
+    #[derive(serde::Deserialize)]
+    struct ConfigFile {
+        #[serde(default)]
+        tools: Vec<String>,
+    }
+    let files: Vec<ConfigFile> = serde_json::from_slice(files).ok()?;
+    let names: std::collections::BTreeSet<_> = files
+        .iter()
+        .flat_map(|file| file.tools.iter().map(String::as_str))
+        .filter(|name| tools::manager_tool(name))
+        .collect();
+    let mut requests = names.into_iter().filter_map(|name| {
+        // This field comes from mise's effective requests, even when no
+        // version can be resolved. A policy probe must not fetch versions.
+        let cmd =
+            mise_command(run, mise, ["tool", name, "--requested", "--json"]).map(|mut cmd| {
+                cmd.env("MISE_OFFLINE", "1");
+                cmd
+            });
+        let requested: Option<Vec<String>> = json(run, cmd).ok()?;
+        Some((name, requested?))
+    });
+    let (tool, requested) = requests.next()?;
+    if !tool.eq_ignore_ascii_case(TOOL) || requested != ["latest"] || requests.next().is_some() {
         return None;
     }
 
@@ -72,13 +85,12 @@ pub(super) fn direct(run: &Run<'_>, mise: &Mise<'_>) -> Option<Direct> {
         ("MISE_ENABLE_TOOLS", allowed.join(","))
     } else {
         let mut disabled: Vec<String> = serde_json::from_str(&setting("disable_tools")?).ok()?;
-        disabled.push(tool.clone());
+        disabled.push(tool.to_owned());
         ("MISE_DISABLE_TOOLS", disabled.join(","))
     };
     Some(Direct {
-        tool: tool.clone(),
+        tool: tool.to_owned(),
         install_filter,
-        install_path: row.install_path.clone(),
     })
 }
 
@@ -86,8 +98,8 @@ pub(super) fn update(ctx: &Ctx, run: &Run<'_>, before: Direct) {
     step(run, "dots manager", |id| {
         let changed = (|| {
             // Hooks and standalone mise may have changed the effective selection.
-            let mise = Mise::new_in_run(run).ok()?;
-            let direct = direct(run, &mise)?;
+            let (_, mise, files) = super::Config::reload(ctx, run).ok()?;
+            let direct = direct(run, &mise, &files)?;
             if before.tool != direct.tool
                 || tools::text(
                     run,
@@ -166,7 +178,11 @@ fn install(
     direct: &Direct,
     release: &Version,
 ) -> Option<()> {
-    let parent = direct.install_path.parent()?;
+    let tools = tools::list(run, mise).ok()?;
+    let [request] = tools.get(&direct.tool)?.as_slice() else {
+        return None;
+    };
+    let parent = request.install_path.parent()?;
     let installs = parent.parent()?;
     let data = installs.parent()?;
     let user_installs = crate::config_commands::mise_installs(&ctx.env)?;

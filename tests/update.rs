@@ -741,10 +741,10 @@ fn new_offline_latest_manager_is_excluded_from_native_install_and_upgrade_unless
     for locked in [false, true] {
         let fixture = Fixture::new();
         fixture.write("manager-policy", "");
-        let tools = format!(r#"{{"github:EzraCerpac/dots":[{ROW}]}}"#);
-        fixture.write("tools-before.json", &tools);
-        fixture.write("tools-after.json", &tools);
         if locked {
+            let tools = format!(r#"{{"github:EzraCerpac/dots":[{ROW}]}}"#);
+            fixture.write("tools-before.json", &tools);
+            fixture.write("tools-after.json", &tools);
             fixture.write("manager-locked", &format!("[{ROW}]"));
         }
         assert!(changes(&fixture.run(0)).iter().all(|row| row.0 != "dots"));

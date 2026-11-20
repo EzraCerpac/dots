@@ -29,7 +29,11 @@ case "${1-}" in
                     printf '%s %s\n' "$$" "$helper" > config-ready
                     wait "$helper"
                 fi
-                printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                if [ -f manager-policy ]; then
+                    printf '[{"path":"%s/config.toml","tools":["github:EzraCerpac/dots"]}]\n' "$PWD"
+                else
+                    printf '[{"path":"%s/config.toml"}]\n' "$PWD"
+                fi
                 ;;
             get)
                 for last; do :; done
@@ -57,6 +61,11 @@ case "${1-}" in
     ls)
         if [ -f installed ]; then state=tools-after.json; else state=tools-before.json; fi
         if [ -f "$state" ]; then cat "$state"; else printf '{}\n'; fi
+        ;;
+    tool)
+        [ "$*" = 'tool github:EzraCerpac/dots --requested --json' ]
+        [ "${MISE_OFFLINE:-}" = 1 ]
+        printf '["latest"]\n'
         ;;
     --locked)
         [ "$*" = '--locked ls --current --json github:EzraCerpac/dots' ]
